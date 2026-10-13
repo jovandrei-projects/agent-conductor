@@ -520,7 +520,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     with open(stdout_log, "wb") as out:
         try:
             proc = subprocess.Popen(cmd, cwd=str(work_dir), stdout=out,
-                                    stderr=subprocess.STDOUT)
+                                    stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL)
             with STATE_LOCK:
                 rec["pid"] = proc.pid
                 save_state(run_dir, state)
