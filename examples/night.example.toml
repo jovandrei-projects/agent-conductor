@@ -55,3 +55,29 @@ prompt = "Pick up the next task in .agent_tasks/QUEUE.md and work it to done or 
 # project = "disk-cleanup"
 # cloud = true
 # prompt = "..."
+
+# Parallel wave: adjacent steps sharing a `wave` number run concurrently.
+# Steps on the SAME project must set worktree=true - each runs in a git
+# worktree on branch conductor/<run>/<step>, merged back after the wave in
+# manifest order. Merge conflict -> step fails, worktree is kept under
+# data/worktrees/ for manual merge. Different projects parallelize freely.
+#
+# [[step]]
+# name = "ui-polish"
+# project = "project-hub"
+# wave = 1
+# worktree = true
+# prompt = "..."
+#
+# [[step]]
+# name = "api-polish"
+# project = "project-hub"
+# wave = 1
+# worktree = true
+# prompt = "..."
+#
+# [[step]]
+# name = "unrelated-other-project"
+# project = "thermalwatch"
+# wave = 1            # runs in the same wave, in the project dir itself
+# prompt = "..."

@@ -76,7 +76,9 @@ def main() -> int:
     if prompt_file:
         body = Path(prompt_file).read_text(encoding="utf-8")
 
-    work = cwd / "WORK.txt"
+    import re
+    m = re.search(r"([A-Za-z0-9_]+\.txt)", body)
+    work = cwd / (m.group(1) if m else "WORK.txt")
     n = sum(1 for _ in open(work, encoding="utf-8")) if work.is_file() else 0
     with open(work, "a", encoding="utf-8") as f:
         f.write(f"mock-step-{n + 1}\n")

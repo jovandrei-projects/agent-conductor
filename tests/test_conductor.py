@@ -229,6 +229,56 @@ prompt = "second"
             self.assertEqual(state["steps"]["one"]["status"], "failed")
             self.assertNotIn("two", state["steps"])
 
+    def test_parallel_wave_worktrees_merge(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "p1"
+project = "{proj.as_posix()}"
+prompt = "Append a line to FILE_A.txt."
+wave = 1
+worktree = true
+
+[[step]]
+name = "p2"
+project = "{proj.as_posix()}"
+prompt = "Append a line to FILE_B.txt."
+wave = 1
+worktree = true
+
+[[step]]
+name = "after"
+project = "{proj.as_posix()}"
+prompt = "third"
+''')
+            rc = run_manifest(m, runs)
+            self.assertEqual(rc, 0)
+            # each parallel branch lands its own file; the sequential step too
+            self.assertTrue((proj / "FILE_A.txt").read_text().strip())
+            self.assertTrue((proj / "FILE_B.txt").read_text().strip())
+            self.assertEqual(len((proj / "WORK.txt").read_text().splitlines()), 1)
+            branches = git(proj, "branch", "--list", "conductor/*").stdout
+            self.assertEqual(branches.strip(), "")   # merged branches deleted
+            state = json.loads(
+                (next(runs.iterdir()) / "state.json").read_text())
+            self.assertTrue(state["steps"]["p1"]["merged"])
+            self.assertTrue(state["steps"]["p2"]["merged"])
+
+    def test_wave_collision_without_worktree_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            steps = [conductor.Step(name="a", project=str(proj), prompt="1",
+                                    wave=1),
+                     conductor.Step(name="b", project=str(proj), prompt="2",
+                                    wave=1)]
+            resolved = [(proj, "p", s) for s in steps]
+            with self.assertRaises(conductor.ManifestError):
+                conductor.validate_groups(conductor.group_waves(resolved))
+
     def test_resume_skips_done(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)

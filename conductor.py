@@ -25,11 +25,12 @@ import logging
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
+import threading
 import time
 import tomllib
+import concurrent.futures
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -41,10 +42,10 @@ PROJECTS_FILE = ROOT / "projects.toml"
 TASK_PY = ROOT.parent / "mobile-apps" / "pc-bridge" / "task.py"
 
 LOG = logging.getLogger("conductor")
+STATE_LOCK = threading.RLock()
 STATUS_RE = re.compile(r"^STATUS:\s*([A-Za-z_-]+)", re.M)
 VALID_MODES = {"normal", "accept-edits", "smart", "bypass", "dangerous", "yolo",
                "auto"}
-PRIVATE_SLUGS = {"wifi-network-monitor", "chrome-bookmarks", "money-plan"}
 
 PREAMBLE = """\
 This session was spawned unattended by agent-conductor
@@ -86,9 +87,11 @@ class Step:
     model: str | None = None
     mode: str = "bypass"
     timeout_min: float = 60
-    verify: str | None = None          # cmd.exe command run in the project dir
+    verify: str | None = None          # cmd.exe command run in the work dir
     verify_must_pass: bool = True
     cloud: bool = False
+    wave: int | None = None            # adjacent steps sharing a wave run in parallel
+    worktree: bool = False             # run in a temp git worktree + branch, merged after
 
 
 @dataclasses.dataclass
@@ -133,6 +136,10 @@ def load_manifest(path: Path) -> Manifest:
         mode = str(merged.get("mode", "bypass"))
         if mode not in VALID_MODES:
             raise ManifestError(f"step {merged['name']!r}: bad mode {mode!r}")
+        if merged.get("cloud") and merged.get("worktree"):
+            raise ManifestError(
+                f"step {merged['name']!r}: worktree makes no sense with "
+                f"cloud=true (cloud runs on a Devin VM)")
         steps.append(Step(
             name=merged["name"], project=merged["project"],
             prompt=merged.get("prompt"),
@@ -141,7 +148,9 @@ def load_manifest(path: Path) -> Manifest:
             timeout_min=float(merged.get("timeout_min", 60)),
             verify=merged.get("verify"),
             verify_must_pass=bool(merged.get("verify_must_pass", True)),
-            cloud=bool(merged.get("cloud", False))))
+            cloud=bool(merged.get("cloud", False)),
+            wave=merged.get("wave"),
+            worktree=bool(merged.get("worktree", False))))
     if not steps:
         raise ManifestError("manifest has no [[step]] entries")
     return Manifest(path=path, name=name, on_failure=on_failure,
@@ -184,6 +193,42 @@ def resolve_project(step: Step, projects: dict, manifest_dir: Path) -> tuple[Pat
             f"step {step.name!r}: cloud steps require a projects.toml entry "
             f"with cloud_ok=true; literal paths default to local-only")
     return p, p.name
+
+
+def group_waves(resolved: list[tuple[Path, str, Step]]) -> list[list]:
+    """Adjacent steps sharing a non-None `wave` number form one parallel
+    group; everything else is a singleton, in manifest order."""
+    groups: list[list] = []
+    cur: list = []
+    cur_wave = None
+    for item in resolved:
+        w = item[2].wave
+        if w is not None and cur and w == cur_wave:
+            cur.append(item)
+        else:
+            if cur:
+                groups.append(cur)
+            cur = [item]
+            cur_wave = w
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def validate_groups(groups: list[list]) -> None:
+    """Parallel steps on the SAME project dir must each run in a worktree."""
+    for members in groups:
+        if len(members) < 2:
+            continue
+        by_dir: dict[str, list[Step]] = {}
+        for pdir, _slug, step in members:
+            by_dir.setdefault(str(pdir), []).append(step)
+        for d, ss in by_dir.items():
+            if len(ss) > 1 and not all(s.worktree for s in ss):
+                names = ", ".join(s.name for s in ss)
+                raise ManifestError(
+                    f"wave collision: {len(ss)} parallel steps ({names}) share "
+                    f"{d} - set worktree=true on all of them")
 
 
 # ---------------------------------------------------------------- spawn
@@ -267,6 +312,31 @@ def git_commit(path: Path, msg: str, allow_empty: bool = False) -> bool:
     return _git(path, *cmd).returncode == 0
 
 
+def sanitize_branch(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._/-]", "-", s)
+
+
+def worktree_add(repo_dir: Path, wt_path: Path, branch: str) -> bool:
+    if wt_path.is_dir():
+        return True   # resume: reuse the worktree left by an earlier attempt
+    r = _git(repo_dir, "worktree", "add", str(wt_path), "-b", branch)
+    if r.returncode != 0 and "already exists" in r.stderr:
+        r = _git(repo_dir, "worktree", "add", str(wt_path), branch)
+    return r.returncode == 0
+
+
+def worktree_merge(repo_dir: Path, wt_path: Path, branch: str) -> bool:
+    """Merge the step's branch into the main checkout. On conflict, abort the
+    merge and LEAVE the worktree+branch for a human - the work is not lost."""
+    r = _git(repo_dir, "merge", "--no-edit", branch)
+    if r.returncode != 0:
+        _git(repo_dir, "merge", "--abort")
+        return False
+    _git(repo_dir, "worktree", "remove", "--force", str(wt_path))
+    _git(repo_dir, "branch", "-D", branch)
+    return True
+
+
 # ---------------------------------------------------------------- run state
 
 def now_iso() -> str:
@@ -274,15 +344,18 @@ def now_iso() -> str:
 
 
 def save_state(run_dir: Path, state: dict) -> None:
-    tmp = run_dir / "state.json.tmp"
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    tmp.replace(run_dir / "state.json")
+    with STATE_LOCK:
+        tmp = run_dir / "state.json.tmp"
+        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        tmp.replace(run_dir / "state.json")
 
 
 def log_event(run_dir: Path, **kv) -> None:
     kv["ts"] = now_iso()
-    with open(run_dir / "events.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps(kv, ensure_ascii=False) + "\n")
+    line = json.dumps(kv, ensure_ascii=False)
+    with STATE_LOCK:
+        with open(run_dir / "events.jsonl", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
 
 def tail_status(stdout_log: Path) -> str | None:
@@ -294,40 +367,50 @@ def tail_status(stdout_log: Path) -> str | None:
     return found[-1].lower() if found else None
 
 
-def run_step(step: Step, slug: str, project_dir: Path, cfg: Manifest,
-             run_dir: Path, devin_argv: list[str], state: dict) -> str:
-    """Run one step; return final status: done|partial|blocked|failed|timed_out."""
-    rec = state["steps"].setdefault(step.name, {})
-    rec.update(name=step.name, slug=slug, project=str(project_dir),
-               status="running", started_at=now_iso(),
-               model=step.model, mode=step.mode, cloud=step.cloud)
-    save_state(run_dir, state)
-    log_event(run_dir, event="step_start", step=step.name, project=str(project_dir))
+def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
+             run_dir: Path, devin_argv: list[str], state: dict,
+             do_checkpoint: bool = True) -> str:
+    """Run one step; return final status: done|partial|blocked|failed|timed_out.
+
+    work_dir is where the session runs and where checkpoints/verify happen -
+    the project dir, or a git worktree for parallel steps. When a worktree is
+    used the caller owns the pre-step checkpoint (on the main checkout), so
+    do_checkpoint=False.
+    """
+    with STATE_LOCK:
+        rec = state["steps"].setdefault(step.name, {})
+        rec.update(name=step.name, slug=slug, project=str(work_dir),
+                   status="running", started_at=now_iso(),
+                   model=step.model, mode=step.mode, cloud=step.cloud)
+        save_state(run_dir, state)
+    log_event(run_dir, event="step_start", step=step.name, project=str(work_dir))
 
     prompt_path = run_dir / "prompts" / f"{step.name}.md"
     prompt_path.parent.mkdir(exist_ok=True)
     prompt_path.write_text(
-        render_prompt(step, slug, project_dir, cfg.path.parent, cfg.preamble),
+        render_prompt(step, slug, work_dir, cfg.path.parent, cfg.preamble),
         encoding="utf-8")
     stdout_log = run_dir / f"{step.name}.stdout.log"
     export_path = run_dir / f"{step.name}.export.json"
 
-    if cfg.checkpoint:
-        if not is_git_repo(project_dir):
-            rec.update(status="failed", note="not a git repo; checkpoint required")
-            save_state(run_dir, state)
+    if cfg.checkpoint and do_checkpoint:
+        if not is_git_repo(work_dir):
+            with STATE_LOCK:
+                rec.update(status="failed",
+                           note="not a git repo root; checkpoint required")
+                save_state(run_dir, state)
             return "failed"
-        git_commit(project_dir, f"conductor: checkpoint before {step.name}",
+        git_commit(work_dir, f"conductor: checkpoint before {step.name}",
                    allow_empty=True)
 
-    before = session_ids(devin_argv, project_dir)
+    before = session_ids(devin_argv, work_dir)
     cmd = devin_cmd(devin_argv, step, prompt_path, export_path)
-    LOG.info("step %s: %s (cwd=%s)", step.name, " ".join(cmd), project_dir)
+    LOG.info("step %s: %s (cwd=%s)", step.name, " ".join(cmd), work_dir)
     t0 = time.time()
     timed_out = False
     with open(stdout_log, "wb") as out:
         try:
-            proc = subprocess.run(cmd, cwd=str(project_dir), stdout=out,
+            proc = subprocess.run(cmd, cwd=str(work_dir), stdout=out,
                                   stderr=subprocess.STDOUT,
                                   timeout=step.timeout_min * 60)
             rc = proc.returncode
@@ -339,15 +422,11 @@ def run_step(step: Step, slug: str, project_dir: Path, cfg: Manifest,
             log_event(run_dir, event="spawn_error", step=step.name, error=str(exc))
     elapsed = round(time.time() - t0, 1)
 
-    new_sessions = session_ids(devin_argv, project_dir) - before
-    rec["session_id"] = sorted(new_sessions)[-1] if new_sessions else None
-    rec["exit_code"] = rc
-    rec["elapsed_s"] = elapsed
+    new_sessions = session_ids(devin_argv, work_dir) - before
     status_line = tail_status(stdout_log)
-
     verify_ok = None
     if step.verify and not timed_out:
-        v = subprocess.run(step.verify, cwd=str(project_dir), shell=True,
+        v = subprocess.run(step.verify, cwd=str(work_dir), shell=True,
                            capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=600)
         verify_ok = v.returncode == 0
@@ -355,8 +434,8 @@ def run_step(step: Step, slug: str, project_dir: Path, cfg: Manifest,
             (v.stdout or "") + (v.stderr or ""), encoding="utf-8",
             errors="replace")
 
-    if cfg.checkpoint and is_git_repo(project_dir) and git_dirty(project_dir):
-        git_commit(project_dir, f"conductor: work from {step.name}")
+    if cfg.checkpoint and is_git_repo(work_dir) and git_dirty(work_dir):
+        git_commit(work_dir, f"conductor: work from {step.name}")
 
     if timed_out:
         status = "timed_out"
@@ -368,12 +447,16 @@ def run_step(step: Step, slug: str, project_dir: Path, cfg: Manifest,
         status = "failed"
     else:
         status = "done"
-        if status_line is None:
-            rec["note"] = "worker did not emit a STATUS line; assuming done"
 
-    rec.update(status=status, ended_at=now_iso(), status_line=status_line,
-               verify_ok=verify_ok)
-    save_state(run_dir, state)
+    with STATE_LOCK:
+        rec["session_id"] = sorted(new_sessions)[-1] if new_sessions else None
+        rec["exit_code"] = rc
+        rec["elapsed_s"] = elapsed
+        if status == "done" and status_line is None:
+            rec["note"] = "worker did not emit a STATUS line; assuming done"
+        rec.update(status=status, ended_at=now_iso(), status_line=status_line,
+                   verify_ok=verify_ok)
+        save_state(run_dir, state)
     log_event(run_dir, event="step_end", step=step.name, status=status,
               exit_code=rc, elapsed_s=elapsed, session=rec.get("session_id"))
     return status
@@ -452,17 +535,81 @@ def cmd_run(args: argparse.Namespace) -> int:
             log_event(run_dir, event="run_abort", reason="auth")
             return 2
 
-    for project_dir, slug, step in resolved:
-        prior = state["steps"].get(step.name, {})
-        if args.resume is not None and prior.get("status") == "done":
-            print(f"[skip ] {step.name} (done)")
-            continue
-        status = run_step(step, slug, project_dir, cfg, run_dir, devin_argv,
-                          state)
-        print(f"[{status:>8}] {step.name}")
-        if status in ("failed", "timed_out", "blocked") \
-                and cfg.on_failure == "stop":
-            print(f"stopping run: {step.name} -> {status}")
+    groups = group_waves(resolved)
+    validate_groups(groups)
+    stop = False
+    for members in groups:
+        # Materialize worktrees for members that want isolation.
+        prepared: list[tuple[Step, str, Path, Path, str | None]] = []
+        wave_ckpt_done = False
+        for project_dir, slug, step in members:
+            prior = state["steps"].get(step.name, {})
+            if args.resume is not None and prior.get("status") == "done":
+                print(f"[skip ] {step.name} (done)")
+                continue
+            if step.worktree:
+                if cfg.checkpoint and not wave_ckpt_done \
+                        and is_git_repo(project_dir):
+                    git_commit(project_dir,
+                               f"conductor: checkpoint before wave "
+                               f"{step.wave}", allow_empty=True)
+                    wave_ckpt_done = True
+                branch = sanitize_branch(f"conductor/{cfg.name}/{step.name}")
+                wt = DATA_DIR / "worktrees" / run_dir.name / step.name
+                if not worktree_add(project_dir, wt, branch):
+                    with STATE_LOCK:
+                        state["steps"].setdefault(step.name, {}).update(
+                            status="failed", note="worktree add failed")
+                        save_state(run_dir, state)
+                    print(f"[  failed] {step.name} (worktree add)")
+                    if cfg.on_failure == "stop":
+                        stop = True
+                        break
+                    continue
+                prepared.append((step, slug, wt, project_dir, branch))
+            else:
+                prepared.append((step, slug, project_dir, project_dir, None))
+        if stop:
+            break
+        if not prepared:
+            continue   # every member of this group was already done (resume)
+
+        if len(prepared) == 1:
+            step, slug, work_dir, _repo, branch = prepared[0]
+            statuses = {step.name: run_step(step, slug, work_dir, cfg,
+                                            run_dir, devin_argv, state,
+                                            do_checkpoint=(branch is None))}
+        else:
+            statuses = {}
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=len(prepared)) as ex:
+                futs = {ex.submit(run_step, step, slug, work_dir, cfg,
+                                  run_dir, devin_argv, state,
+                                  do_checkpoint=(branch is None)): step.name
+                        for step, slug, work_dir, _r, branch in prepared}
+                for f in concurrent.futures.as_completed(futs):
+                    statuses[futs[f]] = f.result()
+
+        # Merge worktree branches back into the main checkout, in order.
+        for step, slug, work_dir, repo_dir, branch in prepared:
+            status = statuses.get(step.name)
+            print(f"[{status or 'skipped':>8}] {step.name}")
+            if branch:
+                rec = state["steps"].get(step.name, {})
+                if status in ("done", "partial", "blocked"):
+                    if worktree_merge(repo_dir, work_dir, branch):
+                        rec["merged"] = True
+                    else:
+                        rec.update(status="failed",
+                                   note="merge conflict; worktree kept at "
+                                        f"{work_dir}", merged=False)
+                        status = "failed"
+                        statuses[step.name] = "failed"
+                    save_state(run_dir, state)
+        if cfg.on_failure == "stop" and any(
+                s in ("failed", "timed_out", "blocked")
+                for s in statuses.values()):
+            print("stopping run after wave")
             break
 
     state["ended_at"] = now_iso()
@@ -482,10 +629,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
     manifest_path = Path(args.manifest).resolve()
     cfg = load_manifest(manifest_path)
     projects = load_projects()
+    resolved = [(*resolve_project(s, projects, manifest_path.parent), s)
+                for s in cfg.steps]
+    validate_groups(group_waves(resolved))
     print(f"run {cfg.name!r}: {len(cfg.steps)} steps, on_failure={cfg.on_failure}, "
           f"checkpoint={cfg.checkpoint}")
-    for s in cfg.steps:
-        pdir, slug = resolve_project(s, projects, manifest_path.parent)
+    for pdir, slug, s in resolved:
         cloud = " [cloud]" if s.cloud else ""
         if s.cloud:
             dirty = "unknown"
@@ -493,8 +642,10 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 ahead = _git(pdir, "rev-list", "--count", "@{u}..HEAD").stdout.strip()
                 dirty = f"unpushed_commits={ahead or '?'}"
             print(f"    note: cloud workers see origin, not local state ({dirty})")
+        tags = cloud + (" [worktree]" if s.worktree else "") \
+            + (f" [wave {s.wave}]" if s.wave is not None else "")
         print(f"  {s.name:<20} {slug:<22} model={s.model or '-':<10} "
-              f"mode={s.mode:<8} timeout={s.timeout_min:g}m{cloud}")
+              f"mode={s.mode:<8} timeout={s.timeout_min:g}m{tags}")
         print(f"    verify: {s.verify or '-'}")
         print(f"    $ {' '.join(devin_cmd(shlex.split(args.devin or 'devin'), s, Path('<pf>'), Path('<exp>')))}")
     return 0
