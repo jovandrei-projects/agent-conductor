@@ -133,6 +133,11 @@ step completion tracks the session.
 Outcome appended to ROADMAP.md Phase 2. No regressions; trap 5 remains the
 blocker for live manifests.
 
+**Update 2026-10-13 - readme task dispatched a fourth time, still a no-op.**
+README.md unchanged (62 lines, committed in 88d8ea3, working tree clean);
+spec still satisfied. Four dispatches of one landed step - the trap-5 cost
+is now measurable in wasted sessions.
+
 ## Deferred or blocked
 
 - Session-completion tracking for `devin -p` steps - the subprocess
