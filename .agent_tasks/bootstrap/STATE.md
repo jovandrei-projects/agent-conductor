@@ -100,6 +100,12 @@ parent - happened, fixed, regression test added); `--permission-mode`
 flag wants `dangerous`, not `bypass` (normalized via MODE_FLAG); Desktop
 login != CLI credentials.toml.
 
+**Update 2026-10-13 ~09:23 - nightly smoke run green.** `run_tests.py
+--quick` 20/20, `conductor.py demo` 2/2 done (run `20261013-092326-demo`).
+Outcome appended to ROADMAP.md Phase 2. The `-p` detach blocker is
+unchanged - it lives above the mock layer, so unit/demo green does not
+mean live manifests work yet.
+
 ## Deferred or blocked
 
 - Session-completion tracking for `devin -p` steps - the subprocess

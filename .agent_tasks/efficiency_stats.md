@@ -15,6 +15,7 @@ new input, so the column to watch is **new input**.
 | agent-conductor / bootstrap (auth diagnosis, abort-path fix) | n/a | n/a | n/a | n/a |
 | agent-conductor / bootstrap (smoke readme step; found -p detaches) | n/a | n/a | n/a | n/a |
 | agent-conductor / bootstrap (verified README task already landed; no-op) | n/a | n/a | n/a | n/a |
+| agent-conductor / bootstrap (nightly smoke: tests+demo green, docs updated) | n/a | n/a | n/a | n/a |
 
 If the figures are not available at the end of a session, write the row with
 the counts left as `n/a` rather than skipping it, so the session is still

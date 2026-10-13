@@ -34,6 +34,12 @@ One phase at a time, in order. Mark items `[x]` as they land.
 - [ ] Cloud step on a `cloud_ok` project end-to-end (origin visibility caveat documented)
 - [ ] First real overnight manifest on a real project
 
+Smoke-run log: 2026-10-13 ~09:23 - `run_tests.py --quick` 20/20 green,
+`conductor.py demo` 2/2 done (run `20261013-092326-demo`). No regressions;
+the mock/unit layer is unaffected by the `-p` detach finding - the real
+`devin -p` session-completion polling (trap 5) remains the blocker for a
+live manifest.
+
 ## Phase 3 - polish
 
 - [ ] Planner step pattern validated (re-slices QUEUE.md mid-run) - the pattern is documented in `examples/night.example.toml`, needs a live run
