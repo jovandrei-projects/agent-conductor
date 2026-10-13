@@ -112,6 +112,15 @@ Append as they are hit.
    token is rejected). Fix: `devin auth logout` FIRST, then `devin auth
    login`. Hit 2026-10-13: Aug-26-era token; an expired app.devin.ai/auth
    browser tab is leftover and can just be closed.
+5. **`devin -p` detaches: subprocess exit != session done.** Hit
+   2026-10-13 on the first authed smoke run: the spawned process exited
+   after 0.1-1.8s with empty stdout and no export.json, while the real
+   agent session kept working for minutes afterward (visible in `devin
+   list`; it later committed). Conductor marked every step `done` and the
+   verify gates ran against a tree the worker had not touched yet. The
+   orchestration model needs "poll the session until it reports finished"
+   (via `devin list`/session API/`acp`), not "wait for exit". Also the
+   captured `session_id` may not be the session's display slug.
 
 ## The task workspace - read before starting work
 

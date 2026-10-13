@@ -11,7 +11,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 | # | Task | Status | Folder | Waits on |
 |---|---|---|---|---|
-| 1 | Bootstrap: conductor.py v1 + mock tests + docs | in progress | bootstrap/ | `devin auth logout` then `devin auth login` in a real terminal (stale token makes login say "already logged in" - traps 3-4) |
+| 1 | Bootstrap: conductor.py v1 + mock tests + docs | in progress | bootstrap/ | step completion must track the session, not the `devin -p` subprocess (it detaches ~2s in - trap 5); auth is solved |
 
 ## Not yet filed as tasks
 

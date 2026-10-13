@@ -38,7 +38,7 @@ a real manifest the moment `devin auth login` has been done once.
 - [x] `[run] max_parallel` resource cap (auto ~1 per 4 cores, max 4) + `queued` marking; free RAM recorded per run
 - [x] Agent registry in state.json (pid, work_dir, branch, started/ended/elapsed, session, output paths)
 - [x] `conductor.py serve` live dashboard on 127.0.0.1:8773 (+ `/api/state`)
-- [ ] Live `devin -p` smoke test once authed (manifest ready: examples/smoke.toml, targets agent-conductor itself)
+- [x] Live `devin -p` smoke test once authed - ran 2026-10-13 ~09:00; sessions spawn and do real work, but `devin -p` detaches so conductor misjudged completion (trap 5). README.md landed from the still-running readme session
 
 ### Phase 2 - stretch tonight
 
@@ -71,17 +71,22 @@ paths in cmd_run now write `ended_at` + drop the hub row, so aborted runs
 no longer display as "running" forever on :8773. The stale smoke run's
 state.json and hub row #257 were patched by hand.
 
-Once authed:
+**Update 2026-10-13 ~09:05 - auth fixed, smoke ran, new blocker found.**
+`python conductor.py run examples/smoke.toml` executed real sessions
+(runs 20261013-084732 and -085914). The smoke readme session wrote and
+committed `README.md`. But `devin -p` exits ~0.1-1.8s after registering
+the session: stdout logs empty, no export.json, step `done`+checkpoints
+commit nothing, and the actual agents keep running detached (visible in
+`devin list`; several stale "spawned unattended" sessions may still be
+live). Step gating must track session completion, not subprocess exit -
+see AGENTS.md trap 5. That is now the blocker for any real manifest.
 
-    cd C:\Projects\agent-conductor
-    python conductor.py run examples/smoke.toml
-    python conductor.py serve     # then http://127.0.0.1:8773
-
-Then check `python conductor.py status`, `devin list` in the project dir,
-and `data/runs/*/*.export.json`. Open questions the live run answers: does
-`-p` run the full agentic loop, do spawned sessions appear in `devin
-list`/Desktop, what does ATIF export contain. Fallback if `-p` proves
-single-turn-only: drive `devin acp` (JSON-RPC stdio) - not built yet.
+Next session's first job: find how to observe a spawned session's state
+(`devin list` is a TUI; look for a non-interactive flag, `devin acp`
+JSON-RPC, or the ATIF export appearing only at session end), then gate
+`step_end` on it. Also worth checking: whether `-p` streams if stdout is
+a TTY, and whether the captured `session_id` (`showy-headlight`) maps to
+the display slug (`gleaming-magnolia`) at all.
 
 Traps already hit and documented in AGENTS.md: `-p` positional-after-flag
 is parsed as PATH not prompt (use --prompt-file); `is_git_repo` must
@@ -92,8 +97,9 @@ login != CLI credentials.toml.
 
 ## Deferred or blocked
 
-- Live verification of `devin -p` behavior - blocked on terminal-side
-  `devin auth login` (Desktop-side login does not count; see trap 3).
+- Session-completion tracking for `devin -p` steps - the subprocess
+  detaches (trap 5); blocked on finding a non-interactive session-state
+  channel (`devin acp`, a `devin list --json`-style flag, or ATIF).
 - Cloud steps: `devin --cloud -p` repo selection behavior unknown - verify live.
 - notes-ui relation: dashboard is standalone (:8773, loopback). Phone view
   of runs already works via hub.db rows on tasks-ui (:8762). A bridge proxy

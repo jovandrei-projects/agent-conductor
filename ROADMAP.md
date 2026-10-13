@@ -24,13 +24,13 @@ One phase at a time, in order. Mark items `[x]` as they land.
 - [x] `run.max_parallel` resource cap (default ~1 per 4 cores, max 4; wave members queue past the cap) + `--max-parallel` override; effective cap + free RAM recorded per run
 - [x] Agent registry: each step record in `state.json` carries pid, work_dir, branch, started_at/ended_at/elapsed_s, session id, output paths - the durable session-work record
 - [x] `conductor.py serve` dashboard on `127.0.0.1:8773`: every agent + run, live elapsed, status colors, `/api/state` JSON
-- [ ] Live `devin -p` smoke test (blocked on `devin auth login` - see AGENTS.md trap 3: Desktop login does NOT write credentials.toml)
-- [ ] Live run on one real project's queue (cheap model)
+- [x] Live `devin -p` smoke test (ran 2026-10-13 ~09:00; real sessions spawned and do the work - but `devin -p` detaches, see AGENTS.md trap 5 and the Phase 2 finding below)
+- [ ] Live run on one real project's queue (cheap model) - blocked until step completion tracks the session, not the subprocess
 
 ## Phase 2 - verified live behavior
 
-- [ ] Confirm `-p` runs a full agentic loop (not a single turn) and sessions appear in `devin list` / Desktop
-- [ ] Confirm `--export` ATIF output; use it for richer step summaries if useful
+- [x] Confirm `-p` runs a full agentic loop (not a single turn) and sessions appear in `devin list` / Desktop - confirmed 2026-10-13: the smoke readme session kept working ~5min and committed README.md after its subprocess exited; it shows in `devin list`. **Finding: `devin -p` exits after ~0.1-1.8s once the session is registered - the session is a detached managed object, the subprocess is not its lifetime.** Exit code, elapsed_s, stdout log and export are all empty/premature; step gating must poll session state instead (trap 5)
+- [ ] Confirm `--export` ATIF output; use it for richer step summaries if useful - no export.json was written in the detached runs; needs a session-completion-aware fetch
 - [ ] Cloud step on a `cloud_ok` project end-to-end (origin visibility caveat documented)
 - [ ] First real overnight manifest on a real project
 
