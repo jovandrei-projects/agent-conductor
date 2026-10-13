@@ -626,7 +626,8 @@ def hub_start(cfg: Manifest, run_dir: Path) -> int | None:
         return None
 
 
-def hub_update(tid: int | None, state: dict, final: bool = False) -> None:
+def hub_update(tid: int | None, state: dict, final: bool = False,
+               final_status: str = "done") -> None:
     if tid is None or not TASK_PY.is_file():
         return
     counts: dict[str, int] = {}
@@ -640,7 +641,7 @@ def hub_update(tid: int | None, state: dict, final: bool = False) -> None:
         args_ = ["update", str(tid), "--body", body,
                  "--title", f"conductor run {state['run']}: {dict(counts)}"]
         if final:
-            args_ += ["--status", "done"]
+            args_ += ["--status", final_status]
         _task_py(*args_)
     except Exception as exc:
         LOG.warning("hub.db update failed: %s", exc)
@@ -656,6 +657,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     resolved = [(*resolve_project(s, projects, manifest_path.parent), s)
                 for s in cfg.steps]
+    # Validate before any run state exists: a bad wave must not leave a
+    # state.json the dashboard will show as "running" forever.
+    groups = group_waves(resolved)
+    validate_groups(groups)
     cap = effective_max_parallel(cfg, getattr(args, "max_parallel", None))
 
     if getattr(args, "keep_awake", True):
@@ -680,11 +685,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     if "devin" in os.path.basename(devin_argv[0]).lower():
         if not check_auth(devin_argv):
             print("devin is not logged in. Run `devin auth login` first.")
+            state["ended_at"] = now_iso()
+            state["aborted"] = "auth"
+            save_state(run_dir, state)
             log_event(run_dir, event="run_abort", reason="auth")
+            hub_update(tid, state, final=True, final_status="dropped")
             return 2
 
-    groups = group_waves(resolved)
-    validate_groups(groups)
     run_t0 = time.time()
     stop = False
     for members in groups:

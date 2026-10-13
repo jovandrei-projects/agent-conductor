@@ -106,6 +106,12 @@ Append as they are hit.
    `--force-manual-token-flow` + pasted code from app.devin.ai). The login
    TUI reads the console directly - piped stdin can't drive it. Env vars
    `WINDSURF_API_KEY`/`DEVIN_API_KEY` are NOT honored.
+4. **`auth login` trusts the file, `auth status` trusts the server.** A
+   stale `credentials.toml` makes login short-circuit with "You are already
+   logged in" while `auth status` still says "Not logged in" (the stored
+   token is rejected). Fix: `devin auth logout` FIRST, then `devin auth
+   login`. Hit 2026-10-13: Aug-26-era token; an expired app.devin.ai/auth
+   browser tab is leftover and can just be closed.
 
 ## The task workspace - read before starting work
 

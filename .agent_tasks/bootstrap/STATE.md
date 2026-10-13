@@ -61,6 +61,16 @@ terminal** (or `--force-manual-token-flow` + code from app.devin.ai).
 Hub question #256 posted to the phone queue with these instructions.
 Full details: AGENTS.md trap 3.
 
+**Update 2026-10-13 ~08:30:** the 02:28 smoke run aborted at the auth gate
+(`run_abort reason="auth"` in its events.jsonl) - correct behavior. New
+wrinkle: `devin auth login` claimed "already logged in" because
+credentials.toml EXISTS, while `auth status` still rejects the stored
+Aug-26 token. The command to unblock is `devin auth logout` FIRST, then
+`devin auth login` (AGENTS.md trap 4). Also fixed today: abort/validation
+paths in cmd_run now write `ended_at` + drop the hub row, so aborted runs
+no longer display as "running" forever on :8773. The stale smoke run's
+state.json and hub row #257 were patched by hand.
+
 Once authed:
 
     cd C:\Projects\agent-conductor
