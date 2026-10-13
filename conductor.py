@@ -108,6 +108,7 @@ class Manifest:
     on_failure: str                    # stop | continue
     checkpoint: bool
     preamble: str | None
+    max_hours: float | None            # wall-clock cap for the whole run
     steps: list[Step]
 
 
@@ -162,7 +163,8 @@ def load_manifest(path: Path) -> Manifest:
         raise ManifestError("manifest has no [[step]] entries")
     return Manifest(path=path, name=name, on_failure=on_failure,
                     checkpoint=bool(run.get("checkpoint", True)),
-                    preamble=preamble, steps=steps)
+                    preamble=preamble, max_hours=run.get("max_hours"),
+                    steps=steps)
 
 
 def load_projects() -> dict[str, dict]:
@@ -602,8 +604,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     groups = group_waves(resolved)
     validate_groups(groups)
+    run_t0 = time.time()
     stop = False
     for members in groups:
+        if cfg.max_hours and time.time() - run_t0 > cfg.max_hours * 3600:
+            print(f"stopping run: max_hours={cfg.max_hours} reached")
+            log_event(run_dir, event="run_deadline", max_hours=cfg.max_hours)
+            break
         # Materialize worktrees for members that want isolation.
         prepared: list[tuple[Step, str, Path, Path, str | None]] = []
         wave_ckpt_done = False
