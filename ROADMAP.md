@@ -12,6 +12,9 @@ One phase at a time, in order. Mark items `[x]` as they land.
 || Permission model | `bypass` per step + conductor-owned git checkpoints before and after. Revertibility is the safety boundary. |
 || Privacy | `cloud_ok` per project in `projects.toml`; false for wifi-network-monitor, chrome-bookmarks, money-plan. Enforced at resolve time. |
 || Manifest format | TOML (stdlib `tomllib`), not Markdown - QUEUE.md stays the task source, the manifest is the run skeleton. |
+| First cloud_ok pair | `agent-conductor` + `apartment-3d` (human call, 2026-10-13). Caveat: agent-conductor has no git remote - a cloud step clones from origin, so it needs the repo pushed first. |
+| Default model | `swe` (= SWE-2 Max) while it is free through 2026-10-16; after that `gpt-6-luna` at max thinking effort. Set per manifest via `[defaults] model`. |
+| Spawned-session hygiene | `conductor.py sessions` whitelists on ids recorded in state.json - human sessions can't be touched. `--rm` deletes sessions from runs ended >48h ago; transcripts live in the run dir anyway. |
 
 ## Phase 1 - sequential core (this session)
 
@@ -61,6 +64,15 @@ unchanged.
 subprocess"; real cause: mid-spawn `state.json` write into the watched
 workspace -> user-edit awareness ends the session). Live smoke green:
 readme 56.6s + sanity 96.6s, real commits; 22/22 tests; bootstrap task done.
+
+2026-10-13 ~18:30 - pre-live hygiene pass. Found a worse bug than the stale
+dashboard rows that prompted it: `pid_alive` used `os.kill(pid, 0)`, which
+is TerminateProcess on Windows - every dashboard refresh KILLED the workers
+it probed. Fixed (OpenProcess + GetExitCodeProcess + creation-time pid-reuse
+guard). Stale records now sweep to `lost` (10 phantom rows cleared; `lost`
+re-runs on --resume); `sessions` command lists/cleans spawned devin
+sessions; cloud_ok marked for agent-conductor + apartment-3d; 34/34 tests
+green.
 
 ## Phase 3 - polish
 

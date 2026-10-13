@@ -12,8 +12,10 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | # | Task | Status | Folder | Waits on |
 |---|---|---|---|---|
 | 1 | Bootstrap: conductor.py v1 + mock tests + docs | done | bootstrap/ | trap 5 root-caused + fixed (no workspace writes while a worker is alive); auth solved; live smoke green |
+| 2 | Pre-live hygiene: liveness probe, lost/sweep, sessions cleanup, cloud marks | done | hygiene/ | os.kill probe bug found + fixed (was killing live workers) |
 
 ## Not yet filed as tasks
 
 - First real overnight manifest on a real project (Phase 2 in ROADMAP.md; live smoke already green)
+- Push agent-conductor to GitHub if cloud steps on it are wanted - it has NO remote, and cloud workers clone from origin (human decision: repo name + private/public)
 - Phone access to the :8773 dashboard via lan-bridge proxy (needs mobile-apps change; tasks-ui rows already give coarse progress)

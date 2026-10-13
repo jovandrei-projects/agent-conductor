@@ -51,9 +51,20 @@ python conductor.py run  <manifest.toml>    execute -> data/runs/<ts>-<name>/
 python conductor.py run  <manifest> --resume [dir]   skip done steps
 python conductor.py status [run_dir]        step table of latest run
 python conductor.py serve [--port 8773]     live dashboard of all agents
+python conductor.py sweep                   re-mark orphaned records 'lost'
+python conductor.py sessions [--rm]         list/clean spawned devin sessions
 python conductor.py demo                    end-to-end vs tests/mock_devin.py
 python run_tests.py                         unittest suite (mock-only, no auth)
 ```
+
+Session hygiene: `sessions` whitelists on ids recorded in run state.json -
+interactive/human sessions can never be listed or removed. `--rm` deletes
+sessions whose run ended more than `--keep-hours` ago (default 48); the
+ATIF transcript survives in the run dir, so spawned sessions are
+disposable bookkeeping. `devin list` is cwd-scoped: sessions are only
+visible under the work_dir that spawned them, so sessions from merged
+worktrees can't be enumerated (`devin rm <id>` still works if you know
+the id - it is in state.json).
 
 Run flags: `--devin "<cmd>"` worker binary override, `--no-hub` skip the
 hub.db row, `--no-keep-awake` allow system sleep (runs request
@@ -135,6 +146,22 @@ Append as they are hit.
    turn starts (see trap 5) or print `STATUS` only at the end of a real
    turn. `run_step` now marks `rc==0` + missing `STATUS` as `failed`
    (note: "no-op run"), never `done`.
+7. **`os.kill(pid, 0)` is TerminateProcess on Windows.** It KILLS the
+   process it probes - verified by spawning a sleeper and watching it die.
+   The dashboard's liveness check used it on every `running` record per
+   `/api/state` refresh, so an open dashboard during a run murdered the
+   workers (their pids reach disk via sibling save_state calls in waves).
+   Probe with OpenProcess + GetExitCodeProcess (259=STILL_ACTIVE) instead.
+   Windows also recycles pids: `pid_alive` compares the process's creation
+   time to the step's `started_at`, or a reused pid reads as alive.
+8. **`running`/`queued` records can be orphans.** A conductor that dies
+   mid-run leaves live-looking rows forever (the dashboard showed "6
+   running" 9h after the last worker died). `sweep` re-marks them `lost`
+   (dead pid, or no-pid record older than timeout+15min; queued is lost
+   when the run ended or went quiet >10min). `serve` sweeps once at
+   startup; `status`/dashboard compute the same `lost` display live.
+   `sweep` refuses to write while a live step's work_dir contains
+   `data/runs` - a self-hosted run in flight (trap 5).
 
 ## The task workspace - read before starting work
 

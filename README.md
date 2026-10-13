@@ -51,6 +51,8 @@ python conductor.py run  <manifest.toml>           execute -> data/runs/<ts>-<na
 python conductor.py run  <manifest> --resume [dir] skip done steps (default: latest)
 python conductor.py status [run_dir]               step table of the latest run
 python conductor.py serve [--port 8773]            live dashboard, loopback only
+python conductor.py sweep                          re-mark orphaned records 'lost'
+python conductor.py sessions [--rm] [--keep-hours N] list/clean spawned sessions
 python conductor.py demo                           end-to-end vs tests/mock_devin.py
 python run_tests.py                                unittest suite (mock, no auth)
 ```
