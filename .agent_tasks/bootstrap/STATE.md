@@ -81,6 +81,11 @@ commit nothing, and the actual agents keep running detached (visible in
 live). Step gating must track session completion, not subprocess exit -
 see AGENTS.md trap 5. That is now the blocker for any real manifest.
 
+**Update 2026-10-13 ~09:22 - readme step confirmed landed.** A later
+spawned session re-checked `README.md`: present (62 lines), committed in
+88d8ea3, and accurate against conductor.py (all manifest fields, flags,
+and paths verified). No changes needed; the step stays done.
+
 Next session's first job: find how to observe a spawned session's state
 (`devin list` is a TUI; look for a non-interactive flag, `devin acp`
 JSON-RPC, or the ATIF export appearing only at session end), then gate
