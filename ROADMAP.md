@@ -18,6 +18,9 @@ One phase at a time, in order. Mark items `[x]` as they land.
 - [x] `conductor.py`: manifest load/validate, per-step `devin -p` spawn, git checkpoints, verify gate, run dir + state.json + events.jsonl, resume, status, demo
 - [x] `projects.toml` registry with `cloud_ok` privacy gate
 - [x] `tests/mock_devin.py` + `tests/test_conductor.py` - loop proven without auth
+- [x] Parallel `wave` groups in git worktrees + merge-back (landed early; `conductor/<run>/<step>` branches)
+- [x] hub.db: one task row per run, live-updated per step (`--no-hub` opts out)
+- [x] Cloud-session ref capture: `app.devin.ai/sessions/...` parsed from stdout (cloud sessions don't show in `devin list`)
 - [ ] Live `devin -p` smoke test (blocked on `devin auth login`)
 - [ ] Live run on one real project's queue (cheap model)
 
@@ -28,11 +31,10 @@ One phase at a time, in order. Mark items `[x]` as they land.
 - [ ] Cloud step on a `cloud_ok` project end-to-end (origin visibility caveat documented)
 - [ ] First real overnight manifest on a real project
 
-## Phase 3 - parallelism & polish
+## Phase 3 - polish
 
-- [ ] `wave`/`parallel` groups: concurrent steps in separate git worktrees + merge step
-- [ ] Planner step pattern validated (re-slices QUEUE.md mid-run)
-- [ ] hub.db: per-step status rows (not just end-of-run), maybe a runs view in project-hub
+- [ ] Planner step pattern validated (re-slices QUEUE.md mid-run) - the pattern is documented in `examples/night.example.toml`, needs a live run
+- [ ] Maybe a runs view in project-hub (reads `data/runs/*/state.json`)
 - [ ] Transcript-extract integration: distilled handoff notes into run dir
 - [ ] Desktop visibility of spawned sessions confirmed/documented
 

@@ -46,7 +46,7 @@ def write_manifest(base: Path, steps: str, extra: str = "") -> Path:
 def run_manifest(manifest: Path, runs_dir: Path, resume=None) -> int:
     return conductor.cmd_run(argparse.Namespace(
         manifest=str(manifest), resume=resume, devin=MOCK,
-        runs_dir=str(runs_dir), hub=False))
+        runs_dir=str(runs_dir), hub=False, keep_awake=False))
 
 
 class ManifestTests(unittest.TestCase):
@@ -152,6 +152,9 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn("--cloud", cmd)
         i = cmd.index("--model")
         self.assertEqual(cmd[i + 1], "swe")
+        # manifest alias -> canonical flag value
+        i = cmd.index("--permission-mode")
+        self.assertEqual(cmd[i + 1], "dangerous")
 
     def test_cloud_flag(self):
         step = conductor.Step(name="a", project="x", prompt="p", cloud=True)

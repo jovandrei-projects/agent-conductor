@@ -46,8 +46,13 @@ STATE_LOCK = threading.RLock()
 STATUS_RE = re.compile(r"^STATUS:\s*([A-Za-z_-]+)", re.M)
 SESSION_URL_RE = re.compile(
     r"app\.devin\.ai/sessions/([A-Za-z0-9_-]+)|(devin-[0-9a-f]{32})")
-VALID_MODES = {"normal", "accept-edits", "smart", "bypass", "dangerous", "yolo",
-               "auto"}
+VALID_MODES = {"normal", "accept-edits", "smart", "bypass", "dangerous",
+               "yolo", "auto"}
+# Canonical --permission-mode flag values (from `devin --help`); the manifest
+# may use friendlier slash-command aliases.
+MODE_FLAG = {"normal": "auto", "auto": "auto", "accept-edits": "accept-edits",
+             "smart": "smart", "bypass": "dangerous", "yolo": "dangerous",
+             "dangerous": "dangerous"}
 
 PREAMBLE = """\
 This session was spawned unattended by agent-conductor
@@ -243,7 +248,7 @@ def devin_cmd(devin_argv: list[str], step: Step, prompt_path: Path,
     cmd += ["--print", "--prompt-file", str(prompt_path)]
     if step.model:
         cmd += ["--model", step.model]
-    cmd += ["--permission-mode", step.mode,
+    cmd += ["--permission-mode", MODE_FLAG[step.mode],
             "--export", str(export_path),
             "--respect-workspace-trust", "false"]
     return cmd
@@ -277,6 +282,19 @@ def check_auth(devin_argv: list[str]) -> bool:
         return "not logged in" not in (out.stdout + out.stderr).lower()
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------- power
+
+def keep_awake() -> None:
+    """Prevent system sleep for the duration of this process (Windows).
+    ES_CONTINUOUS|ES_SYSTEM_REQUIRED; released automatically on exit."""
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000003)
+        LOG.info("keep_awake: SetThreadExecutionState set")
+    except Exception as exc:
+        LOG.warning("keep_awake failed: %s", exc)
 
 
 # ---------------------------------------------------------------- git
@@ -558,6 +576,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     resolved = [(*resolve_project(s, projects, manifest_path.parent), s)
                 for s in cfg.steps]
 
+    if getattr(args, "keep_awake", True):
+        keep_awake()
+
     if args.resume is not None:
         run_dir = find_resume_dir(cfg, runs_dir, args.resume or "latest")
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
@@ -746,7 +767,7 @@ verify = "python -c \\"import pathlib;assert pathlib.Path('WORK.txt').read_text(
     py = Path(sys.executable).as_posix()
     ns = argparse.Namespace(manifest=str(manifest), resume=None,
                             devin=f"{py} {mock}", runs_dir=args.runs_dir,
-                            hub=False)
+                            hub=False, keep_awake=False)
     return cmd_run(ns)
 
 
@@ -788,6 +809,9 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--runs-dir", default=None, help=argparse.SUPPRESS)
             p.add_argument("--no-hub", dest="hub", action="store_false",
                            default=True, help="don't create/update a hub.db row")
+            p.add_argument("--no-keep-awake", dest="keep_awake",
+                           action="store_false", default=True,
+                           help="allow the machine to sleep during the run")
         if name == "status":
             p.add_argument("run_dir", nargs="?", default=None)
     args = ap.parse_args(argv)

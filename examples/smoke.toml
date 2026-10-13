@@ -1,0 +1,35 @@
+# First live test manifest - conductor working on agent-conductor itself.
+# Two steps prove a fresh session can read .agent_tasks, do real work,
+# commit, emit STATUS, and pass a verify gate. Cheap model, tight timeouts.
+#
+#   python conductor.py plan examples/smoke.toml
+#   python conductor.py run  examples/smoke.toml
+#   python conductor.py status
+
+[run]
+name = "smoke"
+on_failure = "stop"
+checkpoint = true
+
+[defaults]
+model = "swe"
+mode = "bypass"
+timeout_min = 20
+
+[[step]]
+name = "readme"
+project = "agent-conductor"
+prompt = """Write a top-level README.md for this project: one paragraph on
+what conductor is, the manifest format shown as one small annotated TOML
+example, and the plan/run/resume/status commands. Under 80 lines. Match the
+house style (terse, no emoji). Commit it."""
+
+[[step]]
+name = "sanity"
+project = "agent-conductor"
+prompt = """Run `python run_tests.py --quick` and `python conductor.py demo`.
+If either fails, fix the regression (prefer fixing code over deleting tests).
+Then append tonight's smoke-run outcome to ROADMAP.md Phase 2 notes if the
+run went green."""
+verify = "python run_tests.py --quick"
+timeout_min = 30

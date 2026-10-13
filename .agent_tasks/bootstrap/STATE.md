@@ -25,23 +25,34 @@ a real manifest the moment `devin auth login` has been done once.
 
 - [x] Scaffold from _templates/new_project, git init
 - [x] conductor.py: plan/run/status/demo, checkpoints, verify, resume
-- [x] tests/mock_devin.py + test_conductor.py - 12 tests green
-- [x] projects.toml + examples/night.example.toml
+- [x] tests/mock_devin.py + test_conductor.py - 15 tests green
+- [x] projects.toml + examples/night.example.toml + examples/smoke.toml
 - [x] AGENTS.md / ROADMAP.md / QUEUE.md / this file
-- [ ] Commit scaffold
-- [ ] Live `devin -p` smoke test once authed
-- [ ] One real task on a real project (low-risk pick)
+- [x] Parallel `wave` groups via git worktrees + merge-back
+- [x] hub.db run row live-updated per step (`--no-hub` opt-out)
+- [x] Cloud session URL capture from stdout
+- [ ] Commit everything
+- [ ] Live `devin -p` smoke test once authed (manifest ready: examples/smoke.toml, targets agent-conductor itself)
 
 ### Phase 2 - stretch tonight
 
-- [ ] Parallel `wave` steps via git worktrees (if v1 stays green)
-- [ ] hub.db run rows verified against mobile-apps task.py
+- [x] Parallel `wave` steps via git worktrees
+- [x] hub.db run rows verified against mobile-apps task.py
 
 ## Where it stopped
 
-`python run_tests.py` green (12 tests), `conductor.py demo` works, `plan`
-prints resolved steps. Next: commit scaffold; then poll `devin auth status`
-for the user's login and run a real `devin -p` smoke step on a scratch dir.
+Everything is built and mock-tested (15 tests green). **Blocked on
+`devin auth login`** - the user said they'd run it tonight. Once live:
+`python conductor.py run examples/smoke.toml` runs 2 real `devin -p`
+workers against agent-conductor itself (write README.md, run tests).
+A background watcher in the building session polls `devin auth status`
+every 60s.
+
+Traps already hit and documented in AGENTS.md: `-p` positional-after-flag
+is parsed as PATH not prompt (use --prompt-file); `is_git_repo` must
+require repo ROOT (nested dirs inside a parent repo would checkpoint the
+parent - happened, fixed, regression test added); `--permission-mode`
+flag wants `dangerous`, not `bypass` (normalized via MODE_FLAG).
 
 ## Deferred or blocked
 
