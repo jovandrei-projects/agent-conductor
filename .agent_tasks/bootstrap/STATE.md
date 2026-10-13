@@ -120,6 +120,14 @@ mean live manifests work yet.
 Outcome appended to ROADMAP.md Phase 2. No regressions; trap 5 remains the
 blocker for live manifests.
 
+**Update 2026-10-13 - readme task assigned a third time, still a no-op.**
+`README.md` (62 lines, committed in 88d8ea3) still satisfies the spec: one
+intro paragraph, one annotated TOML example, plan/run/--resume/status plus
+serve/demo and all run flags, verified against the argparse surface in
+main(). Nothing written. These repeat dispatches are the trap-5 symptom:
+detached `-p` sessions keep getting re-spawned for already-done steps until
+step completion tracks the session.
+
 ## Deferred or blocked
 
 - Session-completion tracking for `devin -p` steps - the subprocess
