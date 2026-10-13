@@ -484,5 +484,216 @@ prompt = "first"
             self.assertTrue(str(a["work_dir"]).endswith("proj"))
 
 
+class PidAliveTests(unittest.TestCase):
+    """2026-10-13: os.kill(pid, 0) is TerminateProcess on Windows - the old
+    implementation KILLED every worker the dashboard probed. The probe must
+    leave the process running."""
+
+    def test_probe_does_not_kill(self):
+        import time as _t
+        p = subprocess.Popen([sys.executable, "-c",
+                              "import time;time.sleep(30)"])
+        try:
+            self.assertTrue(conductor.pid_alive(p.pid))
+            self.assertIsNone(p.poll())   # probe must not have killed it
+        finally:
+            p.terminate()
+            p.wait()
+        for _ in range(50):
+            if not conductor.pid_alive(p.pid):
+                break
+            _t.sleep(0.1)
+        self.assertFalse(conductor.pid_alive(p.pid))
+        self.assertFalse(conductor.pid_alive(None))
+
+    @unittest.skipUnless(os.name == "nt", "creation-time check is win32")
+    def test_pid_reuse_guard(self):
+        p = subprocess.Popen([sys.executable, "-c",
+                              "import time;time.sleep(30)"])
+        try:
+            # a live pid whose creation predates the claimed start is a
+            # recycled pid, not our worker
+            self.assertFalse(
+                conductor.pid_alive(p.pid, "2999-01-01T00:00:00"))
+            self.assertIsNone(p.poll())
+            self.assertTrue(conductor.pid_alive(
+                p.pid, conductor.now_iso()))
+        finally:
+            p.terminate()
+            p.wait()
+
+
+class LivenessTests(unittest.TestCase):
+    def _state(self, steps, **kw):
+        s = {"run": "t", "started_at": conductor.now_iso(), "steps": steps}
+        s.update(kw)
+        return s
+
+    def test_fresh_no_pid_running_is_live(self):
+        rec = {"status": "running", "started_at": conductor.now_iso(),
+               "timeout_min": 60}
+        self.assertTrue(conductor.step_live(rec))
+
+    def test_stale_no_pid_running_is_lost(self):
+        old = (conductor.dt.datetime.now()
+               - conductor.dt.timedelta(hours=3)).isoformat(timespec="seconds")
+        st = self._state({"a": {"status": "running", "started_at": old,
+                                "timeout_min": 60}})
+        self.assertFalse(conductor.step_live(st["steps"]["a"]))
+        self.assertEqual(conductor.effective_statuses(st)["a"], "lost")
+
+    def test_dead_pid_running_is_lost(self):
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        st = self._state({"a": {"status": "running",
+                                "started_at": conductor.now_iso(),
+                                "pid": p.pid}})
+        self.assertEqual(conductor.effective_statuses(st)["a"], "lost")
+
+    def test_queued_orphaned_when_run_over(self):
+        st = self._state(
+            {"a": {"status": "done", "started_at": conductor.now_iso(),
+                   "ended_at": conductor.now_iso()},
+             "b": {"status": "queued"}},
+            ended_at=conductor.now_iso())
+        self.assertEqual(conductor.effective_statuses(st)["b"], "lost")
+
+    def test_queued_survives_while_sibling_live(self):
+        st = self._state(
+            {"a": {"status": "running", "started_at": conductor.now_iso(),
+                   "timeout_min": 60},
+             "b": {"status": "queued"}})
+        self.assertEqual(conductor.effective_statuses(st)["b"], "queued")
+
+
+class SweepTests(unittest.TestCase):
+    def test_sweep_marks_stale_and_closes_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            rd = runs / "20990101-000000-t"
+            rd.mkdir(parents=True)
+            old = (conductor.dt.datetime.now()
+                   - conductor.dt.timedelta(hours=5)).isoformat(
+                       timespec="seconds")
+            state = {"run": "t", "started_at": old, "steps": {
+                "a": {"status": "running", "started_at": old,
+                      "timeout_min": 60},
+                "b": {"status": "queued"},
+                "c": {"status": "done", "started_at": old,
+                      "ended_at": old}}}
+            (rd / "state.json").write_text(json.dumps(state))
+            lines = conductor.sweep_runs(runs)
+            self.assertTrue(any("a" in l and "lost" in l for l in lines))
+            out = json.loads((rd / "state.json").read_text())
+            self.assertEqual(out["steps"]["a"]["status"], "lost")
+            self.assertEqual(out["steps"]["b"]["status"], "lost")
+            self.assertEqual(out["steps"]["c"]["status"], "done")
+            self.assertTrue(out["ended_at"])
+
+    def test_sweep_dry_run_when_live_self_run_watches(self):
+        """A live step whose work_dir contains runs_dir means a self-hosted
+        worker is in flight - writing would trip trap 5. Report only."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "data" / "runs"
+            runs.mkdir(parents=True)
+            # dead run that WOULD be swept
+            rd = runs / "20990101-000000-old"
+            rd.mkdir()
+            old = (conductor.dt.datetime.now()
+                   - conductor.dt.timedelta(hours=5)).isoformat(
+                       timespec="seconds")
+            (rd / "state.json").write_text(json.dumps(
+                {"run": "old", "started_at": old, "ended_at": old,
+                 "steps": {"a": {"status": "running", "started_at": old,
+                                 "timeout_min": 60}}}))
+            # live self-hosted run: work_dir = base, contains runs_dir
+            live = runs / "20990102-000000-self"
+            live.mkdir()
+            p = subprocess.Popen([sys.executable, "-c",
+                                  "import time;time.sleep(30)"])
+            try:
+                (live / "state.json").write_text(json.dumps(
+                    {"run": "self", "started_at": conductor.now_iso(),
+                     "steps": {"x": {"status": "running", "pid": p.pid,
+                                     "work_dir": str(base),
+                                     "started_at": conductor.now_iso()}}}))
+                lines = conductor.sweep_runs(runs)
+                self.assertTrue(any(l.startswith("DRY-RUN") for l in lines))
+                disk = json.loads((rd / "state.json").read_text())
+                self.assertEqual(disk["steps"]["a"]["status"],
+                                 "running")   # untouched
+            finally:
+                p.terminate()
+                p.wait()
+
+
+class StatusCommandTests(unittest.TestCase):
+    def test_minimal_state_does_not_crash(self):
+        """regression: a hand-made state.json (run+steps only) crashed
+        cmd_status with KeyError 'started_at' (data/runs/repro3)."""
+        with tempfile.TemporaryDirectory() as td:
+            rd = Path(td) / "repro"
+            rd.mkdir()
+            (rd / "state.json").write_text(json.dumps(
+                {"run": "repro3", "steps": {}}))
+            self.assertEqual(conductor.cmd_status(argparse.Namespace(
+                run_dir=str(rd))), 0)
+
+
+class SessionsCommandTests(unittest.TestCase):
+    def _args(self, runs, rm=False, keep_hours=48):
+        return argparse.Namespace(runs_dir=str(runs), devin=MOCK, rm=rm,
+                                  keep_hours=keep_hours)
+
+    def test_lists_and_removes_only_spawned_sessions(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            reg = json.loads((proj / ".mock_sessions.json").read_text())
+            self.assertEqual(len(reg), 1)
+            # recent session: kept (inside keep_hours)
+            self.assertEqual(
+                conductor.cmd_sessions(self._args(runs)), 0)
+            self.assertEqual(
+                len(json.loads((proj / ".mock_sessions.json").read_text())), 1)
+            # keep_hours=0 -> eligible -> --rm deletes via devin rm --force
+            self.assertEqual(
+                conductor.cmd_sessions(self._args(runs, rm=True,
+                                                  keep_hours=0)), 0)
+            self.assertEqual(
+                json.loads((proj / ".mock_sessions.json").read_text()), [])
+
+    def test_session_of_unfinished_run_never_eligible(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            run_dir = next(runs.iterdir())
+            state = json.loads((run_dir / "state.json").read_text())
+            del state["ended_at"]          # pretend run still in flight
+            (run_dir / "state.json").write_text(json.dumps(state))
+            self.assertEqual(
+                conductor.cmd_sessions(self._args(runs, rm=True,
+                                                  keep_hours=0)), 0)
+            reg = json.loads((proj / ".mock_sessions.json").read_text())
+            self.assertEqual(len(reg), 1)   # still there
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,8 @@ wait, repeat. The conductor does the same thing from a TOML manifest - one
     python conductor.py run   night.toml --resume [dir]   skip finished steps
     python conductor.py status [run_dir]      table from the latest run
     python conductor.py serve [--port 8773]   live dashboard of every agent
+    python conductor.py sweep                 mark orphaned records 'lost'
+    python conductor.py sessions [--rm]       list/clean spawned devin sessions
     python conductor.py demo                  end-to-end against a mock devin
 
 Manifest: see examples/night.example.toml. Project registry: projects.toml.
@@ -315,10 +317,59 @@ def effective_max_parallel(cfg: Manifest, override: int | None = None) -> int:
     return cfg.max_parallel or default_max_parallel()
 
 
-def pid_alive(pid: int | None) -> bool:
-    """Is this child pid still running? os.kill(pid, 0) works on Windows."""
+def _iso_ts(s: str | None) -> float | None:
+    try:
+        return dt.datetime.fromisoformat(s).timestamp() if s else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _proc_started_epoch(handle) -> float | None:
+    """Process creation time from an OpenProcess handle (Windows)."""
+    import ctypes
+    ct = ctypes.c_ulonglong(0)
+    buf = ctypes.c_ulonglong(0)
+    if not ctypes.windll.kernel32.GetProcessTimes(
+            handle, ctypes.byref(ct), ctypes.byref(buf),
+            ctypes.byref(buf), ctypes.byref(buf)):
+        return None
+    return ct.value / 10_000_000 - 11644473600.0   # FILETIME -> unix epoch
+
+
+def pid_alive(pid: int | None, since: str | None = None) -> bool:
+    """Is this child pid still running? MUST be non-destructive.
+
+    Never probe with os.kill(pid, 0) on Windows: there it means
+    TerminateProcess(handle, 0) - it KILLS the process it checks (verified
+    2026-10-13; os.kill is still fine on POSIX where sig 0 is a pure probe).
+    Use OpenProcess + GetExitCodeProcess instead.
+
+    `since` (the step's started_at) guards against pid reuse: Windows
+    recycles pids, so a live pid may belong to an unrelated process. Its
+    creation time must be within ~just-after the step start or it isn't
+    our worker.
+    """
     if not pid:
         return False
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)) \
+                    or code.value != 259:        # 259 = STILL_ACTIVE
+                return False
+            if since:
+                t0, created = _iso_ts(since), _proc_started_epoch(h)
+                if t0 is not None and created is not None \
+                        and not (t0 - 5 <= created <= t0 + 900):
+                    return False                 # recycled pid, not ours
+            return True
+        finally:
+            k32.CloseHandle(h)
     try:
         os.kill(pid, 0)
         return True
@@ -326,6 +377,54 @@ def pid_alive(pid: int | None) -> bool:
         return True    # exists but we can't signal it
     except OSError:
         return False
+
+
+def step_live(rec: dict) -> bool:
+    """Is a 'running' step record backed by something actually alive?
+
+    Two live shapes: a live pid, or a fresh no-pid record. No-pid mid-run
+    is normal - the pid is kept in memory only until the worker exits
+    (trap 5) - but a no-pid 'running' record older than its own timeout
+    means the conductor process died mid-step.
+    """
+    if rec.get("status") != "running":
+        return False
+    if rec.get("pid"):
+        return pid_alive(rec["pid"], rec.get("started_at"))
+    t0 = _iso_ts(rec.get("started_at"))
+    if t0 is None:
+        return False
+    timeout_s = float(rec.get("timeout_min") or 60) * 60
+    return time.time() - t0 <= timeout_s + 900
+
+
+def effective_statuses(state: dict) -> dict[str, str]:
+    """Per-step status corrected for reality, without mutating state.json.
+
+    'running' with nothing alive behind it displays as 'lost'. 'queued' is
+    'lost' when the run ended or has been quiet >10min with nothing live -
+    an orphaned queue entry can never start. ('lost' steps re-run on
+    --resume like any non-done step.)
+    """
+    steps = state.get("steps") or {}
+    live = {n: step_live(r) for n, r in steps.items()}
+    stamps = [_iso_ts(state.get(k)) for k in ("started_at", "ended_at")]
+    stamps += [_iso_ts(r.get(k)) for r in steps.values()
+               for k in ("started_at", "ended_at")]
+    newest = max((t for t in stamps if t), default=None)
+    quiet = time.time() - newest if newest else 0.0
+    orphaned = bool(state.get("ended_at")) \
+        or (not any(live.values()) and quiet > 600)
+    out = {}
+    for n, r in steps.items():
+        st = r.get("status", "?")
+        if st == "running" and not live[n]:
+            out[n] = "lost"
+        elif st == "queued" and orphaned:
+            out[n] = "lost"
+        else:
+            out[n] = st
+    return out
 
 
 def free_ram_gb() -> float | None:
@@ -496,6 +595,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                    work_dir=str(work_dir), branch=branch,
                    status="running", started_at=now_iso(), ended_at=None,
                    model=step.model, mode=step.mode, cloud=step.cloud,
+                   timeout_min=step.timeout_min,
                    prompt=str(prompt_path), stdout_log=str(stdout_log),
                    export=str(export_path))
         save_state(run_dir, state)
@@ -842,17 +942,17 @@ def cmd_status(args: argparse.Namespace) -> int:
             return 0
         run_dir = cands[0].parent
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    eff = effective_statuses(state)
     ended = state.get("ended_at") or "still running"
-    print(f"run {state['run']}  started {state['started_at']}  "
-          f"ended {ended}  ({run_dir})")
-    for name, rec in state["steps"].items():
+    print(f"run {state.get('run', '?')}  started "
+          f"{state.get('started_at') or '?'}  ended {ended}  ({run_dir})")
+    for name, rec in (state.get("steps") or {}).items():
         sess = rec.get("session_id") or "-"
         span = rec.get("elapsed_s")
         if span is None and rec.get("started_at"):
-            span = round(dt.datetime.now().timestamp()
-                         - dt.datetime.fromisoformat(
-                             rec["started_at"]).timestamp())
-        print(f"  {rec['status']:>9}  {name:<20} {span or 0:>7.0f}s  "
+            t0 = _iso_ts(rec["started_at"])
+            span = round(time.time() - t0) if t0 else 0
+        print(f"  {eff.get(name, '?'):>9}  {name:<20} {span or 0:>7.0f}s  "
               f"ended={rec.get('ended_at') or '-'}  "
               f"session={sess}  verify={rec.get('verify_ok')}")
         if rec.get("note"):
@@ -863,13 +963,155 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- hygiene
+
+def sweep_runs(runs_dir: Path, write: bool = True) -> list[str]:
+    """Re-mark orphaned 'running'/'queued' records as 'lost' and close runs
+    with nothing alive. Returns human-readable lines about what changed.
+
+    Write guard (trap 5): if a live step's work_dir contains runs_dir, a
+    self-hosted run is in flight and ANY write under runs_dir lands in the
+    worker's watched tree - so this degrades to a dry-run report.
+    """
+    states: list[tuple[Path, dict]] = []
+    watched = False
+    for sj in sorted(runs_dir.glob("*/state.json")):
+        try:
+            st = json.loads(sj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        states.append((sj, st))
+        for rec in (st.get("steps") or {}).values():
+            if step_live(rec):
+                wd = rec.get("work_dir") or rec.get("project")
+                try:
+                    if wd and runs_dir.resolve().is_relative_to(
+                            Path(wd).resolve()):
+                        watched = True
+                except OSError:
+                    pass
+    lines: list[str] = []
+    for sj, st in states:
+        eff = effective_statuses(st)
+        steps = st.get("steps") or {}
+        dirty = False
+        for name, rec in steps.items():
+            if eff.get(name) == "lost":
+                lines.append(f"{sj.parent.name}/{name}: "
+                             f"{rec.get('status')} -> lost")
+                if write:
+                    rec["status"] = "lost"
+                    if not rec.get("ended_at"):
+                        rec["ended_at"] = now_iso()
+                    rec.setdefault(
+                        "note", "marked lost by sweep: nothing alive behind "
+                                "the record (conductor or worker died?)")
+                    dirty = True
+        if steps and not st.get("ended_at") and not any(
+                r.get("status") in ("running", "queued")
+                for r in steps.values()):
+            lines.append(f"{sj.parent.name}: run closed (no live steps)")
+            if write:
+                st["ended_at"] = now_iso()
+                dirty = True
+        if dirty:
+            if watched:
+                lines.insert(0, f"DRY-RUN: a live worker watches {runs_dir} "
+                                f"(self-hosted run) - not writing (trap 5)")
+                return lines
+            save_state(sj.parent, st)
+    return lines
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    runs_dir = Path(args.runs_dir).resolve() if args.runs_dir else RUNS_DIR
+    lines = sweep_runs(runs_dir)
+    print("\n".join(lines) if lines else "nothing stale")
+    return 0
+
+
+def devin_rm(devin_argv: list[str], cwd: Path, sid: str) -> int:
+    try:
+        return subprocess.run(devin_argv + ["rm", sid, "--force"],
+                              cwd=str(cwd), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=60).returncode
+    except Exception:
+        return 1
+
+
+def cmd_sessions(args: argparse.Namespace) -> int:
+    """Conductor-spawned devin sessions still registered in their work_dir.
+
+    Whitelist: only session ids recorded in run state.json are ever listed
+    or removed - interactive sessions are not in that registry, so human
+    sessions can't be touched. --rm deletes sessions whose run ended more
+    than --keep-hours ago via `devin rm --force`; the transcript survives
+    in the run dir (export.json + stdout.log).
+    """
+    runs_dir = Path(args.runs_dir).resolve() if args.runs_dir else RUNS_DIR
+    devin_argv = shlex.split(args.devin or os.environ.get("CONDUCTOR_DEVIN")
+                             or "devin")
+    spawned: dict[str, dict] = {}
+    for sj in sorted(runs_dir.glob("*/state.json")):
+        try:
+            st = json.loads(sj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for name, rec in (st.get("steps") or {}).items():
+            sid = rec.get("session_id")
+            if not sid or "/" in str(sid):
+                continue            # cloud URL refs aren't local sessions
+            spawned[str(sid)] = {
+                "run": st.get("run"), "step": name,
+                "status": rec.get("status"),
+                "ended": rec.get("ended_at") or st.get("ended_at"),
+                "run_ended": bool(st.get("ended_at")),
+                "work_dir": rec.get("work_dir") or rec.get("project")}
+    by_dir: dict[str, list[str]] = {}
+    for sid, info in spawned.items():
+        if info["work_dir"] and Path(info["work_dir"]).is_dir():
+            by_dir.setdefault(info["work_dir"], []).append(sid)
+    present: list[tuple[str, dict]] = []
+    for wd, sids in by_dir.items():
+        live_ids = session_ids(devin_argv, Path(wd))
+        present += [(sid, spawned[sid]) for sid in sids if sid in live_ids]
+    if not present:
+        print("no conductor-spawned sessions in `devin list`")
+        return 0
+    removable: list[tuple[str, dict]] = []
+    print(f"{len(present)} conductor-spawned session(s) registered:")
+    for sid, info in present:
+        t = _iso_ts(info["ended"])
+        age_s = time.time() - t if t else None
+        age_h = round(age_s / 3600, 1) if age_s is not None else None
+        ok = (info["run_ended"] and age_s is not None
+              and age_s > args.keep_hours * 3600)
+        if ok:
+            removable.append((sid, info))
+        print(f"  {sid:<22} {info['step']:<16} {info['status'] or '?':<9} "
+              f"age={age_h if age_h is not None else '?'}h  "
+              f"{'rm-eligible' if ok else 'kept'}  "
+              f"{Path(info['work_dir']).name}")
+    if not args.rm:
+        if removable:
+            print(f"{len(removable)} from runs ended >{args.keep_hours}h ago "
+                  f"- `--rm` deletes them (transcripts stay in the run dir)")
+        return 0
+    for sid, info in removable:
+        rc = devin_rm(devin_argv, Path(info["work_dir"]), sid)
+        print(f"  rm {sid}: {'ok' if rc == 0 else f'rc={rc}'}")
+    return 0
+
+
 # ---------------------------------------------------------------- dashboard
 
 SERVE_PORT = 8773    # registered in C:\Projects\AGENTS.md
 
 _STATUS_COLOR = {"done": "#3fb950", "partial": "#d29922", "blocked": "#d29922",
                  "failed": "#f85149", "timed_out": "#f0883e",
-                 "running": "#58a6ff", "queued": "#8b949e"}
+                 "running": "#58a6ff", "queued": "#8b949e",
+                 "lost": "#6e7681"}
 
 
 def collect_dashboard(runs_dir: Path) -> dict:
@@ -884,8 +1126,9 @@ def collect_dashboard(runs_dir: Path) -> dict:
         except (OSError, ValueError):
             continue
         counts: dict[str, int] = {}
-        for rec in st.get("steps", {}).values():
-            status = rec.get("status", "?")
+        eff = effective_statuses(st)
+        for name, rec in st.get("steps", {}).items():
+            status = eff.get(name, rec.get("status", "?"))
             counts[status] = counts.get(status, 0) + 1
             agents.append({
                 "run": st.get("run"), "run_dir": st.get("run_dir"),
@@ -894,7 +1137,7 @@ def collect_dashboard(runs_dir: Path) -> dict:
                 "status": status, "started_at": rec.get("started_at"),
                 "ended_at": rec.get("ended_at"),
                 "elapsed_s": rec.get("elapsed_s"),
-                "alive": status == "running" and pid_alive(rec.get("pid")),
+                "alive": step_live(rec),
                 "pid": rec.get("pid"), "session_id": rec.get("session_id"),
                 "model": rec.get("model"), "mode": rec.get("mode"),
                 "cloud": rec.get("cloud"), "verify_ok": rec.get("verify_ok"),
@@ -940,7 +1183,8 @@ a { color:#58a6ff; text-decoration:none; }
 <h2>runs</h2><div class="wrapw"><table id="runs"></table></div>
 <script>
 const COLORS = {done:'#3fb950',partial:'#d29922',blocked:'#d29922',
-failed:'#f85149',timed_out:'#f0883e',running:'#58a6ff',queued:'#8b949e'};
+failed:'#f85149',timed_out:'#f0883e',running:'#58a6ff',queued:'#8b949e',
+lost:'#6e7681'};
 const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,
   c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const loc = iso => { if(!iso) return '-';
@@ -1003,6 +1247,8 @@ tick();
 
 def cmd_serve(args: argparse.Namespace) -> int:
     runs_dir = Path(args.runs_dir).resolve() if args.runs_dir else RUNS_DIR
+    for line in sweep_runs(runs_dir):       # one-shot cleanup at startup;
+        print(f"sweep: {line}")             # display stays honest after
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def _send(self, body: bytes, ctype: str) -> None:
@@ -1094,6 +1340,9 @@ def main(argv: list[str] | None = None) -> int:
             ("run", cmd_run, "execute a manifest"),
             ("status", cmd_status, "show a run's step table"),
             ("serve", cmd_serve, "live dashboard of all runs + agents"),
+            ("sweep", cmd_sweep, "mark orphaned running/queued records lost"),
+            ("sessions", cmd_sessions,
+             "list / clean up conductor-spawned devin sessions"),
             ("demo", cmd_demo, "self-test against a mock devin")):
         p = sub.add_parser(name, help=helptext)
         if name in ("plan", "run"):
@@ -1104,13 +1353,20 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--max-parallel", type=int, default=None,
                            help="cap concurrent agents (overrides the "
                                 "manifest's run.max_parallel)")
-        if name in ("plan", "run", "demo"):
+        if name in ("plan", "run", "demo", "sessions"):
             p.add_argument("--devin", default=None,
                            help="devin command override (e.g. mock shim). "
                                 "Split with shlex - quote or use forward "
                                 "slashes in Windows paths")
-        if name in ("run", "demo", "serve"):
+        if name in ("run", "demo", "serve", "sweep", "sessions"):
             p.add_argument("--runs-dir", default=None, help=argparse.SUPPRESS)
+        if name == "sessions":
+            p.add_argument("--rm", action="store_true",
+                           help="delete sessions from runs ended more than "
+                                "--keep-hours ago (devin rm --force)")
+            p.add_argument("--keep-hours", type=float, default=48,
+                           help="grace period after a run ends before its "
+                                "sessions are rm-eligible (default 48)")
         if name in ("run", "demo"):
             p.add_argument("--no-hub", dest="hub", action="store_false",
                            default=True, help="don't create/update a hub.db row")
@@ -1123,7 +1379,8 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("run_dir", nargs="?", default=None)
     args = ap.parse_args(argv)
     return {"plan": cmd_plan, "run": cmd_run, "status": cmd_status,
-            "serve": cmd_serve, "demo": cmd_demo}[args.cmd](args)
+            "serve": cmd_serve, "sweep": cmd_sweep,
+            "sessions": cmd_sessions, "demo": cmd_demo}[args.cmd](args)
 
 
 if __name__ == "__main__":

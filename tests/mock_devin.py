@@ -4,6 +4,7 @@
 Implements the surface conductor.py uses:
     mock_devin.py auth status
     mock_devin.py list --format json          (per-cwd registry)
+    mock_devin.py rm <id> [--force]           (drop a registered session)
     mock_devin.py [--cloud] --print --prompt-file F [--model M]
                   [--permission-mode M] [--export P] [--respect-workspace-trust B]
 
@@ -40,6 +41,12 @@ def main() -> int:
         return 0
     if args[:1] == ["list"]:
         print(json.dumps(_registry(cwd)))
+        return 0
+    if args[:1] == ["rm"]:
+        target = next((a for a in args[1:] if not a.startswith("-")), None)
+        sessions = [s for s in _registry(cwd) if s.get("id") != target]
+        _save_registry(cwd, sessions)
+        print(f"deleted session {target} (mock)")
         return 0
     if args[:1] == ["models"]:
         print(json.dumps({"families": {"swe": ["swe-1-6"], "claude": ["opus"]}}))
