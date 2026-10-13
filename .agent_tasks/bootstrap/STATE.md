@@ -143,6 +143,12 @@ is now measurable in wasted sessions.
 Outcome appended to ROADMAP.md Phase 2. No regressions; trap 5 remains the
 blocker for live manifests.
 
+**Update 2026-10-13 - readme task dispatched a fifth time, still a no-op.**
+README.md unchanged (62 lines, committed in 88d8ea3, working tree clean);
+re-verified against the argparse surface in main() - plan/run/status/serve/
+demo, --resume/--max-parallel/--devin/--no-hub/--no-keep-awake/--port all
+match. Five dispatches of one landed step.
+
 ## Deferred or blocked
 
 - Session-completion tracking for `devin -p` steps - the subprocess
