@@ -54,6 +54,16 @@ python conductor.py demo                    end-to-end vs tests/mock_devin.py
 python run_tests.py                         unittest suite (mock-only, no auth)
 ```
 
+Run flags: `--devin "<cmd>"` worker binary override, `--no-hub` skip the
+hub.db row, `--no-keep-awake` allow system sleep (runs request
+`SetThreadExecutionState` by default so overnight work survives).
+
+Parallel: adjacent `[[step]]` entries sharing `wave = N` run concurrently.
+Steps on the *same* project in a wave need `worktree = true` - each runs in
+`data/worktrees/<run>/<step>` on branch `conductor/<run>/<step>`, merged back
+in manifest order after the wave; a merge conflict fails the step but keeps
+the worktree for manual merge.
+
 `examples/night.example.toml` is the reference manifest. `projects.toml`
 registers slug -> path + `cloud_ok`. `--devin "..."` or `CONDUCTOR_DEVIN`
 overrides the spawned binary (shlex-split; use forward slashes or quotes -

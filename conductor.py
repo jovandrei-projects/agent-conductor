@@ -732,6 +732,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         sess = rec.get("session_id") or "-"
         print(f"  {rec['status']:>9}  {name:<20} {rec.get('elapsed_s', 0):>7.0f}s  "
               f"session={sess}  verify={rec.get('verify_ok')}")
+        if rec.get("note"):
+            print(f"             note: {rec['note']}")
+        if sess not in (None, "-") and not str(sess).startswith("mock"):
+            how = "devin --cloud -r" if "/" in str(sess) else "devin -r"
+            print(f"             resume: cd {rec.get('project')} && {how} {sess}")
     return 0
 
 
