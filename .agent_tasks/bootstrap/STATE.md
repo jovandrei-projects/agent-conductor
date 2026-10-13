@@ -149,6 +149,11 @@ re-verified against the argparse surface in main() - plan/run/status/serve/
 demo, --resume/--max-parallel/--devin/--no-hub/--no-keep-awake/--port all
 match. Five dispatches of one landed step.
 
+**Update 2026-10-13 ~09:38 - nightly smoke run green again.** `run_tests.py
+--quick` 22/22, `conductor.py demo` 2/2 done (run `20261013-093750-demo`).
+Outcome appended to ROADMAP.md Phase 2. No regressions; trap 5 remains the
+blocker for live manifests.
+
 ## Deferred or blocked
 
 - Session-completion tracking for `devin -p` steps - the subprocess

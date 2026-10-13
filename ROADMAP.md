@@ -52,6 +52,10 @@ unchanged.
 2/2 done (run `20261013-093107-demo`). No regressions; trap 5 blocker
 unchanged.
 
+2026-10-13 ~09:38 - `run_tests.py --quick` 22/22 green, `conductor.py demo`
+2/2 done (run `20261013-093750-demo`). No regressions; trap 5 blocker
+unchanged.
+
 ## Phase 3 - polish
 
 - [ ] Planner step pattern validated (re-slices QUEUE.md mid-run) - the pattern is documented in `examples/night.example.toml`, needs a live run
