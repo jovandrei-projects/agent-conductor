@@ -44,6 +44,8 @@ TASK_PY = ROOT.parent / "mobile-apps" / "pc-bridge" / "task.py"
 LOG = logging.getLogger("conductor")
 STATE_LOCK = threading.RLock()
 STATUS_RE = re.compile(r"^STATUS:\s*([A-Za-z_-]+)", re.M)
+SESSION_URL_RE = re.compile(
+    r"app\.devin\.ai/sessions/([A-Za-z0-9_-]+)|(devin-[0-9a-f]{32})")
 VALID_MODES = {"normal", "accept-edits", "smart", "bypass", "dangerous", "yolo",
                "auto"}
 
@@ -367,6 +369,19 @@ def tail_status(stdout_log: Path) -> str | None:
     return found[-1].lower() if found else None
 
 
+def tail_session_ref(stdout_log: Path) -> str | None:
+    """Cloud sessions never show up in `devin list` (they live server-side);
+    the CLI prints an app.devin.ai session URL to stdout instead."""
+    try:
+        data = stdout_log.read_bytes()[-65536:].decode("utf-8", "replace")
+    except OSError:
+        return None
+    matches = SESSION_URL_RE.findall(data)
+    if not matches:
+        return None
+    return matches[-1][0] or matches[-1][1]
+
+
 def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
              run_dir: Path, devin_argv: list[str], state: dict,
              do_checkpoint: bool = True) -> str:
@@ -449,7 +464,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         status = "done"
 
     with STATE_LOCK:
-        rec["session_id"] = sorted(new_sessions)[-1] if new_sessions else None
+        rec["session_id"] = (sorted(new_sessions)[-1] if new_sessions
+                             else tail_session_ref(stdout_log))
         rec["exit_code"] = rc
         rec["elapsed_s"] = elapsed
         if status == "done" and status_line is None:
@@ -485,25 +501,50 @@ def find_resume_dir(cfg: Manifest, runs_dir: Path, arg: str | None) -> Path:
     raise SystemExit(f"--resume: no prior run of {cfg.name!r} under {runs_dir}")
 
 
-def hub_report(cfg: Manifest, run_dir: Path, state: dict) -> None:
-    """One row in hub.db per finished run, for morning review on the phone."""
+def _task_py(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(TASK_PY), *args],
+                          capture_output=True, text=True, timeout=60,
+                          encoding="utf-8", errors="replace")
+
+
+def hub_start(cfg: Manifest, run_dir: Path) -> int | None:
+    """Create the run's hub.db row; returns its id or None. The row is
+    live-updated per step so the phone shows overnight progress."""
     if not TASK_PY.is_file():
+        return None
+    try:
+        out = _task_py("add", "--project", "agent-conductor", "--kind", "task",
+                       "--title", f"conductor run: {cfg.name}",
+                       "--body", f"run dir: {run_dir}\nstarted {now_iso()}",
+                       "--by", "conductor")
+        m = re.search(r"#(\d+)", out.stdout or "")
+        if not m:
+            return None
+        tid = int(m.group(1))
+        _task_py("update", str(tid), "--status", "in_progress")
+        return tid
+    except Exception as exc:
+        LOG.warning("hub.db row create failed: %s", exc)
+        return None
+
+
+def hub_update(tid: int | None, state: dict, final: bool = False) -> None:
+    if tid is None or not TASK_PY.is_file():
         return
     counts: dict[str, int] = {}
     for rec in state["steps"].values():
         counts[rec["status"]] = counts.get(rec["status"], 0) + 1
-    body = (f"run dir: {run_dir}\n"
+    body = ("run dir: " + state.get("run_dir", "?") + "\n"
             + "\n".join(f"- {r['name']}: {r['status']}"
                         for r in state["steps"].values()))
     try:
-        subprocess.run(
-            [sys.executable, str(TASK_PY), "add", "--project", "agent-conductor",
-             "--kind", "proposal",
-             "--title", f"conductor run {cfg.name}: {dict(counts)}",
-             "--body", body, "--by", "conductor"],
-            capture_output=True, timeout=60)
+        args_ = ["update", str(tid), "--body", body,
+                 "--title", f"conductor run {state['run']}: {dict(counts)}"]
+        if final:
+            args_ += ["--status", "done"]
+        _task_py(*args_)
     except Exception as exc:
-        LOG.warning("hub.db report failed: %s", exc)
+        LOG.warning("hub.db update failed: %s", exc)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -525,9 +566,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         run_dir = new_run_dir(cfg, runs_dir)
         state = {"run": cfg.name, "manifest": str(manifest_path),
                  "started_at": now_iso(), "devin": " ".join(devin_argv),
-                 "steps": {}}
+                 "run_dir": str(run_dir), "steps": {}}
         save_state(run_dir, state)
-    log_event(run_dir, event="run_start", manifest=str(manifest_path))
+    hub = getattr(args, "hub", True)
+    tid = hub_start(cfg, run_dir) if hub else None
+    log_event(run_dir, event="run_start", manifest=str(manifest_path),
+              hub_task=tid)
 
     if "devin" in os.path.basename(devin_argv[0]).lower():
         if not check_auth(devin_argv):
@@ -594,6 +638,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         for step, slug, work_dir, repo_dir, branch in prepared:
             status = statuses.get(step.name)
             print(f"[{status or 'skipped':>8}] {step.name}")
+            hub_update(tid, state)
             if branch:
                 rec = state["steps"].get(step.name, {})
                 if status in ("done", "partial", "blocked"):
@@ -615,7 +660,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     state["ended_at"] = now_iso()
     save_state(run_dir, state)
     log_event(run_dir, event="run_end")
-    hub_report(cfg, run_dir, state)
+    hub_update(tid, state, final=True)
     counts: dict[str, int] = {}
     for rec in state["steps"].values():
         counts[rec["status"]] = counts.get(rec["status"], 0) + 1
@@ -700,7 +745,8 @@ verify = "python -c \\"import pathlib;assert pathlib.Path('WORK.txt').read_text(
     mock = (ROOT / "tests" / "mock_devin.py").as_posix()
     py = Path(sys.executable).as_posix()
     ns = argparse.Namespace(manifest=str(manifest), resume=None,
-                            devin=f"{py} {mock}", runs_dir=args.runs_dir)
+                            devin=f"{py} {mock}", runs_dir=args.runs_dir,
+                            hub=False)
     return cmd_run(ns)
 
 
@@ -740,6 +786,8 @@ def main(argv: list[str] | None = None) -> int:
                                 "slashes in Windows paths")
         if name in ("run", "demo"):
             p.add_argument("--runs-dir", default=None, help=argparse.SUPPRESS)
+            p.add_argument("--no-hub", dest="hub", action="store_false",
+                           default=True, help="don't create/update a hub.db row")
         if name == "status":
             p.add_argument("run_dir", nargs="?", default=None)
     args = ap.parse_args(argv)

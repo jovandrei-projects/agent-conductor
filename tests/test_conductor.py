@@ -46,7 +46,7 @@ def write_manifest(base: Path, steps: str, extra: str = "") -> Path:
 def run_manifest(manifest: Path, runs_dir: Path, resume=None) -> int:
     return conductor.cmd_run(argparse.Namespace(
         manifest=str(manifest), resume=resume, devin=MOCK,
-        runs_dir=str(runs_dir)))
+        runs_dir=str(runs_dir), hub=False))
 
 
 class ManifestTests(unittest.TestCase):
