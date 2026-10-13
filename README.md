@@ -1,0 +1,62 @@
+# agent-conductor
+
+`conductor.py` runs a TOML manifest of steps as a sequence of fresh Devin
+CLI sessions - one `devin -p` subprocess per step, in the target project's
+directory. It automates the loop a human otherwise drives by hand (new
+session, paste prompt, wait, repeat), so multi-phase work can run overnight
+without one bloated context window or per-message cost growth. State hands
+off through the project's own `AGENTS.md` + `.agent_tasks/` files, not a
+conversation; conductor adds git checkpoints before and after each step, a
+run log, verify gates, and a `STATUS:` line contract. Python stdlib only.
+
+## Manifest
+
+```toml
+[run]
+name = "night"               # run dir: data/runs/<ts>-<name>/
+on_failure = "stop"          # "continue" keeps going past failed steps
+checkpoint = true            # git commit the project before AND after each step
+# max_hours = 8              # optional wall-clock cap for the whole run
+# max_parallel = 2           # concurrent agents; default ~1 per 4 cores, max 4
+
+[defaults]                   # inherited by every step, overridable per step
+model = "swe"
+mode = "bypass"              # unattended: nobody to answer prompts
+timeout_min = 60
+
+[[step]]
+name = "next-queue-task"
+project = "video-tools"      # slug -> path + cloud_ok, from projects.toml
+prompt = "Pick up the next task in .agent_tasks/QUEUE.md and work it to done or blocked."
+
+[[step]]
+name = "test-sweep"
+project = "video-tools"
+prompt = "Run the test suite and fix failures."
+verify = "python run_tests.py --quick"   # cmd.exe gate; nonzero exit = step fails
+timeout_min = 90
+
+# Adjacent steps sharing `wave = N` run in parallel up to the cap;
+# same-project wave members need `worktree = true` (own branch, merged back).
+# `cloud = true` spawns `devin --cloud -p`; requires cloud_ok in projects.toml.
+```
+
+Fully annotated manifest: `examples/night.example.toml`.
+
+## Commands
+
+```
+python conductor.py plan <manifest.toml>           validate + show resolved steps
+python conductor.py run  <manifest.toml>           execute -> data/runs/<ts>-<name>/
+python conductor.py run  <manifest> --resume [dir] skip done steps (default: latest)
+python conductor.py status [run_dir]               step table of the latest run
+python conductor.py serve [--port 8773]            live dashboard, loopback only
+python conductor.py demo                           end-to-end vs tests/mock_devin.py
+python run_tests.py                                unittest suite (mock, no auth)
+```
+
+Run flags: `--devin "<cmd>"` binary override, `--no-hub`, `--no-keep-awake`,
+`--max-parallel N`.
+
+Requires `devin` on PATH with `devin auth login` done once in a real
+terminal. Ground rules and traps: `AGENTS.md`. Phase status: `ROADMAP.md`.
