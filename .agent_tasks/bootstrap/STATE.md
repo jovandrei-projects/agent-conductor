@@ -31,7 +31,8 @@ a real manifest the moment `devin auth login` has been done once.
 - [x] Parallel `wave` groups via git worktrees + merge-back
 - [x] hub.db run row live-updated per step (`--no-hub` opt-out)
 - [x] Cloud session URL capture from stdout
-- [ ] Commit everything
+- [x] Commit everything (7 commits)
+- [x] `[run] max_hours` wall-clock cap; keep-awake power request during runs
 - [ ] Live `devin -p` smoke test once authed (manifest ready: examples/smoke.toml, targets agent-conductor itself)
 
 ### Phase 2 - stretch tonight

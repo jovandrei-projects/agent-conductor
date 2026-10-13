@@ -18,6 +18,7 @@
 name = "video-tools-night"
 on_failure = "stop"
 checkpoint = true
+# max_hours = 8      # wall-clock cap for the whole run (optional)
 
 [defaults]
 model = "swe"          # cheap model for grind phases; use "opus"/"gpt" for planning
