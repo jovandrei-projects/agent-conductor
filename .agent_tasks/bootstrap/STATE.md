@@ -86,6 +86,15 @@ spawned session re-checked `README.md`: present (62 lines), committed in
 88d8ea3, and accurate against conductor.py (all manifest fields, flags,
 and paths verified). No changes needed; the step stays done.
 
+**Update 2026-10-13 ~09:26 - readme task assigned again, still a no-op.**
+This session's stated task was "write the top-level README.md"; it already
+exists from the detached smoke session above. Re-verified independently
+this time: every command line in the README matches the argparse surface
+in conductor.py main() (plan/run/status/serve/demo + --resume,
+--max-parallel, --devin, --no-hub, --no-keep-awake, --port), 62 lines,
+working tree clean, committed in 88d8ea3. Nothing to write. The real
+blocker for the queue remains trap 5 below.
+
 Next session's first job: find how to observe a spawned session's state
 (`devin list` is a TUI; look for a non-interactive flag, `devin acp`
 JSON-RPC, or the ATIF export appearing only at session end), then gate
