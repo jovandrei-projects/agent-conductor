@@ -42,12 +42,19 @@ a real manifest the moment `devin auth login` has been done once.
 
 ## Where it stopped
 
-Everything is built and mock-tested (15 tests green). **Blocked on
-`devin auth login`** - the user said they'd run it tonight. Once live:
-`python conductor.py run examples/smoke.toml` runs 2 real `devin -p`
-workers against agent-conductor itself (write README.md, run tests).
-A background watcher in the building session polls `devin auth status`
-every 60s.
+Everything is built, tested (15 green), committed (8 commits) and
+documented. **Blocked on `devin auth login`** - the user said they'd run it
+tonight; it had not landed by ~02:00. Next action once it has:
+
+    cd C:\Projects\agent-conductor
+    python conductor.py run examples/smoke.toml
+
+Then check `python conductor.py status`, `devin list` in the project dir,
+and `data/runs/*/​*.export.json`. The open questions the live run answers:
+does `-p` run the full agentic loop (not one turn), do spawned sessions
+appear in `devin list`/Desktop, what does ATIF export contain. If `-p`
+proves single-turn-only, the fallback is driving `devin acp` (JSON-RPC
+stdio) - deliberately not built until disproven.
 
 Traps already hit and documented in AGENTS.md: `-p` positional-after-flag
 is parsed as PATH not prompt (use --prompt-file); `is_git_repo` must
