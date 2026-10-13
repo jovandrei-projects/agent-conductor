@@ -21,7 +21,10 @@ One phase at a time, in order. Mark items `[x]` as they land.
 - [x] Parallel `wave` groups in git worktrees + merge-back (landed early; `conductor/<run>/<step>` branches)
 - [x] hub.db: one task row per run, live-updated per step (`--no-hub` opts out)
 - [x] Cloud-session ref capture: `app.devin.ai/sessions/...` parsed from stdout (cloud sessions don't show in `devin list`)
-- [ ] Live `devin -p` smoke test (blocked on `devin auth login`)
+- [x] `run.max_parallel` resource cap (default ~1 per 4 cores, max 4; wave members queue past the cap) + `--max-parallel` override; effective cap + free RAM recorded per run
+- [x] Agent registry: each step record in `state.json` carries pid, work_dir, branch, started_at/ended_at/elapsed_s, session id, output paths - the durable session-work record
+- [x] `conductor.py serve` dashboard on `127.0.0.1:8773`: every agent + run, live elapsed, status colors, `/api/state` JSON
+- [ ] Live `devin -p` smoke test (blocked on `devin auth login` - see AGENTS.md trap 3: Desktop login does NOT write credentials.toml)
 - [ ] Live run on one real project's queue (cheap model)
 
 ## Phase 2 - verified live behavior
@@ -34,6 +37,8 @@ One phase at a time, in order. Mark items `[x]` as they land.
 ## Phase 3 - polish
 
 - [ ] Planner step pattern validated (re-slices QUEUE.md mid-run) - the pattern is documented in `examples/night.example.toml`, needs a live run
+- [ ] Phone access to the dashboard: either a lan-bridge proxy port for :8773 (needs a mobile-apps bridge.defaults.json change + app redeploy) or accept that `tasks-ui` hub rows are enough
+- [ ] `run.min_free_gb` scheduling gate: pause new agents when RAM is scarce (free_ram_gb is already recorded; the gate itself is unbuilt)
 - [ ] Maybe a runs view in project-hub (reads `data/runs/*/state.json`)
 - [ ] Transcript-extract integration: distilled handoff notes into run dir
 - [ ] Desktop visibility of spawned sessions confirmed/documented

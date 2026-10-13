@@ -19,6 +19,9 @@ name = "video-tools-night"
 on_failure = "stop"
 checkpoint = true
 # max_hours = 8      # wall-clock cap for the whole run (optional)
+# max_parallel = 2   # concurrent-agent cap. Default is conservative
+                     # (about 1 per 4 logical cores, max 4). Each agent is a
+                     # full Devin session - don't set 100 on a desktop.
 
 [defaults]
 model = "swe"          # cheap model for grind phases; use "opus"/"gpt" for planning

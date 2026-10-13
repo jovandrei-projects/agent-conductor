@@ -11,9 +11,9 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 | # | Task | Status | Folder | Waits on |
 |---|---|---|---|---|
-| 1 | Bootstrap: conductor.py v1 + mock tests + docs | in progress | bootstrap/ | `devin auth login` for live smoke test |
+| 1 | Bootstrap: conductor.py v1 + mock tests + docs | in progress | bootstrap/ | `devin auth login` in a real terminal (Desktop-side login doesn't count - AGENTS.md trap 3) |
 
 ## Not yet filed as tasks
 
 - Live smoke test + first real overnight manifest (Phase 2 in ROADMAP.md)
-- Parallel worktree mode (Phase 3)
+- Phone access to the :8773 dashboard via lan-bridge proxy (needs mobile-apps change; tasks-ui rows already give coarse progress)

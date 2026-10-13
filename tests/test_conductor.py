@@ -311,5 +311,106 @@ prompt = "second"
             self.assertEqual(len(lines), lines_before + 1)  # only "two" re-ran
 
 
+class ResourceTests(unittest.TestCase):
+    def test_default_max_parallel_bounds(self):
+        self.assertGreaterEqual(conductor.default_max_parallel(), 1)
+        self.assertLessEqual(conductor.default_max_parallel(), 4)
+
+    def test_max_parallel_parse_and_override(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            m = write_manifest(base, f'''
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "p"
+''', extra='max_parallel = 3\n')
+            cfg = conductor.load_manifest(m)
+            self.assertEqual(cfg.max_parallel, 3)
+            self.assertEqual(conductor.effective_max_parallel(cfg), 3)
+            self.assertEqual(conductor.effective_max_parallel(cfg, 7), 7)
+            with self.assertRaises(conductor.ManifestError):
+                conductor.effective_max_parallel(cfg, 0)
+
+    def test_max_parallel_zero_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            m = write_manifest(Path(td), '''
+[[step]]
+name = "a"
+project = "x"
+prompt = "p"
+''', extra='max_parallel = 0\n')
+            with self.assertRaises(conductor.ManifestError):
+                conductor.load_manifest(m)
+
+    def test_max_parallel_one_serializes_wave(self):
+        """cap=1 must run wave members strictly one at a time: the events
+        log shows each step fully ending before the next starts."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "p1"
+project = "{proj.as_posix()}"
+prompt = "Append a line to FILE_A.txt."
+wave = 1
+worktree = true
+
+[[step]]
+name = "p2"
+project = "{proj.as_posix()}"
+prompt = "Append a line to FILE_B.txt."
+wave = 1
+worktree = true
+''', extra='max_parallel = 1\n')
+            rc = run_manifest(m, runs)
+            self.assertEqual(rc, 0)
+            run_dir = next(runs.iterdir())
+            state = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(state["max_parallel"], 1)
+            seq = [(e["event"], e.get("step")) for e in
+                   (json.loads(l) for l in
+                    (run_dir / "events.jsonl").read_text().splitlines())]
+            order = [(ev, st) for ev, st in seq
+                     if ev in ("step_start", "step_end")]
+            # strict serial: start,end pairs never interleave
+            self.assertEqual(order[0][0], "step_start")
+            self.assertEqual(order[1], ("step_end", order[0][1]))
+            self.assertEqual(order[2][0], "step_start")
+            self.assertEqual(order[3], ("step_end", order[2][1]))
+
+
+class DashboardTests(unittest.TestCase):
+    def test_collect_dashboard(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            rc = run_manifest(m, runs)
+            self.assertEqual(rc, 0)
+            d = conductor.collect_dashboard(runs)
+            self.assertEqual(len(d["runs"]), 1)
+            self.assertEqual(d["runs"][0]["run"], "t")
+            self.assertTrue(d["runs"][0]["ended_at"])
+            self.assertEqual(len(d["agents"]), 1)
+            a = d["agents"][0]
+            self.assertEqual(a["step"], "one")
+            self.assertEqual(a["status"], "done")
+            self.assertTrue(a["ended_at"])
+            self.assertIsNotNone(a["elapsed_s"])
+            self.assertIn("pid", a)
+            self.assertFalse(a["alive"])   # mock child is long dead
+            self.assertTrue(str(a["work_dir"]).endswith("proj"))
+
+
 if __name__ == "__main__":
     unittest.main()

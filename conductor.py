@@ -11,6 +11,7 @@ wait, repeat. The conductor does the same thing from a TOML manifest - one
     python conductor.py run   night.toml      execute -> data/runs/<ts>-<name>/
     python conductor.py run   night.toml --resume [dir]   skip finished steps
     python conductor.py status [run_dir]      table from the latest run
+    python conductor.py serve [--port 8773]   live dashboard of every agent
     python conductor.py demo                  end-to-end against a mock devin
 
 Manifest: see examples/night.example.toml. Project registry: projects.toml.
@@ -18,8 +19,10 @@ Manifest: see examples/night.example.toml. Project registry: projects.toml.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import dataclasses
 import datetime as dt
+import http.server
 import json
 import logging
 import os
@@ -30,7 +33,6 @@ import sys
 import threading
 import time
 import tomllib
-import concurrent.futures
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -109,6 +111,7 @@ class Manifest:
     checkpoint: bool
     preamble: str | None
     max_hours: float | None            # wall-clock cap for the whole run
+    max_parallel: int | None           # cap on concurrent agents; None = auto
     steps: list[Step]
 
 
@@ -161,10 +164,15 @@ def load_manifest(path: Path) -> Manifest:
             worktree=bool(merged.get("worktree", False))))
     if not steps:
         raise ManifestError("manifest has no [[step]] entries")
+    max_parallel = run.get("max_parallel")
+    if max_parallel is not None:
+        max_parallel = int(max_parallel)
+        if max_parallel < 1:
+            raise ManifestError("run.max_parallel must be >= 1")
     return Manifest(path=path, name=name, on_failure=on_failure,
                     checkpoint=bool(run.get("checkpoint", True)),
                     preamble=preamble, max_hours=run.get("max_hours"),
-                    steps=steps)
+                    max_parallel=max_parallel, steps=steps)
 
 
 def load_projects() -> dict[str, dict]:
@@ -286,6 +294,63 @@ def check_auth(devin_argv: list[str]) -> bool:
         return False
 
 
+# ---------------------------------------------------------------- resources
+
+def default_max_parallel() -> int:
+    """Conservative concurrency ceiling when the manifest doesn't set one.
+
+    Every worker is a full Devin agent session - a spawned CLI plus tool
+    subprocesses, model streaming and whatever builds it runs. One agent per
+    ~4 logical cores, never more than 4, keeps an ordinary desktop usable.
+    Set run.max_parallel (or --max-parallel) to override; the box is yours.
+    """
+    return max(1, min(4, (os.cpu_count() or 4) // 4))
+
+
+def effective_max_parallel(cfg: Manifest, override: int | None = None) -> int:
+    if override is not None:
+        if override < 1:
+            raise ManifestError("--max-parallel must be >= 1")
+        return override
+    return cfg.max_parallel or default_max_parallel()
+
+
+def pid_alive(pid: int | None) -> bool:
+    """Is this child pid still running? os.kill(pid, 0) works on Windows."""
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True    # exists but we can't signal it
+    except OSError:
+        return False
+
+
+def free_ram_gb() -> float | None:
+    """Free physical memory via GlobalMemoryStatusEx (informational)."""
+    try:
+        import ctypes
+
+        class MEMSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        st = MEMSTATUSEX()
+        st.dwLength = ctypes.sizeof(MEMSTATUSEX)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+        return round(st.ullAvailPhys / 1e9, 1)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------- power
 
 def keep_awake() -> None:
@@ -404,22 +469,19 @@ def tail_session_ref(stdout_log: Path) -> str | None:
 
 def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
              run_dir: Path, devin_argv: list[str], state: dict,
-             do_checkpoint: bool = True) -> str:
+             do_checkpoint: bool = True, branch: str | None = None) -> str:
     """Run one step; return final status: done|partial|blocked|failed|timed_out.
 
     work_dir is where the session runs and where checkpoints/verify happen -
     the project dir, or a git worktree for parallel steps. When a worktree is
     used the caller owns the pre-step checkpoint (on the main checkout), so
     do_checkpoint=False.
-    """
-    with STATE_LOCK:
-        rec = state["steps"].setdefault(step.name, {})
-        rec.update(name=step.name, slug=slug, project=str(work_dir),
-                   status="running", started_at=now_iso(),
-                   model=step.model, mode=step.mode, cloud=step.cloud)
-        save_state(run_dir, state)
-    log_event(run_dir, event="step_start", step=step.name, project=str(work_dir))
 
+    The step's record in state.json doubles as the agent registry entry:
+    status/started_at are set while it queues, pid once the child process
+    exists, and ended_at/elapsed_s/session_id when it finishes. The dashboard
+    reads exactly this.
+    """
     prompt_path = run_dir / "prompts" / f"{step.name}.md"
     prompt_path.parent.mkdir(exist_ok=True)
     prompt_path.write_text(
@@ -427,6 +489,17 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         encoding="utf-8")
     stdout_log = run_dir / f"{step.name}.stdout.log"
     export_path = run_dir / f"{step.name}.export.json"
+
+    with STATE_LOCK:
+        rec = state["steps"].setdefault(step.name, {})
+        rec.update(name=step.name, slug=slug, project=str(work_dir),
+                   work_dir=str(work_dir), branch=branch,
+                   status="running", started_at=now_iso(), ended_at=None,
+                   model=step.model, mode=step.mode, cloud=step.cloud,
+                   prompt=str(prompt_path), stdout_log=str(stdout_log),
+                   export=str(export_path))
+        save_state(run_dir, state)
+    log_event(run_dir, event="step_start", step=step.name, project=str(work_dir))
 
     if cfg.checkpoint and do_checkpoint:
         if not is_git_repo(work_dir):
@@ -443,16 +516,21 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     LOG.info("step %s: %s (cwd=%s)", step.name, " ".join(cmd), work_dir)
     t0 = time.time()
     timed_out = False
+    rc: int | None = None
     with open(stdout_log, "wb") as out:
         try:
-            proc = subprocess.run(cmd, cwd=str(work_dir), stdout=out,
-                                  stderr=subprocess.STDOUT,
-                                  timeout=step.timeout_min * 60)
-            rc = proc.returncode
-        except subprocess.TimeoutExpired:
-            rc, timed_out = None, True
+            proc = subprocess.Popen(cmd, cwd=str(work_dir), stdout=out,
+                                    stderr=subprocess.STDOUT)
+            with STATE_LOCK:
+                rec["pid"] = proc.pid
+                save_state(run_dir, state)
+            try:
+                rc = proc.wait(timeout=step.timeout_min * 60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                timed_out = True
         except OSError as exc:
-            rc, timed_out = None, False
             LOG.error("step %s spawn failed: %s", step.name, exc)
             log_event(run_dir, event="spawn_error", step=step.name, error=str(exc))
     elapsed = round(time.time() - t0, 1)
@@ -555,6 +633,7 @@ def hub_update(tid: int | None, state: dict, final: bool = False) -> None:
     for rec in state["steps"].values():
         counts[rec["status"]] = counts.get(rec["status"], 0) + 1
     body = ("run dir: " + state.get("run_dir", "?") + "\n"
+            + "ended: " + (state.get("ended_at") or "still running") + "\n"
             + "\n".join(f"- {r['name']}: {r['status']}"
                         for r in state["steps"].values()))
     try:
@@ -577,6 +656,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     resolved = [(*resolve_project(s, projects, manifest_path.parent), s)
                 for s in cfg.steps]
+    cap = effective_max_parallel(cfg, getattr(args, "max_parallel", None))
 
     if getattr(args, "keep_awake", True):
         keep_awake()
@@ -589,7 +669,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         run_dir = new_run_dir(cfg, runs_dir)
         state = {"run": cfg.name, "manifest": str(manifest_path),
                  "started_at": now_iso(), "devin": " ".join(devin_argv),
-                 "run_dir": str(run_dir), "steps": {}}
+                 "run_dir": str(run_dir), "max_parallel": cap,
+                 "free_ram_gb": free_ram_gb(), "steps": {}}
         save_state(run_dir, state)
     hub = getattr(args, "hub", True)
     tid = hub_start(cfg, run_dir) if hub else None
@@ -646,19 +727,29 @@ def cmd_run(args: argparse.Namespace) -> int:
         if not prepared:
             continue   # every member of this group was already done (resume)
 
+        # Mark members queued up front: the pool may hold them while a
+        # max_parallel-sized set runs, and the dashboard shows the queue.
+        with STATE_LOCK:
+            for step, _s, _w, _r, _b in prepared:
+                state["steps"].setdefault(step.name, {}).update(
+                    status="queued", name=step.name)
+            save_state(run_dir, state)
+
         if len(prepared) == 1:
             step, slug, work_dir, _repo, branch = prepared[0]
             statuses = {step.name: run_step(step, slug, work_dir, cfg,
                                             run_dir, devin_argv, state,
-                                            do_checkpoint=(branch is None))}
+                                            do_checkpoint=(branch is None),
+                                            branch=branch)}
             hub_update(tid, state)
         else:
             statuses = {}
             with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=len(prepared)) as ex:
+                    max_workers=min(len(prepared), cap)) as ex:
                 futs = {ex.submit(run_step, step, slug, work_dir, cfg,
                                   run_dir, devin_argv, state,
-                                  do_checkpoint=(branch is None)): step.name
+                                  do_checkpoint=(branch is None),
+                                  branch=branch): step.name
                         for step, slug, work_dir, _r, branch in prepared}
                 for f in concurrent.futures.as_completed(futs):
                     statuses[futs[f]] = f.result()
@@ -707,7 +798,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 for s in cfg.steps]
     validate_groups(group_waves(resolved))
     print(f"run {cfg.name!r}: {len(cfg.steps)} steps, on_failure={cfg.on_failure}, "
-          f"checkpoint={cfg.checkpoint}")
+          f"checkpoint={cfg.checkpoint}, "
+          f"max_parallel={effective_max_parallel(cfg)}")
     for pdir, slug, s in resolved:
         cloud = " [cloud]" if s.cloud else ""
         if s.cloud:
@@ -734,16 +826,195 @@ def cmd_status(args: argparse.Namespace) -> int:
             return 0
         run_dir = cands[0].parent
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
-    print(f"run {state['run']}  started {state['started_at']}  ({run_dir})")
+    ended = state.get("ended_at") or "still running"
+    print(f"run {state['run']}  started {state['started_at']}  "
+          f"ended {ended}  ({run_dir})")
     for name, rec in state["steps"].items():
         sess = rec.get("session_id") or "-"
-        print(f"  {rec['status']:>9}  {name:<20} {rec.get('elapsed_s', 0):>7.0f}s  "
+        span = rec.get("elapsed_s")
+        if span is None and rec.get("started_at"):
+            span = round(dt.datetime.now().timestamp()
+                         - dt.datetime.fromisoformat(
+                             rec["started_at"]).timestamp())
+        print(f"  {rec['status']:>9}  {name:<20} {span or 0:>7.0f}s  "
+              f"ended={rec.get('ended_at') or '-'}  "
               f"session={sess}  verify={rec.get('verify_ok')}")
         if rec.get("note"):
             print(f"             note: {rec['note']}")
         if sess not in (None, "-") and not str(sess).startswith("mock"):
             how = "devin --cloud -r" if "/" in str(sess) else "devin -r"
             print(f"             resume: cd {rec.get('project')} && {how} {sess}")
+    return 0
+
+
+# ---------------------------------------------------------------- dashboard
+
+SERVE_PORT = 8773    # registered in C:\Projects\AGENTS.md
+
+_STATUS_COLOR = {"done": "#3fb950", "partial": "#d29922", "blocked": "#d29922",
+                 "failed": "#f85149", "timed_out": "#f0883e",
+                 "running": "#58a6ff", "queued": "#8b949e"}
+
+
+def collect_dashboard(runs_dir: Path) -> dict:
+    """Flatten every run's state.json into the shape the UI renders: one
+    agent row per step record, one run row per state file, newest first.
+    state.json is the single source of truth - this adds no second registry."""
+    runs: list[dict] = []
+    agents: list[dict] = []
+    for sj in sorted(runs_dir.glob("*/state.json"), reverse=True):
+        try:
+            st = json.loads(sj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        counts: dict[str, int] = {}
+        for rec in st.get("steps", {}).values():
+            status = rec.get("status", "?")
+            counts[status] = counts.get(status, 0) + 1
+            agents.append({
+                "run": st.get("run"), "run_dir": st.get("run_dir"),
+                "step": rec.get("name"), "slug": rec.get("slug"),
+                "work_dir": rec.get("work_dir") or rec.get("project"),
+                "status": status, "started_at": rec.get("started_at"),
+                "ended_at": rec.get("ended_at"),
+                "elapsed_s": rec.get("elapsed_s"),
+                "alive": status == "running" and pid_alive(rec.get("pid")),
+                "pid": rec.get("pid"), "session_id": rec.get("session_id"),
+                "model": rec.get("model"), "mode": rec.get("mode"),
+                "cloud": rec.get("cloud"), "verify_ok": rec.get("verify_ok"),
+                "note": rec.get("note"), "exit_code": rec.get("exit_code"),
+                "branch": rec.get("branch"), "merged": rec.get("merged"),
+                "stdout_log": rec.get("stdout_log"),
+                "export": rec.get("export"), "prompt": rec.get("prompt")})
+        runs.append({"run": st.get("run"), "dir": str(sj.parent),
+                     "started_at": st.get("started_at"),
+                     "ended_at": st.get("ended_at"), "counts": counts,
+                     "max_parallel": st.get("max_parallel")})
+    agents.sort(key=lambda a: a.get("started_at") or "", reverse=True)
+    return {"generated_at": now_iso(), "cpu_count": os.cpu_count(),
+            "free_ram_gb": free_ram_gb(), "runs": runs, "agents": agents}
+
+
+_DASH_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>agent-conductor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2313161f'/%3E%3Crect x='14' y='30' width='8' height='22' rx='2' fill='%2358a6ff'/%3E%3Crect x='28' y='18' width='8' height='34' rx='2' fill='%23bc8cff'/%3E%3Crect x='42' y='38' width='8' height='14' rx='2' fill='%23d29922'/%3E%3C/svg%3E">
+<style>
+:root { color-scheme: dark; }
+body { background:#0d1117; color:#e6edf3; font:14px/1.45 ui-monospace,Consolas,monospace; margin:0; padding:16px; }
+h1 { font-size:18px; margin:0 0 4px; }
+.sub { color:#8b949e; font-size:12px; margin-bottom:14px; }
+h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:#8b949e; margin:22px 0 8px; }
+table { border-collapse:collapse; width:100%; }
+th { text-align:left; font-weight:600; color:#8b949e; font-size:11px; text-transform:uppercase; padding:4px 10px 4px 0; border-bottom:1px solid #21262d; }
+td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top; white-space:nowrap; }
+td.wrap { white-space:normal; color:#8b949e; font-size:12px; }
+.dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
+.dot.run { animation:pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity:.35; } }
+.wrapw { overflow-x:auto; }
+.counts span { background:#161b22; border-radius:8px; padding:1px 8px; margin-right:5px; font-size:12px; }
+a { color:#58a6ff; text-decoration:none; }
+@media (max-width:640px) { .hide-s { display:none; } }
+</style></head><body>
+<h1>agent-conductor</h1>
+<div class="sub" id="meta">loading&hellip;</div>
+<h2>agents</h2><div class="wrapw"><table id="agents"></table></div>
+<h2>runs</h2><div class="wrapw"><table id="runs"></table></div>
+<script>
+const COLORS = {done:'#3fb950',partial:'#d29922',blocked:'#d29922',
+failed:'#f85149',timed_out:'#f0883e',running:'#58a6ff',queued:'#8b949e'};
+const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const loc = iso => { if(!iso) return '-';
+  const d=new Date(iso);
+  return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',
+    second:'2-digit'}) + ' ' + d.toLocaleDateString(); };
+const fmtS = s => { if(s==null) return '-';
+  s=Math.round(s); const h=Math.floor(s/3600), m=Math.floor(s%3600/60);
+  return (h? h+'h':'') + (m? m+'m':'') + (s%60)+'s'; };
+function elapsed(a, now){
+  if (a.elapsed_s != null) return fmtS(a.elapsed_s);
+  if (a.started_at && (a.status==='running'||a.status==='queued'))
+    return fmtS((now - new Date(a.started_at))/1000);
+  return '-'; }
+function render(d){
+  const now = Date.now();
+  const live = d.agents.filter(a=>a.status==='running');
+  document.getElementById('meta').textContent =
+    `${d.agents.length} agents | ${live.length} running | ` +
+    `cpu ${d.cpu_count||'?'} cores | free ram ${d.free_ram_gb||'?'} GB | ` +
+    `refreshed ${loc(d.generated_at)}`;
+  let h = '<tr><th></th><th>step</th><th>run</th><th>project</th>' +
+    '<th class="hide-s">model</th><th class="hide-s">mode</th>' +
+    '<th>started</th><th>elapsed</th><th>ended</th>' +
+    '<th class="hide-s">session</th><th>note</th></tr>';
+  for (const a of d.agents){
+    const c = COLORS[a.status]||'#8b949e';
+    const pulse = a.status==='running' ? ' run' : '';
+    const sess = a.session_id ? String(a.session_id).slice(0,14) : '-';
+    h += `<tr><td><span class="dot${pulse}" style="background:${c}" ` +
+      `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>${a.status}</td>` +
+      `<td>${esc(a.step)}</td><td>${esc(a.run)}</td><td>${esc(a.slug)}</td>` +
+      `<td class="hide-s">${esc(a.model||'-')}</td>` +
+      `<td class="hide-s">${esc(a.mode||'-')}${a.cloud?' cloud':''}</td>` +
+      `<td>${loc(a.started_at)}</td><td>${elapsed(a,now)}</td>` +
+      `<td>${loc(a.ended_at)}</td>` +
+      `<td class="hide-s">${esc(sess)}</td>` +
+      `<td class="wrap">${esc(a.note||'')}</td></tr>`;
+  }
+  document.getElementById('agents').innerHTML = h;
+  h = '<tr><th>run</th><th>started</th><th>ended</th>' +
+    '<th>steps</th><th>max//</th><th class="hide-s">dir</th></tr>';
+  for (const r of d.runs){
+    const counts = Object.entries(r.counts||{})
+      .map(([k,v])=>`<span style="color:${COLORS[k]||'#8b949e'}">${v} ${k}</span>`)
+      .join('');
+    h += `<tr><td>${esc(r.run)}</td><td>${loc(r.started_at)}</td>` +
+      `<td>${r.ended_at?loc(r.ended_at):'<b>running</b>'}</td>` +
+      `<td class="counts">${counts}</td><td>${r.max_parallel||'-'}</td>` +
+      `<td class="hide-s wrap">${esc(r.dir)}</td></tr>`;
+  }
+  document.getElementById('runs').innerHTML = h;
+}
+async function tick(){
+  try { render(await (await fetch('/api/state')).json()); }
+  catch(e){} finally { setTimeout(tick, 2000); } }
+tick();
+</script></body></html>"""
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    runs_dir = Path(args.runs_dir).resolve() if args.runs_dir else RUNS_DIR
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, body: bytes, ctype: str) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:                    # noqa: N802 - stdlib name
+            if self.path == "/api/state":
+                self._send(json.dumps(collect_dashboard(runs_dir)).encode(),
+                           "application/json")
+            elif self.path in ("/", "/index.html"):
+                self._send(_DASH_HTML.encode(), "text/html; charset=utf-8")
+            else:
+                self.send_error(404)
+
+        def log_message(self, fmt: str, *a) -> None:
+            LOG.debug("http %s", fmt % a)
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    print(f"conductor dashboard: http://127.0.0.1:{args.port}  "
+          f"(watching {runs_dir})")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
     return 0
 
 
@@ -806,6 +1077,7 @@ def main(argv: list[str] | None = None) -> int:
             ("plan", cmd_plan, "validate a manifest and show resolved steps"),
             ("run", cmd_run, "execute a manifest"),
             ("status", cmd_status, "show a run's step table"),
+            ("serve", cmd_serve, "live dashboard of all runs + agents"),
             ("demo", cmd_demo, "self-test against a mock devin")):
         p = sub.add_parser(name, help=helptext)
         if name in ("plan", "run"):
@@ -813,23 +1085,29 @@ def main(argv: list[str] | None = None) -> int:
         if name == "run":
             p.add_argument("--resume", nargs="?", const="latest", default=None,
                            help="resume a run dir (default: latest for this manifest)")
+            p.add_argument("--max-parallel", type=int, default=None,
+                           help="cap concurrent agents (overrides the "
+                                "manifest's run.max_parallel)")
         if name in ("plan", "run", "demo"):
             p.add_argument("--devin", default=None,
                            help="devin command override (e.g. mock shim). "
                                 "Split with shlex - quote or use forward "
                                 "slashes in Windows paths")
-        if name in ("run", "demo"):
+        if name in ("run", "demo", "serve"):
             p.add_argument("--runs-dir", default=None, help=argparse.SUPPRESS)
+        if name in ("run", "demo"):
             p.add_argument("--no-hub", dest="hub", action="store_false",
                            default=True, help="don't create/update a hub.db row")
             p.add_argument("--no-keep-awake", dest="keep_awake",
                            action="store_false", default=True,
                            help="allow the machine to sleep during the run")
+        if name == "serve":
+            p.add_argument("--port", type=int, default=SERVE_PORT)
         if name == "status":
             p.add_argument("run_dir", nargs="?", default=None)
     args = ap.parse_args(argv)
     return {"plan": cmd_plan, "run": cmd_run, "status": cmd_status,
-            "demo": cmd_demo}[args.cmd](args)
+            "serve": cmd_serve, "demo": cmd_demo}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -50,19 +50,34 @@ python conductor.py plan <manifest.toml>    validate + show resolved steps
 python conductor.py run  <manifest.toml>    execute -> data/runs/<ts>-<name>/
 python conductor.py run  <manifest> --resume [dir]   skip done steps
 python conductor.py status [run_dir]        step table of latest run
+python conductor.py serve [--port 8773]     live dashboard of all agents
 python conductor.py demo                    end-to-end vs tests/mock_devin.py
 python run_tests.py                         unittest suite (mock-only, no auth)
 ```
 
 Run flags: `--devin "<cmd>"` worker binary override, `--no-hub` skip the
 hub.db row, `--no-keep-awake` allow system sleep (runs request
-`SetThreadExecutionState` by default so overnight work survives).
+`SetThreadExecutionState` by default so overnight work survives),
+`--max-parallel N` concurrency cap (overrides `run.max_parallel`).
 
-Parallel: adjacent `[[step]]` entries sharing `wave = N` run concurrently.
-Steps on the *same* project in a wave need `worktree = true` - each runs in
-`data/worktrees/<run>/<step>` on branch `conductor/<run>/<step>`, merged back
-in manifest order after the wave; a merge conflict fails the step but keeps
-the worktree for manual merge.
+Concurrency: `run.max_parallel` caps how many agents run at once across the
+whole run; wave members beyond the cap wait in a queue (marked `queued` in
+state). Default is conservative: ~1 agent per 4 logical cores, max 4 -
+each agent is a full Devin session with tool subprocesses, not a thread.
+The run records the effective cap + free RAM in `state.json`.
+
+Tracking: `state.json` is the agent registry (status, pid, started/ended,
+elapsed, session id, work dir, paths to prompt/stdout/export). `serve`
+renders it as a live page at `http://127.0.0.1:8773` (loopback only,
+auto-refreshes, shows elapsed time ticking for running agents). The same
+run row is live-posted to `hub.db`, so `http://127.0.0.1:8762/tasks-ui`
+shows coarse progress on the phone without any new wiring.
+
+Parallel: adjacent `[[step]]` entries sharing `wave = N` run concurrently,
+bounded by the cap. Steps on the *same* project in a wave need
+`worktree = true` - each runs in `data/worktrees/<run>/<step>` on branch
+`conductor/<run>/<step>`, merged back in manifest order after the wave; a
+merge conflict fails the step but keeps the worktree for manual merge.
 
 `examples/night.example.toml` is the reference manifest. `projects.toml`
 registers slug -> path + `cloud_ok`. `--devin "..."` or `CONDUCTOR_DEVIN`
@@ -83,6 +98,14 @@ Append as they are hit.
 2. **Mock sessions register in `.mock_sessions.json`** inside the target
    project - fixture projects must gitignore it or conductor's `add -A`
    will commit it.
+3. **Desktop auth != CLI auth.** Logging in inside Devin Desktop feeds the
+   app's host credentials to `devin acp` over the protocol - it never writes
+   `%APPDATA%\devin\credentials.toml`, which is the ONLY file the standalone
+   CLI (`devin -p`, `auth status`) reads. Spawning workers therefore needs a
+   real terminal `devin auth login` (browser flow or
+   `--force-manual-token-flow` + pasted code from app.devin.ai). The login
+   TUI reads the console directly - piped stdin can't drive it. Env vars
+   `WINDSURF_API_KEY`/`DEVIN_API_KEY` are NOT honored.
 
 ## The task workspace - read before starting work
 
