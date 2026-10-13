@@ -644,6 +644,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             statuses = {step.name: run_step(step, slug, work_dir, cfg,
                                             run_dir, devin_argv, state,
                                             do_checkpoint=(branch is None))}
+            hub_update(tid, state)
         else:
             statuses = {}
             with concurrent.futures.ThreadPoolExecutor(
@@ -654,12 +655,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                         for step, slug, work_dir, _r, branch in prepared}
                 for f in concurrent.futures.as_completed(futs):
                     statuses[futs[f]] = f.result()
+                    hub_update(tid, state)
 
         # Merge worktree branches back into the main checkout, in order.
         for step, slug, work_dir, repo_dir, branch in prepared:
             status = statuses.get(step.name)
             print(f"[{status or 'skipped':>8}] {step.name}")
-            hub_update(tid, state)
             if branch:
                 rec = state["steps"].get(step.name, {})
                 if status in ("done", "partial", "blocked"):
