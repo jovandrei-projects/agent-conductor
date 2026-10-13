@@ -522,9 +522,12 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             proc = subprocess.Popen(cmd, cwd=str(work_dir), stdout=out,
                                     stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL)
+            # Record pid in memory only: writing state.json into run_dir at
+            # this point lands inside the worker's watched workspace (for
+            # self-hosted runs) and the CLI's user-edit awareness ends the
+            # fresh session mid-init. The final save_state below persists it.
             with STATE_LOCK:
                 rec["pid"] = proc.pid
-                save_state(run_dir, state)
             try:
                 rc = proc.wait(timeout=step.timeout_min * 60)
             except subprocess.TimeoutExpired:
@@ -557,6 +560,10 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         status = "failed"
     elif status_line in ("blocked", "partial"):
         status = status_line
+    elif status_line is None:
+        # rc 0 without STATUS is a no-op: the CLI can exit cleanly before the
+        # ACP turn even starts (seen 2026-10-13). Never report that as done.
+        status = "failed"
     elif verify_ok is False and step.verify_must_pass:
         status = "failed"
     else:
@@ -567,8 +574,9 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                              else tail_session_ref(stdout_log))
         rec["exit_code"] = rc
         rec["elapsed_s"] = elapsed
-        if status == "done" and status_line is None:
-            rec["note"] = "worker did not emit a STATUS line; assuming done"
+        if status_line is None and rc == 0:
+            rec["note"] = ("worker exited 0 without a STATUS line "
+                           "(no-op run - nothing was done)")
         rec.update(status=status, ended_at=now_iso(), status_line=status_line,
                    verify_ok=verify_ok)
         save_state(run_dir, state)

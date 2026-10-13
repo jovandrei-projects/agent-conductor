@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -381,6 +382,77 @@ worktree = true
             self.assertEqual(order[1], ("step_end", order[0][1]))
             self.assertEqual(order[2][0], "step_start")
             self.assertEqual(order[3], ("step_end", order[2][1]))
+
+
+class SpawnGuardTests(unittest.TestCase):
+    """Regression for 2026-10-13: real `devin -p` workers died ~1-3s in with
+    a clean exit and no STATUS. Cause: conductor's `save_state` between
+    Popen() and wait() wrote state.json into run_dir - inside a self-hosted
+    worker's watched cwd - and the CLI's user-edit awareness ended the
+    fresh session. Invariant: nothing under run_dir may be written while a
+    worker process is alive."""
+
+    def _fixture(self, base: Path):
+        proj = make_project(base)
+        run_dir = base / "runs" / "r1"
+        (run_dir / "prompts").mkdir(parents=True)
+        cfg = conductor.load_manifest(write_manifest(base, f'''
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "p"
+'''))
+        state = {"run": "t", "run_dir": str(run_dir), "steps": {}}
+        return proj, run_dir, cfg, state
+
+    def test_pid_not_persisted_while_worker_alive(self):
+        with tempfile.TemporaryDirectory() as td:
+            proj, run_dir, cfg, state = self._fixture(Path(td))
+
+            class FakeProc:
+                pid = 4242
+
+                def __init__(self, *a, **kw):
+                    self._out = kw["stdout"]
+
+                def wait(self, timeout=None):
+                    disk = json.loads(
+                        (run_dir / "state.json").read_text())
+                    self._out.write(b"STATUS: done\n")
+                    self._out.flush()
+                    # while the child is alive the on-disk state must not
+                    # have been rewritten with the pid
+                    assert disk["steps"]["a"].get("pid") is None
+                    return 0
+
+                def kill(self):
+                    pass
+
+            with mock.patch.object(conductor.subprocess, "Popen", FakeProc), \
+                    mock.patch.object(conductor, "session_ids",
+                                      lambda *a, **k: set()), \
+                    mock.patch.object(conductor, "is_git_repo",
+                                      lambda p: True), \
+                    mock.patch.object(conductor, "git_commit",
+                                      lambda *a, **k: True), \
+                    mock.patch.object(conductor, "git_dirty",
+                                      lambda p: False):
+                st = conductor.run_step(cfg.steps[0], "s", proj, cfg,
+                                        run_dir, ["devin"], state)
+            self.assertEqual(st, "done")
+            self.assertEqual(state["steps"]["a"]["pid"], 4242)
+
+    def test_no_status_line_is_failed(self):
+        """rc 0 without a STATUS line is a no-op worker, never 'done'."""
+        with tempfile.TemporaryDirectory() as td:
+            proj, run_dir, cfg, state = self._fixture(Path(td))
+            silent = [sys.executable, "-c", "pass"]
+            with mock.patch.object(conductor, "session_ids",
+                                   lambda *a, **k: set()):
+                st = conductor.run_step(cfg.steps[0], "s", proj, cfg,
+                                        run_dir, silent, state)
+            self.assertEqual(st, "failed")
+            self.assertIn("STATUS", state["steps"]["a"]["note"])
 
 
 class DashboardTests(unittest.TestCase):
