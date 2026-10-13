@@ -1,0 +1,66 @@
+# Project registry for conductor manifests.
+#
+# A [[step]] project = "slug" resolves here; otherwise it is treated as a
+# literal path relative to the manifest. `path` may be absolute or relative
+# to this file's directory.
+#
+# cloud_ok = true allows `cloud = true` steps (devin --cloud -p). The session
+# clones the repo from origin onto a Devin VM - code already on GitHub is fine,
+# but the three private-data projects stay false because their work product
+# must not leave this machine. Note: cloud workers see origin's last push,
+# not local uncommitted/unpushed state.
+
+[project.agent-conductor]
+path = "."
+
+[project.apartment-3d]
+path = "../apartment-3d"
+cloud_ok = true
+
+[project.chrome-bookmarks]
+path = "../chrome-bookmarks"
+cloud_ok = false    # private: personal browsing record
+
+[project.disk-cleanup]
+path = "../disk-cleanup"
+cloud_ok = true
+
+[project.mobile-apps]
+path = "../mobile-apps"
+cloud_ok = true
+
+[project.model-compare]
+path = "../model-compare"
+cloud_ok = true
+
+[project.money-plan]
+path = "../money-plan"
+cloud_ok = false    # private: strictest bar - financial data
+
+[project.nirvana-concert-images]
+path = "../nirvana-concert-images"
+cloud_ok = true
+
+[project.project-hub]
+path = "../project-hub"
+cloud_ok = true
+
+[project.senior-safety-mx]
+path = "../senior-safety-mx"
+cloud_ok = true
+
+[project.singing-practice-tools]
+path = "../singing-practice-tools"
+cloud_ok = true
+
+[project.thermalwatch]
+path = "../thermalwatch"
+cloud_ok = true
+
+[project.video-tools]
+path = "../video-tools"
+cloud_ok = true
+
+[project.wifi-network-monitor]
+path = "../wifi-network-monitor"
+cloud_ok = false    # private: device inventory, MACs, router data

@@ -1,0 +1,57 @@
+# Example overnight manifest. Copy to <project>/night.toml (or anywhere) and
+# edit. Run with:  python conductor.py plan night.toml   then   run.
+#
+# Semantics:
+#  - steps run in file order, each in a FRESH `devin -p` session
+#  - on_failure = "stop" halts the run on failed/timed_out/blocked steps
+#    ("continue" keeps going; partial/done never stop the run)
+#  - checkpoint = true: conductor commits the project before AND after each
+#    step, so every worker starts from a clean committed state and any
+#    damage is one `git revert/reset` away
+#  - [defaults] keys apply to every step that doesn't override them
+#
+# Good prompt style: point at .agent_tasks rather than pasting the task -
+# "pick up the next task in QUEUE.md" stays correct even if a planner step
+# earlier in the same manifest reorders the queue.
+
+[run]
+name = "video-tools-night"
+on_failure = "stop"
+checkpoint = true
+
+[defaults]
+model = "swe"          # cheap model for grind phases; use "opus"/"gpt" for planning
+mode = "bypass"        # unattended: no human to answer prompts
+timeout_min = 60
+
+[[step]]
+name = "next-queue-task"
+project = "video-tools"
+prompt = "Pick up the next task in .agent_tasks/QUEUE.md and work it to done or blocked. One task only."
+
+[[step]]
+name = "test-sweep"
+project = "video-tools"
+prompt = "Run python run_tests.py, fix any failures, then update ROADMAP.md statuses that the green suite proves out."
+verify = "python run_tests.py --quick"
+timeout_min = 90
+
+# A planner step: a stronger model re-slices the queue mid-run. Because worker
+# prompts point at QUEUE.md, steps after this one pick up the new plan.
+[[step]]
+name = "replan"
+project = "video-tools"
+model = "opus"
+prompt = "You are the planner. Read ROADMAP.md and every STATE.md not done. Re-order QUEUE.md for the next sessions: split anything too big for one session, drop anything stale. Do not implement anything."
+
+[[step]]
+name = "next-queue-task-2"
+project = "video-tools"
+prompt = "Pick up the next task in .agent_tasks/QUEUE.md and work it to done or blocked. One task only."
+
+# Cloud step (needs projects.toml cloud_ok = true and the repo pushed):
+# [[step]]
+# name = "docs-pass"
+# project = "disk-cleanup"
+# cloud = true
+# prompt = "..."
