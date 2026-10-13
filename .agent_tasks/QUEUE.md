@@ -11,9 +11,9 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 | # | Task | Status | Folder | Waits on |
 |---|---|---|---|---|
-| 1 | Bootstrap: conductor.py v1 + mock tests + docs | in progress | bootstrap/ | step completion must track the session, not the `devin -p` subprocess (it detaches ~2s in - trap 5); auth is solved |
+| 1 | Bootstrap: conductor.py v1 + mock tests + docs | done | bootstrap/ | trap 5 root-caused + fixed (no workspace writes while a worker is alive); auth solved; live smoke green |
 
 ## Not yet filed as tasks
 
-- Live smoke test + first real overnight manifest (Phase 2 in ROADMAP.md)
+- First real overnight manifest on a real project (Phase 2 in ROADMAP.md; live smoke already green)
 - Phone access to the :8773 dashboard via lan-bridge proxy (needs mobile-apps change; tasks-ui rows already give coarse progress)

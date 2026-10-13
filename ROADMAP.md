@@ -24,13 +24,14 @@ One phase at a time, in order. Mark items `[x]` as they land.
 - [x] `run.max_parallel` resource cap (default ~1 per 4 cores, max 4; wave members queue past the cap) + `--max-parallel` override; effective cap + free RAM recorded per run
 - [x] Agent registry: each step record in `state.json` carries pid, work_dir, branch, started_at/ended_at/elapsed_s, session id, output paths - the durable session-work record
 - [x] `conductor.py serve` dashboard on `127.0.0.1:8773`: every agent + run, live elapsed, status colors, `/api/state` JSON
-- [x] Live `devin -p` smoke test (ran 2026-10-13 ~09:00; real sessions spawned and do the work - but `devin -p` detaches, see AGENTS.md trap 5 and the Phase 2 finding below)
-- [ ] Live run on one real project's queue (cheap model) - blocked until step completion tracks the session, not the subprocess
+- [x] Live `devin -p` smoke test - first authed runs died in 0.1-3s (rc 0, no STATUS); root-caused 2026-10-13: conductor's mid-spawn `save_state` wrote into the worker's watched cwd and the CLI's user-edit awareness killed the session (trap 5). Fixed + verified: `20261013-093553-smoke` ran readme 56.6s / sanity 96.6s, both `STATUS: done`, README.md + commits landed
+- [x] Step-completion contract hardened: rc 0 without `STATUS:` is `failed`, never `done`; regression test locks the no-workspace-writes-while-alive invariant
+- [ ] Live run on one real project's queue (cheap model) - unblocked; next up
 
 ## Phase 2 - verified live behavior
 
-- [x] Confirm `-p` runs a full agentic loop (not a single turn) and sessions appear in `devin list` / Desktop - confirmed 2026-10-13: the smoke readme session kept working ~5min and committed README.md after its subprocess exited; it shows in `devin list`. **Finding: `devin -p` exits after ~0.1-1.8s once the session is registered - the session is a detached managed object, the subprocess is not its lifetime.** Exit code, elapsed_s, stdout log and export are all empty/premature; step gating must poll session state instead (trap 5)
-- [ ] Confirm `--export` ATIF output; use it for richer step summaries if useful - no export.json was written in the detached runs; needs a session-completion-aware fetch
+- [x] Confirm `-p` runs a full agentic loop (not a single turn) and sessions appear in `devin list` / Desktop - confirmed 2026-10-13 (corrected finding): `-p` DOES track the session to completion - the earlier "subprocess exits while the session runs on" observation was actually the CLI ending the session itself because conductor wrote `state.json` into the watched workspace mid-init (trap 5). Sessions now run to real completion and appear in `devin list`/Desktop sidebar
+- [x] Confirm `--export` ATIF output - written normally now that sessions survive (see `data/runs/*/*.export.json`)
 - [ ] Cloud step on a `cloud_ok` project end-to-end (origin visibility caveat documented)
 - [ ] First real overnight manifest on a real project
 
@@ -55,6 +56,11 @@ unchanged.
 2026-10-13 ~09:38 - `run_tests.py --quick` 22/22 green, `conductor.py demo`
 2/2 done (run `20261013-093750-demo`). No regressions; trap 5 blocker
 unchanged.
+
+2026-10-13 ~09:55 - trap 5 resolved (was misdiagnosed as "detached
+subprocess"; real cause: mid-spawn `state.json` write into the watched
+workspace -> user-edit awareness ends the session). Live smoke green:
+readme 56.6s + sanity 96.6s, real commits; 22/22 tests; bootstrap task done.
 
 ## Phase 3 - polish
 

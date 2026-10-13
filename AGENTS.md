@@ -112,15 +112,29 @@ Append as they are hit.
    token is rejected). Fix: `devin auth logout` FIRST, then `devin auth
    login`. Hit 2026-10-13: Aug-26-era token; an expired app.devin.ai/auth
    browser tab is leftover and can just be closed.
-5. **`devin -p` detaches: subprocess exit != session done.** Hit
-   2026-10-13 on the first authed smoke run: the spawned process exited
-   after 0.1-1.8s with empty stdout and no export.json, while the real
-   agent session kept working for minutes afterward (visible in `devin
-   list`; it later committed). Conductor marked every step `done` and the
-   verify gates ran against a tree the worker had not touched yet. The
-   orchestration model needs "poll the session until it reports finished"
-   (via `devin list`/session API/`acp`), not "wait for exit". Also the
-   captured `session_id` may not be the session's display slug.
+5. **Never write into the worker's watched workspace after `Popen`.**
+   `cli-user-edit-awareness` treats an external file change in the cwd as a
+   user edit and *ends the session itself* - clean `rc 0`, logs stop cold,
+   the ACP child gets `session/end` mid-first-delta. Conductor's
+   post-spawn `save_state(state.json)` did exactly this on self-hosted
+   runs (run_dir `data/runs/...` sits inside `agent-conductor`'s own cwd),
+   so every live smoke worker died in 0.1-3s and the step was recorded
+   `done` with "no STATUS line". Diagnosed 2026-10-13 by bisecting
+   `run_step` inside `cmd_run`: bare `Popen`+`wait` ran 76s of real work;
+   adding only the mid-spawn `save_state` killed it in 0.2s. Fix: `rec`
+   keeps `pid` in memory; `state.json`/`events.jsonl` are written only
+   *before* spawn and *after* wait. (Earlier theory "the subprocess
+   detaches while the session runs on" was wrong - `devin list` showed a
+   session entry but it was already dead; the README that appeared later
+   came from a manually spawned session.)
+   - Parallel safety: same-project waves are forced onto worktrees whose
+     cwd is `data/worktrees/<run>/<step>` - `data/runs` writes are outside
+     every worker's watch dir. Cross-project runs write outside the
+     worker's cwd too. The poisoned case was only non-worktree self-runs.
+6. **`rc 0` proves nothing.** A `devin -p` worker can exit 0 before the ACP
+   turn starts (see trap 5) or print `STATUS` only at the end of a real
+   turn. `run_step` now marks `rc==0` + missing `STATUS` as `failed`
+   (note: "no-op run"), never `done`.
 
 ## The task workspace - read before starting work
 

@@ -1,6 +1,6 @@
 # Task: bootstrap
 
-**Status:** in progress
+**Status:** done
 **Started:** 2026-10-13   **Last touched:** 2026-10-13
 
 ## Objective
@@ -38,26 +38,30 @@ a real manifest the moment `devin auth login` has been done once.
 - [x] `[run] max_parallel` resource cap (auto ~1 per 4 cores, max 4) + `queued` marking; free RAM recorded per run
 - [x] Agent registry in state.json (pid, work_dir, branch, started/ended/elapsed, session, output paths)
 - [x] `conductor.py serve` live dashboard on 127.0.0.1:8773 (+ `/api/state`)
-- [x] Live `devin -p` smoke test once authed - ran 2026-10-13 ~09:00; sessions spawn and do real work, but `devin -p` detaches so conductor misjudged completion (trap 5). README.md landed from the still-running readme session
+- [x] Live `devin -p` smoke test once authed - first authed runs 2026-10-13 died in 0.1-3s with rc 0 and no STATUS (trap 5 misdiagnosed as "detached"); real root cause found + fixed: conductor's post-Popen `save_state` wrote state.json into the worker's watched workspace and the CLI's user-edit awareness ended the session. After the fix, run `20261013-093553-smoke` ran readme 56.6s (sess nutritious-myth) and sanity 96.6s (sess coal-meteorite, verify green); README.md + commits landed.
 
 ### Phase 2 - stretch tonight
 
 - [x] Parallel `wave` steps via git worktrees
 - [x] hub.db run rows verified against mobile-apps task.py
+- [x] Spawn-guard fix + regression tests (no run_dir writes while a worker is alive; rc 0 without STATUS = failed, not done) - 22/22 tests green
 
 ## Where it stopped
 
-Session ended **2026-10-13 ~02:35** (the "ending time" the user asked to
-register - this line is it). Everything is built, tested (20 green) and
-documented; dashboard verified live against demo runs.
+**2026-10-13 ~09:55 - bootstrap is DONE.** Auth solved (user: `devin auth
+logout` + `login`); the live-smoke false-green root cause found, fixed, and
+verified end-to-end: `20261013-093553-smoke` ran two real sessions
+(readme 56.6s, sanity 96.6s verify green, both `STATUS: done`), README.md
++ worker commits landed, working tree clean, 22/22 tests green.
 
-**Auth is still the blocker, and the diagnosis changed:** the 1:36am login
-went to *Devin Desktop* (host credentials passed to `devin acp`), NOT to the
-standalone CLI's `%APPDATA%\devin\credentials.toml` (file untouched since
-Aug 26; `auth status` still says not logged in; `devin -p` errors "Not
-logged in"). The login TUI reads the console directly, so it can't be
-driven non-interactively - **the user must run `devin auth login` in a real
-terminal** (or `--force-manual-token-flow` + code from app.devin.ai).
+Diagnosis trail for the record: identical argv worked from plain scripts
+but died inside `run_step`; bisecting inside `cmd_run` showed the only
+difference was `save_state(state.json)` executing between `Popen()` and
+`wait()` - a write into `data/runs/` which, for a self-hosted manifest, is
+inside the worker's own cwd and trips `cli-user-edit-awareness`. All
+bookkeeping now happens outside the spawn-to-exit window.
+
+Next: Phase 2 - the first real overnight manifest (queue in QUEUE.md).
 Hub question #256 posted to the phone queue with these instructions.
 Full details: AGENTS.md trap 3.
 
@@ -155,10 +159,6 @@ Outcome appended to ROADMAP.md Phase 2. No regressions; trap 5 remains the
 blocker for live manifests.
 
 ## Deferred or blocked
-
-- Session-completion tracking for `devin -p` steps - the subprocess
-  detaches (trap 5); blocked on finding a non-interactive session-state
-  channel (`devin acp`, a `devin list --json`-style flag, or ATIF).
 - Cloud steps: `devin --cloud -p` repo selection behavior unknown - verify live.
 - notes-ui relation: dashboard is standalone (:8773, loopback). Phone view
   of runs already works via hub.db rows on tasks-ui (:8762). A bridge proxy
@@ -166,5 +166,7 @@ blocker for live manifests.
 
 ## Verification
 
-`python run_tests.py` green (20); `python conductor.py demo` prints
-done/done; `curl http://127.0.0.1:8773/api/state` returns runs+agents JSON.
+`python run_tests.py` green (22); `python conductor.py demo` prints
+done/done; `curl http://127.0.0.1:8773/api/state` returns runs+agents JSON;
+live `run examples/smoke.toml` verified 2026-10-13 (two real sessions,
+STATUS lines, commits).
