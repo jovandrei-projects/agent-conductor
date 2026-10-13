@@ -128,6 +128,11 @@ main(). Nothing written. These repeat dispatches are the trap-5 symptom:
 detached `-p` sessions keep getting re-spawned for already-done steps until
 step completion tracks the session.
 
+**Update 2026-10-13 ~09:29 - nightly smoke run green again.** `run_tests.py
+--quick` 20/20, `conductor.py demo` 2/2 done (run `20261013-092923-demo`).
+Outcome appended to ROADMAP.md Phase 2. No regressions; trap 5 remains the
+blocker for live manifests.
+
 ## Deferred or blocked
 
 - Session-completion tracking for `devin -p` steps - the subprocess

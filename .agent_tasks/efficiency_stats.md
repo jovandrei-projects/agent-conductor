@@ -19,6 +19,7 @@ new input, so the column to watch is **new input**.
 | agent-conductor / bootstrap (README task again; re-verified vs argparse, no-op) | n/a | n/a | n/a | n/a |
 | agent-conductor / bootstrap (nightly smoke: tests+demo green, docs updated) | n/a | n/a | n/a | n/a |
 | agent-conductor / bootstrap (README task 3rd dispatch; still a no-op - trap-5 respawn) | n/a | n/a | n/a | n/a |
+| agent-conductor / bootstrap (nightly smoke: tests+demo green, docs updated) | n/a | n/a | n/a | n/a |
 
 If the figures are not available at the end of a session, write the row with
 the counts left as `n/a` rather than skipping it, so the session is still
