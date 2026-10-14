@@ -1465,8 +1465,16 @@ function showDetail(i){
   document.getElementById('backdrop').hidden = false;
 }
 
+let lastSig = null;
+function tickElapsed(now){
+  for (const a of AGENTS){
+    const td = document.querySelector(`td[data-el="${a._i}"]`);
+    if (td) td.textContent = elapsed(a, now);
+  }
+}
 function render(d){
   lastData = d; AGENTS = d.agents;
+  AGENTS.forEach((a,i)=>a._i=i);   // stable cell ids before the sig check
   const now = Date.now();
   const live = d.agents.filter(a=>a.status==='running');
   document.getElementById('meta').innerHTML =
@@ -1478,6 +1486,11 @@ function render(d){
         ` <a href="#" data-auth="login">[log in]</a>` +
         ` <a href="#" data-auth="recheck">[recheck]</a>`
       : '');
+  // Only rebuild the tables when the payload actually changes - rebuilding
+  // innerHTML every 2s resets animations/hover and looks like a reload.
+  const sig = JSON.stringify([d.runs, d.agents]);
+  if (sig === lastSig){ tickElapsed(now); return; }
+  lastSig = sig;
 
   // status filter chips (click toggles)
   const byStatus = {};
@@ -1509,7 +1522,7 @@ function render(d){
 
   // one fixed-width table per project slug, ordered by newest activity
   const groups = {};
-  d.agents.forEach((a,i)=>{ a._i=i; (groups[a.slug||'?'] ??= []).push(a); });
+  d.agents.forEach(a=>{ (groups[a.slug||'?'] ??= []).push(a); });
   const slugs = Object.keys(groups).sort((x,y)=>
     (groups[y][0].started_at||'') < (groups[x][0].started_at||'') ? -1 : 1);
   h = '';
@@ -1545,7 +1558,8 @@ function render(d){
         `<td class="hide-s">${esc(a.model||'-')}</td>` +
         `<td class="hide-s">${esc(a.effort||'-')}</td>` +
         `<td class="hide-s">${esc(a.mode||'-')}${a.cloud?' cloud':''}</td>` +
-        `<td>${loc(a.started_at)}</td><td>${elapsed(a,now)}</td>` +
+        `<td>${loc(a.started_at)}</td>` +
+        `<td data-el="${a._i}">${elapsed(a,now)}</td>` +
         `<td>${loc(a.ended_at)}</td>` + sessTd +
         `<td class="wrap">${esc(a.next||a.note||'')}</td></tr>`;
     }
