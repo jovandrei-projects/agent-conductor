@@ -90,6 +90,9 @@ conversation has no history beyond them.
   steps in the STATE.md you worked from, refresh its "Where it stopped" line,
   update QUEUE.md if the task's status changed.
 - Commit your work in logical groups (why-not-what messages). Never push.
+- Kill any servers/watchers you spawned (vite, `npm run dev`, playwright)
+  BEFORE printing STATUS - a live child keeps this CLI process from
+  exiting and your step gets killed at the timeout regardless.
 - End your final message with exactly these two lines:
 
 STATUS: done | partial | blocked
