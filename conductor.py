@@ -1386,6 +1386,51 @@ def devin_rm(devin_argv: list[str], cwd: Path, sid: str) -> int:
         return 1
 
 
+def _worktree_checkout_paths() -> list[Path]:
+    """Registered git worktrees of THIS repo (ROOT), excluding ROOT itself
+    - dev checkouts like agent-conductor-wt. Each keeps its own data/runs
+    with its own spawned-session whitelist (trap 13)."""
+    try:
+        r = subprocess.run(["git", "worktree", "list", "--porcelain"],
+                           cwd=str(ROOT), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=30)
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    try:
+        root = ROOT.resolve()
+    except OSError:
+        root = ROOT
+    out = []
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            p = Path(line[9:].strip())
+            try:
+                p = p.resolve()
+            except OSError:
+                pass
+            if p != root:
+                out.append(p)
+    return out
+
+
+def _session_runs_dirs(runs_dir: Path) -> list[Path]:
+    """The runs dir being scanned, PLUS registered worktree checkouts'
+    data/runs when the caller asked for the default RUNS_DIR - a dev
+    worktree's spawned sessions are whitelisted only in ITS state.jsons,
+    so skipping them leaves them manual-cleanup-only (trap 13)."""
+    dirs = [runs_dir]
+    try:
+        if runs_dir.resolve() == RUNS_DIR.resolve():
+            dirs += [wt / "data" / "runs" for wt in
+                     _worktree_checkout_paths()
+                     if (wt / "data" / "runs").is_dir()]
+    except OSError:
+        pass
+    return dirs
+
+
 def collect_sessions(runs_dir: Path, devin_argv: list[str]) -> list[dict]:
     """Conductor-spawned devin sessions still registered under their work_dir.
 
@@ -1394,7 +1439,9 @@ def collect_sessions(runs_dir: Path, devin_argv: list[str]) -> list[dict]:
     row carries age_s for --keep-hours decisions.
     """
     spawned: dict[str, dict] = {}
-    for sj in sorted(runs_dir.glob("*/state.json")):
+    state_files = sorted(s for d in _session_runs_dirs(runs_dir)
+                         for s in d.glob("*/state.json"))
+    for sj in state_files:
         try:
             st = json.loads(sj.read_text(encoding="utf-8"))
         except (OSError, ValueError):
