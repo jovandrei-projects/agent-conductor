@@ -371,6 +371,38 @@ prompt = "first"
             state = json.loads((run_dir / "state.json").read_text())
             self.assertEqual(state["steps"]["one"]["status"], "done")
 
+    def test_auth_lost_midrun_blocks_remaining(self):
+        """Token dying mid-run: the NEXT group's pre-spawn probe fails ->
+        remaining steps marked blocked, run aborts cleanly, --resume can
+        pick them up."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            flag = base / "authdead"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "do one killauth"
+
+[[step]]
+name = "two"
+project = "{proj.as_posix()}"
+prompt = "do two"
+''')
+            os.environ["MOCK_AUTH_FILE"] = str(flag)
+            try:
+                rc = run_manifest(m, runs)
+            finally:
+                os.environ.pop("MOCK_AUTH_FILE", None)
+            self.assertEqual(rc, 2)
+            state = json.loads(
+                (next(runs.iterdir()) / "state.json").read_text())
+            self.assertEqual(state["steps"]["one"]["status"], "done")
+            self.assertEqual(state["steps"]["two"]["status"], "blocked")
+            self.assertEqual(state.get("aborted"), "auth_midrun")
+
     def test_wave_finish_order_keeps_manifest_merge_order(self):
         """p2 finishing FIRST must not change merge-back order: merges are
         sequential in manifest order regardless of worker speed."""

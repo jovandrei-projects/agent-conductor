@@ -834,7 +834,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     log_event(run_dir, event="run_start", manifest=str(manifest_path),
               hub_task=tid)
 
-    if "devin" in os.path.basename(devin_argv[0]).lower():
+    if "devin" in os.path.basename(devin_argv[-1]).lower():
         if not check_auth(devin_argv):
             print("devin is not logged in. Run `devin auth login` first.")
             state["ended_at"] = now_iso()
@@ -846,11 +846,33 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     run_t0 = time.time()
     stop = False
-    for members in groups:
+    for gi, members in enumerate(groups):
         if cfg.max_hours and time.time() - run_t0 > cfg.max_hours * 3600:
             print(f"stopping run: max_hours={cfg.max_hours} reached")
             log_event(run_dir, event="run_deadline", max_hours=cfg.max_hours)
             break
+        if "devin" in os.path.basename(devin_argv[-1]).lower() \
+                and not check_auth(devin_argv):
+            # Token died mid-run: mark every remaining step blocked and
+            # stop - spawning more workers would just burn failures.
+            # --resume re-runs blocked steps after a fresh login.
+            print("devin auth lost mid-run; remaining steps -> blocked "
+                  "(fix auth, then --resume)")
+            log_event(run_dir, event="run_abort", reason="auth_midrun")
+            with STATE_LOCK:
+                for grp in groups[gi:]:
+                    for _d, _s, s_ in grp:
+                        if state["steps"].get(s_.name, {}).get(
+                                "status") != "done":
+                            state["steps"].setdefault(s_.name, {}).update(
+                                name=s_.name, status="blocked",
+                                note="auth lost mid-run; --resume after "
+                                     "devin auth login")
+                state["aborted"] = "auth_midrun"
+                state["ended_at"] = now_iso()
+                save_state(run_dir, state)
+            hub_update(tid, state, final=True, final_status="dropped")
+            return 2
         # Materialize worktrees for members that want isolation.
         prepared: list[tuple[Step, str, Path, Path, str | None]] = []
         wave_ckpt_done = False
@@ -1273,6 +1295,17 @@ def task_label(rec: dict) -> str | None:
     return " ".join(body.split())[:160] or None
 
 
+def stdout_tail(path: str | None, lines: int = 15) -> str | None:
+    """Last `lines` of a step's stdout log - the modal's 'how it ended'."""
+    if not path:
+        return None
+    try:
+        data = Path(path).read_bytes()[-8192:]
+    except OSError:
+        return None
+    return "\n".join(data.decode("utf-8", "replace").splitlines()[-lines:])
+
+
 def collect_dashboard(runs_dir: Path,
                       devin_argv: list[str] | None = None) -> dict:
     """Flatten every run's state.json into the shape the UI renders: one
@@ -1312,6 +1345,7 @@ def collect_dashboard(runs_dir: Path,
                 "exit_code": rec.get("exit_code"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
                 "stdout_log": rec.get("stdout_log"),
+                "tail": stdout_tail(rec.get("stdout_log")),
                 "export": rec.get("export"), "prompt": rec.get("prompt")})
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
                      "started_at": st.get("started_at"),
@@ -1344,7 +1378,10 @@ th { text-align:left; font-weight:600; color:#8b949e; font-size:11px; text-trans
 td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 td.wrap { white-space:normal; color:#8b949e; font-size:12px; }
 tr.agen { cursor:pointer; }
+tr.agen td { transition:background .12s; }
+tr.agen:hover td { background:#26405a; }
 tr.hl td { background:#1c2833; }
+tr.agen.hl:hover td { background:#2a4a68; }
 .gone { opacity:.45; text-decoration:line-through; }
 .chip { display:inline-block; border:1px solid #30363d; border-radius:10px; padding:1px 9px; margin:0 5px 5px 0; font-size:12px; cursor:pointer; user-select:none; }
 .chip.off { opacity:.35; }
@@ -1354,20 +1391,21 @@ tr.hl td { background:#1c2833; }
 .wrapw { overflow-x:auto; }
 .counts span { background:#161b22; border-radius:8px; padding:1px 8px; margin-right:5px; font-size:12px; }
 a { color:#58a6ff; text-decoration:none; }
-#detail { position:fixed; inset:8% 12%; background:#161b22; border:1px solid #30363d; border-radius:10px; padding:20px 24px; overflow:auto; z-index:9; font-size:13px; }
-#detail h3 { margin:0 0 10px; }
-#detail .kv { display:grid; grid-template-columns:110px 1fr; gap:4px 12px; }
+#backdrop { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:8; }
+#detail { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); width:min(660px,92vw); max-height:72vh; background:#161b22; border:1px solid #30363d; border-radius:10px; padding:18px 22px; overflow:auto; z-index:9; font-size:13px; }
+#detail h3 { margin:0 0 10px; font-size:14px; }
+#detail .kv { display:grid; grid-template-columns:96px 1fr; gap:4px 12px; }
 #detail .k { color:#8b949e; }
-#detail pre { white-space:pre-wrap; color:#8b949e; }
+#detail pre { white-space:pre-wrap; color:#8b949e; background:#0d1117; border-radius:6px; padding:8px 10px; font-size:12px; max-height:180px; overflow:auto; }
 #detail .x { position:absolute; top:10px; right:16px; cursor:pointer; color:#8b949e; }
-@media (max-width:640px) { .hide-s { display:none; } #detail { inset:4%; } }
+@media (max-width:640px) { .hide-s { display:none; } #detail { width:92vw; } }
 </style></head><body>
 <h1>agent-conductor</h1>
 <div class="sub" id="meta">loading&hellip;</div>
 <div class="sub" id="filters"></div>
 <h2>runs</h2><div class="wrapw"><table id="runs"></table></div>
 <h2>agents by project</h2><div id="agents"></div>
-<div id="detail" hidden><span class="x" id="dx">[close]</span><div id="dbody"></div></div>
+<div id="backdrop" hidden><div id="detail"><span class="x" id="dx">[close]</span><div id="dbody"></div></div></div>
 <script>
 const COLORS = {done:'#3fb950',partial:'#d29922',blocked:'#d29922',
 failed:'#f85149',timed_out:'#f0883e',running:'#58a6ff',queued:'#8b949e',
@@ -1422,8 +1460,9 @@ function showDetail(i){
   document.getElementById('dbody').innerHTML =
     `<h3>${esc(a.slug)} / ${esc(a.step)}</h3><div class="kv">` +
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">${esc(v??'-')}</div>`).join('') +
-    `</div>`;
-  document.getElementById('detail').hidden = false;
+    `</div>` +
+    (a.tail ? `<h3 style="margin-top:14px">stdout tail</h3><pre>${esc(a.tail)}</pre>` : '');
+  document.getElementById('backdrop').hidden = false;
 }
 
 function render(d){
@@ -1521,8 +1560,8 @@ function render(d){
 }
 document.addEventListener('click', async e=>{
   const t = e.target;
-  if (t.id==='dx' || t.id==='detail'){
-    document.getElementById('detail').hidden = true; return; }
+  if (t.id==='dx' || t.id==='backdrop'){
+    document.getElementById('backdrop').hidden = true; return; }
   if (t.dataset && t.dataset.st){            // status filter chip
     e.preventDefault();
     if (t.dataset.st==='__all') hidden.clear();
@@ -1540,7 +1579,7 @@ document.addEventListener('click', async e=>{
     if (t.dataset.auth==='login'){
       await fetch('/api/auth/login', {method:'POST'});
       t.outerHTML = ' <span style="color:#8b949e">a terminal opened - ' +
-        'finish the login there; this banner clears itself</span>';
+        'sign in at the link, paste the code back; this clears itself</span>';
     } else {
       await fetch('/api/auth/recheck', {method:'POST'});
     }
@@ -1548,6 +1587,10 @@ document.addEventListener('click', async e=>{
   }
   const row = t.closest && t.closest('tr.agen');
   if (row) showDetail(+row.dataset.i);
+});
+document.addEventListener('keydown', e=>{
+  if (e.key==='Escape')
+    document.getElementById('backdrop').hidden = true;
 });
 // hovering a run row highlights its agent rows across all project tables
 document.addEventListener('mouseover', e=>{
@@ -1600,7 +1643,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 # logout first: a stale credentials.toml makes plain `login`
                 # short-circuit with "already logged in" (trap 4).
                 subprocess.Popen(
-                    'start "" cmd /k "devin auth logout & devin auth login"',
+                    'start "" cmd /k "devin auth logout & '
+                    'devin auth login --force-manual-token-flow"',
                     shell=True)
                 _AUTH_CACHE[0] = 0.0      # next tick re-probes
                 self._send(b"{}", "application/json")

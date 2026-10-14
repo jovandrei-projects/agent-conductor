@@ -37,6 +37,10 @@ def main() -> int:
     cwd = Path.cwd()
 
     if args[:1] == ["auth"]:
+        dead = os.environ.get("MOCK_AUTH_FILE")
+        if dead and Path(dead).is_file():
+            print("Not logged in (mock)")
+            return 1
         print("Logged in (mock)")
         return 0
     if args[:1] == ["list"]:
@@ -84,6 +88,10 @@ def main() -> int:
         body = Path(prompt_file).read_text(encoding="utf-8")
 
     sid = "mock-" + "".join(random.choices(string.ascii_lowercase, k=6))
+    # prompt "killauth" trips the MOCK_AUTH_FILE flag: the NEXT step's
+    # auth probe then fails -> simulates the token dying mid-run.
+    if "killauth" in body and os.environ.get("MOCK_AUTH_FILE"):
+        Path(os.environ["MOCK_AUTH_FILE"]).write_text("x")
     import re
     m = re.search(r"([A-Za-z0-9_]+\.txt)", body)
     # prompt "sleep=N" simulates a slow worker so waves can finish

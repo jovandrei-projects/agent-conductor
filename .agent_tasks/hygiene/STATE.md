@@ -124,6 +124,27 @@ Doc fix: `devin list` interactive picker is GLOBAL ("all sessions"); only
 - Global skill installed: %APPDATA%\devin\skills\agent-conductor\SKILL.md
   lets any session launch overnight runs; manifests/README got the
   money-plan/mobile-apps worked example.
+- Dashboard modal rework: compact centered panel (max 660px/72vh) with a
+  stdout tail (last 15 log lines per step), backdrop-click + Esc close,
+  stronger row hover.
+- Login button now launches `devin auth login --force-manual-token-flow`:
+  on this account the BROWSER flow mints tokens the server rejects while
+  the manual flow's token verified OK at mint (then died ~10min later -
+  server-side revocation, third observed death). Only-one-login-at-a-time
+  guidance added.
+- Mid-run auth guard: each wave re-probes `devin auth status`; a dead
+  token marks remaining steps blocked + aborts (auth_midrun) instead of
+  burning spawn failures; --resume re-runs them. Mock gained
+  MOCK_AUTH_FILE + 'killauth' prompt trigger; test
+  test_auth_lost_midrun_blocks_remaining. Auth gate now keys on
+  argv[-1] basename so --devin "python mock_devin.py" tests exercise it.
+- First real manifest: manifests/apartment-3d-views-floorplan.toml (5
+  sequential steps, swe-2 + effort=max -> swe-2-max; fused name
+  UNVERIFIED - if step 1 fails unknown-model, drop the effort line and
+  --resume). apartment-3d got .agent_tasks/views-floorplan/STATE.md +
+  QUEUE row + 3 reference images under gitignored assets/floorplan/.
+- Repo litter: deleted a 0-byte 'devin' file that shadowed the binary in
+  `where devin` (probably a stray '>' redirect).
 
 ## Verification
 

@@ -1,0 +1,77 @@
+# Overnight run: apartment-3d second-pass (camera modes + floor-plan fixes).
+# Brief lives in the target repo: .agent_tasks/views-floorplan/STATE.md
+# (phases A-E). Reference images: assets/floorplan/ (gitignored, local only).
+#
+# Sequential on purpose: every step touches the same scene/camera files, so
+# no waves/worktrees - concurrent same-file edits are the conflict case.
+#
+#   cd C:\Projects\agent-conductor
+#   python conductor.py plan manifests\apartment-3d-views-floorplan.toml
+#   python conductor.py run  manifests\apartment-3d-views-floorplan.toml
+
+[run]
+name = "views-floorplan"
+on_failure = "continue"   # overnight resilience: a failed phase must not
+                          # kill the rest; failures stay visible in state
+max_hours = 10
+
+[defaults]
+project = "apartment-3d"
+model = "swe-2"           # free through 2026-10-16
+effort = "max"            # -> --model swe-2-max
+mode = "bypass"
+timeout_min = 90
+verify = "npm run verify" # playwright gate; runs inside the project
+verify_must_pass = true
+
+[[step]]
+name = "floorplan-fixes"
+prompt = """
+Work Phase A of .agent_tasks/views-floorplan/STATE.md - all 7 floor-plan
+corrections (door to end of hall, empty the hall, shoe rack + golf clubs on
+the right of entry, couch facing the room, desktop out of the bedroom,
+kitchen cabinet division wall, sink position). Use assets/floorplan/
+a2-apt1617.png and annotated-arrows.png as the source of truth. Tick each
+item in STATE.md only after it is verified, and update its 'Where it
+stopped' line before finishing."""
+
+[[step]]
+name = "minimap"
+prompt = """
+Work Phase B of .agent_tasks/views-floorplan/STATE.md - the minimap is
+horizontally flipped (standing at the entrance shows 'bathroom'). Rebuild
+the minimap so it matches assets/floorplan/minimap-flipped.png exactly:
+that file is the spec for orientation and door positions (its lettering is
+intentionally mirrored, ignore the letters). Keep world geometry per
+a2-apt1617.png. Update STATE.md before finishing."""
+
+[[step]]
+name = "avatar-slim"
+timeout_min = 60
+prompt = """
+Work Phase C of .agent_tasks/views-floorplan/STATE.md - the avatar is too
+fat. Slim its proportions; keep the stylized look and the pink-hair
+identity from assets/avatar/. Update STATE.md before finishing."""
+
+[[step]]
+name = "camera-stability"
+timeout_min = 120
+prompt = """
+Work Phase D of .agent_tasks/views-floorplan/STATE.md - camera follow
+glitches on zoom changes; a 180-degree turn (hold up then down) pops walls
+and the avatar in and out. Find and fix the root cause (likely frustum
+culling vs the camera rig). Target: Zelda-style smooth 3rd-person follow.
+Verify a held right-arrow for 2-3s stays smooth through a ~360 turn, in
+both the kitchen (open) and the entry hall (narrow, now cleared). Update
+STATE.md before finishing."""
+
+[[step]]
+name = "camera-modes"
+timeout_min = 120
+prompt = """
+Work Phase E of .agent_tasks/views-floorplan/STATE.md - add a 3-mode view
+switch: (1) third-person behind avatar (current), (2) first-person at the
+avatar's eyes, (3) bird's view ~45 deg down with no roof - walls must not
+hide the avatar (transparency or outline, your call), mouse rotates view,
+arrows move the avatar without rotating the camera, camera catches up with
+a ~1s smooth lag. Update STATE.md before finishing."""
