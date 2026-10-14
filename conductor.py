@@ -59,6 +59,15 @@ MODE_FLAG = {"normal": "auto", "auto": "auto", "accept-edits": "accept-edits",
              "smart": "smart", "bypass": "dangerous", "yolo": "dangerous",
              "dangerous": "dangerous"}
 
+# A `devin -p` worker stays alive while any session-spawned child lives -
+# workers' playwright probes leave a vite dev server up, and the CLI then
+# idles until timeout_min (trap 12: 3 steps burned 52/52/85min post-turn).
+# Once a STATUS line reaches the log the turn is over, so the remaining
+# wait collapses to this grace, the tree is killed, and the step counts as
+# a completed turn (verify still runs) instead of a timeout.
+STATUS_GRACE_S = 120.0
+WAIT_POLL_S = 15.0        # wait() slice between STATUS checks on the log
+
 PREAMBLE = """\
 This session was spawned unattended by agent-conductor
 (C:\\Projects\\agent-conductor). No human is watching this run. Do NOT use
@@ -723,6 +732,85 @@ def tail_metrics(export_path: Path) -> dict | None:
     return out or None
 
 
+def kill_tree(proc) -> None:
+    """Kill the worker AND its children. Bare proc.kill() orphans
+    grandchildren - a spawned vite kept :8805 bound for hours after its
+    run ended (hit 2026-10-14); taskkill /T walks the tree on Windows."""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        r = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True)
+        if r.returncode != 0 and proc.poll() is None:
+            proc.kill()
+    else:
+        proc.kill()
+
+
+def wait_worker(proc, stdout_log: Path,
+                timeout_s: float) -> tuple[int | None, bool, bool]:
+    """Wait for the worker; returns (rc, timed_out, hung_after_status).
+
+    Polls in short slices so a STATUS line in the log is noticed within
+    WAIT_POLL_S: the turn is then over, so the remaining wait collapses to
+    STATUS_GRACE_S before the tree is killed. hung_after_status tells the
+    caller the work completed - run verify and honor the status line
+    rather than reporting a timeout.
+    """
+    deadline = time.time() + timeout_s
+    grace_at = None
+    while True:
+        try:
+            return proc.wait(timeout=WAIT_POLL_S), False, False
+        except subprocess.TimeoutExpired:
+            pass
+        if tail_status(stdout_log) is not None:
+            if grace_at is None:
+                grace_at = time.time() + STATUS_GRACE_S
+            if time.time() >= grace_at:
+                kill_tree(proc)
+                return proc.wait(), False, True
+        elif time.time() >= deadline:
+            kill_tree(proc)
+            return proc.wait(), True, False
+
+
+def _capture_session_id(rec: dict, devin_argv: list[str], work_dir: Path,
+                        before: set[str], state: dict, run_dir: Path,
+                        watched: bool, proc) -> None:
+    """Record the spawned session id while the step is still running.
+
+    The post-wait `devin list` diff already captures it, but a conductor
+    that dies mid-step loses that write forever - the orphaned session is
+    then indistinguishable from a human one and invisible to `sessions`
+    (AGENTS.md 'Running things'). The id registers in `devin list` seconds
+    after spawn; probe a few times, then stop. `devin list` only reads, so
+    running it inside the worker's watched cwd is safe (verified live: a
+    list call mid-step did not disturb the worker).
+
+    Best-effort by design: any failure just leaves session_id for the
+    post-wait diff.
+    """
+    try:
+        for _ in range(5):
+            try:
+                proc.wait(timeout=25)
+                return                   # step already over - diff wins
+            except subprocess.TimeoutExpired:
+                pass
+            new = (session_ids(devin_argv, work_dir) or set()) - before
+            if len(new) != 1:
+                continue                 # not registered yet, or ambiguous
+            with STATE_LOCK:
+                if not rec.get("session_id"):
+                    rec["session_id"] = sorted(new)[0]
+                    if not watched:
+                        save_state(run_dir, state)
+            return
+    except Exception:
+        return
+
+
 def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
              run_dir: Path, devin_argv: list[str], state: dict,
              do_checkpoint: bool = True, branch: str | None = None,
@@ -784,6 +872,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     LOG.info("step %s: %s (cwd=%s)", step.name, " ".join(cmd), work_dir)
     t0 = time.time()
     timed_out = False
+    hung = False
     rc: int | None = None
     with open(stdout_log, "wb") as out:
         try:
@@ -807,10 +896,16 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                     watched = True
                 if not watched:
                     save_state(run_dir, state)
+            threading.Thread(
+                target=_capture_session_id,
+                args=(rec, devin_argv, work_dir, before, state, run_dir,
+                      watched, proc),
+                daemon=True).start()
             try:
-                rc = proc.wait(timeout=step.timeout_min * 60)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+                rc, timed_out, hung = wait_worker(
+                    proc, stdout_log, step.timeout_min * 60)
+            except subprocess.TimeoutExpired:      # unreachable; safety
+                kill_tree(proc)
                 proc.wait()
                 timed_out = True
         except OSError as exc:
@@ -836,7 +931,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
 
     if timed_out:
         status = "timed_out"
-    elif rc is None or rc != 0:
+    elif (rc is None or rc != 0) and not hung:
         status = "failed"
     elif status_line in ("blocked", "partial"):
         status = status_line
@@ -857,6 +952,10 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         if status_line is None and rc == 0:
             rec["note"] = ("worker exited 0 without a STATUS line "
                            "(no-op run - nothing was done)")
+        if hung:
+            rec["note"] = ("STATUS printed but the CLI stayed alive on a "
+                           "spawned child (trap 12); tree-killed after "
+                           "grace - counted as turn end")
         rec.update(status=status, ended_at=now_iso(), status_line=status_line,
                    verify_ok=verify_ok, next=tail_next(stdout_log),
                    tokens=tail_metrics(export_path))

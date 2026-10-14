@@ -218,6 +218,23 @@ Append as they are hit.
     fake 'resolved'). Same reasoning: resolver is refused on a dirty main
     checkout - someone else's uncommitted work would get swept into the
     merge commit (trap 10 shape).
+12. **A `devin -p` worker that leaves a spawned server alive never
+    exits.** The CLI's process stays up while any session-spawned child
+    lives (workers' playwright probes boot vite :8805 and leave it
+    running) - the turn can be fully over (STATUS printed, export.json
+    written) yet the process idles until timeout_min. 2026-10-14
+    views-floorplan run: 3 of 5 steps printed `STATUS: done` then burned
+    52/52/85min; the one clean exit (camera-stability) had explicitly
+    `taskkill /F`ed its leftover server first. Fixes in place:
+    `wait_worker` polls the log for a STATUS line and collapses the
+    remaining wait to `STATUS_GRACE_S` before killing (counts as turn
+    end - verify still runs, status_line honored); `kill_tree` uses
+    `taskkill /T` because bare `proc.kill()` orphans grandchildren - a
+    stray vite kept :8805 bound 3h after that run. Worker-side
+    convention still helps: workers should kill servers they spawn
+    before STATUS (camera-stability's agent knew via apartment-3d's own
+    trap notes; a `devin -p` exit-hang on live children is arguably a
+    CLI bug - worth reporting upstream if it persists).
 
 ## The task workspace - read before starting work
 

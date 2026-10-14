@@ -728,7 +728,8 @@ class SpawnGuardTests(unittest.TestCase):
     and the pid IS persisted mid-run (dashboard liveness + sweep need it).
     """
 
-    def _fixture(self, base: Path, self_hosted: bool = False):
+    def _fixture(self, base: Path, self_hosted: bool = False,
+                 step_extra: str = ""):
         proj = make_project(base)
         run_dir = (proj if self_hosted else base) / "runs" / "r1"
         (run_dir / "prompts").mkdir(parents=True)
@@ -737,6 +738,7 @@ class SpawnGuardTests(unittest.TestCase):
 name = "a"
 project = "{proj.as_posix()}"
 prompt = "p"
+{step_extra}
 '''))
         state = {"run": "t", "run_dir": str(run_dir), "steps": {}}
         return proj, run_dir, cfg, state
@@ -790,6 +792,69 @@ prompt = "p"
         """Cross-project run: run_dir is outside the watched cwd, so the
         pid IS persisted while the worker is alive."""
         self.assertEqual(self._pid_seen_on_disk(self_hosted=False), 4242)
+
+    class _NeverExits:
+        """FakeProc whose wait() always times out until kill_tree lands
+        (on Windows kill_tree goes through taskkill - which fails on a
+        fake pid - then falls back to proc.kill())."""
+        pid = 999_999_999          # deliberately impossible: taskkill must
+                                   # fail cleanly, never hit a real process
+
+        def __init__(self, *a, **kw):
+            self._out = kw["stdout"]
+            self.killed = False
+
+        def wait(self, timeout=None):
+            if self.killed:
+                return 0
+            raise subprocess.TimeoutExpired("devin", timeout)
+
+        def poll(self):
+            return 0 if self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+    def _run_step_with(self, proc_cls, **kw):
+        with tempfile.TemporaryDirectory() as td:
+            proj, run_dir, cfg, state = self._fixture(Path(td), **kw)
+            with mock.patch.object(conductor.subprocess, "Popen", proc_cls), \
+                    mock.patch.object(conductor, "kill_tree",
+                                      lambda p: p.kill()), \
+                    mock.patch.object(conductor, "session_ids",
+                                      lambda *a, **k: set()), \
+                    mock.patch.object(conductor, "is_git_repo",
+                                      lambda p: True), \
+                    mock.patch.object(conductor, "git_commit",
+                                      lambda *a, **k: True), \
+                    mock.patch.object(conductor, "git_dirty",
+                                      lambda p: False), \
+                    mock.patch.object(conductor, "STATUS_GRACE_S", 0.05), \
+                    mock.patch.object(conductor, "WAIT_POLL_S", 0.01):
+                st = conductor.run_step(cfg.steps[0], "s", proj, cfg,
+                                        run_dir, ["devin"], state)
+            return st, state["steps"]["a"]
+
+    def test_status_then_hang_kills_after_grace(self):
+        """STATUS printed then the CLI lingers on a spawned child: grace-
+        kill counts it as a completed turn (trap 12), never a timeout."""
+
+        class Proc(self._NeverExits):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self._out.write(b"STATUS: done\nNEXT: n\n")
+                self._out.flush()
+
+        st, rec = self._run_step_with(Proc)
+        self.assertEqual(st, "done")
+        self.assertIn("tree-killed after grace", rec["note"])
+
+    def test_no_status_hang_still_times_out(self):
+        """A worker that never prints STATUS is a real timeout no matter
+        how long the process lingers."""
+        st, rec = self._run_step_with(
+            self._NeverExits, step_extra="timeout_min = 0.001")
+        self.assertEqual(st, "timed_out")
 
     def test_no_status_line_is_failed(self):
         """rc 0 without a STATUS line is a no-op worker, never 'done'."""
