@@ -1557,7 +1557,8 @@ function render(d){
     const counts = Object.entries(r.counts||{})
       .map(([k,v])=>`<span style="color:${COLORS[k]||'#8b949e'}">${v} ${k}</span>`)
       .join('');
-    h += `<tr data-run="${esc(r.run)}"><td>${esc(r.run)}</td>` +
+    h += `<tr data-run="${esc(r.dir)}"><td><b>${esc(r.run)}</b> ` +
+      `<span class="sub">${esc((r.dir||'').split(/[\\/]/).pop())}</span></td>` +
       `<td>${(r.projects||[]).map(p=>`<span class="chip">${esc(p)}</span>`).join('')}</td>` +
       `<td>${loc(r.started_at)}</td>` +
       `<td>${r.ended_at?loc(r.ended_at):'<b>running</b>'}</td>` +
@@ -1600,7 +1601,7 @@ function render(d){
           `title="live session (inferred - recorded at step end)">` +
           `${esc(sess)}…</td>`
         : `<td class="hide-s"${sess==='…'?' title="recorded when the step ends"':''}>${esc(sess)}</td>`;
-      h += `<tr class="agen" data-i="${a._i}" data-run="${esc(a.run)}">` +
+      h += `<tr class="agen" data-i="${a._i}" data-run="${esc(a.run_dir||'')}">` +
         `<td><span class="dot${pulse}" style="background:${c}" ` +
         `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>` +
         `${a.status}</td>` +
