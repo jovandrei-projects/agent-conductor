@@ -723,11 +723,14 @@ class SpawnGuardTests(unittest.TestCase):
     Popen() and wait() wrote state.json into run_dir - inside a self-hosted
     worker's watched cwd - and the CLI's user-edit awareness ended the
     fresh session. Invariant: nothing under run_dir may be written while a
-    worker process is alive."""
+    worker process is alive WHEN run_dir sits inside the worker's watched
+    cwd. When run_dir is outside it, the write is invisible to the worker
+    and the pid IS persisted mid-run (dashboard liveness + sweep need it).
+    """
 
-    def _fixture(self, base: Path):
+    def _fixture(self, base: Path, self_hosted: bool = False):
         proj = make_project(base)
-        run_dir = base / "runs" / "r1"
+        run_dir = (proj if self_hosted else base) / "runs" / "r1"
         (run_dir / "prompts").mkdir(parents=True)
         cfg = conductor.load_manifest(write_manifest(base, f'''
 [[step]]
@@ -738,9 +741,13 @@ prompt = "p"
         state = {"run": "t", "run_dir": str(run_dir), "steps": {}}
         return proj, run_dir, cfg, state
 
-    def test_pid_not_persisted_while_worker_alive(self):
+    def _pid_seen_on_disk(self, self_hosted: bool):
+        """Run one fake step; returns the pid value state.json held while
+        the 'worker' was inside wait() (None when never persisted)."""
         with tempfile.TemporaryDirectory() as td:
-            proj, run_dir, cfg, state = self._fixture(Path(td))
+            proj, run_dir, cfg, state = self._fixture(
+                Path(td), self_hosted=self_hosted)
+            seen = {}
 
             class FakeProc:
                 pid = 4242
@@ -751,11 +758,9 @@ prompt = "p"
                 def wait(self, timeout=None):
                     disk = json.loads(
                         (run_dir / "state.json").read_text())
+                    seen["pid"] = disk["steps"]["a"].get("pid")
                     self._out.write(b"STATUS: done\n")
                     self._out.flush()
-                    # while the child is alive the on-disk state must not
-                    # have been rewritten with the pid
-                    assert disk["steps"]["a"].get("pid") is None
                     return 0
 
                 def kill(self):
@@ -774,6 +779,17 @@ prompt = "p"
                                         run_dir, ["devin"], state)
             self.assertEqual(st, "done")
             self.assertEqual(state["steps"]["a"]["pid"], 4242)
+            return seen["pid"]
+
+    def test_pid_not_persisted_while_worker_alive(self):
+        """Self-hosted run: run_dir is inside the watched cwd, so the pid
+        must NOT hit disk while the worker is alive."""
+        self.assertIsNone(self._pid_seen_on_disk(self_hosted=True))
+
+    def test_pid_persisted_while_worker_alive(self):
+        """Cross-project run: run_dir is outside the watched cwd, so the
+        pid IS persisted while the worker is alive."""
+        self.assertEqual(self._pid_seen_on_disk(self_hosted=False), 4242)
 
     def test_no_status_line_is_failed(self):
         """rc 0 without a STATUS line is a no-op worker, never 'done'."""

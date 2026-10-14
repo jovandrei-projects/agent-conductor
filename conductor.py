@@ -298,10 +298,12 @@ def clean_devin_env() -> dict:
     return env
 
 
-def session_ids(devin_argv: list[str], cwd: Path) -> set[str] | None:
-    """Session ids `devin list` reports for cwd, or None when the listing
-    itself failed (devin missing, bad dir) - callers must not treat a
-    failed listing as 'all sessions gone'."""
+def session_activity(devin_argv: list[str], cwd: Path) -> dict[str, float] | None:
+    """Session id -> last_activity epoch `devin list` reports for cwd, or
+    None when the listing itself failed (devin missing, bad dir) - callers
+    must not treat a failed listing as 'no sessions'. The activity stamp is
+    what lets the dashboard attribute a live session to the step that
+    spawned it (the session appears seconds after the step starts)."""
     try:
         out = subprocess.run(devin_argv + ["list", "--format", "json"],
                              cwd=str(cwd), capture_output=True, text=True,
@@ -309,9 +311,18 @@ def session_ids(devin_argv: list[str], cwd: Path) -> set[str] | None:
                              env=clean_devin_env())
         if out.returncode != 0:
             return None
-        return {s["id"] for s in json.loads(out.stdout or "[]")}
+        return {s["id"]: float(s.get("last_activity_at") or 0)
+                for s in json.loads(out.stdout or "[]")}
     except Exception:
         return None
+
+
+def session_ids(devin_argv: list[str], cwd: Path) -> set[str] | None:
+    """Session ids `devin list` reports for cwd, or None when the listing
+    itself failed (devin missing, bad dir) - callers must not treat a
+    failed listing as 'all sessions gone'."""
+    act = session_activity(devin_argv, cwd)
+    return set(act) if act is not None else None
 
 
 def check_auth(devin_argv: list[str]) -> bool:
@@ -682,12 +693,22 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                                     stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL,
                                     env=clean_devin_env())
-            # Record pid in memory only: writing state.json into run_dir at
-            # this point lands inside the worker's watched workspace (for
-            # self-hosted runs) and the CLI's user-edit awareness ends the
-            # fresh session mid-init. The final save_state below persists it.
+            # Writing state.json into run_dir mid-spawn lands inside the
+            # worker's watched workspace on self-hosted runs, and the
+            # CLI's user-edit awareness ends the fresh session mid-init
+            # (trap 5) - there the pid stays memory-only until the final
+            # save_state below. Anywhere else the write is invisible to
+            # the worker, so persist now: a live pid is what lets the
+            # dashboard and sweep tell 'running' from 'orphaned'.
             with STATE_LOCK:
                 rec["pid"] = proc.pid
+                try:
+                    watched = run_dir.resolve().is_relative_to(
+                        Path(work_dir).resolve())
+                except OSError:
+                    watched = True
+                if not watched:
+                    save_state(run_dir, state)
             try:
                 rc = proc.wait(timeout=step.timeout_min * 60)
             except subprocess.TimeoutExpired:
@@ -1297,10 +1318,14 @@ def auth_status(devin_argv: list[str]) -> str:
 
 
 def live_sessions_by_dir(runs_dir: Path,
-                         devin_argv: list[str]) -> dict[str, set | None]:
-    """work_dir -> session ids currently in `devin list` there, cached 2min.
-    A dir maps to None when listing failed (devin down/missing) - never
-    interpret None as 'all sessions gone'."""
+                         devin_argv: list[str]) -> dict[str, dict | None]:
+    """work_dir -> {session id: last_activity epoch} from `devin list`
+    there, cached 2min. A dir maps to None when listing failed (devin
+    down/missing) - never interpret None as 'all sessions gone'.
+
+    Dirs are collected for two uses: records with a session_id (gone
+    checks) and steps still plausibly alive (live attribution of the
+    not-yet-recorded session id)."""
     if _SESS_CACHE[1] and time.time() - _SESS_CACHE[0] < 120:
         return _SESS_CACHE[1]
     dirs: set[str] = set()
@@ -1311,9 +1336,10 @@ def live_sessions_by_dir(runs_dir: Path,
             continue
         for rec in (st.get("steps") or {}).values():
             wd = rec.get("work_dir") or rec.get("project")
-            if wd and rec.get("session_id") and Path(wd).is_dir():
+            if wd and (rec.get("session_id") or step_live(rec)) \
+                    and Path(wd).is_dir():
                 dirs.add(wd)
-    out = {d: session_ids(devin_argv, Path(d)) for d in dirs}
+    out = {d: session_activity(devin_argv, Path(d)) for d in dirs}
     _SESS_CACHE[0], _SESS_CACHE[1] = time.time(), out
     return out
 
@@ -1402,14 +1428,17 @@ def collect_dashboard(runs_dir: Path,
                                          st.get("steps", {}).values()
                                          if r.get("slug")})})
     # session_id is discovered post-spawn (diff of `devin list`); while a
-    # step runs the cell is empty. Attribute it live instead: a running
-    # step's work_dir should list exactly one session id not yet claimed
-    # by any record.
+    # step runs the cell is empty. Attribute it live instead: among the
+    # unclaimed ids in the step's work_dir, the spawned one is the session
+    # that went active when the step started (older human sessions in the
+    # same dir have stale activity stamps). Ambiguous -> leave blank.
     claimed = {a["session_id"] for a in agents if a.get("session_id")}
     for a in agents:
         if a["status"] == "running" and not a.get("session_id"):
-            live = sess_by_dir.get(a.get("work_dir")) or set()
-            cand = [s for s in live if str(s) not in claimed]
+            live = sess_by_dir.get(a.get("work_dir")) or {}
+            started = (_iso_ts(a.get("started_at")) or 0) - 5
+            cand = [s for s, act in live.items()
+                    if str(s) not in claimed and act >= started]
             if len(cand) == 1:
                 a["session_id"], a["session_live"] = cand[0], True
         a["tail_last"] = next(
@@ -1847,7 +1876,7 @@ verify = "python -c \\"import pathlib;assert pathlib.Path('WORK.txt').read_text(
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(errors="backslashreplace")
+            stream.reconfigure(errors="backslashreplace", line_buffering=True)
         except AttributeError:
             pass
     LOGS_DIR.mkdir(exist_ok=True)
