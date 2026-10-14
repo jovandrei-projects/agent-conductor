@@ -81,6 +81,7 @@ green.
 - [ ] `run.min_free_gb` scheduling gate: pause new agents when RAM is scarce (free_ram_gb is already recorded; the gate itself is unbuilt)
 - [ ] Maybe a runs view in project-hub (reads `data/runs/*/state.json`)
 - [ ] Transcript-extract integration: distilled handoff notes into run dir
+- [ ] Session-cleanup surface on :8773 (the `sessions` command's list/rm as a dashboard panel)
 - [ ] Desktop visibility of spawned sessions confirmed/documented
 
 ---

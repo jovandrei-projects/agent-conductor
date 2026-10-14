@@ -93,7 +93,8 @@ bounded by the cap. Steps on the *same* project in a wave need
 `conductor/<run>/<step>`, merged back in manifest order after the wave; a
 merge conflict fails the step but keeps the worktree for manual merge.
 
-`examples/night.example.toml` is the reference manifest. `projects.toml`
+`manifests/` holds real manifests (`<project>-<what>.toml`, see its
+README); `examples/` is reference-only. `projects.toml`
 registers slug -> path + `cloud_ok`. `--devin "..."` or `CONDUCTOR_DEVIN`
 overrides the spawned binary (shlex-split; use forward slashes or quotes -
 posix shlex eats unquoted backslashes).

@@ -41,7 +41,8 @@ timeout_min = 90
 # `cloud = true` spawns `devin --cloud -p`; requires cloud_ok in projects.toml.
 ```
 
-Fully annotated manifest: `examples/night.example.toml`.
+Fully annotated manifest: `examples/night.example.toml`. Real manifests
+live in `manifests/` (one `<project>-<what>.toml` per job - see its README).
 
 ## Commands
 

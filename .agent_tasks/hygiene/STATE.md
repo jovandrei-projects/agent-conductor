@@ -63,9 +63,12 @@ the 6 recorded spawned sessions, 26 unrecorded spawned orphans removed by
 `devin rm` (34 -> 2 sidebar entries, the 2 human sessions kept); `data/runs`
 pruned to 2 run dirs (kept `20261013-093553-smoke` + `20261013-182727-demo`);
 agent-conductor registered as a managed service in project-hub
-`services.json` (commit a71a194 there). Next: the first real manifest
-(queue "not yet filed" item) - and the human must decide whether to push
-agent-conductor to GitHub before a cloud step can actually run on it.
+`services.json` (commit a71a194 there). Second cleanup pass: `data/` pruned
+of repro files + ~50 empty worktree dirs; `manifests/` created as the
+convention for real manifests (its README documents location + run syntax).
+Next: the first real manifest (queue "not yet filed" item) - and the human
+must decide whether to push agent-conductor to GitHub before a cloud step
+can actually run on it.
 
 ## Verification
 
