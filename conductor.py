@@ -1365,6 +1365,20 @@ def collect_dashboard(runs_dir: Path,
                 "stdout_log": rec.get("stdout_log"),
                 "tail": stdout_tail(rec.get("stdout_log")),
                 "export": rec.get("export"), "prompt": rec.get("prompt")})
+    # session_id is discovered post-spawn (diff of `devin list`); while a
+    # step runs the cell is empty. Attribute it live instead: a running
+    # step's work_dir should list exactly one session id not yet claimed
+    # by any record.
+    claimed = {a["session_id"] for a in agents if a.get("session_id")}
+    for a in agents:
+        if a["status"] == "running" and not a.get("session_id"):
+            live = sess_by_dir.get(a.get("work_dir")) or set()
+            cand = [s for s in live if str(s) not in claimed]
+            if len(cand) == 1:
+                a["session_id"], a["session_live"] = cand[0], True
+        a["tail_last"] = next(
+            (ln for ln in reversed((a.get("tail") or "").splitlines())
+             if ln.strip()), None)
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
                      "started_at": st.get("started_at"),
                      "ended_at": st.get("ended_at"), "counts": counts,
@@ -1572,11 +1586,16 @@ function render(d){
     for (const a of show){
       const c = COLORS[a.status]||'#8b949e';
       const pulse = a.status==='running' ? ' run' : '';
-      const sess = a.session_id ? String(a.session_id).slice(0,14) : '-';
+      const sess = a.session_id ? String(a.session_id).slice(0,14)
+        : (a.status==='running' ? '…' : '-');
       const sessTd = a.session_gone
         ? `<td class="hide-s gone" title="session deleted from devin list; ` +
           `transcript stays in the run dir">${esc(sess)}</td>`
-        : `<td class="hide-s">${esc(sess)}</td>`;
+        : a.session_live
+        ? `<td class="hide-s" style="color:#58a6ff" ` +
+          `title="live session (inferred - recorded at step end)">` +
+          `${esc(sess)}…</td>`
+        : `<td class="hide-s"${sess==='…'?' title="recorded when the step ends"':''}>${esc(sess)}</td>`;
       h += `<tr class="agen" data-i="${a._i}" data-run="${esc(a.run)}">` +
         `<td><span class="dot${pulse}" style="background:${c}" ` +
         `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>` +
@@ -1589,7 +1608,8 @@ function render(d){
         `<td>${loc(a.started_at)}</td>` +
         `<td data-el="${a._i}">${elapsed(a,now)}</td>` +
         `<td>${loc(a.ended_at)}</td>` + sessTd +
-        `<td class="wrap">${esc(a.next||a.note||'')}</td></tr>`;
+        `<td class="wrap">${esc(a.status==='running'
+          ? (a.tail_last||'') : (a.next||a.note||''))}</td></tr>`;
     }
     if (rows.length > SHOW_N)
       h += `<tr><td colspan="12"><a href="#" data-slug="${esc(slug)}">` +
