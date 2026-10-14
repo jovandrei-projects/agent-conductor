@@ -1439,6 +1439,7 @@ table { border-collapse:collapse; width:100%; table-layout:fixed; }
 th { text-align:left; font-weight:600; color:#8b949e; font-size:11px; text-transform:uppercase; padding:4px 10px 4px 0; border-bottom:1px solid #21262d; }
 td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 td.wrap { white-space:normal; color:#8b949e; font-size:12px; }
+td.step { white-space:normal; }  /* wt/merged chips wrap under a long name */
 tr.agen { cursor:pointer; }
 .dots span { animation:blink 1.2s infinite; color:#58a6ff; }
 .dots span:nth-child(2) { animation-delay:.4s; }
@@ -1509,11 +1510,11 @@ let AGENTS = [];          // last payload, for the detail modal
 // column layout shared by every per-project table (fixed layout -> the
 // same widths line up across tables)
 const AGENT_COLS = '<colgroup>' +
-  '<col style="width:8%"><col style="width:8%"><col style="width:22%">' +
+  '<col style="width:7%"><col style="width:14%"><col style="width:18%">' +
   '<col style="width:7%"><col class="hide-s" style="width:7%">' +
   '<col class="hide-s" style="width:5%"><col class="hide-s" style="width:6%">' +
   '<col style="width:6%"><col style="width:5%"><col style="width:6%">' +
-  '<col class="hide-s" style="width:6%"><col style="width:14%">' +
+  '<col class="hide-s" style="width:6%"><col style="width:13%">' +
   '</colgroup>';
 
 let detailIdx = null;
@@ -1647,7 +1648,8 @@ function render(d){
         `<td><span class="dot${pulse}" style="background:${c}" ` +
         `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>` +
         `${a.status}</td>` +
-        `<td>${esc(a.step)}${a.wt
+        `<td class="step"><span ` +
+        `style="white-space:nowrap">${esc(a.step)}</span>${a.wt
           ? ` <span class="chip" style="color:#58a6ff" ` +
             `title="${esc(a.branch||'')}">wt</span>` +
             (a.merged===true
