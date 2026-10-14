@@ -1410,6 +1410,10 @@ th { text-align:left; font-weight:600; color:#8b949e; font-size:11px; text-trans
 td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 td.wrap { white-space:normal; color:#8b949e; font-size:12px; }
 tr.agen { cursor:pointer; }
+.dots span { animation:blink 1.2s infinite; color:#58a6ff; }
+.dots span:nth-child(2) { animation-delay:.4s; }
+.dots span:nth-child(3) { animation-delay:.8s; }
+@keyframes blink { 0%,100%{opacity:.15} 50%{opacity:1} }
 tr.agen td { transition:background .12s; }
 tr.agen:hover td { background:#26405a; }
 tr.hl td { background:#1c2833; }
@@ -1470,11 +1474,11 @@ let AGENTS = [];          // last payload, for the detail modal
 // column layout shared by every per-project table (fixed layout -> the
 // same widths line up across tables)
 const AGENT_COLS = '<colgroup>' +
-  '<col style="width:8%"><col style="width:8%"><col style="width:24%">' +
-  '<col style="width:8%"><col class="hide-s" style="width:7%">' +
+  '<col style="width:8%"><col style="width:8%"><col style="width:22%">' +
+  '<col style="width:7%"><col class="hide-s" style="width:7%">' +
   '<col class="hide-s" style="width:5%"><col class="hide-s" style="width:6%">' +
   '<col style="width:6%"><col style="width:5%"><col style="width:6%">' +
-  '<col class="hide-s" style="width:7%"><col style="width:10%">' +
+  '<col class="hide-s" style="width:6%"><col style="width:14%">' +
   '</colgroup>';
 
 let detailIdx = null;
@@ -1608,8 +1612,11 @@ function render(d){
         `<td>${loc(a.started_at)}</td>` +
         `<td data-el="${a._i}">${elapsed(a,now)}</td>` +
         `<td>${loc(a.ended_at)}</td>` + sessTd +
-        `<td class="wrap">${esc(a.status==='running'
-          ? (a.tail_last||'') : (a.next||a.note||''))}</td></tr>`;
+        (a.status==='running'
+          ? `<td title="${esc(a.tail_last||'')}">${esc(a.tail_last||'')}` +
+            `<span class="dots"><span>.</span><span>.</span><span>.</span>` +
+            `</span></td>`
+          : `<td class="wrap">${esc(a.next||a.note||'')}</td>`) + `</tr>`;
     }
     if (rows.length > SHOW_N)
       h += `<tr><td colspan="12"><a href="#" data-slug="${esc(slug)}">` +
