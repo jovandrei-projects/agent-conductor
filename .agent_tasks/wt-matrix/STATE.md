@@ -70,13 +70,29 @@ the merge instead of only parking the worktree for a human.
       manifests/README parallel section, examples/night.example.toml
 - [ ] efficiency_stats row at session end; commit on dev/merge-tests
 
+## Live proof - lab-merge-stress run (20261014-034119)
+
+`python conductor.py run manifests\lab-merge-stress.toml` from the worktree:
+**21/21 done, 0 failed** (~12 min, alongside the live apartment run).
+- Waves 1-3: 9 worktree members, all `merged=True`. One clean merge per
+  wave; the other 8 all hit REAL conflicts (every worker edited the
+  shared `.agent_tasks/QUEUE.md`) and every one was finished by a
+  `resolve-<step>` session - semantically correct unions (all queue rows
+  marked done, no markers, trees clean).
+- Wave 4 + audits: all done; audit steps committed real work post-merge.
+- Token totals across 21 sessions: 3.03M prompt / 2.50M cached (82%) /
+  25.9k completion / 340 LLM steps - ~144k prompt per trivial task,
+  all visible on dashboard :8774.
+- Sessions spawned: scythe-longan, rare-soap, habitual-spirit,
+  nonchalant-mitten, melted-cashew, + 10 more (names in state.json).
+
 ## Where it stopped
 
-All machinery + matrix + lab staged, 75/75 mock tests green. Remaining:
-commit on `dev/merge-tests`, then (when the apartment-3d run frees the box)
-`python conductor.py run manifests\lab-merge-stress.toml` from
-`C:\Projects\agent-conductor-wt` for the live proof. Verify:
-`python run_tests.py`.
+Committed `5ba30c4` on `dev/merge-tests`. Task effectively complete:
+machinery + matrix + lab + live proof + docs all landed, 75/75 green.
+Deferred: point the main checkout's dashboard at the wt `data/runs` (or
+merge the branch) so :8773 shows token columns - needs the main checkout
+free of the other agent.
 
 ## Deferred or blocked
 

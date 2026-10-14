@@ -94,8 +94,15 @@ worktree `agent-conductor-wt`, parallel to the apartment-3d live run).
 combination space; `merge_resolver` implemented + proven end-to-end
 against real git conflicts via mock `resolve-merge`. Token metrics now
 flow ATIF export -> state.json -> dashboard (per-agent `prompt/out` cell +
-per-run totals). lab-a/b/c fixtures + `manifests/lab-merge-stress.toml`
-staged for a live 4-wave run once the box frees up. 75/75 green.
+per-run totals). 75/75 green.
+
+2026-10-14 ~04:00 - LIVE proof: `lab-merge-stress` ran all 15 steps +
+6 resolver sessions alongside the apartment run, 21/21 done, zero
+failures. 9 worktree branches merged; 8 real conflicts (shared
+`.agent_tasks/QUEUE.md`) all resolved semantically by delegated resolver
+sessions. Tokens: 3.03M prompt / 82% cached / 340 LLM steps for a trivial
+15-file workload (~144k prompt per fresh session - session spin-up cost
+is the dominant term, worth a keep-warm/prompt-cache look later).
 
 ## Phase 3 - polish
 
