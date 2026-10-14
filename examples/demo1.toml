@@ -1,0 +1,29 @@
+# Demo run: two tasks on demo1 (the book-catalog fixture).
+# Needs data/demo1 - `python examples/make_demo_projects.py` creates it.
+# Real sessions, disposable output.
+
+[run]
+name = "demo1"
+checkpoint = true
+
+[defaults]
+model = "gpt-6-luna"
+effort = "min"        # thinking-effort variant -> --model gpt-6-luna-min
+timeout_min = 15
+
+[[step]]
+name = "add-books"
+project = "demo1"
+prompt = """Add exactly these two rows to books.csv (keep the column order
+title,author,genre,year, no trailing blank line):
+  A Fire Upon the Deep,Vernor Vinge,sci-fi,1992
+  The Remains of the Day,Kazuo Ishiguro,literary,1989
+Commit the change."""
+verify = 'findstr /c:"Vinge" books.csv'
+
+[[step]]
+name = "summarize"
+project = "demo1"
+prompt = """Read books.csv and write SUMMARY.md: a short markdown report with
+the total book count and a per-genre count table. Commit it."""
+verify = 'findstr /c:"sci-fi" SUMMARY.md'

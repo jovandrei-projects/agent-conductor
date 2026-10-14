@@ -1,0 +1,26 @@
+# Demo run: two tasks on demo2 (the notes fixture).
+# Needs data/demo2 - `python examples/make_demo_projects.py` creates it.
+
+[run]
+name = "demo2"
+checkpoint = true
+
+[defaults]
+model = "gpt-6-luna"
+effort = "min"
+timeout_min = 15
+
+[[step]]
+name = "fix-index"
+project = "demo2"
+prompt = """INDEX.md is missing notes/todo.md. Rebuild it so it lists every
+file under notes/, alphabetically sorted, one "- notes/<file>" line each.
+Commit the change."""
+verify = 'findstr /c:"todo.md" INDEX.md'
+
+[[step]]
+name = "fix-typos"
+project = "demo2"
+prompt = """notes/todo.md has a typo: "teh" should be "the". Fix it (and any
+other obvious typo you find in notes/). Commit the change."""
+verify = 'findstr /c:"the leaky faucet" notes\\todo.md'

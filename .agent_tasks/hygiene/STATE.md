@@ -66,13 +66,27 @@ agent-conductor registered as a managed service in project-hub
 `services.json` (commit a71a194 there). Second cleanup pass: `data/` pruned
 of repro files + ~50 empty worktree dirs; `manifests/` created as the
 convention for real manifests (its README documents location + run syntax).
-Third: `demo` artifacts sandboxed under `data/demo/` (own project+runs dir)
-so self-test runs stop polluting `data/runs` and the dashboard - the demo
-row flood the user flagged as confusing is gone. Doc fix: `devin list`
-interactive picker is GLOBAL ("all sessions"); only `--format json|csv`
-is cwd-scoped. Next: the first real manifest (queue "not yet filed" item)
-- and the human must decide whether to push agent-conductor to GitHub
-before a cloud step can actually run on it.
+Doc fix: `devin list` interactive picker is GLOBAL ("all sessions"); only
+`--format json|csv` is cwd-scoped.
+
+2026-10-13 ~23:30 follow-ups (same task, reopened):
+- Demo sandbox REVERTED on user call: `demo` writes to `data/runs` again -
+  all projects share the convention; task column disambiguates demo rows.
+- Dashboard: agents split into per-project tables; new `task` column
+  (step's prompt text; old records fall back to extracting the `## Task`
+  body of the rendered prompt file) + `effort` column.
+- `effort` manifest field: fuses as a model-variant suffix on `--model`
+  (`model="gpt-6-luna"` + `effort="min"` -> `gpt-6-luna-min`); unknown
+  variant errors loudly at spawn. Docs say check `devin models list` for
+  exact names (needs auth).
+- Session cleanup AUTOMATED per user approval: `sweep_sessions` runs the
+  same 48h whitelist policy inside `sweep` and once at `serve` startup.
+- Fixtures: `data/demo1` (books.csv catalog) + `data/demo2` (notes/) via
+  `examples/make_demo_projects.py`, registered as slugs in projects.toml;
+  manifests `examples/demo1.toml` / `demo2.toml` / `demo-mixed.toml` (mixed
+  wave-1 parallel across projects). Live run pending auth.
+- BLOCKER: `devin auth status` reports not logged in again (~14h after the
+  morning login) - real demo runs queued on `devin auth logout && login`.
 
 ## Verification
 

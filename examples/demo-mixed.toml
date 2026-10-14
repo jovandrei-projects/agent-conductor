@@ -1,0 +1,38 @@
+# Demo run: one manifest spanning demo1 + demo2.
+# Wave 1 runs one step in each project in parallel (different dirs - no
+# worktree needed); a final demo1 step cross-references demo2's index.
+
+[run]
+name = "demo-mixed"
+checkpoint = true
+
+[defaults]
+model = "gpt-6-luna"
+effort = "min"
+timeout_min = 15
+
+[[step]]
+name = "authors-list"
+project = "demo1"
+wave = 1
+prompt = """Read books.csv and write AUTHORS.md: a markdown list of the
+unique authors, alphabetically sorted, one "- Name" line each. Commit it."""
+verify = 'findstr /c:"Bulgakov" AUTHORS.md'
+
+[[step]]
+name = "new-note"
+project = "demo2"
+wave = 1
+prompt = """Create notes/shopping.md with a short "# Shopping" list (3
+items of your choosing) and add it to INDEX.md, keeping the alphabetical
+order. Commit the change."""
+verify = 'findstr /c:"shopping.md" INDEX.md'
+
+[[step]]
+name = "crossref"
+project = "demo1"
+prompt = """Write CROSSREF.md explaining how this project (the book catalog)
+relates to ../demo2 (a notes collection whose notes/reading.md tracks
+reading). Mention that ../demo2/INDEX.md is the index of the notes.
+One short paragraph is enough. Commit it."""
+verify = 'findstr /i "INDEX.md" CROSSREF.md'

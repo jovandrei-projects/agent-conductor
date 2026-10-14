@@ -94,6 +94,28 @@ mode = "yeet"
             with self.assertRaises(conductor.ManifestError):
                 conductor.load_manifest(m)
 
+    def test_effort_parses_from_defaults(self):
+        with tempfile.TemporaryDirectory() as td:
+            m = write_manifest(Path(td), '''
+[defaults]
+model = "gpt-6-luna"
+effort = "min"
+
+[[step]]
+name = "a"
+project = "."
+prompt = "x"
+
+[[step]]
+name = "b"
+project = "."
+prompt = "y"
+effort = "high"
+''')
+            cfg = conductor.load_manifest(m)
+            self.assertEqual(cfg.steps[0].effort, "min")
+            self.assertEqual(cfg.steps[1].effort, "high")   # step overrides
+
     def test_duplicate_names_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             m = write_manifest(Path(td), '''
@@ -162,6 +184,18 @@ class CommandTests(unittest.TestCase):
         cmd = conductor.devin_cmd(["devin"], step, Path("pf"), Path("ex"))
         self.assertEqual(cmd[1], "--cloud")
 
+    def test_effort_fuses_into_model(self):
+        step = conductor.Step(name="a", project="x", prompt="p",
+                              model="gpt-6-luna", effort="min")
+        cmd = conductor.devin_cmd(["devin"], step, Path("pf"), Path("ex"))
+        i = cmd.index("--model")
+        self.assertEqual(cmd[i + 1], "gpt-6-luna-min")
+        step2 = conductor.Step(name="a", project="x", prompt="p",
+                               model="swe")
+        cmd = conductor.devin_cmd(["devin"], step2, Path("pf"), Path("ex"))
+        i = cmd.index("--model")
+        self.assertEqual(cmd[i + 1], "swe")          # no effort, no suffix
+
 
 class GitTests(unittest.TestCase):
     def test_nested_dir_is_not_a_repo_root(self):
@@ -202,6 +236,7 @@ verify = "python -c \\"import pathlib;assert len(pathlib.Path('WORK.txt').read_t
             run_dir = next(runs.iterdir())
             state = json.loads((run_dir / "state.json").read_text())
             self.assertEqual(state["steps"]["one"]["status"], "done")
+            self.assertEqual(state["steps"]["one"]["task"], "first")
             self.assertEqual(state["steps"]["two"]["status"], "done")
             self.assertEqual(state["steps"]["two"]["verify_ok"], True)
             self.assertTrue(state["steps"]["two"]["session_id"]
@@ -483,6 +518,39 @@ prompt = "first"
             self.assertFalse(a["alive"])   # mock child is long dead
             self.assertTrue(str(a["work_dir"]).endswith("proj"))
 
+    def test_agent_row_carries_task_and_effort(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "  tidy   the  catalog "
+effort = "min"
+''')
+            run_manifest(m, runs)
+            d = conductor.collect_dashboard(runs)
+            a = d["agents"][0]
+            self.assertEqual(a["task"], "tidy the catalog")
+            self.assertEqual(a["effort"], "min")
+
+    def test_task_label_falls_back_to_prompt_file(self):
+        """Old records have no `task` field - recover it from the rendered
+        prompt between the '## Task' / '## Before you finish' markers."""
+        with tempfile.TemporaryDirectory() as td:
+            pf = Path(td) / "p.md"
+            pf.write_text("preamble\n\n## Task\n\nrewrite the parser  "
+                          "carefully\n\n## Before you finish\n\n- stuff\n",
+                          encoding="utf-8")
+            self.assertEqual(
+                conductor.task_label({"prompt": str(pf)}),
+                "rewrite the parser carefully")
+            self.assertIsNone(conductor.task_label({}))
+            self.assertIsNone(conductor.task_label(
+                {"prompt": str(Path(td) / "gone.md")}))
+
 
 class PidAliveTests(unittest.TestCase):
     """2026-10-13: os.kill(pid, 0) is TerminateProcess on Windows - the old
@@ -693,6 +761,35 @@ prompt = "first"
                                                   keep_hours=0)), 0)
             reg = json.loads((proj / ".mock_sessions.json").read_text())
             self.assertEqual(len(reg), 1)   # still there
+
+    def test_sweep_sessions_removes_eligible(self):
+        """The automated path (sweep / serve startup) rms sessions of runs
+        ended >keep_hours ago, whitelist-only, no --rm flag needed."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            self.assertEqual(
+                len(json.loads((proj / ".mock_sessions.json").read_text())), 1)
+            devin = __import__("shlex").split(MOCK)
+            # inside the grace window -> kept
+            self.assertEqual(
+                conductor.sweep_sessions(runs, devin, keep_hours=48), [])
+            self.assertEqual(
+                len(json.loads((proj / ".mock_sessions.json").read_text())), 1)
+            # keep_hours=0 -> eligible -> removed automatically
+            lines = conductor.sweep_sessions(runs, devin, keep_hours=0)
+            self.assertEqual(len(lines), 1)
+            self.assertIn("ok", lines[0])
+            self.assertEqual(
+                json.loads((proj / ".mock_sessions.json").read_text()), [])
 
 
 if __name__ == "__main__":

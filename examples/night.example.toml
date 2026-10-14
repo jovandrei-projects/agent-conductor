@@ -25,6 +25,9 @@ checkpoint = true
 
 [defaults]
 model = "swe"          # cheap model for grind phases; use "opus"/"gpt" for planning
+# effort = "min"       # thinking-effort variant; fuses onto the model id
+                       # (model+effort -> "swe-min" style). Unknown variant
+                       # fails loudly at spawn. Column on the dashboard.
 mode = "bypass"        # unattended: no human to answer prompts
 timeout_min = 60
 

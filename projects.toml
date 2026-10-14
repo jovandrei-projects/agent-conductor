@@ -20,6 +20,14 @@ cloud_ok = true   # decided 2026-10-13. NOTE: repo has no git remote yet -
 path = "../apartment-3d"
 cloud_ok = true
 
+# Demo fixtures under data/ (gitignored, disposable). Recreate with
+# `python examples/make_demo_projects.py`; used by examples/demo*.toml.
+[project.demo1]
+path = "data/demo1"
+
+[project.demo2]
+path = "data/demo2"
+
 [project.chrome-bookmarks]
 path = "../chrome-bookmarks"
 cloud_ok = false    # private: personal browsing record

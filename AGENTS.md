@@ -61,7 +61,9 @@ Session hygiene: `sessions` whitelists on ids recorded in run state.json -
 interactive/human sessions can never be listed or removed. `--rm` deletes
 sessions whose run ended more than `--keep-hours` ago (default 48); the
 ATIF transcript survives in the run dir, so spawned sessions are
-disposable bookkeeping. `devin list --format json|csv` is cwd-scoped -
+disposable bookkeeping. The same 48h cleanup runs automatically inside
+`sweep` and once at `serve` startup (`sweep_sessions`) - still
+whitelist-only, so automation is safe. `devin list --format json|csv` is cwd-scoped -
 sessions are only visible under the work_dir that spawned them (the
 interactive `devin list` picker is GLOBAL, "all sessions" - it ignores
 cwd, so the sidebar-style list mixes every workspace's sessions).

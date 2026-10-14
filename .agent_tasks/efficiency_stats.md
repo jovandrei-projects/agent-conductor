@@ -30,3 +30,4 @@ new input, so the column to watch is **new input**.
 If the figures are not available at the end of a session, write the row with
 the counts left as `n/a` rather than skipping it, so the session is still
 accounted for.
+| agent-conductor / hygiene (demo un-sandboxed; per-project dashboard + task/effort cols; auto 48h session sweep; demo1/demo2 fixtures+manifests pending auth) | n/a | n/a | n/a | n/a |

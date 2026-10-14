@@ -103,6 +103,8 @@ class Step:
     cloud: bool = False
     wave: int | None = None            # adjacent steps sharing a wave run in parallel
     worktree: bool = False             # run in a temp git worktree + branch, merged after
+    effort: str | None = None          # thinking-effort variant suffix fused onto
+                                       # the model id ("min" -> "model-min")
 
 
 @dataclasses.dataclass
@@ -163,7 +165,8 @@ def load_manifest(path: Path) -> Manifest:
             verify_must_pass=bool(merged.get("verify_must_pass", True)),
             cloud=bool(merged.get("cloud", False)),
             wave=merged.get("wave"),
-            worktree=bool(merged.get("worktree", False))))
+            worktree=bool(merged.get("worktree", False)),
+            effort=merged.get("effort") or None))
     if not steps:
         raise ManifestError("manifest has no [[step]] entries")
     max_parallel = run.get("max_parallel")
@@ -259,7 +262,11 @@ def devin_cmd(devin_argv: list[str], step: Step, prompt_path: Path,
         cmd.append("--cloud")
     cmd += ["--print", "--prompt-file", str(prompt_path)]
     if step.model:
-        cmd += ["--model", step.model]
+        # effort fuses as a model-variant suffix ("swe-1-6-fast" style); an
+        # unknown variant makes devin error loudly at spawn instead of
+        # silently running the wrong effort.
+        model = f"{step.model}-{step.effort}" if step.effort else step.model
+        cmd += ["--model", model]
     cmd += ["--permission-mode", MODE_FLAG[step.mode],
             "--export", str(export_path),
             "--respect-workspace-trust", "false"]
@@ -589,13 +596,21 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     stdout_log = run_dir / f"{step.name}.stdout.log"
     export_path = run_dir / f"{step.name}.export.json"
 
+    body_src = step.prompt
+    if body_src is None and step.prompt_file:
+        try:
+            body_src = (cfg.path.parent / step.prompt_file).read_text(
+                encoding="utf-8")
+        except OSError:
+            body_src = step.prompt_file
     with STATE_LOCK:
         rec = state["steps"].setdefault(step.name, {})
         rec.update(name=step.name, slug=slug, project=str(work_dir),
                    work_dir=str(work_dir), branch=branch,
                    status="running", started_at=now_iso(), ended_at=None,
                    model=step.model, mode=step.mode, cloud=step.cloud,
-                   timeout_min=step.timeout_min,
+                   effort=step.effort, timeout_min=step.timeout_min,
+                   task=" ".join((body_src or "").split())[:160],
                    prompt=str(prompt_path), stdout_log=str(stdout_log),
                    export=str(export_path))
         save_state(run_dir, state)
@@ -1026,6 +1041,10 @@ def sweep_runs(runs_dir: Path, write: bool = True) -> list[str]:
 def cmd_sweep(args: argparse.Namespace) -> int:
     runs_dir = Path(args.runs_dir).resolve() if args.runs_dir else RUNS_DIR
     lines = sweep_runs(runs_dir)
+    devin_argv = shlex.split(getattr(args, "devin", None)
+                             or os.environ.get("CONDUCTOR_DEVIN") or "devin")
+    lines += sweep_sessions(runs_dir, devin_argv,
+                            getattr(args, "keep_hours", 48.0))
     print("\n".join(lines) if lines else "nothing stale")
     return 0
 
@@ -1040,18 +1059,13 @@ def devin_rm(devin_argv: list[str], cwd: Path, sid: str) -> int:
         return 1
 
 
-def cmd_sessions(args: argparse.Namespace) -> int:
-    """Conductor-spawned devin sessions still registered in their work_dir.
+def collect_sessions(runs_dir: Path, devin_argv: list[str]) -> list[dict]:
+    """Conductor-spawned devin sessions still registered under their work_dir.
 
-    Whitelist: only session ids recorded in run state.json are ever listed
-    or removed - interactive sessions are not in that registry, so human
-    sessions can't be touched. --rm deletes sessions whose run ended more
-    than --keep-hours ago via `devin rm --force`; the transcript survives
-    in the run dir (export.json + stdout.log).
+    Whitelist on ids recorded in run state.json - interactive sessions are
+    never in that registry, so human sessions can never appear here. Each
+    row carries age_s for --keep-hours decisions.
     """
-    runs_dir = Path(args.runs_dir).resolve() if args.runs_dir else RUNS_DIR
-    devin_argv = shlex.split(args.devin or os.environ.get("CONDUCTOR_DEVIN")
-                             or "devin")
     spawned: dict[str, dict] = {}
     for sj in sorted(runs_dir.glob("*/state.json")):
         try:
@@ -1072,24 +1086,59 @@ def cmd_sessions(args: argparse.Namespace) -> int:
     for sid, info in spawned.items():
         if info["work_dir"] and Path(info["work_dir"]).is_dir():
             by_dir.setdefault(info["work_dir"], []).append(sid)
-    present: list[tuple[str, dict]] = []
+    out: list[dict] = []
     for wd, sids in by_dir.items():
         live_ids = session_ids(devin_argv, Path(wd))
-        present += [(sid, spawned[sid]) for sid in sids if sid in live_ids]
+        for sid in sids:
+            if sid in live_ids:
+                info = dict(spawned[sid], sid=sid)
+                t = _iso_ts(info["ended"])
+                info["age_s"] = time.time() - t if t else None
+                out.append(info)
+    return out
+
+
+def _session_eligible(info: dict, keep_hours: float) -> bool:
+    return (info["run_ended"] and info["age_s"] is not None
+            and info["age_s"] > keep_hours * 3600)
+
+
+def sweep_sessions(runs_dir: Path, devin_argv: list[str],
+                   keep_hours: float = 48.0) -> list[str]:
+    """Automated half of `sessions --rm`: delete spawned sessions whose run
+    ended >keep_hours ago. Same whitelist as `sessions` - human sessions are
+    structurally unreachable. Transcripts stay in the run dir."""
+    lines: list[str] = []
+    for info in collect_sessions(runs_dir, devin_argv):
+        if not _session_eligible(info, keep_hours):
+            continue
+        rc = devin_rm(devin_argv, Path(info["work_dir"]), info["sid"])
+        lines.append(f"rm {info['sid']} ({info['run']}/{info['step']}): "
+                     f"{'ok' if rc == 0 else f'rc={rc}'}")
+    return lines
+
+
+def cmd_sessions(args: argparse.Namespace) -> int:
+    """List/remove conductor-spawned devin sessions (whitelist via
+    collect_sessions). --rm deletes sessions whose run ended more than
+    --keep-hours ago; the transcript survives in the run dir."""
+    runs_dir = Path(args.runs_dir).resolve() if args.runs_dir else RUNS_DIR
+    devin_argv = shlex.split(args.devin or os.environ.get("CONDUCTOR_DEVIN")
+                             or "devin")
+    present = collect_sessions(runs_dir, devin_argv)
     if not present:
         print("no conductor-spawned sessions in `devin list`")
         return 0
-    removable: list[tuple[str, dict]] = []
+    removable: list[dict] = []
     print(f"{len(present)} conductor-spawned session(s) registered:")
-    for sid, info in present:
-        t = _iso_ts(info["ended"])
-        age_s = time.time() - t if t else None
+    for info in present:
+        age_s = info["age_s"]
         age_h = round(age_s / 3600, 1) if age_s is not None else None
-        ok = (info["run_ended"] and age_s is not None
-              and age_s > args.keep_hours * 3600)
+        ok = _session_eligible(info, args.keep_hours)
         if ok:
-            removable.append((sid, info))
-        print(f"  {sid:<22} {info['step']:<16} {info['status'] or '?':<9} "
+            removable.append(info)
+        print(f"  {info['sid']:<22} {info['step']:<16} "
+              f"{info['status'] or '?':<9} "
               f"age={age_h if age_h is not None else '?'}h  "
               f"{'rm-eligible' if ok else 'kept'}  "
               f"{Path(info['work_dir']).name}")
@@ -1098,9 +1147,9 @@ def cmd_sessions(args: argparse.Namespace) -> int:
             print(f"{len(removable)} from runs ended >{args.keep_hours}h ago "
                   f"- `--rm` deletes them (transcripts stay in the run dir)")
         return 0
-    for sid, info in removable:
-        rc = devin_rm(devin_argv, Path(info["work_dir"]), sid)
-        print(f"  rm {sid}: {'ok' if rc == 0 else f'rc={rc}'}")
+    for info in removable:
+        rc = devin_rm(devin_argv, Path(info["work_dir"]), info["sid"])
+        print(f"  rm {info['sid']}: {'ok' if rc == 0 else f'rc={rc}'}")
     return 0
 
 
@@ -1112,6 +1161,24 @@ _STATUS_COLOR = {"done": "#3fb950", "partial": "#d29922", "blocked": "#d29922",
                  "failed": "#f85149", "timed_out": "#f0883e",
                  "running": "#58a6ff", "queued": "#8b949e",
                  "lost": "#6e7681"}
+
+
+def task_label(rec: dict) -> str | None:
+    """What the agent was asked to do. New records store `task` directly;
+    for pre-field records, dig the body out of the rendered prompt file
+    (between the preamble's '## Task' and '## Before you finish' markers)."""
+    if rec.get("task"):
+        return rec["task"]
+    pf = rec.get("prompt")
+    if not pf:
+        return None
+    try:
+        text = Path(pf).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(r"## Task\s*\n+(.*?)\n*## ", text, re.S)
+    body = m.group(1) if m else text
+    return " ".join(body.split())[:160] or None
 
 
 def collect_dashboard(runs_dir: Path) -> dict:
@@ -1140,6 +1207,7 @@ def collect_dashboard(runs_dir: Path) -> dict:
                 "alive": step_live(rec),
                 "pid": rec.get("pid"), "session_id": rec.get("session_id"),
                 "model": rec.get("model"), "mode": rec.get("mode"),
+                "effort": rec.get("effort"), "task": task_label(rec),
                 "cloud": rec.get("cloud"), "verify_ok": rec.get("verify_ok"),
                 "note": rec.get("note"), "exit_code": rec.get("exit_code"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
@@ -1165,6 +1233,8 @@ body { background:#0d1117; color:#e6edf3; font:14px/1.45 ui-monospace,Consolas,m
 h1 { font-size:18px; margin:0 0 4px; }
 .sub { color:#8b949e; font-size:12px; margin-bottom:14px; }
 h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:#8b949e; margin:22px 0 8px; }
+h3.proj { font-size:13px; color:#e6edf3; margin:16px 0 4px; }
+h3.proj .sub { margin-bottom:0; font-weight:400; }
 table { border-collapse:collapse; width:100%; }
 th { text-align:left; font-weight:600; color:#8b949e; font-size:11px; text-transform:uppercase; padding:4px 10px 4px 0; border-bottom:1px solid #21262d; }
 td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top; white-space:nowrap; }
@@ -1179,7 +1249,7 @@ a { color:#58a6ff; text-decoration:none; }
 </style></head><body>
 <h1>agent-conductor</h1>
 <div class="sub" id="meta">loading&hellip;</div>
-<h2>agents</h2><div class="wrapw"><table id="agents"></table></div>
+<h2>agents by project</h2><div id="agents"></div>
 <h2>runs</h2><div class="wrapw"><table id="runs"></table></div>
 <script>
 const COLORS = {done:'#3fb950',partial:'#d29922',blocked:'#d29922',
@@ -1206,25 +1276,45 @@ function render(d){
     `${d.agents.length} agents | ${live.length} running | ` +
     `cpu ${d.cpu_count||'?'} cores | free ram ${d.free_ram_gb||'?'} GB | ` +
     `refreshed ${loc(d.generated_at)}`;
-  let h = '<tr><th></th><th>step</th><th>run</th><th>project</th>' +
-    '<th class="hide-s">model</th><th class="hide-s">mode</th>' +
-    '<th>started</th><th>elapsed</th><th>ended</th>' +
-    '<th class="hide-s">session</th><th>note</th></tr>';
-  for (const a of d.agents){
-    const c = COLORS[a.status]||'#8b949e';
-    const pulse = a.status==='running' ? ' run' : '';
-    const sess = a.session_id ? String(a.session_id).slice(0,14) : '-';
-    h += `<tr><td><span class="dot${pulse}" style="background:${c}" ` +
-      `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>${a.status}</td>` +
-      `<td>${esc(a.step)}</td><td>${esc(a.run)}</td><td>${esc(a.slug)}</td>` +
-      `<td class="hide-s">${esc(a.model||'-')}</td>` +
-      `<td class="hide-s">${esc(a.mode||'-')}${a.cloud?' cloud':''}</td>` +
-      `<td>${loc(a.started_at)}</td><td>${elapsed(a,now)}</td>` +
-      `<td>${loc(a.ended_at)}</td>` +
-      `<td class="hide-s">${esc(sess)}</td>` +
-      `<td class="wrap">${esc(a.note||'')}</td></tr>`;
+  // one table per project (slug) so each project's agents are visible
+  // independently; groups ordered by newest activity first.
+  const groups = {};
+  for (const a of d.agents) (groups[a.slug||'?'] ??= []).push(a);
+  const slugs = Object.keys(groups).sort((x,y)=>
+    (groups[y][0].started_at||'') < (groups[x][0].started_at||'') ? -1 : 1);
+  let h = '';
+  for (const slug of slugs){
+    const rows = groups[slug];
+    const nRun = rows.filter(r=>r.status==='running').length;
+    h += `<h3 class="proj">${esc(slug)} <span class="sub">` +
+      `${rows.length} agent(s)${nRun?`, ${nRun} running`:''}</span></h3>` +
+      '<div class="wrapw"><table><tr><th></th><th>step</th>' +
+      '<th>task</th><th>run</th>' +
+      '<th class="hide-s">model</th><th class="hide-s">effort</th>' +
+      '<th class="hide-s">mode</th>' +
+      '<th>started</th><th>elapsed</th><th>ended</th>' +
+      '<th class="hide-s">session</th><th>note</th></tr>';
+    for (const a of rows){
+      const c = COLORS[a.status]||'#8b949e';
+      const pulse = a.status==='running' ? ' run' : '';
+      const sess = a.session_id ? String(a.session_id).slice(0,14) : '-';
+      h += `<tr><td><span class="dot${pulse}" style="background:${c}" ` +
+        `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>` +
+        `${a.status}</td>` +
+        `<td>${esc(a.step)}</td><td class="wrap">${esc(a.task||'')}</td>` +
+        `<td>${esc(a.run)}</td>` +
+        `<td class="hide-s">${esc(a.model||'-')}</td>` +
+        `<td class="hide-s">${esc(a.effort||'-')}</td>` +
+        `<td class="hide-s">${esc(a.mode||'-')}${a.cloud?' cloud':''}</td>` +
+        `<td>${loc(a.started_at)}</td><td>${elapsed(a,now)}</td>` +
+        `<td>${loc(a.ended_at)}</td>` +
+        `<td class="hide-s">${esc(sess)}</td>` +
+        `<td class="wrap">${esc(a.note||'')}</td></tr>`;
+    }
+    h += '</table></div>';
   }
-  document.getElementById('agents').innerHTML = h;
+  document.getElementById('agents').innerHTML =
+    h || '<span class="sub">no agents yet</span>';
   h = '<tr><th>run</th><th>started</th><th>ended</th>' +
     '<th>steps</th><th>max//</th><th class="hide-s">dir</th></tr>';
   for (const r of d.runs){
@@ -1249,6 +1339,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     runs_dir = Path(args.runs_dir).resolve() if args.runs_dir else RUNS_DIR
     for line in sweep_runs(runs_dir):       # one-shot cleanup at startup;
         print(f"sweep: {line}")             # display stays honest after
+    # 48h session cleanup also runs here: spawned sessions are disposable
+    # bookkeeping (transcripts live in the run dir) and the whitelist makes
+    # human sessions unreachable, so it is safe unattended.
+    devin_argv = shlex.split(os.environ.get("CONDUCTOR_DEVIN") or "devin")
+    for line in sweep_sessions(runs_dir, devin_argv):
+        print(f"sweep: {line}")
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def _send(self, body: bytes, ctype: str) -> None:
@@ -1281,11 +1377,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_demo(args: argparse.Namespace) -> int:
-    """End-to-end against tests/mock_devin.py - no auth, no credits.
-    Self-test only: all artifacts are sandboxed under data/demo/ so its
-    runs never pollute the real data/runs/ registry or the dashboard."""
-    demo_dir = DATA_DIR / "demo"
-    proj = demo_dir / "project"
+    """End-to-end against tests/mock_devin.py - no auth, no credits."""
+    proj = DATA_DIR / "demo-project"
     proj.mkdir(parents=True, exist_ok=True)
     if not is_git_repo(proj):
         subprocess.run(["git", "init"], cwd=str(proj), capture_output=True)
@@ -1296,7 +1389,7 @@ def cmd_demo(args: argparse.Namespace) -> int:
     tasks.mkdir(exist_ok=True)
     (tasks / "QUEUE.md").write_text("# queue\n\n| # | Task | Status |\n",
                                     encoding="utf-8")
-    manifest = demo_dir / "demo.toml"
+    manifest = DATA_DIR / "demo.toml"
     manifest.write_text(f"""\
 [run]
 name = "demo"
@@ -1315,9 +1408,7 @@ verify = "python -c \\"import pathlib;assert pathlib.Path('WORK.txt').read_text(
     mock = (ROOT / "tests" / "mock_devin.py").as_posix()
     py = Path(sys.executable).as_posix()
     ns = argparse.Namespace(manifest=str(manifest), resume=None,
-                            devin=f"{py} {mock}",
-                            runs_dir=args.runs_dir
-                                    or str(demo_dir / "runs"),
+                            devin=f"{py} {mock}", runs_dir=args.runs_dir,
                             hub=False, keep_awake=False)
     return cmd_run(ns)
 
@@ -1358,20 +1449,21 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--max-parallel", type=int, default=None,
                            help="cap concurrent agents (overrides the "
                                 "manifest's run.max_parallel)")
-        if name in ("plan", "run", "demo", "sessions"):
+        if name in ("plan", "run", "demo", "sessions", "sweep"):
             p.add_argument("--devin", default=None,
                            help="devin command override (e.g. mock shim). "
                                 "Split with shlex - quote or use forward "
                                 "slashes in Windows paths")
         if name in ("run", "demo", "serve", "sweep", "sessions"):
             p.add_argument("--runs-dir", default=None, help=argparse.SUPPRESS)
+        if name in ("sessions", "sweep"):
+            p.add_argument("--keep-hours", type=float, default=48,
+                           help="grace period after a run ends before its "
+                                "sessions are rm-eligible (default 48)")
         if name == "sessions":
             p.add_argument("--rm", action="store_true",
                            help="delete sessions from runs ended more than "
                                 "--keep-hours ago (devin rm --force)")
-            p.add_argument("--keep-hours", type=float, default=48,
-                           help="grace period after a run ends before its "
-                                "sessions are rm-eligible (default 48)")
         if name in ("run", "demo"):
             p.add_argument("--no-hub", dest="hub", action="store_false",
                            default=True, help="don't create/update a hub.db row")

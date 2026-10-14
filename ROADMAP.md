@@ -13,8 +13,8 @@ One phase at a time, in order. Mark items `[x]` as they land.
 || Privacy | `cloud_ok` per project in `projects.toml`; false for wifi-network-monitor, chrome-bookmarks, money-plan. Enforced at resolve time. |
 || Manifest format | TOML (stdlib `tomllib`), not Markdown - QUEUE.md stays the task source, the manifest is the run skeleton. |
 | First cloud_ok pair | `agent-conductor` + `apartment-3d` (human call, 2026-10-13). Caveat: agent-conductor has no git remote - a cloud step clones from origin, so it needs the repo pushed first. |
-| Default model | `swe` (= SWE-2 Max) while it is free through 2026-10-16; after that `gpt-6-luna` at max thinking effort. Set per manifest via `[defaults] model`. |
-| Spawned-session hygiene | `conductor.py sessions` whitelists on ids recorded in state.json - human sessions can't be touched. `--rm` deletes sessions from runs ended >48h ago; transcripts live in the run dir anyway. |
+| Default model | `swe` (= SWE-2 Max) while it is free through 2026-10-16; after that `gpt-6-luna` at max thinking effort. Set per manifest via `[defaults] model`; thinking effort via `effort` which fuses as a variant suffix (`gpt-6-luna` + `min` -> `--model gpt-6-luna-min`). |
+| Spawned-session hygiene | `conductor.py sessions` whitelists on ids recorded in state.json - human sessions can't be touched. `--rm` deletes sessions from runs ended >48h ago; the same cleanup is automated in `sweep` + `serve` startup (user-approved 2026-10-13); transcripts live in the run dir anyway. |
 
 ## Phase 1 - sequential core (this session)
 
@@ -73,6 +73,16 @@ guard). Stale records now sweep to `lost` (10 phantom rows cleared; `lost`
 re-runs on --resume); `sessions` command lists/cleans spawned devin
 sessions; cloud_ok marked for agent-conductor + apartment-3d; 34/34 tests
 green.
+
+2026-10-13 ~23:30 - dashboard + demo upgrade. Agents now grouped into
+per-project tables with a `task` column (prompt text, with a fallback that
+extracts the `## Task` body of old records' prompt files) and an `effort`
+column (`effort` manifest field -> model-variant suffix). Demo sandbox
+reverted per user call: `demo` writes to `data/runs` like every project.
+Two fixture projects (demo1 book catalog, demo2 notes) under `data/` +
+`examples/make_demo_projects.py` + three real manifests (demo1-only,
+demo2-only, mixed) pending a live run - blocked on `devin auth login`
+(credentials lapsed again). 39/39 tests green.
 
 ## Phase 3 - polish
 
