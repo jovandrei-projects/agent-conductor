@@ -1324,6 +1324,11 @@ def stdout_tail(path: str | None, lines: int = 15) -> str | None:
     return "\n".join(data.decode("utf-8", "replace").splitlines()[-lines:])
 
 
+# serve process boot id - embedded in every payload so an open tab notices
+# a restart and reloads itself to get fresh JS/HTML.
+SERVE_BOOT = now_iso()
+
+
 def collect_dashboard(runs_dir: Path,
                       devin_argv: list[str] | None = None) -> dict:
     """Flatten every run's state.json into the shape the UI renders: one
@@ -1387,7 +1392,8 @@ def collect_dashboard(runs_dir: Path,
                                          st.get("steps", {}).values()
                                          if r.get("slug")})})
     agents.sort(key=lambda a: a.get("started_at") or "", reverse=True)
-    return {"generated_at": now_iso(), "cpu_count": os.cpu_count(),
+    return {"generated_at": now_iso(), "serve_boot": SERVE_BOOT,
+            "cpu_count": os.cpu_count(),
             "free_ram_gb": free_ram_gb(), "runs": runs, "agents": agents,
             "auth": auth_status(devin_argv or ["devin"])}
 
@@ -1503,7 +1509,7 @@ function showDetail(i){
   document.getElementById('backdrop').hidden = false;
 }
 
-let lastSig = null;
+let lastSig = null, BOOT = null;
 function tickElapsed(now){
   for (const a of AGENTS){
     const td = document.querySelector(`td[data-el="${a._i}"]`);
@@ -1511,6 +1517,8 @@ function tickElapsed(now){
   }
 }
 function render(d){
+  if (BOOT===null) BOOT = d.serve_boot;
+  else if (d.serve_boot !== BOOT){ location.reload(); return; }
   lastData = d; AGENTS = d.agents;
   AGENTS.forEach((a,i)=>a._i=i);   // stable cell ids before the sig check
   const now = Date.now();
