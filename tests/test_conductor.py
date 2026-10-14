@@ -371,6 +371,169 @@ prompt = "first"
             state = json.loads((run_dir / "state.json").read_text())
             self.assertEqual(state["steps"]["one"]["status"], "done")
 
+    def test_wave_finish_order_keeps_manifest_merge_order(self):
+        """p2 finishing FIRST must not change merge-back order: merges are
+        sequential in manifest order regardless of worker speed."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "slow"
+project = "{proj.as_posix()}"
+prompt = "sleep=2 write SLOW.txt"
+wave = 1
+worktree = true
+
+[[step]]
+name = "fast"
+project = "{proj.as_posix()}"
+prompt = "write FAST.txt"
+wave = 1
+worktree = true
+''')
+            rc = run_manifest(m, runs)
+            self.assertEqual(rc, 0)
+            # slow ends after fast but still merged first - the first merge
+            # fast-forwards (no merge commit), so read order from reflog:
+            # newest entry first, so 'fast' must appear BEFORE 'slow'.
+            # Branch names carry the run dir: conductor/<ts>-t/<step>.
+            run_name = next(runs.iterdir()).name
+            reflog = git(proj, "reflog", "--format=%gs").stdout
+            self.assertLess(reflog.index(f"conductor/{run_name}/fast"),
+                            reflog.index(f"conductor/{run_name}/slow"))
+
+    def test_middle_failure_continue_runs_rest(self):
+        """on_failure=continue: a failed middle step must not starve the
+        steps after it."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "write A.txt"
+
+[[step]]
+name = "bad"
+project = "{proj.as_posix()}"
+prompt = "write B.txt"
+verify = "exit 1"
+
+[[step]]
+name = "three"
+project = "{proj.as_posix()}"
+prompt = "write C.txt"
+''', extra='on_failure = "continue"')
+            rc = run_manifest(m, runs)
+            self.assertEqual(rc, 1)   # run reports failure overall
+            state = json.loads(
+                (next(runs.iterdir()) / "state.json").read_text())
+            self.assertEqual(state["steps"]["one"]["status"], "done")
+            self.assertEqual(state["steps"]["bad"]["status"], "failed")
+            self.assertEqual(state["steps"]["bad"]["verify_ok"], False)
+            self.assertEqual(state["steps"]["three"]["status"], "done")
+
+    def test_verify_soft_fail_still_done(self):
+        """verify_must_pass=false: a failing verify records verify_ok=False
+        but the step still counts as done (advisory gate)."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+verify = "exit 1"
+verify_must_pass = false
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            state = json.loads(
+                (next(runs.iterdir()) / "state.json").read_text())
+            self.assertEqual(state["steps"]["one"]["status"], "done")
+            self.assertEqual(state["steps"]["one"]["verify_ok"], False)
+
+    def test_two_projects_same_wave_parallel_no_worktree(self):
+        """Different project dirs in one wave run in the dirs themselves -
+        no worktree needed, nothing to merge."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            p1 = make_project(base, "projA")
+            p2 = make_project(base, "projB")
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "a"
+project = "{p1.as_posix()}"
+prompt = "write A.txt"
+wave = 1
+
+[[step]]
+name = "b"
+project = "{p2.as_posix()}"
+prompt = "write B.txt"
+wave = 1
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            self.assertTrue((p1 / "A.txt").read_text().strip())
+            self.assertTrue((p2 / "B.txt").read_text().strip())
+
+    def test_failed_worktree_step_keeps_unmerged_work(self):
+        """A failed step whose branch DID get commits keeps its worktree
+        (partial work is preserved, merge aborted)."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "write A.txt"
+worktree = true
+verify = "exit 1"
+''')
+            self.assertEqual(run_manifest(m, runs), 1)
+            run_dir = next(runs.iterdir())
+            rec = json.loads((run_dir / "state.json").read_text())["steps"]["one"]
+            self.assertEqual(rec["status"], "failed")
+            self.assertTrue(Path(rec["work_dir"]).is_dir())
+            self.assertIn("unmerged work", rec["note"])
+            self.assertTrue(git(proj, "branch", "--list",
+                                "conductor/*").stdout.strip())
+
+    def test_dead_spawn_worktree_removed_as_debris(self):
+        """A step that fails before spawning (bad devin cmd) leaves a
+        worktree+branch with zero commits -> cleaned as debris."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+worktree = true
+''')
+            rc = conductor.cmd_run(argparse.Namespace(
+                manifest=str(m), resume=None, devin="nonexistent-xyz-abc",
+                runs_dir=str(runs), hub=False, keep_awake=False))
+            self.assertEqual(rc, 1)
+            run_dir = next(runs.iterdir())
+            rec = json.loads((run_dir / "state.json").read_text())["steps"]["one"]
+            self.assertEqual(rec["status"], "failed")
+            self.assertIn("no work product", rec["note"])
+            self.assertEqual(git(proj, "worktree", "list",
+                                 "--porcelain").stdout.count("worktree"), 1)
+            self.assertEqual(git(proj, "branch", "--list",
+                                 "conductor/*").stdout.strip(), "")
+
     def test_wave_collision_without_worktree_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)

@@ -1,0 +1,17 @@
+# One-step sanity on a REAL project via the mock: exercises worktree add,
+# spawn, post-step commit and merge-back on apartment-3d's actual repo.
+# Run with: python conductor.py run examples/real-touch.toml
+#           --devin "<python> tests/mock_devin.py"
+
+[run]
+name = "real-touch"
+checkpoint = true
+
+[defaults]
+timeout_min = 5
+
+[[step]]
+name = "touch"
+project = "apartment-3d"
+worktree = true
+prompt = "Append a line to DEMO_TOUCH.txt - conductor machinery check."

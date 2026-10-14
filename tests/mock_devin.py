@@ -86,6 +86,11 @@ def main() -> int:
     sid = "mock-" + "".join(random.choices(string.ascii_lowercase, k=6))
     import re
     m = re.search(r"([A-Za-z0-9_]+\.txt)", body)
+    # prompt "sleep=N" simulates a slow worker so waves can finish
+    # out of manifest order
+    slow = re.search(r"sleep=([0-9.]+)", body)
+    if slow:
+        time.sleep(float(slow.group(1)))
     work = cwd / (m.group(1) if m else "WORK.txt")
     n = sum(1 for _ in open(work, encoding="utf-8")) if work.is_file() else 0
     # sid in the line: two parallel worktrees writing the same file produce

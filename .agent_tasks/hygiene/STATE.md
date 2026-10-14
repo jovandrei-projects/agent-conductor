@@ -101,8 +101,29 @@ Doc fix: `devin list` interactive picker is GLOBAL ("all sessions"); only
   both paths + resume-of-lost-step; mock lines are now session-unique so
   parallel same-file writes actually diverge.
 - Token TTL answered by docs: CLI tokens do NOT expire by default - dead
-  means revoked/rejected server-side. Two observed cases; watch the next
-  login for a pattern.
+  means revoked/rejected server-side. CONFIRMED 2026-10-14 ~00:30: a fresh
+  `devin auth login` wrote credentials.toml and `auth status`/`-p` still
+  report not-logged-in minutes later - the freshly minted token is rejected
+  server-side immediately. Next user action: `--force-manual-token-flow`
+  paste flow, else a `devin bug`/support ticket.
+- Dashboard v3: fixed-width colgroup (aligned across project tables), runs
+  table on top with per-run project chips, status filter chips, latest-10 +
+  "show N older" per table, hover-a-run highlights its agents, click an
+  agent row for a detail modal, `NEXT:` line captured into a result column,
+  session cell dims when the session was rm'd from devin list.
+- Real-repo proof: examples/real-touch.toml ran a mock worktree step on
+  apartment-3d; DEMO_TOUCH.txt merged into main. Found + fixed: worktree
+  branches now carry the RUN DIR name (re-running a manifest can't collide
+  with a stale branch), nameless failed-worktree rec crashed hub_update,
+  failed steps with empty branches auto-remove their worktree as debris,
+  failed steps WITH work keep the worktree + a note.
+- Adversarial coverage now at 47 tests: out-of-order finish merge order,
+  same-file conflict, middle-failure with on_failure=continue, advisory
+  verify (must_pass=false), cross-project wave without worktrees,
+  lost-step resume, spawn-failure debris cleanup.
+- Global skill installed: %APPDATA%\devin\skills\agent-conductor\SKILL.md
+  lets any session launch overnight runs; manifests/README got the
+  money-plan/mobile-apps worked example.
 
 ## Verification
 

@@ -48,6 +48,7 @@ TASK_PY = ROOT.parent / "mobile-apps" / "pc-bridge" / "task.py"
 LOG = logging.getLogger("conductor")
 STATE_LOCK = threading.RLock()
 STATUS_RE = re.compile(r"^STATUS:\s*([A-Za-z_-]+)", re.M)
+NEXT_RE = re.compile(r"^NEXT:\s*(.+)", re.M)
 SESSION_URL_RE = re.compile(
     r"app\.devin\.ai/sessions/([A-Za-z0-9_-]+)|(devin-[0-9a-f]{32})")
 VALID_MODES = {"normal", "accept-edits", "smart", "bypass", "dangerous",
@@ -283,14 +284,19 @@ def render_prompt(step: Step, slug: str, project_dir: Path,
                                        project_dir=project_dir)
 
 
-def session_ids(devin_argv: list[str], cwd: Path) -> set[str]:
+def session_ids(devin_argv: list[str], cwd: Path) -> set[str] | None:
+    """Session ids `devin list` reports for cwd, or None when the listing
+    itself failed (devin missing, bad dir) - callers must not treat a
+    failed listing as 'all sessions gone'."""
     try:
         out = subprocess.run(devin_argv + ["list", "--format", "json"],
                              cwd=str(cwd), capture_output=True, text=True,
                              encoding="utf-8", errors="replace", timeout=60)
+        if out.returncode != 0:
+            return None
         return {s["id"] for s in json.loads(out.stdout or "[]")}
     except Exception:
-        return set()
+        return None
 
 
 def check_auth(devin_argv: list[str]) -> bool:
@@ -518,6 +524,18 @@ def worktree_add(repo_dir: Path, wt_path: Path, branch: str) -> bool:
     return r.returncode == 0
 
 
+def worktree_remove(repo_dir: Path, wt_path: Path, branch: str) -> None:
+    _git(repo_dir, "worktree", "remove", "--force", str(wt_path))
+    _git(repo_dir, "branch", "-D", branch)
+
+
+def worktree_debris(repo_dir: Path, wt_path: Path, branch: str) -> bool:
+    """A branch is debris when it carries no commits beyond the repo's HEAD
+    (the step died before committing anything). Safe to delete."""
+    r = _git(repo_dir, "rev-list", "--count", f"HEAD..{branch}")
+    return r.returncode == 0 and r.stdout.strip() == "0"
+
+
 def worktree_merge(repo_dir: Path, wt_path: Path, branch: str) -> bool:
     """Merge the step's branch into the main checkout. On conflict, abort the
     merge and LEAVE the worktree+branch for a human - the work is not lost."""
@@ -525,8 +543,7 @@ def worktree_merge(repo_dir: Path, wt_path: Path, branch: str) -> bool:
     if r.returncode != 0:
         _git(repo_dir, "merge", "--abort")
         return False
-    _git(repo_dir, "worktree", "remove", "--force", str(wt_path))
-    _git(repo_dir, "branch", "-D", branch)
+    worktree_remove(repo_dir, wt_path, branch)
     return True
 
 
@@ -558,6 +575,17 @@ def tail_status(stdout_log: Path) -> str | None:
         return None
     found = STATUS_RE.findall(data)
     return found[-1].lower() if found else None
+
+
+def tail_next(stdout_log: Path) -> str | None:
+    """The worker's NEXT: line - its one-line report to the next session
+    (and to a human reading the dashboard)."""
+    try:
+        data = stdout_log.read_bytes()[-8192:].decode("utf-8", "replace")
+    except OSError:
+        return None
+    found = NEXT_RE.findall(data)
+    return found[-1].strip()[:300] if found else None
 
 
 def tail_session_ref(stdout_log: Path) -> str | None:
@@ -626,7 +654,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         git_commit(work_dir, f"conductor: checkpoint before {step.name}",
                    allow_empty=True)
 
-    before = session_ids(devin_argv, work_dir)
+    before = session_ids(devin_argv, work_dir) or set()
     cmd = devin_cmd(devin_argv, step, prompt_path, export_path)
     LOG.info("step %s: %s (cwd=%s)", step.name, " ".join(cmd), work_dir)
     t0 = time.time()
@@ -654,7 +682,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             log_event(run_dir, event="spawn_error", step=step.name, error=str(exc))
     elapsed = round(time.time() - t0, 1)
 
-    new_sessions = session_ids(devin_argv, work_dir) - before
+    new_sessions = (session_ids(devin_argv, work_dir) or set()) - before
     status_line = tail_status(stdout_log)
     verify_ok = None
     if step.verify and not timed_out:
@@ -693,7 +721,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             rec["note"] = ("worker exited 0 without a STATUS line "
                            "(no-op run - nothing was done)")
         rec.update(status=status, ended_at=now_iso(), status_line=status_line,
-                   verify_ok=verify_ok)
+                   verify_ok=verify_ok, next=tail_next(stdout_log))
         save_state(run_dir, state)
     log_event(run_dir, event="step_end", step=step.name, status=status,
               exit_code=rc, elapsed_s=elapsed, session=rec.get("session_id"))
@@ -759,7 +787,7 @@ def hub_update(tid: int | None, state: dict, final: bool = False,
         counts[rec["status"]] = counts.get(rec["status"], 0) + 1
     body = ("run dir: " + state.get("run_dir", "?") + "\n"
             + "ended: " + (state.get("ended_at") or "still running") + "\n"
-            + "\n".join(f"- {r['name']}: {r['status']}"
+            + "\n".join(f"- {r.get('name', '?')}: {r.get('status', '?')}"
                         for r in state["steps"].values()))
     try:
         args_ = ["update", str(tid), "--body", body,
@@ -834,15 +862,21 @@ def cmd_run(args: argparse.Namespace) -> int:
             if step.worktree:
                 if cfg.checkpoint and not wave_ckpt_done \
                         and is_git_repo(project_dir):
+                    tag = step.wave if step.wave is not None else step.name
                     git_commit(project_dir,
-                               f"conductor: checkpoint before wave "
-                               f"{step.wave}", allow_empty=True)
+                               f"conductor: checkpoint before wave {tag}",
+                               allow_empty=True)
                     wave_ckpt_done = True
-                branch = sanitize_branch(f"conductor/{cfg.name}/{step.name}")
+                # Branch carries the RUN DIR name, not the manifest name:
+                # re-running the same manifest can never collide with a
+                # stale branch still checked out in an old run's worktree.
+                branch = sanitize_branch(
+                    f"conductor/{run_dir.name}/{step.name}")
                 wt = DATA_DIR / "worktrees" / run_dir.name / step.name
                 if not worktree_add(project_dir, wt, branch):
                     with STATE_LOCK:
                         state["steps"].setdefault(step.name, {}).update(
+                            name=step.name, slug=slug,
                             status="failed", note="worktree add failed")
                         save_state(run_dir, state)
                     print(f"[  failed] {step.name} (worktree add)")
@@ -901,6 +935,21 @@ def cmd_run(args: argparse.Namespace) -> int:
                                         f"{work_dir}", merged=False)
                         status = "failed"
                         statuses[step.name] = "failed"
+                    save_state(run_dir, state)
+                elif worktree_debris(repo_dir, work_dir, branch):
+                    # step died before doing work and the branch carries
+                    # nothing - remove the worktree+branch instead of
+                    # leaving orphan debris in the target repo.
+                    worktree_remove(repo_dir, work_dir, branch)
+                    rec = state["steps"].get(step.name, {})
+                    rec.setdefault("note", "worktree removed: step failed "
+                                           "with no work product")
+                    save_state(run_dir, state)
+                else:
+                    rec = state["steps"].get(step.name, {})
+                    rec.setdefault("note", "worktree kept at "
+                                           f"{work_dir} - branch has "
+                                           "unmerged work")
                     save_state(run_dir, state)
         if cfg.on_failure == "stop" and any(
                 s in ("failed", "timed_out", "blocked")
@@ -1088,7 +1137,7 @@ def collect_sessions(runs_dir: Path, devin_argv: list[str]) -> list[dict]:
             by_dir.setdefault(info["work_dir"], []).append(sid)
     out: list[dict] = []
     for wd, sids in by_dir.items():
-        live_ids = session_ids(devin_argv, Path(wd))
+        live_ids = session_ids(devin_argv, Path(wd)) or set()
         for sid in sids:
             if sid in live_ids:
                 info = dict(spawned[sid], sid=sid)
@@ -1163,6 +1212,7 @@ _STATUS_COLOR = {"done": "#3fb950", "partial": "#d29922", "blocked": "#d29922",
                  "lost": "#6e7681"}
 
 _AUTH_CACHE = [0.0, "unknown"]        # [checked_at, label]
+_SESS_CACHE = [0.0, {}]               # [checked_at, {work_dir: set|None}]
 
 
 def auth_status(devin_argv: list[str]) -> str:
@@ -1181,6 +1231,28 @@ def auth_status(devin_argv: list[str]) -> str:
         label = "devin missing"
     _AUTH_CACHE[0], _AUTH_CACHE[1] = time.time(), label
     return label
+
+
+def live_sessions_by_dir(runs_dir: Path,
+                         devin_argv: list[str]) -> dict[str, set | None]:
+    """work_dir -> session ids currently in `devin list` there, cached 2min.
+    A dir maps to None when listing failed (devin down/missing) - never
+    interpret None as 'all sessions gone'."""
+    if _SESS_CACHE[1] and time.time() - _SESS_CACHE[0] < 120:
+        return _SESS_CACHE[1]
+    dirs: set[str] = set()
+    for sj in runs_dir.glob("*/state.json"):
+        try:
+            st = json.loads(sj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for rec in (st.get("steps") or {}).values():
+            wd = rec.get("work_dir") or rec.get("project")
+            if wd and rec.get("session_id") and Path(wd).is_dir():
+                dirs.add(wd)
+    out = {d: session_ids(devin_argv, Path(d)) for d in dirs}
+    _SESS_CACHE[0], _SESS_CACHE[1] = time.time(), out
+    return out
 
 
 def task_label(rec: dict) -> str | None:
@@ -1206,6 +1278,7 @@ def collect_dashboard(runs_dir: Path,
     """Flatten every run's state.json into the shape the UI renders: one
     agent row per step record, one run row per state file, newest first.
     state.json is the single source of truth - this adds no second registry."""
+    sess_by_dir = live_sessions_by_dir(runs_dir, devin_argv or ["devin"])
     runs: list[dict] = []
     agents: list[dict] = []
     for sj in sorted(runs_dir.glob("*/state.json"), reverse=True):
@@ -1218,6 +1291,9 @@ def collect_dashboard(runs_dir: Path,
         for name, rec in st.get("steps", {}).items():
             status = eff.get(name, rec.get("status", "?"))
             counts[status] = counts.get(status, 0) + 1
+            sid = rec.get("session_id")
+            wd = rec.get("work_dir") or rec.get("project")
+            live = sess_by_dir.get(wd)
             agents.append({
                 "run": st.get("run"), "run_dir": st.get("run_dir"),
                 "step": rec.get("name"), "slug": rec.get("slug"),
@@ -1230,14 +1306,20 @@ def collect_dashboard(runs_dir: Path,
                 "model": rec.get("model"), "mode": rec.get("mode"),
                 "effort": rec.get("effort"), "task": task_label(rec),
                 "cloud": rec.get("cloud"), "verify_ok": rec.get("verify_ok"),
-                "note": rec.get("note"), "exit_code": rec.get("exit_code"),
+                "note": rec.get("note"), "next": rec.get("next"),
+                "session_gone": bool(sid and live is not None
+                                     and str(sid) not in live),
+                "exit_code": rec.get("exit_code"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
                 "stdout_log": rec.get("stdout_log"),
                 "export": rec.get("export"), "prompt": rec.get("prompt")})
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
                      "started_at": st.get("started_at"),
                      "ended_at": st.get("ended_at"), "counts": counts,
-                     "max_parallel": st.get("max_parallel")})
+                     "max_parallel": st.get("max_parallel"),
+                     "projects": sorted({r.get("slug") for r in
+                                         st.get("steps", {}).values()
+                                         if r.get("slug")})})
     agents.sort(key=lambda a: a.get("started_at") or "", reverse=True)
     return {"generated_at": now_iso(), "cpu_count": os.cpu_count(),
             "free_ram_gb": free_ram_gb(), "runs": runs, "agents": agents,
@@ -1257,32 +1339,48 @@ h1 { font-size:18px; margin:0 0 4px; }
 h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:#8b949e; margin:22px 0 8px; }
 h3.proj { font-size:13px; color:#e6edf3; margin:16px 0 4px; }
 h3.proj .sub { margin-bottom:0; font-weight:400; }
-table { border-collapse:collapse; width:100%; }
+table { border-collapse:collapse; width:100%; table-layout:fixed; }
 th { text-align:left; font-weight:600; color:#8b949e; font-size:11px; text-transform:uppercase; padding:4px 10px 4px 0; border-bottom:1px solid #21262d; }
-td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top; white-space:nowrap; }
+td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 td.wrap { white-space:normal; color:#8b949e; font-size:12px; }
+tr.agen { cursor:pointer; }
+tr.hl td { background:#1c2833; }
+.gone { opacity:.45; text-decoration:line-through; }
+.chip { display:inline-block; border:1px solid #30363d; border-radius:10px; padding:1px 9px; margin:0 5px 5px 0; font-size:12px; cursor:pointer; user-select:none; }
+.chip.off { opacity:.35; }
 .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
 .dot.run { animation:pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity:.35; } }
 .wrapw { overflow-x:auto; }
 .counts span { background:#161b22; border-radius:8px; padding:1px 8px; margin-right:5px; font-size:12px; }
 a { color:#58a6ff; text-decoration:none; }
-@media (max-width:640px) { .hide-s { display:none; } }
+#detail { position:fixed; inset:8% 12%; background:#161b22; border:1px solid #30363d; border-radius:10px; padding:20px 24px; overflow:auto; z-index:9; font-size:13px; }
+#detail h3 { margin:0 0 10px; }
+#detail .kv { display:grid; grid-template-columns:110px 1fr; gap:4px 12px; }
+#detail .k { color:#8b949e; }
+#detail pre { white-space:pre-wrap; color:#8b949e; }
+#detail .x { position:absolute; top:10px; right:16px; cursor:pointer; color:#8b949e; }
+@media (max-width:640px) { .hide-s { display:none; } #detail { inset:4%; } }
 </style></head><body>
 <h1>agent-conductor</h1>
 <div class="sub" id="meta">loading&hellip;</div>
-<h2>agents by project</h2><div id="agents"></div>
+<div class="sub" id="filters"></div>
 <h2>runs</h2><div class="wrapw"><table id="runs"></table></div>
+<h2>agents by project</h2><div id="agents"></div>
+<div id="detail" hidden><span class="x" id="dx">[close]</span><div id="dbody"></div></div>
 <script>
 const COLORS = {done:'#3fb950',partial:'#d29922',blocked:'#d29922',
 failed:'#f85149',timed_out:'#f0883e',running:'#58a6ff',queued:'#8b949e',
 lost:'#6e7681'};
 const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,
   c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const today = new Date().toDateString();
 const loc = iso => { if(!iso) return '-';
   const d=new Date(iso);
-  return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',
-    second:'2-digit'}) + ' ' + d.toLocaleDateString(); };
+  return d.toDateString()===today
+    ? d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})
+    : d.toLocaleDateString([], {month:'2-digit',day:'2-digit'}) + ' ' +
+      d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); };
 const fmtS = s => { if(s==null) return '-';
   s=Math.round(s); const h=Math.floor(s/3600), m=Math.floor(s%3600/60);
   return (h? h+'h':'') + (m? m+'m':'') + (s%60)+'s'; };
@@ -1291,11 +1389,45 @@ function elapsed(a, now){
   if (a.started_at && (a.status==='running'||a.status==='queued'))
     return fmtS((now - new Date(a.started_at))/1000);
   return '-'; }
-const expanded = {};   // slug -> true: show all rows, not just the latest 10
+const expanded = {};      // slug -> true: show all rows, not just latest 10
+const hidden = new Set(); // statuses filtered out via chips
 const SHOW_N = 10;
+const ORDER = ['running','queued','done','partial','blocked','timed_out',
+               'failed','lost'];
 let lastData = null;
+let AGENTS = [];          // last payload, for the detail modal
+
+// column layout shared by every per-project table (fixed layout -> the
+// same widths line up across tables)
+const AGENT_COLS = '<colgroup>' +
+  '<col style="width:8%"><col style="width:8%"><col style="width:24%">' +
+  '<col style="width:8%"><col class="hide-s" style="width:7%">' +
+  '<col class="hide-s" style="width:5%"><col class="hide-s" style="width:6%">' +
+  '<col style="width:6%"><col style="width:5%"><col style="width:6%">' +
+  '<col class="hide-s" style="width:7%"><col style="width:10%">' +
+  '</colgroup>';
+
+function showDetail(i){
+  const a = AGENTS[i]; if(!a) return;
+  const kv = [['step',a.step],['run',a.run],['project',a.slug],
+    ['status',a.status],['task',a.task],['result',a.next||a.note],
+    ['model',(a.model||'-')+(a.effort?' (effort '+a.effort+')':'')],
+    ['mode',(a.mode||'-')+(a.cloud?' cloud':'')],
+    ['started',a.started_at],['ended',a.ended_at],
+    ['elapsed',a.elapsed_s!=null?fmtS(a.elapsed_s):'-'],
+    ['session',(a.session_id||'-')+(a.session_gone?' (deleted from sidebar)':'')],
+    ['verify',a.verify_ok==null?'-':(a.verify_ok?'pass':'FAIL')],
+    ['exit',a.exit_code],['work dir',a.work_dir],['branch',a.branch],
+    ['prompt',a.prompt],['stdout',a.stdout_log],['export',a.export]];
+  document.getElementById('dbody').innerHTML =
+    `<h3>${esc(a.slug)} / ${esc(a.step)}</h3><div class="kv">` +
+    kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">${esc(v??'-')}</div>`).join('') +
+    `</div>`;
+  document.getElementById('detail').hidden = false;
+}
+
 function render(d){
-  lastData = d;
+  lastData = d; AGENTS = d.agents;
   const now = Date.now();
   const live = d.agents.filter(a=>a.status==='running');
   document.getElementById('meta').innerHTML =
@@ -1307,32 +1439,66 @@ function render(d){
         ` <a href="#" data-auth="login">[log in]</a>` +
         ` <a href="#" data-auth="recheck">[recheck]</a>`
       : '');
-  // one table per project (slug) so each project's agents are visible
-  // independently; groups ordered by newest activity first.
+
+  // status filter chips (click toggles)
+  const byStatus = {};
+  for (const a of d.agents) byStatus[a.status]=(byStatus[a.status]||0)+1;
+  document.getElementById('filters').innerHTML = 'filter: ' +
+    ORDER.filter(s=>byStatus[s]).map(s=>
+      `<span class="chip${hidden.has(s)?' off':''}" data-st="${s}" ` +
+      `style="color:${COLORS[s]}">${byStatus[s]} ${s}</span>`).join('') +
+    (hidden.size?` <a href="#" data-st="__all">reset</a>`:'');
+
+  // runs table first - a run can span projects (chips show which)
+  let h = '<colgroup><col style="width:14%"><col style="width:16%">' +
+    '<col style="width:9%"><col style="width:10%"><col style="width:20%">' +
+    '<col style="width:6%"><col class="hide-s" style="width:25%"></colgroup>' +
+    '<tr><th>run</th><th>projects</th><th>started</th><th>ended</th>' +
+    '<th>steps</th><th>max//</th><th class="hide-s">dir</th></tr>';
+  for (const r of d.runs){
+    const counts = Object.entries(r.counts||{})
+      .map(([k,v])=>`<span style="color:${COLORS[k]||'#8b949e'}">${v} ${k}</span>`)
+      .join('');
+    h += `<tr data-run="${esc(r.run)}"><td>${esc(r.run)}</td>` +
+      `<td>${(r.projects||[]).map(p=>`<span class="chip">${esc(p)}</span>`).join('')}</td>` +
+      `<td>${loc(r.started_at)}</td>` +
+      `<td>${r.ended_at?loc(r.ended_at):'<b>running</b>'}</td>` +
+      `<td class="counts">${counts}</td><td>${r.max_parallel||'-'}</td>` +
+      `<td class="hide-s wrap">${esc(r.dir)}</td></tr>`;
+  }
+  document.getElementById('runs').innerHTML = h;
+
+  // one fixed-width table per project slug, ordered by newest activity
   const groups = {};
-  for (const a of d.agents) (groups[a.slug||'?'] ??= []).push(a);
+  d.agents.forEach((a,i)=>{ a._i=i; (groups[a.slug||'?'] ??= []).push(a); });
   const slugs = Object.keys(groups).sort((x,y)=>
     (groups[y][0].started_at||'') < (groups[x][0].started_at||'') ? -1 : 1);
-  let h = '';
+  h = '';
   for (const slug of slugs){
-    const rows = groups[slug];
-    const nRun = rows.filter(r=>r.status==='running').length;
+    const rows = groups[slug].filter(a=>!hidden.has(a.status));
+    const all = groups[slug];
+    const nRun = all.filter(r=>r.status==='running').length;
     const show = expanded[slug] ? rows : rows.slice(0, SHOW_N);
     h += `<h3 class="proj">${esc(slug)} <span class="sub">` +
-      `${rows.length} agent(s)${nRun?`, ${nRun} running`:''}` +
+      `${all.length} agent(s)${nRun?`, ${nRun} running`:''}` +
+      `${rows.length<all.length?`, ${all.length-rows.length} filtered`:''}` +
       `${show.length<rows.length?`, showing latest ${show.length}`:''}` +
       `</span></h3>` +
-      '<div class="wrapw"><table><tr><th></th><th>step</th>' +
-      '<th>task</th><th>run</th>' +
+      '<div class="wrapw"><table>' + AGENT_COLS +
+      '<tr><th></th><th>step</th><th>task</th><th>run</th>' +
       '<th class="hide-s">model</th><th class="hide-s">effort</th>' +
-      '<th class="hide-s">mode</th>' +
-      '<th>started</th><th>elapsed</th><th>ended</th>' +
-      '<th class="hide-s">session</th><th>note</th></tr>';
+      '<th class="hide-s">mode</th><th>started</th><th>elapsed</th>' +
+      '<th>ended</th><th class="hide-s">session</th><th>result</th></tr>';
     for (const a of show){
       const c = COLORS[a.status]||'#8b949e';
       const pulse = a.status==='running' ? ' run' : '';
       const sess = a.session_id ? String(a.session_id).slice(0,14) : '-';
-      h += `<tr><td><span class="dot${pulse}" style="background:${c}" ` +
+      const sessTd = a.session_gone
+        ? `<td class="hide-s gone" title="session deleted from devin list; ` +
+          `transcript stays in the run dir">${esc(sess)}</td>`
+        : `<td class="hide-s">${esc(sess)}</td>`;
+      h += `<tr class="agen" data-i="${a._i}" data-run="${esc(a.run)}">` +
+        `<td><span class="dot${pulse}" style="background:${c}" ` +
         `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>` +
         `${a.status}</td>` +
         `<td>${esc(a.step)}</td><td class="wrap">${esc(a.task||'')}</td>` +
@@ -1341,9 +1507,8 @@ function render(d){
         `<td class="hide-s">${esc(a.effort||'-')}</td>` +
         `<td class="hide-s">${esc(a.mode||'-')}${a.cloud?' cloud':''}</td>` +
         `<td>${loc(a.started_at)}</td><td>${elapsed(a,now)}</td>` +
-        `<td>${loc(a.ended_at)}</td>` +
-        `<td class="hide-s">${esc(sess)}</td>` +
-        `<td class="wrap">${esc(a.note||'')}</td></tr>`;
+        `<td>${loc(a.ended_at)}</td>` + sessTd +
+        `<td class="wrap">${esc(a.next||a.note||'')}</td></tr>`;
     }
     if (rows.length > SHOW_N)
       h += `<tr><td colspan="12"><a href="#" data-slug="${esc(slug)}">` +
@@ -1353,26 +1518,24 @@ function render(d){
   }
   document.getElementById('agents').innerHTML =
     h || '<span class="sub">no agents yet</span>';
-  h = '<tr><th>run</th><th>started</th><th>ended</th>' +
-    '<th>steps</th><th>max//</th><th class="hide-s">dir</th></tr>';
-  for (const r of d.runs){
-    const counts = Object.entries(r.counts||{})
-      .map(([k,v])=>`<span style="color:${COLORS[k]||'#8b949e'}">${v} ${k}</span>`)
-      .join('');
-    h += `<tr><td>${esc(r.run)}</td><td>${loc(r.started_at)}</td>` +
-      `<td>${r.ended_at?loc(r.ended_at):'<b>running</b>'}</td>` +
-      `<td class="counts">${counts}</td><td>${r.max_parallel||'-'}</td>` +
-      `<td class="hide-s wrap">${esc(r.dir)}</td></tr>`;
-  }
-  document.getElementById('runs').innerHTML = h;
 }
 document.addEventListener('click', async e=>{
   const t = e.target;
+  if (t.id==='dx' || t.id==='detail'){
+    document.getElementById('detail').hidden = true; return; }
+  if (t.dataset && t.dataset.st){            // status filter chip
+    e.preventDefault();
+    if (t.dataset.st==='__all') hidden.clear();
+    else hidden.has(t.dataset.st) ? hidden.delete(t.dataset.st)
+                                  : hidden.add(t.dataset.st);
+    if (lastData) render(lastData); return;
+  }
   if (t.dataset && t.dataset.slug){          // expand/collapse a table
     e.preventDefault();
     expanded[t.dataset.slug] = !expanded[t.dataset.slug];
-    if (lastData) render(lastData);
-  } else if (t.dataset && t.dataset.auth){
+    if (lastData) render(lastData); return;
+  }
+  if (t.dataset && t.dataset.auth){
     e.preventDefault();
     if (t.dataset.auth==='login'){
       await fetch('/api/auth/login', {method:'POST'});
@@ -1381,7 +1544,18 @@ document.addEventListener('click', async e=>{
     } else {
       await fetch('/api/auth/recheck', {method:'POST'});
     }
+    return;
   }
+  const row = t.closest && t.closest('tr.agen');
+  if (row) showDetail(+row.dataset.i);
+});
+// hovering a run row highlights its agent rows across all project tables
+document.addEventListener('mouseover', e=>{
+  const tr = e.target.closest && e.target.closest('tr[data-run]');
+  document.querySelectorAll('tr.hl').forEach(x=>x.classList.remove('hl'));
+  if (tr && tr.dataset.run)
+    document.querySelectorAll(`tr.agen[data-run="${tr.dataset.run}"]`)
+      .forEach(x=>x.classList.add('hl'));
 });
 async function tick(){
   try { render(await (await fetch('/api/state')).json()); }
