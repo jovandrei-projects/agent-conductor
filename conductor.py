@@ -1557,6 +1557,7 @@ function render(d){
   }
   document.getElementById('agents').innerHTML =
     h || '<span class="sub">no agents yet</span>';
+  applyHl();
 }
 document.addEventListener('click', async e=>{
   const t = e.target;
@@ -1592,13 +1593,20 @@ document.addEventListener('keydown', e=>{
   if (e.key==='Escape')
     document.getElementById('backdrop').hidden = true;
 });
-// hovering a run row highlights its agent rows across all project tables
+// hovering a run row highlights its agent rows across all project tables.
+// hoverRun persists across the 2s re-render so the highlight doesn't flicker.
+let hoverRun = null;
+function applyHl(){
+  document.querySelectorAll('tr.hl').forEach(x=>x.classList.remove('hl'));
+  if (hoverRun)
+    document.querySelectorAll(
+      `tr.agen[data-run="${CSS.escape(hoverRun)}"]`)
+      .forEach(x=>x.classList.add('hl'));
+}
 document.addEventListener('mouseover', e=>{
   const tr = e.target.closest && e.target.closest('tr[data-run]');
-  document.querySelectorAll('tr.hl').forEach(x=>x.classList.remove('hl'));
-  if (tr && tr.dataset.run)
-    document.querySelectorAll(`tr.agen[data-run="${tr.dataset.run}"]`)
-      .forEach(x=>x.classList.add('hl'));
+  hoverRun = tr && tr.dataset.run || null;
+  applyHl();
 });
 async function tick(){
   try { render(await (await fetch('/api/state')).json()); }
