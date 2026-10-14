@@ -155,6 +155,30 @@ Doc fix: `devin list` interactive picker is GLOBAL ("all sessions"); only
   auth: ok. Trap 9 in AGENTS.md. The '14h token death' was this too.
 - Dashboard flicker fixed properly: JSON signature gates table rebuilds;
   unchanged payloads only refresh meta + tick elapsed cells in place.
+- serve_boot id in /api/state: open tabs auto-reload when serve restarts
+  (stale-JS trap - a 2s-polling page still runs page-load JS forever).
+- Live-row UX: running rows show last stdout line inline, one-line trimmed
+  + animated dots; `...` placeholder for session while running; exactly-one
+  unclaimed session in devin list gets attributed live. Run highlight keyed
+  on run_dir (7 manifests all named 'smoke' exposed the name-key bug);
+  runs table shows the ts dir under the name. Fixed runs.append nested in
+  the agents loop -> one run row per state.json (was N copies). 49->50 tests.
+- Two real worktree runs: favicon2 merged clean (wt removed, merged:true);
+  worker inside the worktree noticed concurrent same-repo edits (trap 10:
+  git add -A in a self-hosted non-wt run steals live worker diffs).
+- Worktree visibility/lifecycle (5ffda4c): `wt` chip + `merged`/`unmerged`
+  badge per row, merged row in modal. RESUME GAP FIXED: a step done-but-
+  unmerged (conductor died between worker-exit and merge) is no longer
+  skipped - --resume finalizes the merge via prior.branch/work_dir;
+  conflict marks failed + keeps the worktree. Test:
+  test_resume_late_merges_unmerged_worktree. 50/50.
+- swe-2-max CONFIRMED via `devin models` - apartment manifest effort=max
+  is correct as written.
+- Worktrees on npm/media projects are UNSAFE today: verify runs cwd=work_dir,
+  and a fresh worktree lacks node_modules + all gitignored assets (the
+  apartment run's source-of-truth images live in gitignored
+  assets/floorplan/). Junctioning node_modules + assets is the feature to
+  add before recommending wt on apartment-3d. Sequential non-wt stays.
 
 ## Verification
 
