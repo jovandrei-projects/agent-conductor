@@ -1162,6 +1162,26 @@ _STATUS_COLOR = {"done": "#3fb950", "partial": "#d29922", "blocked": "#d29922",
                  "running": "#58a6ff", "queued": "#8b949e",
                  "lost": "#6e7681"}
 
+_AUTH_CACHE = [0.0, "unknown"]        # [checked_at, label]
+
+
+def auth_status(devin_argv: list[str]) -> str:
+    """`devin auth status`, cached 2min so the 2s dashboard poll doesn't
+    spawn a probe per refresh."""
+    if time.time() - _AUTH_CACHE[0] < 120:
+        return _AUTH_CACHE[1]
+    try:
+        out = subprocess.run(devin_argv + ["auth", "status"],
+                             capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=30)
+        txt = (out.stdout + out.stderr).lower()
+        label = ("NOT LOGGED IN" if out.returncode != 0
+                 or "not logged in" in txt else "ok")
+    except (OSError, subprocess.SubprocessError):
+        label = "devin missing"
+    _AUTH_CACHE[0], _AUTH_CACHE[1] = time.time(), label
+    return label
+
 
 def task_label(rec: dict) -> str | None:
     """What the agent was asked to do. New records store `task` directly;
@@ -1181,7 +1201,8 @@ def task_label(rec: dict) -> str | None:
     return " ".join(body.split())[:160] or None
 
 
-def collect_dashboard(runs_dir: Path) -> dict:
+def collect_dashboard(runs_dir: Path,
+                      devin_argv: list[str] | None = None) -> dict:
     """Flatten every run's state.json into the shape the UI renders: one
     agent row per step record, one run row per state file, newest first.
     state.json is the single source of truth - this adds no second registry."""
@@ -1219,7 +1240,8 @@ def collect_dashboard(runs_dir: Path) -> dict:
                      "max_parallel": st.get("max_parallel")})
     agents.sort(key=lambda a: a.get("started_at") or "", reverse=True)
     return {"generated_at": now_iso(), "cpu_count": os.cpu_count(),
-            "free_ram_gb": free_ram_gb(), "runs": runs, "agents": agents}
+            "free_ram_gb": free_ram_gb(), "runs": runs, "agents": agents,
+            "auth": auth_status(devin_argv or ["devin"])}
 
 
 _DASH_HTML = """<!doctype html>
@@ -1272,10 +1294,13 @@ function elapsed(a, now){
 function render(d){
   const now = Date.now();
   const live = d.agents.filter(a=>a.status==='running');
-  document.getElementById('meta').textContent =
+  const auth = d.auth && d.auth!=='ok'
+    ? ` | AUTH: ${d.auth}` : '';
+  document.getElementById('meta').innerHTML =
     `${d.agents.length} agents | ${live.length} running | ` +
     `cpu ${d.cpu_count||'?'} cores | free ram ${d.free_ram_gb||'?'} GB | ` +
-    `refreshed ${loc(d.generated_at)}`;
+    `refreshed ${loc(d.generated_at)}` +
+    (auth ? ` <b style="color:#f85149">${esc(auth)}</b>` : '');
   // one table per project (slug) so each project's agents are visible
   // independently; groups ordered by newest activity first.
   const groups = {};
@@ -1356,8 +1381,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         def do_GET(self) -> None:                    # noqa: N802 - stdlib name
             if self.path == "/api/state":
-                self._send(json.dumps(collect_dashboard(runs_dir)).encode(),
-                           "application/json")
+                self._send(json.dumps(
+                    collect_dashboard(runs_dir, devin_argv)).encode(),
+                    "application/json")
             elif self.path in ("/", "/index.html"):
                 self._send(_DASH_HTML.encode(), "text/html; charset=utf-8")
             else:

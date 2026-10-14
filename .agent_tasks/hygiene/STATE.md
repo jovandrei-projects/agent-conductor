@@ -87,6 +87,10 @@ Doc fix: `devin list` interactive picker is GLOBAL ("all sessions"); only
   wave-1 parallel across projects). Live run pending auth.
 - BLOCKER: `devin auth status` reports not logged in again (~14h after the
   morning login) - real demo runs queued on `devin auth logout && login`.
+  Verified `devin -p` is genuinely blocked (auth status isn't lying) and the
+  CLI has NO refresh command - interactive login is the only renewal.
+- Dashboard now probes `auth status` (2min cache) and shows a red
+  `AUTH: NOT LOGGED IN` banner in the meta line when expired.
 
 ## Verification
 

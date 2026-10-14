@@ -517,6 +517,7 @@ prompt = "first"
             self.assertIn("pid", a)
             self.assertFalse(a["alive"])   # mock child is long dead
             self.assertTrue(str(a["work_dir"]).endswith("proj"))
+            self.assertIn("auth", d)       # live auth probe for the banner
 
     def test_agent_row_carries_task_and_effort(self):
         with tempfile.TemporaryDirectory() as td:
