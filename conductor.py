@@ -1449,6 +1449,9 @@ tr.agen:hover td { background:#26405a; }
 tr.hl td { background:#1c2833; }
 tr.agen.hl:hover td { background:#2a4a68; }
 .gone { opacity:.45; text-decoration:line-through; }
+td.res { color:#8b949e; font-size:12px; }
+td.res.fresh { animation:fresh 1.2s ease-out; }
+@keyframes fresh { 0% { background:rgba(88,166,255,.25); } 100% { background:transparent; } }
 .chip { display:inline-block; border:1px solid #30363d; border-radius:10px; padding:1px 9px; margin:0 5px 5px 0; font-size:12px; cursor:pointer; user-select:none; }
 .chip.off { opacity:.35; }
 .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
@@ -1495,6 +1498,8 @@ function elapsed(a, now){
   return '-'; }
 const expanded = {};      // slug -> true: show all rows, not just latest 10
 const hidden = new Set(); // statuses filtered out via chips
+const prevTail = {};      // run|step -> last tail_last shown; a change
+                          // flashes the result cell (.fresh) as logs stream
 const SHOW_N = 10;
 const ORDER = ['running','queued','done','partial','blocked','timed_out',
                'failed','lost'];
@@ -1624,6 +1629,10 @@ function render(d){
     for (const a of show){
       const c = COLORS[a.status]||'#8b949e';
       const pulse = a.status==='running' ? ' run' : '';
+      const tk = (a.run_dir||'') + '|' + a.step;
+      const fresh = a.status==='running' && tk in prevTail &&
+                    prevTail[tk] !== a.tail_last;
+      if (a.status==='running') prevTail[tk] = a.tail_last;
       const sess = a.session_id ? String(a.session_id).slice(0,14)
         : (a.status==='running' ? '…' : '-');
       const sessTd = a.session_gone
@@ -1655,7 +1664,8 @@ function render(d){
         `<td data-el="${a._i}">${elapsed(a,now)}</td>` +
         `<td>${loc(a.ended_at)}</td>` + sessTd +
         (a.status==='running'
-          ? `<td title="${esc(a.tail_last||'')}">${esc(a.tail_last||'')}` +
+          ? `<td class="res${fresh?' fresh':''}" ` +
+            `title="${esc(a.tail_last||'')}">${esc(a.tail_last||'')}` +
             `<span class="dots"><span>.</span><span>.</span><span>.</span>` +
             `</span></td>`
           : `<td class="wrap">${esc(a.next||a.note||'')}</td>`) + `</tr>`;
