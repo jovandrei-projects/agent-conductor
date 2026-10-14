@@ -1510,7 +1510,7 @@ let AGENTS = [];          // last payload, for the detail modal
 // column layout shared by every per-project table (fixed layout -> the
 // same widths line up across tables)
 const AGENT_COLS = '<colgroup>' +
-  '<col style="width:7%"><col style="width:14%"><col style="width:18%">' +
+  '<col style="width:7%"><col style="width:12%"><col style="width:20%">' +
   '<col style="width:7%"><col class="hide-s" style="width:7%">' +
   '<col class="hide-s" style="width:5%"><col class="hide-s" style="width:6%">' +
   '<col style="width:6%"><col style="width:5%"><col style="width:6%">' +
