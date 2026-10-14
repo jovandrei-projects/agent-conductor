@@ -1370,6 +1370,13 @@ def collect_dashboard(runs_dir: Path,
                 "stdout_log": rec.get("stdout_log"),
                 "tail": stdout_tail(rec.get("stdout_log")),
                 "export": rec.get("export"), "prompt": rec.get("prompt")})
+        runs.append({"run": st.get("run"), "dir": str(sj.parent),
+                     "started_at": st.get("started_at"),
+                     "ended_at": st.get("ended_at"), "counts": counts,
+                     "max_parallel": st.get("max_parallel"),
+                     "projects": sorted({r.get("slug") for r in
+                                         st.get("steps", {}).values()
+                                         if r.get("slug")})})
     # session_id is discovered post-spawn (diff of `devin list`); while a
     # step runs the cell is empty. Attribute it live instead: a running
     # step's work_dir should list exactly one session id not yet claimed
@@ -1384,13 +1391,6 @@ def collect_dashboard(runs_dir: Path,
         a["tail_last"] = next(
             (ln for ln in reversed((a.get("tail") or "").splitlines())
              if ln.strip()), None)
-        runs.append({"run": st.get("run"), "dir": str(sj.parent),
-                     "started_at": st.get("started_at"),
-                     "ended_at": st.get("ended_at"), "counts": counts,
-                     "max_parallel": st.get("max_parallel"),
-                     "projects": sorted({r.get("slug") for r in
-                                         st.get("steps", {}).values()
-                                         if r.get("slug")})})
     agents.sort(key=lambda a: a.get("started_at") or "", reverse=True)
     return {"generated_at": now_iso(), "serve_boot": SERVE_BOOT,
             "cpu_count": os.cpu_count(),
@@ -1565,7 +1565,7 @@ function render(d){
     const counts = Object.entries(r.counts||{})
       .map(([k,v])=>`<span style="color:${COLORS[k]||'#8b949e'}">${v} ${k}</span>`)
       .join('');
-    h += `<tr data-run="${esc(r.dir)}"><td><b>${esc(r.run)}</b> ` +
+    h += `<tr data-run="${esc(r.dir)}"><td class="wrap"><b>${esc(r.run)}</b><br>` +
       `<span class="sub">${esc((r.dir||'').split(/[\\/]/).pop())}</span></td>` +
       `<td>${(r.projects||[]).map(p=>`<span class="chip">${esc(p)}</span>`).join('')}</td>` +
       `<td>${loc(r.started_at)}</td>` +

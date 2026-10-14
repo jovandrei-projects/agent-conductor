@@ -779,6 +779,36 @@ prompt = "first"
             self.assertTrue(str(a["work_dir"]).endswith("proj"))
             self.assertIn("auth", d)       # live auth probe for the banner
 
+    def test_dashboard_one_run_row_per_state(self):
+        """Regression: runs.append must run once per state.json. A stray
+        indent once nested it in the agents loop -> N copies of one run."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            for name in ("ra", "rb"):
+                m = write_manifest(base, f'''
+[defaults]
+project = "{proj.as_posix()}"
+
+[[step]]
+name = "s1"
+prompt = "x"
+
+[[step]]
+name = "s2"
+prompt = "y"
+''')
+                # rename the manifest run so the two runs are distinct
+                txt = m.read_text().replace('name = "t"', f'name = "{name}"')
+                m.write_text(txt)
+                run_manifest(m, runs)
+            d = conductor.collect_dashboard(runs)
+            self.assertEqual(len(d["runs"]), 2)
+            self.assertEqual({r["run"] for r in d["runs"]}, {"ra", "rb"})
+            self.assertEqual(len({r["dir"] for r in d["runs"]}), 2)
+            self.assertEqual(len(d["agents"]), 4)
+
     def test_agent_row_carries_task_and_effort(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
