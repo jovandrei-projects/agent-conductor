@@ -1,0 +1,184 @@
+# The worktree/merge matrix against REAL devin sessions.
+# Fixture projects: `python examples/make_lab_projects.py` first.
+#
+# Difficulty ladder, one wave per rung:
+#   wave 1  lab-a  three steps, DISJOINT files           -> clean merges
+#   wave 2  lab-b  three steps, same file, far sections  -> context merges
+#   wave 3  lab-c  three steps, same tail of LOG.md      -> conflicts -> resolver
+#   wave 4  mixed  wt on lab-a + plain on lab-b + lab-c  -> blended wave
+#   tail    sequential audit per project
+#
+# merge_resolver=true: a conflicted merge-back spawns a `resolve-<step>`
+# session in the main checkout to finish the merge instead of parking the
+# worktree for a human.
+#
+#   python conductor.py plan manifests\lab-merge-stress.toml
+#   python conductor.py run  manifests\lab-merge-stress.toml
+
+[run]
+name = "lab-merge-stress"
+on_failure = "continue"      # see every rung's outcome, not just the first
+merge_resolver = true
+checkpoint = true
+max_parallel = 3             # real sessions are heavyweight; keep box usable
+
+[defaults]
+model = "swe-2"
+effort = "medium"            # swe-2 variants are high/medium/max only; all
+                             # free through 2026-10-16 -> cheapest is medium
+mode = "bypass"
+timeout_min = 25
+
+# ---- wave 1 - EASY: three disjoint recipe files on lab-a -----------------
+
+[[step]]
+name = "a-pasta"
+project = "lab-a"
+wave = 1
+worktree = true
+prompt = """Add recipes/pasta.md to the recipe box: aglio e olio - a short
+ingredient list plus 4 numbered steps. Do NOT touch INDEX.md or any other
+file. Commit."""
+verify = 'findstr /i "aglio" recipes\pasta.md'
+
+[[step]]
+name = "a-soup"
+project = "lab-a"
+wave = 1
+worktree = true
+prompt = """Add recipes/soup.md: miso soup - a short ingredient list plus
+4 numbered steps. Do NOT touch INDEX.md or any other file. Commit."""
+verify = 'findstr /i "miso" recipes\soup.md'
+
+[[step]]
+name = "a-salad"
+project = "lab-a"
+wave = 1
+worktree = true
+prompt = """Add recipes/salad.md: caesar salad - a short ingredient list
+plus 4 numbered steps. Do NOT touch INDEX.md or any other file. Commit."""
+verify = 'findstr /i "caesar" recipes\salad.md'
+
+# ---- wave 2 - MEDIUM: same file, far-apart sections on lab-b -------------
+
+[[step]]
+name = "b-birds"
+project = "lab-b"
+wave = 2
+worktree = true
+prompt = """In GUIDE.md, add exactly two one-line entries under the
+## Birds section (above its marker comment): 'heron' and 'wren' in the
+existing '- name: short note' style. Touch no other section. Commit."""
+verify = 'findstr /c:"- heron" GUIDE.md'
+
+[[step]]
+name = "b-trees"
+project = "lab-b"
+wave = 2
+worktree = true
+prompt = """In GUIDE.md, add exactly two one-line entries under the
+## Trees section (above its marker comment): 'birch' and 'maple' in the
+existing '- name: short note' style. Touch no other section. Commit."""
+verify = 'findstr /c:"- birch" GUIDE.md'
+
+[[step]]
+name = "b-fungi"
+project = "lab-b"
+wave = 2
+worktree = true
+prompt = """In GUIDE.md, add exactly two one-line entries under the
+## Fungi section (above its marker comment): 'chanterelle' and 'ink cap'
+in the existing '- name: short note' style. Touch no other section.
+Commit."""
+verify = 'findstr /c:"- chanterelle" GUIDE.md'
+
+# ---- wave 3 - HARD: all three append the tail of lab-c/LOG.md ------------
+
+[[step]]
+name = "c-deploy"
+project = "lab-c"
+wave = 3
+worktree = true
+prompt = """Append exactly this line to the BOTTOM of LOG.md, keeping the
+file's existing lines untouched:
+- 2026-10-14 04:10 deploy 1.1 staged
+Commit."""
+verify = 'findstr /c:"deploy 1.1 staged" LOG.md'
+
+[[step]]
+name = "c-rollback"
+project = "lab-c"
+wave = 3
+worktree = true
+prompt = """Append exactly this line to the BOTTOM of LOG.md, keeping the
+file's existing lines untouched:
+- 2026-10-14 04:25 rollback drill completed
+Commit."""
+verify = 'findstr /c:"rollback drill" LOG.md'
+
+[[step]]
+name = "c-backup"
+project = "lab-c"
+wave = 3
+worktree = true
+prompt = """Append exactly this line to the BOTTOM of LOG.md, keeping the
+file's existing lines untouched:
+- 2026-10-14 04:40 nightly backup verified
+Commit."""
+verify = 'findstr /c:"backup verified" LOG.md'
+
+# ---- wave 4 - MIXED: worktree on lab-a, plain steps on lab-b/lab-c -------
+# Different dirs in a wave only force worktree on the SHARED one; b/c run
+# in their own checkouts.
+
+[[step]]
+name = "a-dessert"
+project = "lab-a"
+wave = 4
+worktree = true
+prompt = """Add recipes/dessert.md: affogato - espresso over vanilla ice
+cream, 3 short steps. Do NOT touch INDEX.md or any other file. Commit."""
+verify = 'findstr /i "affogato" recipes\dessert.md'
+
+[[step]]
+name = "b-weather"
+project = "lab-b"
+wave = 4
+prompt = """In GUIDE.md, add one entry under the ## Weather section (above
+its marker comment): 'red sky at morning: sailor take warning' in the
+existing style. Commit."""
+
+[[step]]
+name = "c-heartbeat"
+project = "lab-c"
+wave = 4
+prompt = """Append exactly this line to the BOTTOM of LOG.md:
+- 2026-10-14 05:00 monitoring heartbeat green
+Commit."""
+verify = 'findstr /c:"heartbeat green" LOG.md'
+
+# ---- sequential audit: each project summarizes what actually landed ------
+
+[[step]]
+name = "audit-a"
+project = "lab-a"
+prompt = """Read recipes/ and write AUDIT.md: one line per recipe file that
+exists (sorted), then a line 'total: N'. Also update INDEX.md to match,
+sorted. Commit."""
+verify = 'findstr /c:"total:" AUDIT.md'
+
+[[step]]
+name = "audit-b"
+project = "lab-b"
+prompt = """Read GUIDE.md and write AUDIT.md: for each ## section, one
+line 'Section: N entries'. Count only '- name:' style entries. Commit."""
+verify = 'findstr /i "entries" AUDIT.md'
+
+[[step]]
+name = "audit-c"
+project = "lab-c"
+prompt = """Read LOG.md and write AUDIT.md: state whether these four lines
+are present (yes/no each): 'deploy 1.1 staged', 'rollback drill completed',
+'nightly backup verified', 'monitoring heartbeat green'. Then note how many
+log lines exist total. Commit."""
+verify = 'findstr /i "deploy 1.1 staged" AUDIT.md'

@@ -22,6 +22,11 @@ checkpoint = true
 # max_parallel = 2   # concurrent-agent cap. Default is conservative
                      # (about 1 per 4 logical cores, max 4). Each agent is a
                      # full Devin session - don't set 100 on a desktop.
+# merge_resolver = true  # on a worktree merge conflict, spawn a
+                     # "resolve-<step>" session in the main checkout to
+                     # finish the merge (mid-merge) instead of only parking
+                     # the worktree for a human. Also settable per step.
+                     # Refused on a dirty main checkout. Default: off.
 
 [defaults]
 model = "swe"          # cheap model for grind phases; use "opus"/"gpt" for planning
@@ -66,8 +71,12 @@ prompt = "Pick up the next task in .agent_tasks/QUEUE.md and work it to done or 
 # Parallel wave: adjacent steps sharing a `wave` number run concurrently.
 # Steps on the SAME project must set worktree=true - each runs in a git
 # worktree on branch conductor/<run>/<step>, merged back after the wave in
-# manifest order. Merge conflict -> step fails, worktree is kept under
-# data/worktrees/ for manual merge. Different projects parallelize freely.
+# manifest order. Merges are always conductor-owned: workers never merge;
+# the parent waits for the whole wave, then merges each branch itself in
+# manifest order. Merge conflict -> step fails, worktree kept under
+# data/worktrees/ for manual merge - or, with merge_resolver=true, a
+# resolve-<step> session finishes it. Different projects parallelize
+# freely (no worktree needed on different dirs).
 #
 # [[step]]
 # name = "ui-polish"
