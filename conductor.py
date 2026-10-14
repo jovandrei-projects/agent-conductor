@@ -1281,8 +1281,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_demo(args: argparse.Namespace) -> int:
-    """End-to-end against tests/mock_devin.py - no auth, no credits."""
-    proj = DATA_DIR / "demo-project"
+    """End-to-end against tests/mock_devin.py - no auth, no credits.
+    Self-test only: all artifacts are sandboxed under data/demo/ so its
+    runs never pollute the real data/runs/ registry or the dashboard."""
+    demo_dir = DATA_DIR / "demo"
+    proj = demo_dir / "project"
     proj.mkdir(parents=True, exist_ok=True)
     if not is_git_repo(proj):
         subprocess.run(["git", "init"], cwd=str(proj), capture_output=True)
@@ -1293,7 +1296,7 @@ def cmd_demo(args: argparse.Namespace) -> int:
     tasks.mkdir(exist_ok=True)
     (tasks / "QUEUE.md").write_text("# queue\n\n| # | Task | Status |\n",
                                     encoding="utf-8")
-    manifest = DATA_DIR / "demo.toml"
+    manifest = demo_dir / "demo.toml"
     manifest.write_text(f"""\
 [run]
 name = "demo"
@@ -1312,7 +1315,9 @@ verify = "python -c \\"import pathlib;assert pathlib.Path('WORK.txt').read_text(
     mock = (ROOT / "tests" / "mock_devin.py").as_posix()
     py = Path(sys.executable).as_posix()
     ns = argparse.Namespace(manifest=str(manifest), resume=None,
-                            devin=f"{py} {mock}", runs_dir=args.runs_dir,
+                            devin=f"{py} {mock}",
+                            runs_dir=args.runs_dir
+                                    or str(demo_dir / "runs"),
                             hub=False, keep_awake=False)
     return cmd_run(ns)
 

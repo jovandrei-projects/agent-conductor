@@ -66,9 +66,13 @@ agent-conductor registered as a managed service in project-hub
 `services.json` (commit a71a194 there). Second cleanup pass: `data/` pruned
 of repro files + ~50 empty worktree dirs; `manifests/` created as the
 convention for real manifests (its README documents location + run syntax).
-Next: the first real manifest (queue "not yet filed" item) - and the human
-must decide whether to push agent-conductor to GitHub before a cloud step
-can actually run on it.
+Third: `demo` artifacts sandboxed under `data/demo/` (own project+runs dir)
+so self-test runs stop polluting `data/runs` and the dashboard - the demo
+row flood the user flagged as confusing is gone. Doc fix: `devin list`
+interactive picker is GLOBAL ("all sessions"); only `--format json|csv`
+is cwd-scoped. Next: the first real manifest (queue "not yet filed" item)
+- and the human must decide whether to push agent-conductor to GitHub
+before a cloud step can actually run on it.
 
 ## Verification
 

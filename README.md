@@ -54,7 +54,9 @@ python conductor.py status [run_dir]               step table of the latest run
 python conductor.py serve [--port 8773]            live dashboard, loopback only
 python conductor.py sweep                          re-mark orphaned records 'lost'
 python conductor.py sessions [--rm] [--keep-hours N] list/clean spawned sessions
-python conductor.py demo                           end-to-end vs tests/mock_devin.py
+python conductor.py demo                           self-test vs tests/mock_devin.py
+                                                   (sandboxed under data/demo/ - its
+                                                   runs never appear in data/runs)
 python run_tests.py                                unittest suite (mock, no auth)
 ```
 

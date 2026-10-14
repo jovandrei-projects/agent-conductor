@@ -61,10 +61,13 @@ Session hygiene: `sessions` whitelists on ids recorded in run state.json -
 interactive/human sessions can never be listed or removed. `--rm` deletes
 sessions whose run ended more than `--keep-hours` ago (default 48); the
 ATIF transcript survives in the run dir, so spawned sessions are
-disposable bookkeeping. `devin list` is cwd-scoped: sessions are only
-visible under the work_dir that spawned them, so sessions from merged
-worktrees can't be enumerated (`devin rm <id>` still works if you know
-the id - it is in state.json). Also invisible to `sessions`: spawned
+disposable bookkeeping. `devin list --format json|csv` is cwd-scoped -
+sessions are only visible under the work_dir that spawned them (the
+interactive `devin list` picker is GLOBAL, "all sessions" - it ignores
+cwd, so the sidebar-style list mixes every workspace's sessions).
+Sessions from merged worktrees can't be enumerated (`devin rm <id>`
+still works if you know the id - it is in state.json). Also invisible
+to `sessions`: spawned
 sessions whose id was never recorded (the trap-5-era dead runs) - they
 are indistinguishable from human sessions in `devin list`, so they stay
 manual cleanup.
