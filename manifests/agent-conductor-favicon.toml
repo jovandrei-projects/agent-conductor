@@ -1,0 +1,27 @@
+# Tiny real-session smoke: one step on agent-conductor itself.
+# Proves auth + spawn + session + state + dashboard row end-to-end before
+# trusting an overnight run.
+#
+#   cd C:\Projects\agent-conductor
+#   python conductor.py run manifests\agent-conductor-favicon.toml
+
+[run]
+name = "favicon"
+
+[defaults]
+project = "agent-conductor"
+model = "swe-2"
+mode = "bypass"
+timeout_min = 20
+verify = "python run_tests.py"   # exercises the verify column
+verify_must_pass = false         # advisory - cosmetic change, don't gate
+
+[[step]]
+name = "new-favicon"
+prompt = """
+Change the dashboard's page icon: it is the inline SVG data-URI in the
+<link rel="icon" ...> inside _DASH_HTML in conductor.py. Design a cleaner
+conductor glyph (e.g. a podium + baton, or a bar-graph that reads as an
+orchestra) - keep it a single compact SVG at viewBox 64x64, keep the
+data-URI mechanics and the dark background tile. Then run python
+run_tests.py to confirm nothing broke."""

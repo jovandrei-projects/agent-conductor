@@ -179,6 +179,16 @@ Append as they are hit.
    startup; `status`/dashboard compute the same `lost` display live.
    `sweep` refuses to write while a live step's work_dir contains
    `data/runs` - a self-hosted run in flight (trap 5).
+9. **IDE env vars poison `devin` auth.** When conductor runs inside the
+   Devin Desktop / VS-Code extension host (this repo's dev session is),
+   inherited `ACP_BACKEND`, `WINDSURF_*`, `VSCODE_*`, `TERM_PROGRAM` make
+   the CLI expect host-supplied auth instead of reading
+   `credentials.toml` - `auth status` and even `-p` report "Not logged
+   in" while a plain console says logged in against the SAME file.
+   Cost a full day of "token died in minutes" false diagnoses
+   (2026-10-14). `clean_devin_env()` strips those prefixes from EVERY
+   spawned devin child: workers, probes, `devin list`, `devin rm`, and
+   the dashboard login terminal.
 
 ## The task workspace - read before starting work
 

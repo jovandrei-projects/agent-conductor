@@ -145,6 +145,16 @@ Doc fix: `devin list` interactive picker is GLOBAL ("all sessions"); only
   QUEUE row + 3 reference images under gitignored assets/floorplan/.
 - Repo litter: deleted a 0-byte 'devin' file that shadowed the binary in
   `where devin` (probably a stray '>' redirect).
+- AUTH MYSTERY SOLVED (2026-10-14 ~01:55): the CLI never had dying tokens.
+  Shells inside Devin Desktop's extension host inherit ACP_BACKEND +
+  WINDSURF_* + VSCODE_* vars that make `devin` expect host-supplied auth
+  -> every probe I ran reported 'Not logged in' while plain consoles
+  (user's cmd, my env-scrubbed run) report Logged in on the same
+  credentials.toml. clean_devin_env() now scrubs those prefixes from
+  every spawned devin child - workers/probes/login pop. Dashboard shows
+  auth: ok. Trap 9 in AGENTS.md. The '14h token death' was this too.
+- Dashboard flicker fixed properly: JSON signature gates table rebuilds;
+  unchanged payloads only refresh meta + tick elapsed cells in place.
 
 ## Verification
 

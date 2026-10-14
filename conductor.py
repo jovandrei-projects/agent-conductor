@@ -284,6 +284,20 @@ def render_prompt(step: Step, slug: str, project_dir: Path,
                                        project_dir=project_dir)
 
 
+def clean_devin_env() -> dict:
+    """Env for any spawned `devin` process. When conductor itself runs
+    inside the Devin Desktop / VS-Code extension host, the inherited
+    ACP_BACKEND + WINDSURF_* + VSCODE_* vars make the CLI expect
+    host-supplied auth instead of reading credentials.toml, so every
+    `auth status`/`-p` reports 'Not logged in' against a perfectly good
+    token. Strip those prefixes from every devin child."""
+    env = dict(os.environ)
+    for k in list(env):
+        if k.startswith(("ACP_", "WINDSURF_", "VSCODE_", "TERM_PROGRAM")):
+            del env[k]
+    return env
+
+
 def session_ids(devin_argv: list[str], cwd: Path) -> set[str] | None:
     """Session ids `devin list` reports for cwd, or None when the listing
     itself failed (devin missing, bad dir) - callers must not treat a
@@ -291,7 +305,8 @@ def session_ids(devin_argv: list[str], cwd: Path) -> set[str] | None:
     try:
         out = subprocess.run(devin_argv + ["list", "--format", "json"],
                              cwd=str(cwd), capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", timeout=60)
+                             encoding="utf-8", errors="replace", timeout=60,
+                             env=clean_devin_env())
         if out.returncode != 0:
             return None
         return {s["id"] for s in json.loads(out.stdout or "[]")}
@@ -303,7 +318,8 @@ def check_auth(devin_argv: list[str]) -> bool:
     try:
         out = subprocess.run(devin_argv + ["auth", "status"],
                              capture_output=True, text=True, timeout=60,
-                             encoding="utf-8", errors="replace")
+                             encoding="utf-8", errors="replace",
+                             env=clean_devin_env())
         return "not logged in" not in (out.stdout + out.stderr).lower()
     except Exception:
         return False
@@ -664,7 +680,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         try:
             proc = subprocess.Popen(cmd, cwd=str(work_dir), stdout=out,
                                     stderr=subprocess.STDOUT,
-                                    stdin=subprocess.DEVNULL)
+                                    stdin=subprocess.DEVNULL,
+                                    env=clean_devin_env())
             # Record pid in memory only: writing state.json into run_dir at
             # this point lands inside the worker's watched workspace (for
             # self-hosted runs) and the CLI's user-edit awareness ends the
@@ -1125,7 +1142,7 @@ def devin_rm(devin_argv: list[str], cwd: Path, sid: str) -> int:
         return subprocess.run(devin_argv + ["rm", sid, "--force"],
                               cwd=str(cwd), capture_output=True, text=True,
                               encoding="utf-8", errors="replace",
-                              timeout=60).returncode
+                              timeout=60, env=clean_devin_env()).returncode
     except Exception:
         return 1
 
@@ -1245,7 +1262,8 @@ def auth_status(devin_argv: list[str]) -> str:
     try:
         out = subprocess.run(devin_argv + ["auth", "status"],
                              capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", timeout=30)
+                             encoding="utf-8", errors="replace", timeout=30,
+                             env=clean_devin_env())
         txt = (out.stdout + out.stderr).lower()
         label = ("NOT LOGGED IN" if out.returncode != 0
                  or "not logged in" in txt else "ok")
@@ -1667,7 +1685,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 subprocess.Popen(
                     'start "" cmd /k "devin auth logout & '
                     'devin auth login --force-manual-token-flow"',
-                    shell=True)
+                    shell=True, env=clean_devin_env())
                 _AUTH_CACHE[0] = 0.0      # next tick re-probes
                 self._send(b"{}", "application/json")
             elif self.path == "/api/auth/recheck":
