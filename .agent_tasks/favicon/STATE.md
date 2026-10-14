@@ -3,7 +3,9 @@
 Conductor-dispatched one-off step (manifest `manifests/agent-conductor-favicon.toml`,
 run `favicon2`). This was the *second* dispatch - the first run's icon change was
 swallowed by a sibling session's mid-run `git add -A` (see AGENTS.md trap 10) and
-never landed as a coherent commit.
+never landed as a coherent commit. A *third* dispatch (run `20261014-024259-favicon2`,
+worktree `new-favicon`) spawned after the merge and found the work already
+landed - a no-op re-verification only.
 
 **Status:** done
 **Started:** 2026-10-14   **Last touched:** 2026-10-14
@@ -32,12 +34,16 @@ data-URI mechanics and the dark `#13161f` tile.
 - [x] Design new glyph, preview at favicon sizes
 - [x] Swap data-URI in `_DASH_HTML`
 - [x] `python run_tests.py` -> 48 tests, OK
+- [x] Third dispatch (run `20261014-024259-favicon2`): glyph confirmed in
+  place, `python run_tests.py` -> 50 tests, OK. No code change made.
 
 ## Where it stopped
 
-Done; nothing to resume. Icon line is `conductor.py` `_DASH_HTML` (the
-`<link rel="icon" ...>` line).
+Done; nothing to resume. Third dispatch was a no-op - the manifest was
+re-run after the second run's merge had already landed the glyph. Icon line
+is `conductor.py` `_DASH_HTML` (the `<link rel="icon" ...>` line).
 
 ## Verification
 
-`python run_tests.py` (48/48 green 2026-10-14).
+`python run_tests.py` (50/50 green 2026-10-14, third dispatch; 48/48 at
+glyph landing).

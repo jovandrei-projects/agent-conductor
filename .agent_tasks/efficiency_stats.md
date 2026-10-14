@@ -33,3 +33,4 @@ accounted for.
 | agent-conductor / hygiene (demo un-sandboxed; per-project dashboard + task/effort cols; auto 48h session sweep; demo1/demo2 fixtures+manifests pending auth) | n/a | n/a | n/a | n/a |
 | agent-conductor / favicon (new baton-over-orchestra glyph; rode in sibling session's commit; 48/48 green) | n/a | n/a | n/a | n/a |
 | agent-conductor / favicon2 (baton-over-musicians glyph, headless-Edge previewed; 48/48 green) | n/a | n/a | n/a | n/a |
+| agent-conductor / favicon2 3rd dispatch (no-op: glyph already merged; re-verified 50/50 green) | n/a | n/a | n/a | n/a |
