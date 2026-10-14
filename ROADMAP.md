@@ -13,7 +13,7 @@ One phase at a time, in order. Mark items `[x]` as they land.
 || Privacy | `cloud_ok` per project in `projects.toml`; false for wifi-network-monitor, chrome-bookmarks, money-plan. Enforced at resolve time. |
 || Manifest format | TOML (stdlib `tomllib`), not Markdown - QUEUE.md stays the task source, the manifest is the run skeleton. |
 | First cloud_ok pair | `agent-conductor` + `apartment-3d` (human call, 2026-10-13). Caveat: agent-conductor has no git remote - a cloud step clones from origin, so it needs the repo pushed first. |
-| Default model | `swe` (= SWE-2 Max) while it is free through 2026-10-16; after that `gpt-6-luna` at max thinking effort. Set per manifest via `[defaults] model`; thinking effort via `effort` which fuses as a variant suffix (`gpt-6-luna` + `min` -> `--model gpt-6-luna-min`). |
+| Default model | `swe` (= SWE-2 Max) while it is free through 2026-10-16; after that `gpt-6-luna` at max thinking effort. Set per manifest via `[defaults] model`; thinking effort via `effort` which fuses as a variant suffix (`gpt-6-luna` + `min` -> `--model gpt-6-luna-min`). `devin models list` (2026-10-14): swe-2 variants are **high/medium/max only** - no min/low; all free. |
 | Spawned-session hygiene | `conductor.py sessions` whitelists on ids recorded in state.json - human sessions can't be touched. `--rm` deletes sessions from runs ended >48h ago; the same cleanup is automated in `sweep` + `serve` startup (user-approved 2026-10-13); transcripts live in the run dir anyway. |
 
 ## Phase 1 - sequential core (this session)
@@ -37,6 +37,10 @@ One phase at a time, in order. Mark items `[x]` as they land.
 - [x] Confirm `--export` ATIF output - written normally now that sessions survive (see `data/runs/*/*.export.json`)
 - [ ] Cloud step on a `cloud_ok` project end-to-end (origin visibility caveat documented)
 - [ ] First real overnight manifest on a real project
+- [x] Worktree/merge matrix proven: `tests/test_worktrees.py` - 3-member waves (clean + 3-way conflict), same-file different-region clean merge, mixed project+worktree waves, wave-2 branching off wave-1 merges, member-fail/timeout/no-commit edge cases, resume-after-conflict, stale-merge cleanup
+- [x] `merge_resolver`: on merge conflict, a `resolve-<step>` session finishes the merge in the main checkout (mid-merge, opt-in [run]/per-step). Guards: refuses dirty checkout, marker+unmerged+ancestor checks, conductor commits only verified resolutions. Stale `conductor/*` merges aborted on resume.
+- [x] `--resume` finalizes unmerged branches (done AND failed/blocked/partial) instead of re-running a conflicted branch pointlessly
+- [x] Per-step token totals in `state.json` + dashboard column + per-run sums (from ATIF `final_metrics`: prompt/completion/cached + LLM step count)
 
 Smoke-run log: 2026-10-13 ~09:23 - `run_tests.py --quick` 20/20 green,
 `conductor.py demo` 2/2 done (run `20261013-092326-demo`). No regressions;
@@ -83,6 +87,22 @@ Two fixture projects (demo1 book catalog, demo2 notes) under `data/` +
 `examples/make_demo_projects.py` + three real manifests (demo1-only,
 demo2-only, mixed) pending a live run - blocked on `devin auth login`
 (credentials lapsed again). 39/39 tests green.
+
+2026-10-14 ~03:40 - worktree merge matrix (branch `dev/merge-tests` in
+worktree `agent-conductor-wt`, parallel to the apartment-3d live run).
+`tests/test_worktrees.py` +25 tests covering the wave/worktree/conflict
+combination space; `merge_resolver` implemented + proven end-to-end
+against real git conflicts via mock `resolve-merge`. Token metrics now
+flow ATIF export -> state.json -> dashboard (per-agent `prompt/out` cell +
+per-run totals). 75/75 green.
+
+2026-10-14 ~04:00 - LIVE proof: `lab-merge-stress` ran all 15 steps +
+6 resolver sessions alongside the apartment run, 21/21 done, zero
+failures. 9 worktree branches merged; 8 real conflicts (shared
+`.agent_tasks/QUEUE.md`) all resolved semantically by delegated resolver
+sessions. Tokens: 3.03M prompt / 82% cached / 340 LLM steps for a trivial
+15-file workload (~144k prompt per fresh session - session spin-up cost
+is the dominant term, worth a keep-warm/prompt-cache look later).
 
 ## Phase 3 - polish
 

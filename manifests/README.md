@@ -77,3 +77,13 @@ To trigger from a plain chat ("activate overnight mode for X"), the
 `agent-conductor` skill is installed globally
 (%APPDATA%\devin\skills\agent-conductor\SKILL.md) - any session can write
 the manifest and launch it from the conductor root.
+
+## Parallel runs and merges
+
+Adjacent `[[step]]`s sharing `wave = N` run in parallel; same-project wave
+members need `worktree = true`. The conductor waits for the whole wave,
+then merges each branch back in manifest order. On a conflict it parks
+the worktree and fails the step - unless `merge_resolver = true` ([run]
+or per-step), which spawns a `resolve-<step>` session in the main
+checkout mid-merge to finish it. See `lab-merge-stress.toml` for a
+4-wave manifest exercising every merge case against lab-a/b/c fixtures.

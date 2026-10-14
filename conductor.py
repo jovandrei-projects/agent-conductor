@@ -87,6 +87,32 @@ STATUS: done | partial | blocked
 NEXT: <one line - what the next session should do first>
 """
 
+RESOLVE_BODY = """\
+<!-- conductor-purpose: resolve-merge -->
+A git merge is in progress in this repo and needs a human-style
+resolution. Conductor tried to merge branch `{branch}` - a parallel
+agent's work, still checked out at {worktree} - back into the main
+checkout, and it conflicts.
+
+Conflicted files:
+{files}
+
+Resolve the merge:
+1. `git status` shows the state. Open each conflicted file and resolve
+   every <<<<<<< marker, keeping the intent of BOTH sides (the main
+   checkout's content and the branch's work - when they merely append
+   different lines, keep both).
+2. `git add` each resolved file, then `git commit --no-edit` to finish
+   the merge. Verify `git status` shows no unmerged paths.
+3. Do NOT `git merge --abort`, do NOT rebase, and do NOT rewrite the
+   branch's commits - its work must land through this merge.
+4. Touch nothing outside the conflict resolution; the rest of the tree
+   is other agents' committed work.
+
+If the conflict cannot be resolved safely, leave the merge in progress
+and end with STATUS: blocked - the branch and its worktree are kept
+either way."""
+
 
 # ---------------------------------------------------------------- manifest
 
@@ -106,6 +132,10 @@ class Step:
     worktree: bool = False             # run in a temp git worktree + branch, merged after
     effort: str | None = None          # thinking-effort variant suffix fused onto
                                        # the model id ("min" -> "model-min")
+    merge_resolver: bool = False       # on merge conflict, spawn a resolver
+                                       # session in the main checkout to
+                                       # finish the merge instead of only
+                                       # parking the worktree for a human
 
 
 @dataclasses.dataclass
@@ -117,6 +147,7 @@ class Manifest:
     preamble: str | None
     max_hours: float | None            # wall-clock cap for the whole run
     max_parallel: int | None           # cap on concurrent agents; None = auto
+    merge_resolver: bool               # run-wide default for step.merge_resolver
     steps: list[Step]
 
 
@@ -156,6 +187,9 @@ def load_manifest(path: Path) -> Manifest:
             raise ManifestError(
                 f"step {merged['name']!r}: worktree makes no sense with "
                 f"cloud=true (cloud runs on a Devin VM)")
+        mr = merged.get("merge_resolver")
+        if mr is None:
+            mr = run.get("merge_resolver", False)
         steps.append(Step(
             name=merged["name"], project=merged["project"],
             prompt=merged.get("prompt"),
@@ -167,7 +201,8 @@ def load_manifest(path: Path) -> Manifest:
             cloud=bool(merged.get("cloud", False)),
             wave=merged.get("wave"),
             worktree=bool(merged.get("worktree", False)),
-            effort=merged.get("effort") or None))
+            effort=merged.get("effort") or None,
+            merge_resolver=bool(mr)))
     if not steps:
         raise ManifestError("manifest has no [[step]] entries")
     max_parallel = run.get("max_parallel")
@@ -178,7 +213,9 @@ def load_manifest(path: Path) -> Manifest:
     return Manifest(path=path, name=name, on_failure=on_failure,
                     checkpoint=bool(run.get("checkpoint", True)),
                     preamble=preamble, max_hours=run.get("max_hours"),
-                    max_parallel=max_parallel, steps=steps)
+                    max_parallel=max_parallel,
+                    merge_resolver=bool(run.get("merge_resolver", False)),
+                    steps=steps)
 
 
 def load_projects() -> dict[str, dict]:
@@ -574,6 +611,42 @@ def worktree_merge(repo_dir: Path, wt_path: Path, branch: str) -> bool:
     return True
 
 
+def unmerged_paths(repo_dir: Path) -> list[str]:
+    """Paths the index still marks conflicted (ls-files -u), deduped."""
+    r = _git(repo_dir, "diff", "--name-only", "--diff-filter=U")
+    return r.stdout.split() if r.returncode == 0 else []
+
+
+def merge_in_progress(repo_dir: Path) -> bool:
+    return _git(repo_dir, "rev-parse", "-q", "--verify",
+                "MERGE_HEAD").returncode == 0
+
+
+def has_conflict_markers(repo_dir: Path, rel: str) -> bool:
+    try:
+        return any(ln.startswith(("<<<<<<<", ">>>>>>>")) for ln in
+                   (repo_dir / rel).read_text(
+                       encoding="utf-8", errors="replace").splitlines())
+    except OSError:
+        return False
+
+
+def abort_own_merge(repo_dir: Path) -> bool:
+    """Abort an in-progress merge ONLY if it is conductor's own: MERGE_HEAD
+    must sit on a conductor/* branch. A merge a human started (or one on an
+    unrelated branch) is left alone. Covers 'conductor died mid-resolution':
+    resume finds the stale merge and backs it out before re-running."""
+    mh = _git(repo_dir, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+    if mh.returncode != 0:
+        return False
+    sha = mh.stdout.strip()
+    brs = _git(repo_dir, "branch", "--contains", sha,
+               "--list", "conductor/*")
+    if "conductor/" not in brs.stdout:
+        return False
+    return _git(repo_dir, "merge", "--abort").returncode == 0
+
+
 # ---------------------------------------------------------------- run state
 
 def now_iso() -> str:
@@ -628,15 +701,40 @@ def tail_session_ref(stdout_log: Path) -> str | None:
     return matches[-1][0] or matches[-1][1]
 
 
+def tail_metrics(export_path: Path) -> dict | None:
+    """Token totals from the ATIF export's final_metrics (written by
+    `devin --export` at session end): prompt/completion/cached token sums
+    and the LLM step count. None for mocks and unfinished steps."""
+    try:
+        d = json.loads(export_path.read_text(encoding="utf-8",
+                                             errors="replace"))
+    except (OSError, ValueError):
+        return None
+    fm = d.get("final_metrics")
+    if not isinstance(fm, dict):
+        return None
+    out = {}
+    for src, dst in (("total_prompt_tokens", "prompt"),
+                     ("total_completion_tokens", "completion"),
+                     ("total_cached_tokens", "cached"),
+                     ("total_steps", "llm_steps")):
+        if isinstance(fm.get(src), (int, float)):
+            out[dst] = int(fm[src])
+    return out or None
+
+
 def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
              run_dir: Path, devin_argv: list[str], state: dict,
-             do_checkpoint: bool = True, branch: str | None = None) -> str:
+             do_checkpoint: bool = True, branch: str | None = None,
+             post_commit: bool = True) -> str:
     """Run one step; return final status: done|partial|blocked|failed|timed_out.
 
     work_dir is where the session runs and where checkpoints/verify happen -
     the project dir, or a git worktree for parallel steps. When a worktree is
     used the caller owns the pre-step checkpoint (on the main checkout), so
-    do_checkpoint=False.
+    do_checkpoint=False. post_commit=False skips the post-step `git add -A &&
+    commit` sweep - required for the merge resolver, whose work_dir sits in
+    an in-progress merge where a blind commit could adopt conflict markers.
 
     The step's record in state.json doubles as the agent registry entry:
     status/started_at are set while it queues, pid once the child process
@@ -732,7 +830,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             (v.stdout or "") + (v.stderr or ""), encoding="utf-8",
             errors="replace")
 
-    if cfg.checkpoint and is_git_repo(work_dir) and git_dirty(work_dir):
+    if post_commit and cfg.checkpoint and is_git_repo(work_dir) \
+            and git_dirty(work_dir):
         git_commit(work_dir, f"conductor: work from {step.name}")
 
     if timed_out:
@@ -759,11 +858,81 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             rec["note"] = ("worker exited 0 without a STATUS line "
                            "(no-op run - nothing was done)")
         rec.update(status=status, ended_at=now_iso(), status_line=status_line,
-                   verify_ok=verify_ok, next=tail_next(stdout_log))
+                   verify_ok=verify_ok, next=tail_next(stdout_log),
+                   tokens=tail_metrics(export_path))
         save_state(run_dir, state)
     log_event(run_dir, event="step_end", step=step.name, status=status,
               exit_code=rc, elapsed_s=elapsed, session=rec.get("session_id"))
     return status
+
+
+def resolve_merge_conflict(step: Step, slug: str, repo_dir: Path,
+                           work_dir: Path, branch: str, cfg: Manifest,
+                           run_dir: Path, devin_argv: list[str],
+                           state: dict) -> bool:
+    """A worktree branch conflicted at merge-back: re-enter the merge in the
+    MAIN checkout and hand the resolution to a fresh session (manifest
+    `merge_resolver`). Returns True when the merge was completed.
+
+    Safety shape: the resolver may stage a fix without committing - the
+    conductor finishes `git commit --no-edit` itself once the index is
+    conflict-free, marker-free, and the branch tip is an ancestor of HEAD
+    (a resolver that quietly aborted the merge can never pass). Anything
+    else -> merge --abort + the worktree/branch stay for a human.
+
+    Refuses entirely on a dirty main checkout: another agent's uncommitted
+    work sitting in the tree would get swept into the merge commit
+    (trap 10 shape) - that is human territory.
+    """
+    if git_dirty(repo_dir):
+        LOG.warning("%s: main checkout dirty; not spawning a merge resolver",
+                    step.name)
+        return False
+    r = _git(repo_dir, "merge", "--no-edit", branch)
+    if r.returncode == 0:                    # raced clean after all
+        worktree_remove(repo_dir, work_dir, branch)
+        return True
+    conflicted = unmerged_paths(repo_dir)
+    body = RESOLVE_BODY.format(
+        branch=branch, worktree=work_dir,
+        files="\n".join(f"- {f}" for f in conflicted) or "- (see git status)")
+    rstep = Step(name=f"resolve-{step.name}", project=slug, prompt=body,
+                 model=step.model, mode=step.mode,
+                 timeout_min=step.timeout_min)
+    # Keep the step's recorded status (done/failed): what is pending is the
+    # MERGE, tracked via merged=False - the resume path keys off exactly
+    # that, so a conductor dying mid-resolution resumes through late-merge.
+    rec = state["steps"].get(step.name, {})
+    rec.update(note=f"merge conflict on {branch}; resolver session "
+                    f"{rstep.name} spawned in the main checkout",
+               merged=False)   # orange 'unmerged' chip while resolving
+    save_state(run_dir, state)
+    log_event(run_dir, event="resolve_start", step=step.name, branch=branch,
+              files=conflicted)
+    status = run_step(rstep, slug, repo_dir, cfg, run_dir, devin_argv,
+                      state, do_checkpoint=False, post_commit=False)
+    log_event(run_dir, event="resolve_end", step=step.name, status=status)
+
+    # Adopt any resolved-but-unstaged file that carries no markers, then
+    # decide. A file still holding markers is never staged.
+    for f in conflicted:
+        if not has_conflict_markers(repo_dir, f):
+            _git(repo_dir, "add", f)
+    if status == "done" and not unmerged_paths(repo_dir) \
+            and not any(has_conflict_markers(repo_dir, f)
+                        for f in conflicted) \
+            and merge_in_progress(repo_dir):
+        # Index clean, merge still open -> conductor commits the resolution.
+        _git(repo_dir, "commit", "--no-edit")
+    tip = _git(repo_dir, "rev-parse", branch).stdout.strip()
+    landed = bool(tip) and _git(repo_dir, "merge-base", "--is-ancestor",
+                                tip, "HEAD").returncode == 0
+    if status == "done" and landed and not unmerged_paths(repo_dir):
+        worktree_remove(repo_dir, work_dir, branch)
+        return True
+    if merge_in_progress(repo_dir):
+        _git(repo_dir, "merge", "--abort")
+    return False
 
 
 def new_run_dir(cfg: Manifest, runs_dir: Path) -> Path:
@@ -916,20 +1085,33 @@ def cmd_run(args: argparse.Namespace) -> int:
         wave_ckpt_done = False
         for project_dir, slug, step in members:
             prior = state["steps"].get(step.name, {})
-            if args.resume is not None and prior.get("status") == "done":
-                # done-but-unmerged worktree step: conductor died between
-                # worker-exit and merge-back. Finalize the merge (manifest
-                # order preserved) instead of skipping, or the branch work
-                # is stranded. Conflict keeps the worktree, marks failed.
-                if prior.get("branch") and prior.get("merged") is not True:
-                    wt = Path(prior["work_dir"]) if prior.get(
-                        "work_dir") else DATA_DIR / "worktrees" / (
-                        run_dir.name) / step.name
-                    if worktree_merge(project_dir, wt, prior["branch"]):
-                        prior["merged"] = True
+            unmerged = bool(prior.get("branch")) \
+                and prior.get("merged") is not True
+            if args.resume is not None and unmerged:
+                # Finalize the merge before anything else: the step's product
+                # is a branch that never landed. Covers 'done' (conductor
+                # died pre-merge), 'failed' (earlier conflict), and
+                # blocked/partial strays. Re-running on the same stale
+                # branch cannot fix a conflict - it shares the merge base -
+                # so a still-failing merge is left parked, not re-run.
+                wt = Path(prior["work_dir"]) if prior.get(
+                    "work_dir") else runs_dir.parent / "worktrees" / (
+                    run_dir.name) / step.name
+                if _git(project_dir, "rev-parse", "-q", "--verify",
+                        prior["branch"]).returncode == 0:
+                    abort_own_merge(project_dir)
+                    ok = worktree_merge(project_dir, wt, prior["branch"])
+                    if not ok and step.merge_resolver:
+                        ok = resolve_merge_conflict(
+                            step, slug, project_dir, wt, prior["branch"],
+                            cfg, run_dir, devin_argv, state)
+                    if ok:
+                        prior.update(status="done", merged=True,
+                                     note="merged on resume (was "
+                                          f"{prior.get('status')})")
                         save_state(run_dir, state)
-                        print(f"[merged] {step.name} (late merge on resume)")
-                    else:
+                        print(f"[merged] {step.name} (merge on resume)")
+                    elif prior.get("status") == "done":
                         prior.update(status="failed", merged=False,
                                      note="merge conflict on resume; "
                                           f"worktree kept at {wt}")
@@ -939,8 +1121,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                         if cfg.on_failure == "stop":
                             stop = True
                             break
-                else:
-                    print(f"[skip ] {step.name} (done)")
+                    else:
+                        prior.update(
+                            merged=False,
+                            note="merge still conflicts; resolve the kept "
+                                 "worktree by hand or enable merge_resolver "
+                                 "- re-running the same branch cannot fix "
+                                 "a conflict")
+                        save_state(run_dir, state)
+                        print(f"[conflict] {step.name} still unmerged")
+                    continue
+            if args.resume is not None and prior.get("status") == "done":
+                print(f"[skip ] {step.name} (done)")
                 continue
             if step.worktree:
                 if cfg.checkpoint and not wave_ckpt_done \
@@ -950,12 +1142,20 @@ def cmd_run(args: argparse.Namespace) -> int:
                                f"conductor: checkpoint before wave {tag}",
                                allow_empty=True)
                     wave_ckpt_done = True
+                # A conductor merge left in progress (conductor died while a
+                # resolver session ran) blocks every new merge in this repo.
+                # Back it out - but only our own conductor/* merges, never a
+                # human's merge in progress.
+                if abort_own_merge(project_dir):
+                    log_event(run_dir, event="merge_abort_stale",
+                              step=step.name, project=str(project_dir))
+                    print(f"[stale-merge aborted] {slug}")
                 # Branch carries the RUN DIR name, not the manifest name:
                 # re-running the same manifest can never collide with a
                 # stale branch still checked out in an old run's worktree.
                 branch = sanitize_branch(
                     f"conductor/{run_dir.name}/{step.name}")
-                wt = DATA_DIR / "worktrees" / run_dir.name / step.name
+                wt = runs_dir.parent / "worktrees" / run_dir.name / step.name
                 if not worktree_add(project_dir, wt, branch):
                     with STATE_LOCK:
                         state["steps"].setdefault(step.name, {}).update(
@@ -1012,6 +1212,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                 if status in ("done", "partial", "blocked"):
                     if worktree_merge(repo_dir, work_dir, branch):
                         rec["merged"] = True
+                    elif step.merge_resolver and resolve_merge_conflict(
+                            step, slug, repo_dir, work_dir, branch, cfg,
+                            run_dir, devin_argv, state):
+                        rec.update(merged=True,
+                                   note="merge conflict resolved by "
+                                        f"resolve-{step.name}")
                     else:
                         rec.update(status="failed",
                                    note="merge conflict; worktree kept at "
@@ -1034,6 +1240,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                                            f"{work_dir} - branch has "
                                            "unmerged work")
                     save_state(run_dir, state)
+        # Once every member merged or was removed, the per-run worktree
+        # dir is an empty husk - drop it (kept worktrees keep it alive).
+        try:
+            (runs_dir.parent / "worktrees" / run_dir.name).rmdir()
+        except OSError:
+            pass
         if cfg.on_failure == "stop" and any(
                 s in ("failed", "timed_out", "blocked")
                 for s in statuses.values()):
@@ -1072,7 +1284,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 dirty = f"unpushed_commits={ahead or '?'}"
             print(f"    note: cloud workers see origin, not local state ({dirty})")
         tags = cloud + (" [worktree]" if s.worktree else "") \
-            + (f" [wave {s.wave}]" if s.wave is not None else "")
+            + (f" [wave {s.wave}]" if s.wave is not None else "") \
+            + (" [resolver]" if s.merge_resolver else "")
         print(f"  {s.name:<20} {slug:<22} model={s.model or '-':<10} "
               f"mode={s.mode:<8} timeout={s.timeout_min:g}m{tags}")
         print(f"    verify: {s.verify or '-'}")
@@ -1183,6 +1396,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
 def devin_rm(devin_argv: list[str], cwd: Path, sid: str) -> int:
     try:
+        if not cwd.is_dir():
+            cwd = Path.cwd()   # recorded worktree may be gone post-merge;
+            # rm only needs the sid, cwd just has to exist
         return subprocess.run(devin_argv + ["rm", sid, "--force"],
                               cwd=str(cwd), capture_output=True, text=True,
                               encoding="utf-8", errors="replace",
@@ -1215,9 +1431,14 @@ def collect_sessions(runs_dir: Path, devin_argv: list[str]) -> list[dict]:
                 "run_ended": bool(st.get("ended_at")),
                 "work_dir": rec.get("work_dir") or rec.get("project")}
     by_dir: dict[str, list[str]] = {}
+    gone: list[str] = []
     for sid, info in spawned.items():
         if info["work_dir"] and Path(info["work_dir"]).is_dir():
             by_dir.setdefault(info["work_dir"], []).append(sid)
+        else:
+            gone.append(sid)   # worktree removed post-merge: can't
+            # enumerate there, but the recorded id is whitelist enough -
+            # `devin rm <id>` does not need the dir.
     out: list[dict] = []
     for wd, sids in by_dir.items():
         live_ids = session_ids(devin_argv, Path(wd)) or set()
@@ -1227,6 +1448,11 @@ def collect_sessions(runs_dir: Path, devin_argv: list[str]) -> list[dict]:
                 t = _iso_ts(info["ended"])
                 info["age_s"] = time.time() - t if t else None
                 out.append(info)
+    for sid in gone:
+        info = dict(spawned[sid], sid=sid, dir_gone=True)
+        t = _iso_ts(info["ended"])
+        info["age_s"] = time.time() - t if t else None
+        out.append(info)
     return out
 
 
@@ -1392,8 +1618,14 @@ def collect_dashboard(runs_dir: Path,
         except (OSError, ValueError):
             continue
         counts: dict[str, int] = {}
+        tok_run: dict[str, int] = {}
         eff = effective_statuses(st)
         for name, rec in st.get("steps", {}).items():
+            t = rec.get("tokens")
+            if isinstance(t, dict):
+                for k in ("prompt", "completion", "cached"):
+                    if isinstance(t.get(k), int):
+                        tok_run[k] = tok_run.get(k, 0) + t[k]
             status = eff.get(name, rec.get("status", "?"))
             counts[status] = counts.get(status, 0) + 1
             sid = rec.get("session_id")
@@ -1416,6 +1648,7 @@ def collect_dashboard(runs_dir: Path,
                                      and str(sid) not in live),
                 "exit_code": rec.get("exit_code"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
+                "tokens": rec.get("tokens"),
                 "wt": bool(rec.get("branch")),
                 "stdout_log": rec.get("stdout_log"),
                 "tail": stdout_tail(rec.get("stdout_log")),
@@ -1423,6 +1656,7 @@ def collect_dashboard(runs_dir: Path,
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
                      "started_at": st.get("started_at"),
                      "ended_at": st.get("ended_at"), "counts": counts,
+                     "tokens": tok_run or None,
                      "max_parallel": st.get("max_parallel"),
                      "projects": sorted({r.get("slug") for r in
                                          st.get("steps", {}).values()
@@ -1521,6 +1755,20 @@ const loc = iso => { if(!iso) return '-';
 const fmtS = s => { if(s==null) return '-';
   s=Math.round(s); const h=Math.floor(s/3600), m=Math.floor(s%3600/60);
   return (h? h+'h':'') + (m? m+'m':'') + (s%60)+'s'; };
+const kfmt = n => n==null?'-':(n>=1000
+  ? (n/1000).toFixed(n>=100000?0:1).replace(/\.0$/,'')+'k' : String(n));
+const fmtT = t => (!t||t.prompt==null) ? '-' :
+  `${kfmt(t.prompt)}/${kfmt(t.completion)}/${kfmt(t.cached)}`;
+const tokTitle = t => !t ? '' :
+  `prompt ${t.prompt} · completion ${t.completion} · ` +
+  `cached ${t.cached} · ${t.llm_steps??'?'} llm steps`;
+const TOK_HELP = 'prompt/completion/cached per step. prompt = input ' +
+  'tokens (system, tools, context, history). cached = the subset of ' +
+  'prompt served from context cache - cheaper, already inside prompt, ' +
+  'never add it on top. completion = output tokens. steps = model ' +
+  'turns. Cost per step = rate(model,effort) x uncached-prompt + ' +
+  'cached-rate x cached + output-rate x completion; a priced column is ' +
+  'planned once model-compare publishes rates.';
 function elapsed(a, now){
   if (a.elapsed_s != null) return fmtS(a.elapsed_s);
   if (a.started_at && (a.status==='running'||a.status==='queued'))
@@ -1539,11 +1787,12 @@ let AGENTS = [];          // last payload, for the detail modal
 // column layout shared by every per-project table (fixed layout -> the
 // same widths line up across tables)
 const AGENT_COLS = '<colgroup>' +
-  '<col style="width:7%"><col style="width:12%"><col style="width:20%">' +
+  '<col style="width:7%"><col style="width:12%"><col style="width:18%">' +
   '<col style="width:7%"><col class="hide-s" style="width:7%">' +
   '<col class="hide-s" style="width:5%"><col class="hide-s" style="width:6%">' +
-  '<col style="width:6%"><col style="width:5%"><col style="width:6%">' +
-  '<col class="hide-s" style="width:6%"><col style="width:13%">' +
+  '<col style="width:6%"><col style="width:5%">' +
+  '<col class="hide-s" style="width:7%"><col style="width:6%">' +
+  '<col class="hide-s" style="width:6%"><col style="width:8%">' +
   '</colgroup>';
 
 let detailIdx = null;
@@ -1556,6 +1805,8 @@ function showDetail(i){
     ['mode',(a.mode||'-')+(a.cloud?' cloud':'')],
     ['started',a.started_at],['ended',a.ended_at],
     ['elapsed',a.elapsed_s!=null?fmtS(a.elapsed_s):'-'],
+    ['tokens',tokTitle(a.tokens)||'-'],
+    ['tokens?',TOK_HELP],
     ['session',(a.session_id||'-')+(a.session_gone?' (deleted from sidebar)':'')],
     ['verify',a.verify_ok==null?'-':(a.verify_ok?'pass':'FAIL')],
     ['exit',a.exit_code],['work dir',a.work_dir],
@@ -1630,7 +1881,11 @@ function render(d){
       `<td>${(r.projects||[]).map(p=>`<span class="chip">${esc(p)}</span>`).join('')}</td>` +
       `<td>${loc(r.started_at)}</td>` +
       `<td>${r.ended_at?loc(r.ended_at):'<b>running</b>'}</td>` +
-      `<td class="counts">${counts}</td><td>${r.max_parallel||'-'}</td>` +
+      `<td class="counts">${counts}` +
+      (r.tokens ? `<br><span class="sub" title="${TOK_HELP}">tok ` +
+        `${kfmt(r.tokens.prompt)}/${kfmt(r.tokens.completion)}/` +
+        `${kfmt(r.tokens.cached)}</span>` : '') +
+      `</td><td>${r.max_parallel||'-'}</td>` +
       `<td class="hide-s wrap">${esc(r.dir)}</td></tr>`;
   }
   document.getElementById('runs').innerHTML = h;
@@ -1655,6 +1910,7 @@ function render(d){
       '<tr><th></th><th>step</th><th>task</th><th>run</th>' +
       '<th class="hide-s">model</th><th class="hide-s">effort</th>' +
       '<th class="hide-s">mode</th><th>started</th><th>elapsed</th>' +
+      '<th class="hide-s" title="' + TOK_HELP + '">tokens?</th>' +
       '<th>ended</th><th class="hide-s">session</th><th>result</th></tr>';
     for (const a of show){
       const c = COLORS[a.status]||'#8b949e';
@@ -1693,6 +1949,8 @@ function render(d){
         `<td class="hide-s">${esc(a.mode||'-')}${a.cloud?' cloud':''}</td>` +
         `<td>${loc(a.started_at)}</td>` +
         `<td data-el="${a._i}">${elapsed(a,now)}</td>` +
+        `<td class="hide-s" title="${esc(tokTitle(a.tokens))}">` +
+        `${fmtT(a.tokens)}</td>` +
         `<td>${loc(a.ended_at)}</td>` + sessTd +
         (a.status==='running'
           ? `<td class="res${fresh?' fresh':''}" ` +
@@ -1702,7 +1960,7 @@ function render(d){
           : `<td class="wrap">${esc(a.next||a.note||'')}</td>`) + `</tr>`;
     }
     if (rows.length > SHOW_N)
-      h += `<tr><td colspan="12"><a href="#" data-slug="${esc(slug)}">` +
+      h += `<tr><td colspan="13"><a href="#" data-slug="${esc(slug)}">` +
         (expanded[slug] ? `show latest ${SHOW_N} only` :
           `show ${rows.length - SHOW_N} older agent(s)`)+`</a></td></tr>`;
     h += '</table></div>';

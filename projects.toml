@@ -28,6 +28,17 @@ path = "data/demo1"
 [project.demo2]
 path = "data/demo2"
 
+# Merge-matrix fixtures (easy/medium/hard). Recreate with
+# `python examples/make_lab_projects.py`; used by manifests/lab-merge-stress.
+[project.lab-a]
+path = "data/lab-a"
+
+[project.lab-b]
+path = "data/lab-b"
+
+[project.lab-c]
+path = "data/lab-c"
+
 [project.chrome-bookmarks]
 path = "../chrome-bookmarks"
 cloud_ok = false    # private: personal browsing record

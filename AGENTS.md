@@ -86,7 +86,10 @@ each agent is a full Devin session with tool subprocesses, not a thread.
 The run records the effective cap + free RAM in `state.json`.
 
 Tracking: `state.json` is the agent registry (status, pid, started/ended,
-elapsed, session id, work dir, paths to prompt/stdout/export). `serve`
+elapsed, session id, work dir, paths to prompt/stdout/export, and per-step
+`tokens` - prompt/completion/cached sums plus LLM step count, read out of
+the ATIF export's `final_metrics` at step end; they roll up per run on the
+dashboard). `serve`
 renders it as a live page at `http://127.0.0.1:8773` (loopback only,
 auto-refreshes, shows elapsed time ticking for running agents). The same
 run row is live-posted to `hub.db`, so `http://127.0.0.1:8762/tasks-ui`
@@ -95,8 +98,17 @@ shows coarse progress on the phone without any new wiring.
 Parallel: adjacent `[[step]]` entries sharing `wave = N` run concurrently,
 bounded by the cap. Steps on the *same* project in a wave need
 `worktree = true` - each runs in `data/worktrees/<run>/<step>` on branch
-`conductor/<run>/<step>`, merged back in manifest order after the wave; a
-merge conflict fails the step but keeps the worktree for manual merge.
+`conductor/<run>/<step>`. Merging is always the parent's job: workers
+never merge; the conductor waits for the whole wave, then merges each
+branch itself, sequentially, in manifest order. A conflict fails the step
+but keeps the worktree for manual merge - or, with `merge_resolver =
+true` ([run] or per-step), spawns a `resolve-<step>` session in the main
+checkout *mid-merge* to finish it (refused on a dirty checkout; a
+resolver that can't finish -> same abort+keep path). `--resume`
+finalizes unmerged branches instead of re-running them (a conflicted
+branch can't be fixed by re-running - it shares the merge base), and
+aborts a stale `conductor/*` merge-in-progress first - a human's merge is
+never touched.
 
 `manifests/` holds real manifests (`<project>-<what>.toml`, see its
 README); `examples/` is reference-only. `projects.toml`
@@ -196,6 +208,16 @@ Append as they are hit.
     the tree consistent, finished clean). Same-repo concurrency is
     exactly what `worktree = true` is for - use it whenever another agent
     (human or not) may commit to the project while a step runs.
+11. **Never auto-`git add -A && commit` around a merge in progress.** The
+    merge resolver deliberately runs a session mid-merge in the main
+    checkout; a blind checkpoint there would finalize whatever is staged -
+    conflict markers included. `run_step(post_commit=False)` exists for
+    exactly this; the conductor only completes the merge itself once the
+    index is conflict-free AND marker-free AND the branch tip is an
+    ancestor of HEAD (a resolver that quietly `merge --abort`s can never
+    fake 'resolved'). Same reasoning: resolver is refused on a dirty main
+    checkout - someone else's uncommitted work would get swept into the
+    merge commit (trap 10 shape).
 
 ## The task workspace - read before starting work
 
