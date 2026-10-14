@@ -1382,7 +1382,7 @@ _DASH_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>agent-conductor</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2313161f'/%3E%3Crect x='14' y='30' width='8' height='22' rx='2' fill='%2358a6ff'/%3E%3Crect x='28' y='18' width='8' height='34' rx='2' fill='%23bc8cff'/%3E%3Crect x='42' y='38' width='8' height='14' rx='2' fill='%23d29922'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2313161f'/%3E%3Cline x1='15' y1='25' x2='42' y2='9' stroke='%23e6edf3' stroke-width='3' stroke-linecap='round'/%3E%3Ccircle cx='15' cy='25' r='3.2' fill='%23e6edf3'/%3E%3Crect x='12' y='38' width='8' height='16' rx='2' fill='%2358a6ff'/%3E%3Crect x='28' y='30' width='8' height='24' rx='2' fill='%23bc8cff'/%3E%3Crect x='44' y='38' width='8' height='16' rx='2' fill='%23d29922'/%3E%3C/svg%3E">
 <style>
 :root { color-scheme: dark; }
 body { background:#0d1117; color:#e6edf3; font:14px/1.45 ui-monospace,Consolas,monospace; margin:0; padding:16px; }
@@ -1463,8 +1463,10 @@ const AGENT_COLS = '<colgroup>' +
   '<col class="hide-s" style="width:7%"><col style="width:10%">' +
   '</colgroup>';
 
+let detailIdx = null;
 function showDetail(i){
   const a = AGENTS[i]; if(!a) return;
+  detailIdx = i;
   const kv = [['step',a.step],['run',a.run],['project',a.slug],
     ['status',a.status],['task',a.task],['result',a.next||a.note],
     ['model',(a.model||'-')+(a.effort?' (effort '+a.effort+')':'')],
@@ -1479,7 +1481,7 @@ function showDetail(i){
     `<h3>${esc(a.slug)} / ${esc(a.step)}</h3><div class="kv">` +
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">${esc(v??'-')}</div>`).join('') +
     `</div>` +
-    (a.tail ? `<h3 style="margin-top:14px">stdout tail</h3><pre>${esc(a.tail)}</pre>` : '');
+    (a.tail ? `<h3 style="margin-top:14px">stdout tail</h3><pre id="dtail">${esc(a.tail)}</pre>` : '');
   document.getElementById('backdrop').hidden = false;
 }
 
@@ -1503,11 +1505,19 @@ function render(d){
       ? ` <b style="color:#f85149">AUTH: ${esc(d.auth)}</b>` +
         ` <a href="#" data-auth="login">[log in]</a>` +
         ` <a href="#" data-auth="recheck">[recheck]</a>`
-      : '');
+      : ` <span style="color:#3fb950">auth ok</span>`);
   // Only rebuild the tables when the payload actually changes - rebuilding
   // innerHTML every 2s resets animations/hover and looks like a reload.
-  const sig = JSON.stringify([d.runs, d.agents]);
-  if (sig === lastSig){ tickElapsed(now); return; }
+  // `tail` is excluded: live log growth streams into the open modal instead.
+  const sig = JSON.stringify([d.runs, d.agents.map(({tail,...r})=>r)]);
+  const tailEl = document.getElementById('dtail');
+  if (sig === lastSig){
+    tickElapsed(now);
+    if (tailEl && detailIdx!=null && AGENTS[detailIdx]
+        && tailEl.textContent !== AGENTS[detailIdx].tail)
+      tailEl.textContent = AGENTS[detailIdx].tail;   // live stdout stream
+    return;
+  }
   lastSig = sig;
 
   // status filter chips (click toggles)
@@ -1590,10 +1600,13 @@ function render(d){
   document.getElementById('agents').innerHTML =
     h || '<span class="sub">no agents yet</span>';
   applyHl();
+  if (detailIdx != null && !document.getElementById('backdrop').hidden)
+    showDetail(detailIdx);        // refresh open modal on real changes
 }
 document.addEventListener('click', async e=>{
   const t = e.target;
   if (t.id==='dx' || t.id==='backdrop'){
+    detailIdx = null;
     document.getElementById('backdrop').hidden = true; return; }
   if (t.dataset && t.dataset.st){            // status filter chip
     e.preventDefault();
@@ -1622,8 +1635,10 @@ document.addEventListener('click', async e=>{
   if (row) showDetail(+row.dataset.i);
 });
 document.addEventListener('keydown', e=>{
-  if (e.key==='Escape')
+  if (e.key==='Escape'){
+    detailIdx = null;
     document.getElementById('backdrop').hidden = true;
+  }
 });
 // hovering a run row highlights its agent rows across all project tables.
 // hoverRun persists across the 2s re-render so the highlight doesn't flicker.
