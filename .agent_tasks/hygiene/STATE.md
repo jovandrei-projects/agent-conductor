@@ -58,9 +58,14 @@ cleanable without risking live workers or human sessions.
 ## Where it stopped
 
 **Done.** 34/34 tests green, demo 2/2 green, live sweep cleared the phantom
-rows. Next: the first real manifest (queue "not yet filed" item) - and the
-human must decide whether to push agent-conductor to GitHub before a cloud
-step can actually run on it.
+rows. Clutter cleanup done same day: `sessions --rm --keep-hours 0` removed
+the 6 recorded spawned sessions, 26 unrecorded spawned orphans removed by
+`devin rm` (34 -> 2 sidebar entries, the 2 human sessions kept); `data/runs`
+pruned to 2 run dirs (kept `20261013-093553-smoke` + `20261013-182727-demo`);
+agent-conductor registered as a managed service in project-hub
+`services.json` (commit a71a194 there). Next: the first real manifest
+(queue "not yet filed" item) - and the human must decide whether to push
+agent-conductor to GitHub before a cloud step can actually run on it.
 
 ## Verification
 

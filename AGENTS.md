@@ -64,7 +64,10 @@ ATIF transcript survives in the run dir, so spawned sessions are
 disposable bookkeeping. `devin list` is cwd-scoped: sessions are only
 visible under the work_dir that spawned them, so sessions from merged
 worktrees can't be enumerated (`devin rm <id>` still works if you know
-the id - it is in state.json).
+the id - it is in state.json). Also invisible to `sessions`: spawned
+sessions whose id was never recorded (the trap-5-era dead runs) - they
+are indistinguishable from human sessions in `devin list`, so they stay
+manual cleanup.
 
 Run flags: `--devin "<cmd>"` worker binary override, `--no-hub` skip the
 hub.db row, `--no-keep-awake` allow system sleep (runs request
