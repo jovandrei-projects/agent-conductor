@@ -1074,7 +1074,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 # branch cannot fix a conflict - it shares the merge base -
                 # so a still-failing merge is left parked, not re-run.
                 wt = Path(prior["work_dir"]) if prior.get(
-                    "work_dir") else DATA_DIR / "worktrees" / (
+                    "work_dir") else runs_dir.parent / "worktrees" / (
                     run_dir.name) / step.name
                 if _git(project_dir, "rev-parse", "-q", "--verify",
                         prior["branch"]).returncode == 0:
@@ -1134,7 +1134,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 # stale branch still checked out in an old run's worktree.
                 branch = sanitize_branch(
                     f"conductor/{run_dir.name}/{step.name}")
-                wt = DATA_DIR / "worktrees" / run_dir.name / step.name
+                wt = runs_dir.parent / "worktrees" / run_dir.name / step.name
                 if not worktree_add(project_dir, wt, branch):
                     with STATE_LOCK:
                         state["steps"].setdefault(step.name, {}).update(
@@ -1219,6 +1219,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                                            f"{work_dir} - branch has "
                                            "unmerged work")
                     save_state(run_dir, state)
+        # Once every member merged or was removed, the per-run worktree
+        # dir is an empty husk - drop it (kept worktrees keep it alive).
+        try:
+            (runs_dir.parent / "worktrees" / run_dir.name).rmdir()
+        except OSError:
+            pass
         if cfg.on_failure == "stop" and any(
                 s in ("failed", "timed_out", "blocked")
                 for s in statuses.values()):
@@ -1369,6 +1375,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
 def devin_rm(devin_argv: list[str], cwd: Path, sid: str) -> int:
     try:
+        if not cwd.is_dir():
+            cwd = Path.cwd()   # recorded worktree may be gone post-merge;
+            # rm only needs the sid, cwd just has to exist
         return subprocess.run(devin_argv + ["rm", sid, "--force"],
                               cwd=str(cwd), capture_output=True, text=True,
                               encoding="utf-8", errors="replace",
@@ -1401,9 +1410,14 @@ def collect_sessions(runs_dir: Path, devin_argv: list[str]) -> list[dict]:
                 "run_ended": bool(st.get("ended_at")),
                 "work_dir": rec.get("work_dir") or rec.get("project")}
     by_dir: dict[str, list[str]] = {}
+    gone: list[str] = []
     for sid, info in spawned.items():
         if info["work_dir"] and Path(info["work_dir"]).is_dir():
             by_dir.setdefault(info["work_dir"], []).append(sid)
+        else:
+            gone.append(sid)   # worktree removed post-merge: can't
+            # enumerate there, but the recorded id is whitelist enough -
+            # `devin rm <id>` does not need the dir.
     out: list[dict] = []
     for wd, sids in by_dir.items():
         live_ids = session_ids(devin_argv, Path(wd)) or set()
@@ -1413,6 +1427,11 @@ def collect_sessions(runs_dir: Path, devin_argv: list[str]) -> list[dict]:
                 t = _iso_ts(info["ended"])
                 info["age_s"] = time.time() - t if t else None
                 out.append(info)
+    for sid in gone:
+        info = dict(spawned[sid], sid=sid, dir_gone=True)
+        t = _iso_ts(info["ended"])
+        info["age_s"] = time.time() - t if t else None
+        out.append(info)
     return out
 
 

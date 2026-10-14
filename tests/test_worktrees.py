@@ -516,6 +516,38 @@ class StaleMergeCleanupTests(unittest.TestCase):
             self.assertFalse(conductor.abort_own_merge(proj))
 
 
+class SessionCleanupTests(unittest.TestCase):
+    def test_gone_workdir_sessions_still_collected(self):
+        """Worktree dirs are deleted after merge - their recorded session
+        ids must still reach `sessions --rm` (devin rm needs only the id)."""
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            rd = runs / "r1"
+            rd.mkdir(parents=True)
+            (rd / "state.json").write_text(json.dumps({
+                "run": "t", "ended_at": "2026-01-01T00:00:00",
+                "steps": {"s": {"session_id": "abc",
+                                "status": "done",
+                                "work_dir": str(Path(td) / "deleted-wt")}}}))
+            got = conductor.collect_sessions(runs, [MOCK])
+            self.assertEqual([g["sid"] for g in got], ["abc"])
+            self.assertTrue(got[0]["dir_gone"])
+
+    def test_existing_workdir_sessions_unaffected(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            rd = runs / "r1"
+            rd.mkdir(parents=True)
+            wd = Path(td) / "proj"
+            wd.mkdir()
+            (rd / "state.json").write_text(json.dumps({
+                "run": "t", "ended_at": "2026-01-01T00:00:00",
+                "steps": {"s": {"session_id": "abc",
+                                "status": "done", "work_dir": str(wd)}}}))
+            got = conductor.collect_sessions(runs, [MOCK])
+            self.assertEqual(got, [])   # 'abc' not in mock's list output
+
+
 class TokenMetricTests(unittest.TestCase):
     """ATIF final_metrics -> state.json tokens -> dashboard payload."""
 
