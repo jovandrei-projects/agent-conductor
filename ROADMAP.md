@@ -106,6 +106,9 @@ is the dominant term, worth a keep-warm/prompt-cache look later).
 
 ## Phase 3 - polish
 
+- [x] Dashboard request workflow (2026-10-14): raw drafts in `data/requests/`, planning-only Devin CLI conversion into timestamped reviewable TOML, description + planned agent rows (waiting/skipped until dispatched after launch), edit/regenerate/discard, explicit Start run with state handoff. No auto-implementation on save or generate; future default switches from swe-2/max to gpt-6-luna/max after 10/16.
+- [x] Dashboard run-row click filters runs + agents with persistent highlight and removable run chip; status/tag facets include wt/merged/unmerged; tokens header corrected and modal help with a worked cost formula.
+- [x] Windows dashboard console flashes: periodic auth/session probes spawned visible cmd windows from `pythonw.exe`. All background subprocesses are now headless; deliberate login console remains visible (trap 14). Mock suite 98/98 and demo 2/2 green on 2026-10-14; live planner was not dispatched during verification.
 - [ ] Planner step pattern validated (re-slices QUEUE.md mid-run) - the pattern is documented in `examples/night.example.toml`, needs a live run
 - [ ] Phone access to the dashboard: either a lan-bridge proxy port for :8773 (needs a mobile-apps bridge.defaults.json change + app redeploy) or accept that `tasks-ui` hub rows are enough
 - [ ] `run.min_free_gb` scheduling gate: pause new agents when RAM is scarce (free_ram_gb is already recorded; the gate itself is unbuilt)

@@ -1,8 +1,10 @@
 # manifests/
 
-Real run manifests live here - one TOML per job, flat, named
-`<project>-<what>.toml` (e.g. `video-tools-cjk-subs.toml`,
-`spt-batch-chapters.toml`). `examples/` is for tests and reference only;
+Real run manifests live here, flat: hand-written files use
+`<project>-<what>.toml` (e.g. `video-tools-cjk-subs.toml`), while dashboard
+proposals use `<YYYYMMDD-HHMMSS>-<random>-<run>.toml`. The timestamp prefix
+sorts by creation; the random suffix prevents same-second collisions. Existing
+manifest names do not change. `examples/` is for tests and reference only;
 nothing durable goes there.
 
 ## Running one
@@ -27,6 +29,16 @@ commit work, update the project's `.agent_tasks`, end with `STATUS:`.
 Copy `../examples/night.example.toml` - every field is annotated there.
 `state.json` in each `data/runs/<ts>-<run>/` tracks what finished;
 `conductor.py status` and the :8773 dashboard render it.
+
+The dashboard's **New request** flow saves raw text in gitignored
+`data/requests/`. **Generate proposal** runs only a planner in a temporary
+workspace; after validation it writes a timestamped TOML here with a short
+`[run].description` and shows its steps as *planned*, not *queued* or
+*running*. Review/edit the TOML or regenerate it before clicking **Start
+run** explicitly. Discard removes only that request's generated TOML and
+planned steps; it cannot discard an already-started run. UI proposals must
+use registered project slugs, a checkpoint, inline prompts, and the ordinary
+cloud privacy gate. Hand-authored manifests may still use the full format.
 
 ## A concrete request -> manifest
 

@@ -110,11 +110,18 @@ branch can't be fixed by re-running - it shares the merge base), and
 aborts a stale `conductor/*` merge-in-progress first - a human's merge is
 never touched.
 
-`manifests/` holds real manifests (`<project>-<what>.toml`, see its
-README); `examples/` is reference-only. `projects.toml`
-registers slug -> path + `cloud_ok`. `--devin "..."` or `CONDUCTOR_DEVIN`
-overrides the spawned binary (shlex-split; use forward slashes or quotes -
-posix shlex eats unquoted backslashes).
+`manifests/` holds real manifests (hand-written `<project>-<what>.toml` and
+UI-generated `<YYYYMMDD-HHMMSS>-<random>-<run>.toml`, flat; see its README);
+`examples/` is reference-only. `projects.toml` registers slug -> path +
+`cloud_ok`. `--devin "..."` or `CONDUCTOR_DEVIN` overrides the spawned binary
+(shlex-split; use forward slashes or quotes - posix shlex eats unquoted
+backslashes). The :8773 dashboard's New request saves raw drafts in ignored
+`data/requests/`, generates/validates a reviewable TOML with a planning-only
+Devin CLI session, and shows its steps as `planned`. Saving or generating NEVER
+launches implementation: only the separate Start run button does. Editing
+request/model after generation marks the plan stale; regenerate or edit+save
+TOML before launching. Discard removes only an unrun, app-owned proposal and
+its planned rows. Real runs still use `state.json` as their registry.
 
 Requires `devin` on PATH and `devin auth login` to have been run once
 (`devin auth status` is checked at run start; conductor aborts cleanly if
@@ -249,6 +256,14 @@ Append as they are hit.
     the main checkout's data/runs (that also puts the runs on :8773).
     Hit 2026-10-14: the dev/merge-tests worktree's lab run left 21
     sessions in the sidebar; cleaned just before the checkout went away.
+14. **`pythonw.exe serve` flashes background console windows on Windows.**
+    The dashboard probes `devin list` for work dirs and `devin auth status`
+    every 120s. Under `pythonw.exe` those console subprocesses open brief
+    blank windows (multiple work dirs -> multiple flashes per refresh), even
+    with captured stdout. All non-interactive subprocesses now use
+    `CREATE_NO_WINDOW` on Windows (`hidden_subprocess_kwargs`); keep the
+    intentionally interactive `[log in]` button's terminal visible. A
+    running `pythonw.exe` server must be restarted to load this fix.
 
 ## The task workspace - read before starting work
 

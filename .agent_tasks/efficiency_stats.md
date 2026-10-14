@@ -35,3 +35,4 @@ accounted for.
 | agent-conductor / favicon2 (baton-over-musicians glyph, headless-Edge previewed; 48/48 green) | n/a | n/a | n/a | n/a |
 | agent-conductor / favicon2 3rd dispatch (no-op: glyph already merged; re-verified 50/50 green) | n/a | n/a | n/a | n/a |
 | agent-conductor / wt-matrix (dev/merge-tests: merge_resolver + resume-finalize + token metrics + 25-test worktree matrix; live lab run resolving real conflicts; 75/75 green) | n/a | n/a | n/a | n/a |
+| agent-conductor / dashboard requests (draft/review/start, filters, token help, headless probes; 98/98 mock tests and demo green) | n/a | n/a | n/a | n/a |

@@ -610,7 +610,7 @@ class TokenMetricTests(unittest.TestCase):
             d = conductor.collect_dashboard(runs)
             self.assertEqual(d["runs"][0]["tokens"],
                              {"prompt": 3000, "completion": 300,
-                              "cached": 2300})
+                              "cached": 2300, "llm_steps": 8})
             by_name = {a["step"]: a for a in d["agents"]}
             self.assertEqual(by_name["a"]["tokens"]["llm_steps"], 3)
             self.assertIsNone(by_name["c"]["tokens"])

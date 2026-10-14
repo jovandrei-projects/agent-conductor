@@ -3,11 +3,14 @@
 Everything here runs against tests/mock_devin.py - no auth, no credits.
 """
 import argparse
+import http.client
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -960,6 +963,508 @@ effort = "min"
             self.assertIsNone(conductor.task_label({}))
             self.assertIsNone(conductor.task_label(
                 {"prompt": str(Path(td) / "gone.md")}))
+
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_run_selection_facets_and_token_details(self):
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,textContent:''}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  addEventListener:(event,handler)=>{handlers[event]=handler;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-14T00:00:00',agents:[
+  {step:'alpha',run:'first',run_dir:'/first',slug:'p',status:'done',wt:true,merged:true,
+   task:'implement one',tokens:{prompt:10000,cached:6000,completion:1000,llm_steps:2}},
+  {step:'beta',run:'second',run_dir:'/second',slug:'p',status:'done',wt:false,
+   task:'implement two'}],runs:[
+  {run:'first',dir:'/first',description:'A proposal',projects:['p'],counts:{done:1}},
+  {run:'second',dir:'/second',description:'A separate run',projects:['p'],counts:{done:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+assert.match(elem('filters').innerHTML,/1 wt/);
+assert.match(elem('filters').innerHTML,/1 merged/);
+assert.match(elem('agents').innerHTML,/>tokens<\/th>/);
+assert.doesNotMatch(elem('agents').innerHTML,/tokens\?/);
+const click=async(target)=>handlers.click({target,preventDefault:()=>{}});
+const row={dataset:{runKey:'/first'}};
+(async()=>{
+  await click({dataset:{},closest:selector=>selector==='tr.runrow'?row:null});
+  assert.match(elem('filters').innerHTML,/Clear run filter/);
+  assert.match(elem('filters').innerHTML,/first ×/);
+  assert.match(elem('runs').innerHTML,/runrow selected/);
+  assert.doesNotMatch(elem('runs').innerHTML,/A separate run/);
+  assert.match(elem('agents').innerHTML,/implement one/);
+  assert.doesNotMatch(elem('agents').innerHTML,/implement two/);
+  await click({dataset:{facet:'merged'}});
+  assert.match(elem('filters').innerHTML,/merged ×/);
+  await click({dataset:{clearRun:''}});
+  assert.match(elem('runs').innerHTML,/A separate run/);
+  assert.doesNotMatch(elem('agents').innerHTML,/implement two/);
+  await click({dataset:{facet:'merged'}});
+  assert.match(elem('agents').innerHTML,/implement two/);
+  vm.runInContext('showDetail(0)',ctx);
+  assert.match(elem('dbody').innerHTML,/Explain tokens and cost/);
+  assert.match(elem('dbody').innerHTML,/\$0\.019/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_draft_and_review_modal_never_start_implementation(self):
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  addEventListener:()=>{}};
+const id='20261014-100000-a1b2c3d4', seen=[];
+const req={id,status:'ready',run:'catalog-cleanup',label:'Tidy catalog',raw:'Please tidy',
+ project:'p',model:'swe-2',effort:'max',manifest:'manifests/a.toml',
+ manifest_text:'[run]\nname = "catalog-cleanup"',proposed_steps:[1,2,3,4].map(i=>({
+   step:'phase-'+i,slug:'p',model:'swe-2',effort:'max',task:'Do phase '+i}))};
+const fetch=async path=>{seen.push(path);return {ok:true,json:async()=>req};};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{},fetch});
+vm.runInContext(src,ctx);
+const d={serve_boot:'b',generated_at:'2026-10-14',agents:req.proposed_steps.map(s=>({
+  ...s,run:'catalog-cleanup',run_key:'request:'+id,status:'planned'})),runs:[
+  {run:'catalog-cleanup',key:'request:'+id,request_id:id,stage:'ready',counts:{planned:4}},
+  {run:'New draft',key:'request:other',request_id:'other',stage:'draft',counts:{}}],
+  project_options:[{slug:'p',cloud_ok:false}],defaults:{model:'swe-2',effort:'max'}};
+vm.runInContext('render('+JSON.stringify(d)+')',ctx);
+assert.match(elem('runs').innerHTML,/Ready to run/);
+assert.match(elem('runs').innerHTML,/Draft · unsent/);
+assert.match(elem('agents').innerHTML,/phase-4/);
+(async()=>{
+  await vm.runInContext('openRequest('+JSON.stringify(id)+')',ctx);
+  assert.match(elem('dbody').innerHTML,/Review proposed run/);
+  assert.match(elem('dbody').innerHTML,/Proposed steps \(4\)/);
+  assert.match(elem('dbody').innerHTML,/Edit proposed TOML/);
+  assert.match(elem('dbody').innerHTML,/data-action="run"/);
+  assert.deepEqual(seen,['/api/requests/'+id]);
+  vm.runInContext('openNew()',ctx);
+  assert.match(elem('dbody').innerHTML,/Save draft/);
+  assert.match(elem('dbody').innerHTML,/Generate proposal/);
+  assert.doesNotMatch(elem('dbody').innerHTML,/data-action="run"/);
+  assert.deepEqual(seen,['/api/requests/'+id]);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
+class RequestWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.proj = make_project(self.base)
+        self.runs = self.base / "runs"
+        self.requests = self.base / "requests"
+        self.manifests = self.base / "manifests"
+        self.manifests.mkdir()
+        patch = mock.patch.object(conductor, "load_projects", return_value={
+            "proj": {"path": self.proj, "cloud_ok": False}})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def proposal(self, description="Tidy the catalog", extra_steps=""):
+        return f'''[run]
+name = "catalog-cleanup"
+description = "{description}"
+checkpoint = true
+
+[defaults]
+project = "proj"
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+
+[[step]]
+name = "organize"
+prompt = "Organize the catalog and verify results."
+{extra_steps}'''
+
+    def new(self):
+        return conductor.create_request(
+            {"raw": "Please tidy the catalog carefully", "project": "proj",
+             "model": "swe-2", "effort": "max"}, self.requests, self.runs)
+
+    def ready(self):
+        rec = self.new()
+        return conductor.save_request(
+            rec["id"], {"manifest": self.proposal()},
+            self.requests, self.manifests, self.runs)
+
+    def test_defaults_change_after_october_16(self):
+        self.assertEqual(conductor.default_model_effort(
+            conductor.dt.date(2026, 10, 16)), ("swe-2", "max"))
+        self.assertEqual(conductor.default_model_effort(
+            conductor.dt.date(2026, 10, 17)), ("gpt-6-luna", "max"))
+
+    def test_draft_has_no_manifest_or_agent_and_ready_has_planned_steps(self):
+        rec = self.new()
+        self.assertEqual(rec["status"], "draft")
+        self.assertFalse(list(self.manifests.iterdir()))
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        self.assertEqual(d["runs"][0]["stage"], "draft")
+        self.assertEqual(d["agents"], [])
+        rec = conductor.save_request(
+            rec["id"], {"manifest": self.proposal(extra_steps='''
+[[step]]
+name = "test"
+prompt = "Run the relevant checks."
+''')}, self.requests, self.manifests, self.runs)
+        self.assertEqual(rec["status"], "ready")
+        self.assertEqual(rec["description"], "Tidy the catalog")
+        self.assertTrue(Path(rec["manifest"]).name.startswith(rec["id"]))
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        self.assertEqual(len(d["runs"]), 1)
+        self.assertEqual(d["runs"][0]["counts"], {"planned": 2})
+        self.assertEqual({a["status"] for a in d["agents"]}, {"planned"})
+        self.assertEqual({a["step"] for a in d["agents"]}, {"organize", "test"})
+        self.assertTrue(all(a["started_at"] is None and a["tokens"] is None
+                            and a["session_id"] is None for a in d["agents"]))
+
+    def test_raw_edits_require_regeneration_or_reviewed_manifest(self):
+        rec = self.ready()
+        conductor.save_request(rec["id"], {"raw": "Change the scope"},
+                               self.requests, self.manifests, self.runs)
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertTrue(rec["stale"])
+        with self.assertRaises(conductor.RequestError):
+            conductor.launch_request(rec["id"], self.requests,
+                                     self.manifests, self.runs, ["devin"])
+        updated = self.proposal("Tidy the catalog and add tests")
+        rec = conductor.save_request(rec["id"], {"manifest": updated},
+                                     self.requests, self.manifests, self.runs)
+        self.assertFalse(rec["stale"])
+        self.assertEqual(rec["description"], "Tidy the catalog and add tests")
+        self.assertEqual(Path(rec["manifest"]).read_text(encoding="utf-8"),
+                         updated)
+
+    def test_interrupted_start_can_be_edited_and_discarded(self):
+        rec = self.ready()
+        rec.update(status="launching", launched_at="2020-01-01T00:00:00")
+        conductor._save_request(rec, self.requests)
+        self.assertEqual(conductor.request_details(
+            rec["id"], self.requests, self.manifests, self.runs)["status"],
+            "launch_failed")
+        edited = conductor.save_request(rec["id"], {"raw": "Try another task"},
+                                       self.requests, self.manifests, self.runs)
+        self.assertEqual(edited["status"], "launch_failed")
+        self.assertTrue(edited["stale"])
+        conductor.discard_request(rec["id"], self.requests,
+                                  self.manifests, self.runs)
+        self.assertFalse(Path(rec["manifest"]).exists())
+
+    def test_refuses_to_write_into_live_workers_workspace(self):
+        run_dir = self.runs / "20261014-000000-live"
+        run_dir.mkdir(parents=True)
+        (run_dir / "state.json").write_text(json.dumps({"steps": {
+            "live": {"status": "running", "started_at": conductor.now_iso(),
+                     "timeout_min": 60, "work_dir": str(self.base)}}}))
+        with self.assertRaises(conductor.RequestError) as error:
+            self.new()
+        self.assertEqual(error.exception.status, 409)
+        self.assertFalse(self.requests.exists())
+
+    def test_generator_changes_only_a_proposal_until_explicit_launch(self):
+        rec = self.new()
+        with mock.patch.object(conductor, "_planner_response",
+                               return_value=self.proposal()) as planner, \
+                mock.patch.object(conductor, "_launch_process") as launcher:
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        self.assertEqual(planner.call_count, 1)
+        launcher.assert_not_called()
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "ready")
+        self.assertFalse(list(self.runs.glob("*/state.json")))
+        first = rec["manifest"]
+        with mock.patch.object(conductor, "_planner_response",
+                               return_value=self.proposal(extra_steps='''
+[[step]]
+name = "audit"
+prompt = "Review the catalog tests."
+''')):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["manifest"], first)
+        self.assertEqual(len(rec["proposed_steps"]), 2)
+
+    def test_failed_regeneration_keeps_old_manifest(self):
+        rec = self.ready()
+        original = Path(rec["manifest"]).read_text(encoding="utf-8")
+        with mock.patch.object(conductor, "_planner_response",
+                               side_effect=ValueError("unavailable")):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "error")
+        self.assertIn("unavailable", rec["error"])
+        self.assertEqual(Path(rec["manifest"]).read_text(encoding="utf-8"),
+                         original)
+
+    def test_planner_is_answer_only_and_keeps_output_outside_workspace(self):
+        rec = self.new()
+        seen = {}
+        proposal = self.proposal()
+
+        class FakeProc:
+            def __init__(self, cmd, **kwargs):
+                seen["cmd"] = cmd
+                seen["cwd"] = kwargs["cwd"]
+                seen["prompt"] = Path(cmd[cmd.index("--prompt-file") + 1])
+                seen["log"] = Path(kwargs["stdout"].name)
+                seen["flags"] = kwargs.get("creationflags", 0)
+                kwargs["stdout"].write(("BEGIN_MANIFEST\n" + proposal +
+                                        "END_MANIFEST\nSTATUS: done\n").encode())
+                kwargs["stdout"].flush()
+
+        with mock.patch.object(conductor.subprocess, "Popen", FakeProc), \
+                mock.patch.object(conductor, "wait_worker",
+                                  return_value=(0, False, False)):
+            text = conductor._planner_response(rec, {}, ["devin"])
+        self.assertEqual(text.strip(), proposal.strip())
+        self.assertIn("--model", seen["cmd"])
+        self.assertEqual(seen["cmd"][seen["cmd"].index("--model") + 1],
+                         "swe-2-max")
+        self.assertEqual(seen["cmd"][seen["cmd"].index("--permission-mode") + 1],
+                         "normal")
+        self.assertEqual(seen["prompt"].parent, Path(seen["cwd"]))
+        self.assertNotEqual(seen["log"].parent, Path(seen["cwd"]))
+        if os.name == "nt":
+            self.assertEqual(seen["flags"], subprocess.CREATE_NO_WINDOW)
+
+    def test_planner_must_honor_selected_model_and_effort(self):
+        rec = self.new()
+        wrong = self.proposal().replace('model = "swe-2"',
+                                        'model = "gpt-6-luna"')
+        with mock.patch.object(conductor, "_planner_response",
+                               return_value=wrong):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "error")
+        self.assertIn("selected model", rec["error"])
+        self.assertFalse(list(self.manifests.iterdir()))
+
+    def test_unsafe_and_invalid_manifests_cannot_become_ready(self):
+        rec = self.new()
+        bad = (self.proposal().replace('project = "proj"',
+                                       'project = "../../secret"'),
+               self.proposal().replace('checkpoint = true',
+                                       'checkpoint = false'),
+               self.proposal().replace('effort = "max"', 'effort = "min"'),
+               self.proposal().replace(
+                   'prompt = "Organize the catalog and verify results."',
+                   'prompt_file = "../outside.md"'),
+               self.proposal().replace('name = "organize"',
+                                       'name = "../../other"'),
+               self.proposal().replace('project = "proj"',
+                                       'project = "proj"\ncloud = true'))
+        for text in bad:
+            with self.subTest(text=text[:50]), self.assertRaises(
+                    conductor.RequestError):
+                conductor.save_request(rec["id"], {"manifest": text},
+                                       self.requests, self.manifests,
+                                       self.runs)
+        self.assertFalse(list(self.manifests.iterdir()))
+
+    def test_discard_removes_only_owned_proposal_not_launched_runs(self):
+        rec = self.ready()
+        manifest = Path(rec["manifest"])
+        conductor.discard_request(rec["id"], self.requests,
+                                  self.manifests, self.runs)
+        self.assertFalse(manifest.exists())
+        self.assertEqual(conductor.collect_dashboard(
+            self.runs, ["no-such-devin"], self.requests)["runs"], [])
+        with self.assertRaises(conductor.RequestError):
+            conductor.launch_request(rec["id"], self.requests,
+                                     self.manifests, self.runs, ["devin"])
+
+    def test_started_run_keeps_all_proposed_steps_visible(self):
+        rec = self.new()
+        rec = conductor.save_request(rec["id"], {"manifest": self.proposal(
+            extra_steps='''
+[[step]]
+name = "check"
+prompt = "Check the catalog."
+
+[[step]]
+name = "polish"
+prompt = "Polish the catalog."
+
+[[step]]
+name = "report"
+prompt = "Report the outcome."
+''')}, self.requests, self.manifests, self.runs)
+        rd = self.runs / "20261014-000000-catalog-cleanup"
+        rd.mkdir(parents=True)
+        state = {"run": rec["run"], "request_id": rec["id"],
+                 "run_dir": str(rd), "description": rec["description"],
+                 "started_at": conductor.now_iso(), "steps": {
+                     "organize": {"name": "organize", "slug": "proj",
+                                  "status": "running",
+                                  "started_at": conductor.now_iso(),
+                                  "work_dir": str(self.proj)}}}
+        (rd / "state.json").write_text(json.dumps(state))
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        self.assertEqual(len(d["runs"]), 1)
+        self.assertEqual(d["runs"][0]["counts"],
+                         {"running": 1, "waiting": 3})
+        self.assertEqual(len(d["agents"]), 4)
+        pending = [a for a in d["agents"] if a["status"] == "waiting"]
+        self.assertEqual({a["step"] for a in pending},
+                         {"check", "polish", "report"})
+        self.assertTrue(all(a["tokens"] is None and a["started_at"] is None
+                            for a in pending))
+        state["ended_at"] = conductor.now_iso()
+        state["steps"]["organize"]["status"] = "failed"
+        (rd / "state.json").write_text(json.dumps(state))
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        self.assertEqual(d["runs"][0]["counts"],
+                         {"failed": 1, "skipped": 3})
+        state["steps"]["check"] = {"name": "check", "status": "blocked"}
+        (rd / "state.json").write_text(json.dumps(state))
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        check = next(a for a in d["agents"] if a["step"] == "check")
+        self.assertEqual(check["slug"], "proj")
+        self.assertEqual(check["task"], "Check the catalog.")
+        self.assertEqual(len(d["agents"]), 4)
+
+    def test_launch_explicitly_passes_request_id_and_real_run_replaces_plan(self):
+        rec = self.ready()
+        with mock.patch.object(conductor, "_launch_process", return_value=42) as start:
+            conductor.launch_request(rec["id"], self.requests,
+                                     self.manifests, self.runs, ["devin"])
+        self.assertIn("--request-id", start.call_args.args[0])
+        self.assertFalse(list(self.runs.glob("*/state.json")))
+        with self.assertRaises(conductor.RequestError):
+            conductor.launch_request(rec["id"], self.requests,
+                                     self.manifests, self.runs, ["devin"])
+        args = argparse.Namespace(manifest=rec["manifest"], resume=None,
+                                  devin=MOCK, runs_dir=str(self.runs),
+                                  request_id=rec["id"], hub=False,
+                                  keep_awake=False)
+        self.assertEqual(conductor.cmd_run(args), 0)
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        self.assertEqual(len(d["runs"]), 1)
+        self.assertEqual(d["runs"][0]["description"], rec["description"])
+        self.assertEqual(d["agents"][0]["status"], "done")
+        self.assertEqual(d["agents"][0]["run_key"],
+                         f"request:{rec['id']}")
+        with self.assertRaises(conductor.RequestError):
+            conductor.discard_request(rec["id"], self.requests,
+                                      self.manifests, self.runs)
+
+    def test_http_draft_review_discard_and_same_origin(self):
+        handler = conductor.make_dashboard_handler(
+            self.runs, ["no-such-devin"], self.requests, self.manifests)
+        server = conductor.http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_port
+
+        def call(method, path, data=None, origin=None, ctype="application/json",
+                 host=None):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            headers = {"Content-Type": ctype,
+                       "Origin": origin or f"http://127.0.0.1:{port}"}
+            if host:
+                headers["Host"] = host
+            conn.request(method, path,
+                         json.dumps(data).encode("utf-8") if data is not None
+                         else None, headers)
+            res = conn.getresponse()
+            payload = json.loads(res.read().decode("utf-8"))
+            conn.close()
+            return res.status, payload
+
+        fields = {"raw": "Clean the catalog", "project": "proj",
+                  "model": "swe-2", "effort": "max"}
+        status, rec = call("POST", "/api/requests", fields)
+        self.assertEqual(status, 201)
+        rid = rec["id"]
+        self.assertEqual(call("GET", "/api/state")[1]["runs"][0]["stage"],
+                         "draft")
+        status, _ = call("POST", "/api/requests", fields,
+                         origin="http://malicious.invalid")
+        self.assertEqual(status, 403)
+        status, _ = call("POST", "/api/requests", fields,
+                         ctype="text/plain")
+        self.assertEqual(status, 415)
+        status, _ = call("GET", "/api/state", host=f"evil.invalid:{port}")
+        self.assertEqual(status, 403)
+        status, rec = call("POST", f"/api/requests/{rid}/save",
+                           {"manifest": self.proposal()})
+        self.assertEqual(status, 200)
+        self.assertEqual(rec["status"], "ready")
+        self.assertEqual(call("GET", f"/api/requests/{rid}")[1][
+            "manifest_text"], self.proposal())
+        status, _ = call("POST", f"/api/requests/{rid}/discard", {})
+        self.assertEqual(status, 400)
+        status, _ = call("POST", f"/api/requests/{rid}/discard",
+                         {"confirm": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(call("GET", "/api/state")[1]["runs"], [])
+        with mock.patch.object(conductor.subprocess, "Popen") as popen:
+            status, _ = call("POST", "/api/auth/login", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(popen.call_args.kwargs["shell"])
+        self.assertNotIn("creationflags", popen.call_args.kwargs)
+
+
+class BackgroundProcessTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows console flags")
+    def test_periodic_dashboard_probes_are_headless(self):
+        prior = list(conductor._AUTH_CACHE)
+        self.addCleanup(lambda: conductor._AUTH_CACHE.__setitem__(slice(None),
+                                                                   prior))
+        conductor._AUTH_CACHE[0] = 0
+        with mock.patch.object(conductor.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                ["devin"], 0, "[]", "")
+            conductor.auth_status(["devin"])
+            self.assertEqual(run.call_args.kwargs["creationflags"],
+                             subprocess.CREATE_NO_WINDOW)
+            conductor.session_activity(["devin"], Path.cwd())
+            self.assertEqual(run.call_args.kwargs["creationflags"],
+                             subprocess.CREATE_NO_WINDOW)
+            conductor._git(Path.cwd(), "status")
+            self.assertEqual(run.call_args.kwargs["creationflags"],
+                             subprocess.CREATE_NO_WINDOW)
 
 
 class PidAliveTests(unittest.TestCase):

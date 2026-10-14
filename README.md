@@ -42,7 +42,30 @@ timeout_min = 90
 ```
 
 Fully annotated manifest: `examples/night.example.toml`. Real manifests
-live in `manifests/` (one `<project>-<what>.toml` per job - see its README).
+live in `manifests/`: hand-written `<project>-<what>.toml` and dashboard-generated
+`<YYYYMMDD-HHMMSS>-<random>-<run>.toml` files stay flat (see its README).
+
+## Dashboard requests
+
+Open `python conductor.py serve` on `http://127.0.0.1:8773` and choose
+**New request**. Enter your raw task, optionally pick a registered project,
+model and effort, then **Save draft** (no Devin session is started). **Generate
+proposal** starts a planning-only local Devin CLI session; it produces a
+reviewable TOML manifest with a run description and proposed agent steps.
+The runs table distinguishes gray drafts from purple **Ready to run** plans;
+planned agents have no start time, session or token counts. Once launched,
+steps not reached yet remain visible as **waiting** (or **skipped** if the run
+ended early), until real step records replace them. The default is SWE-2 Max
+through 2026-10-16, then GPT-6 Luna Max; both are editable.
+
+Review or edit the request and TOML in the modal, save changes, regenerate
+steps, or discard the proposal and its planned steps. Editing the raw request
+or model after generation marks the plan stale until regenerated or explicitly
+edited and saved as TOML. **Nothing implements the request until you separately
+click Start run**; afterward `state.json` drives the usual live run/agent
+progress, and the original request remains viewable. Raw drafts live only in
+gitignored `data/requests/`; accepted TOML lives in `manifests/`. Clicking a
+run row filters both tables; click its filter chip × to clear it.
 
 ## Commands
 
@@ -55,8 +78,8 @@ python conductor.py serve [--port 8773]            live dashboard, loopback only
 python conductor.py sweep                          re-mark orphaned records 'lost'
 python conductor.py sessions [--rm] [--keep-hours N] list/clean spawned sessions
 python conductor.py demo                           self-test vs tests/mock_devin.py
-                                                   (sandboxed under data/demo/ - its
-                                                   runs never appear in data/runs)
+                                                   (fixture under data/demo-project/;
+                                                   run appears in data/runs/)
 python run_tests.py                                unittest suite (mock, no auth)
 ```
 

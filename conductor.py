@@ -29,18 +29,23 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
+import urllib.parse
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 RUNS_DIR = DATA_DIR / "runs"
+REQUESTS_DIR = DATA_DIR / "requests"
+MANIFESTS_DIR = ROOT / "manifests"
 LOGS_DIR = ROOT / "logs"
 PROJECTS_FILE = ROOT / "projects.toml"
 TASK_PY = ROOT.parent / "mobile-apps" / "pc-bridge" / "task.py"
@@ -161,17 +166,21 @@ class Manifest:
     max_parallel: int | None           # cap on concurrent agents; None = auto
     merge_resolver: bool               # run-wide default for step.merge_resolver
     steps: list[Step]
+    description: str | None = None
 
 
 class ManifestError(ValueError):
     pass
 
 
-def load_manifest(path: Path) -> Manifest:
-    doc = tomllib.loads(path.read_text(encoding="utf-8"))
+def load_manifest(path: Path, text: str | None = None) -> Manifest:
+    doc = tomllib.loads(path.read_text(encoding="utf-8") if text is None else text)
     run = doc.get("run", {})
     defaults = doc.get("defaults", {})
     name = run.get("name") or path.stem
+    description = run.get("description")
+    if description is not None and not isinstance(description, str):
+        raise ManifestError("run.description must be a string")
     on_failure = run.get("on_failure", "stop")
     if on_failure not in ("stop", "continue"):
         raise ManifestError(f"run.on_failure must be stop|continue, got {on_failure!r}")
@@ -227,7 +236,7 @@ def load_manifest(path: Path) -> Manifest:
                     preamble=preamble, max_hours=run.get("max_hours"),
                     max_parallel=max_parallel,
                     merge_resolver=bool(run.get("merge_resolver", False)),
-                    steps=steps)
+                    steps=steps, description=description)
 
 
 def load_projects() -> dict[str, dict]:
@@ -347,6 +356,10 @@ def clean_devin_env() -> dict:
     return env
 
 
+def hidden_subprocess_kwargs() -> dict:
+    return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+
+
 def session_activity(devin_argv: list[str], cwd: Path) -> dict[str, float] | None:
     """Session id -> last_activity epoch `devin list` reports for cwd, or
     None when the listing itself failed (devin missing, bad dir) - callers
@@ -357,7 +370,8 @@ def session_activity(devin_argv: list[str], cwd: Path) -> dict[str, float] | Non
         out = subprocess.run(devin_argv + ["list", "--format", "json"],
                              cwd=str(cwd), capture_output=True, text=True,
                              encoding="utf-8", errors="replace", timeout=60,
-                             env=clean_devin_env())
+                             env=clean_devin_env(),
+                             **hidden_subprocess_kwargs())
         if out.returncode != 0:
             return None
         return {s["id"]: float(s.get("last_activity_at") or 0)
@@ -379,8 +393,10 @@ def check_auth(devin_argv: list[str]) -> bool:
         out = subprocess.run(devin_argv + ["auth", "status"],
                              capture_output=True, text=True, timeout=60,
                              encoding="utf-8", errors="replace",
-                             env=clean_devin_env())
-        return "not logged in" not in (out.stdout + out.stderr).lower()
+                             env=clean_devin_env(),
+                             **hidden_subprocess_kwargs())
+        return out.returncode == 0 and "not logged in" not in (
+            out.stdout + out.stderr).lower()
     except Exception:
         return False
 
@@ -557,7 +573,8 @@ def keep_awake() -> None:
 def _git(path: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(path), *args],
                           capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=120)
+                          encoding="utf-8", errors="replace", timeout=120,
+                          **hidden_subprocess_kwargs())
 
 
 def is_git_repo(path: Path) -> bool:
@@ -743,7 +760,7 @@ def kill_tree(proc) -> None:
         return
     if os.name == "nt":
         r = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                           capture_output=True)
+                           capture_output=True, **hidden_subprocess_kwargs())
         if r.returncode != 0 and proc.poll() is None:
             proc.kill()
     else:
@@ -882,7 +899,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             proc = subprocess.Popen(cmd, cwd=str(work_dir), stdout=out,
                                     stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL,
-                                    env=clean_devin_env())
+                                    env=clean_devin_env(),
+                                    **hidden_subprocess_kwargs())
             # Writing state.json into run_dir mid-spawn lands inside the
             # worker's watched workspace on self-hosted runs, and the
             # CLI's user-edit awareness ends the fresh session mid-init
@@ -922,7 +940,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     if step.verify and not timed_out:
         v = subprocess.run(step.verify, cwd=str(work_dir), shell=True,
                            capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=600)
+                           errors="replace", timeout=600,
+                           **hidden_subprocess_kwargs())
         verify_ok = v.returncode == 0
         (run_dir / f"{step.name}.verify.log").write_text(
             (v.stdout or "") + (v.stderr or ""), encoding="utf-8",
@@ -1063,7 +1082,8 @@ def find_resume_dir(cfg: Manifest, runs_dir: Path, arg: str | None) -> Path:
 def _task_py(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, str(TASK_PY), *args],
                           capture_output=True, text=True, timeout=60,
-                          encoding="utf-8", errors="replace")
+                          encoding="utf-8", errors="replace",
+                          **hidden_subprocess_kwargs())
 
 
 def hub_start(cfg: Manifest, run_dir: Path) -> int | None:
@@ -1133,7 +1153,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"[resume] {run_dir.name}")
     else:
         run_dir = new_run_dir(cfg, runs_dir)
-        state = {"run": cfg.name, "manifest": str(manifest_path),
+        state = {"run": cfg.name, "description": cfg.description,
+                 "request_id": getattr(args, "request_id", None),
+                 "manifest": str(manifest_path),
                  "started_at": now_iso(), "devin": " ".join(devin_argv),
                  "run_dir": str(run_dir), "max_parallel": cap,
                  "free_ram_gb": free_ram_gb(), "steps": {}}
@@ -1504,7 +1526,8 @@ def devin_rm(devin_argv: list[str], cwd: Path, sid: str) -> int:
         return subprocess.run(devin_argv + ["rm", sid, "--force"],
                               cwd=str(cwd), capture_output=True, text=True,
                               encoding="utf-8", errors="replace",
-                              timeout=60, env=clean_devin_env()).returncode
+                              timeout=60, env=clean_devin_env(),
+                              **hidden_subprocess_kwargs()).returncode
     except Exception:
         return 1
 
@@ -1516,7 +1539,8 @@ def _worktree_checkout_paths() -> list[Path]:
     try:
         r = subprocess.run(["git", "worktree", "list", "--porcelain"],
                            cwd=str(ROOT), capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=30)
+                           encoding="utf-8", errors="replace", timeout=30,
+                           **hidden_subprocess_kwargs())
     except Exception:
         return []
     if r.returncode != 0:
@@ -1660,6 +1684,472 @@ def cmd_sessions(args: argparse.Namespace) -> int:
     return 0
 
 
+REQUEST_LOCK = threading.RLock()
+REQUEST_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}$")
+_LAUNCH_PIDS: dict[str, int] = {}
+_GENERATING: set[str] = set()
+
+
+class RequestError(ValueError):
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
+
+
+def default_model_effort(today: dt.date | None = None) -> tuple[str, str]:
+    return (("swe-2", "max") if (today or dt.date.today())
+            <= dt.date(2026, 10, 16) else ("gpt-6-luna", "max"))
+
+
+def _request_path(request_id: str, requests_dir: Path) -> Path:
+    if not REQUEST_ID_RE.fullmatch(request_id):
+        raise RequestError("Invalid request id", 404)
+    return requests_dir / f"{request_id}.json"
+
+
+def _read_request(request_id: str, requests_dir: Path) -> dict:
+    try:
+        return json.loads(_request_path(request_id, requests_dir).read_text(
+            encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RequestError("Request not found", 404) from exc
+    except (OSError, ValueError) as exc:
+        raise RequestError("Cannot read request", 500) from exc
+
+
+def _save_request(rec: dict, requests_dir: Path) -> None:
+    requests_dir.mkdir(parents=True, exist_ok=True)
+    p = _request_path(rec["id"], requests_dir)
+    tmp = p.with_suffix(".json.tmp")
+    rec["updated_at"] = now_iso()
+    tmp.write_text(json.dumps(rec, indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    tmp.replace(p)
+
+
+def _request_fields(payload: dict, rec: dict | None = None) -> dict:
+    if not isinstance(payload, dict) or set(payload) - {
+            "raw", "label", "project", "model", "effort", "manifest"}:
+        raise RequestError("Invalid request fields")
+    model, effort = default_model_effort()
+    fields = {k: (rec or {}).get(k, v) for k, v in (
+        ("raw", ""), ("label", ""), ("project", ""),
+        ("model", model), ("effort", effort))}
+    for key in fields:
+        if key in payload:
+            if not isinstance(payload[key], str):
+                raise RequestError(f"{key} must be text")
+            fields[key] = payload[key].strip()
+    if not fields["raw"] or len(fields["raw"]) > 100_000:
+        raise RequestError("Request text must be 1–100,000 characters")
+    if len(fields["label"]) > 80:
+        raise RequestError("Label must be at most 80 characters")
+    if fields["project"] and fields["project"] not in load_projects():
+        raise RequestError("Choose a registered project from projects.toml")
+    for key in ("model", "effort"):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", fields[key]):
+            raise RequestError(f"Invalid {key}")
+    if fields["model"] == "swe-2" and fields["effort"] not in {
+            "medium", "high", "max"}:
+        raise RequestError("SWE-2 supports medium, high or max effort")
+    fields["label"] = fields["label"] or " ".join(fields["raw"].split())[:80]
+    return fields
+
+
+def _assert_unwatched(runs_dir: Path, *destinations: Path) -> None:
+    for sj in runs_dir.glob("*/state.json"):
+        try:
+            st = json.loads(sj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for step in (st.get("steps") or {}).values():
+            wd = step.get("work_dir") or step.get("project")
+            if wd and step_live(step) and any(
+                    p.resolve().is_relative_to(Path(wd).resolve())
+                    for p in destinations):
+                raise RequestError("A live agent is watching this workspace; "
+                                   "wait until it finishes before changing "
+                                   "requests or manifests", 409)
+
+
+def _wait_writable(runs_dir: Path, *destinations: Path) -> None:
+    while True:
+        try:
+            _assert_unwatched(runs_dir, *destinations)
+            return
+        except RequestError:
+            time.sleep(5)
+
+
+def create_request(payload: dict, requests_dir: Path = REQUESTS_DIR,
+                   runs_dir: Path = RUNS_DIR) -> dict:
+    with REQUEST_LOCK:
+        _assert_unwatched(runs_dir, requests_dir)
+        fields = _request_fields(payload)
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        rec = {"id": f"{stamp}-{secrets.token_hex(4)}", "status": "draft",
+               "created_at": now_iso(), "manifest": None, "description": "",
+               "run": None, "proposed_steps": [], "stale": False,
+               "error": None, **fields}
+        _save_request(rec, requests_dir)
+        return dict(rec)
+
+
+def _manifest_path(rec: dict, manifests_dir: Path) -> Path:
+    p = Path(rec.get("manifest") or "")
+    if not rec.get("manifest") or p.parent.resolve() != manifests_dir.resolve() \
+            or not p.name.startswith(f"{rec['id']}-") \
+            or p.suffix != ".toml":
+        raise RequestError("Proposal manifest is not owned by this request", 409)
+    return p
+
+
+def validate_proposal(text: str, manifests_dir: Path = MANIFESTS_DIR) -> Manifest:
+    if not isinstance(text, str) or not 1 <= len(text) <= 150_000:
+        raise RequestError("Manifest must be 1–150,000 characters")
+    try:
+        doc = tomllib.loads(text)
+        run = doc.get("run", {})
+        if not isinstance(run, dict) or run.get("preamble") \
+                or run.get("preamble_file"):
+            raise RequestError("A proposal cannot replace the worker preamble")
+        cfg = load_manifest(manifests_dir / "proposal.toml", text)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,59}", cfg.name):
+            raise RequestError("[run].name must be a short, safe run name")
+        if not cfg.description or not cfg.description.strip() \
+                or len(cfg.description) > 300:
+            raise RequestError("[run].description must be 1–300 characters")
+        if not cfg.checkpoint:
+            raise RequestError("Proposals must keep checkpoint = true")
+        projects = load_projects()
+        for step in cfg.steps:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,59}",
+                                step.name):
+                raise RequestError(f"Invalid step name: {step.name!r}")
+            if step.project not in projects:
+                raise RequestError(f"Use a projects.toml slug, not a path: "
+                                   f"{step.project!r}")
+            if step.prompt_file or not isinstance(step.prompt, str) \
+                    or not step.prompt.strip():
+                raise RequestError(f"{step.name}: include the task as prompt text")
+            if not 0 < step.timeout_min <= 1440:
+                raise RequestError(f"{step.name}: invalid timeout_min")
+            for val in (step.model, step.effort):
+                if val is not None and not re.fullmatch(
+                        r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", val):
+                    raise RequestError(f"{step.name}: invalid model or effort")
+            if step.model == "swe-2" and step.effort not in (
+                    None, "medium", "high", "max"):
+                raise RequestError(f"{step.name}: SWE-2 supports medium, "
+                                   "high or max effort")
+            project_dir, _slug = resolve_project(step, projects, manifests_dir)
+            if not is_git_repo(project_dir):
+                raise RequestError(f"{step.project}: not a git repository root")
+        validate_groups(group_waves([
+            (*resolve_project(s, projects, manifests_dir), s)
+            for s in cfg.steps]))
+        return cfg
+    except (tomllib.TOMLDecodeError, ManifestError, TypeError, KeyError,
+            AttributeError) as exc:
+        raise RequestError(f"Invalid proposal: {exc}") from exc
+
+
+def _publish_proposal(rec: dict, text: str, requests_dir: Path,
+                      manifests_dir: Path, runs_dir: Path) -> dict:
+    cfg = validate_proposal(text, manifests_dir)
+    if not manifests_dir.is_dir():
+        raise RequestError(f"Missing manifests directory: {manifests_dir}", 409)
+    _assert_unwatched(runs_dir, requests_dir, manifests_dir)
+    p = (_manifest_path(rec, manifests_dir) if rec.get("manifest") else
+         manifests_dir / f"{rec['id']}-{cfg.name}.toml")
+    tmp = p.with_suffix(".toml.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(p)
+    rec.update(status="ready", manifest=str(p), run=cfg.name,
+               description=cfg.description.strip(), error=None, stale=False,
+               proposed_steps=[{
+                   "step": s.name, "slug": s.project, "model": s.model,
+                   "effort": s.effort, "mode": s.mode, "task": " ".join(
+                       s.prompt.split())[:160], "wt": s.worktree,
+                   "cloud": s.cloud} for s in cfg.steps])
+    _save_request(rec, requests_dir)
+    return dict(rec)
+
+
+def save_request(request_id: str, payload: dict,
+                 requests_dir: Path = REQUESTS_DIR,
+                 manifests_dir: Path = MANIFESTS_DIR,
+                 runs_dir: Path = RUNS_DIR) -> dict:
+    with REQUEST_LOCK:
+        _assert_unwatched(runs_dir, requests_dir, manifests_dir)
+        rec = _read_request(request_id, requests_dir)
+        stage = _request_status(rec, runs_dir)
+        if stage not in ("draft", "ready", "error", "launch_failed"):
+            raise RequestError("This request is being processed or already run", 409)
+        rec["status"] = stage
+        fields = _request_fields(payload, rec)
+        changed = any(fields[k] != rec.get(k) for k in
+                      ("raw", "project", "model", "effort"))
+        rec.update(fields)
+        if "manifest" in payload:
+            return _publish_proposal(rec, payload["manifest"],
+                                     requests_dir, manifests_dir, runs_dir)
+        if rec.get("manifest") and changed:
+            rec["stale"] = True
+        _save_request(rec, requests_dir)
+        return dict(rec)
+
+
+def request_details(request_id: str, requests_dir: Path = REQUESTS_DIR,
+                    manifests_dir: Path = MANIFESTS_DIR,
+                    runs_dir: Path | None = None) -> dict:
+    with REQUEST_LOCK:
+        rec = dict(_read_request(request_id, requests_dir))
+        if rec.get("manifest"):
+            p = _manifest_path(rec, manifests_dir)
+            rec["manifest_text"] = (p.read_text(encoding="utf-8")
+                                    if p.is_file() else "")
+        else:
+            rec["manifest_text"] = ""
+        if runs_dir:
+            status = _request_status(rec, runs_dir)
+            if status == "error" and rec["status"] == "generating":
+                rec["error"] = "Planning was interrupted. Regenerate to retry."
+            rec["status"] = status
+        return rec
+
+
+def _planner_response(rec: dict, projects: dict,
+                      devin_argv: list[str]) -> str:
+    slugs = ", ".join(sorted(projects))
+    prompt = f"""You are writing a proposed agent-conductor TOML runbook, not doing the work.
+Do not edit files, invoke tools, run commands, inspect projects, or start a run.
+Reply with exactly one TOML document between BEGIN_MANIFEST and END_MANIFEST,
+then a final STATUS: done line. No Markdown fences or other text.
+The ONLY task specification is the human request below; do not invent repo details.
+Registered project slugs (use these, never paths): {slugs}
+Preferred project (if supplied): {rec['project'] or '(infer from request)'}
+[run] needs name (short safe slug), description (one useful sentence),
+on_failure (stop or continue), and checkpoint = true.
+[defaults] needs model = {json.dumps(rec['model'])}, effort =
+{json.dumps(rec['effort'])}, mode = "bypass", and timeout_min.
+Each [[step]] needs a unique name, a registered project slug, and a concrete
+prompt describing only that step. Prefer sequential steps. If using waves on
+one project, every member needs worktree = true. Cloud steps require explicit
+user intent and a project permitted for cloud. No prompt_file or preamble.
+Do not guess verification commands; include verify only when known.
+Do not reproduce credentials or private data in the tracked manifest; refer
+agents to the project files containing those details instead.
+The proposal must NOT start work; the human will edit it and launch later.
+
+HUMAN REQUEST:
+{rec['raw']}
+
+BEGIN_MANIFEST
+...your TOML here...
+END_MANIFEST
+STATUS: done
+"""
+    with tempfile.TemporaryDirectory(prefix="conductor-planner-") as wd, \
+            tempfile.TemporaryDirectory(prefix="conductor-planner-log-") as ld:
+        prompt_path = Path(wd) / "request.md"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        log = Path(ld) / "planner.stdout.log"
+        cmd = devin_argv + [
+            "--print", "--prompt-file", str(prompt_path),
+            "--model", f"{rec['model']}-{rec['effort']}",
+            "--permission-mode", "normal", "--respect-workspace-trust", "false"]
+        with open(log, "wb") as out:
+            proc = subprocess.Popen(cmd, cwd=wd, stdout=out,
+                                    stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL,
+                                    env=clean_devin_env(),
+                                    **hidden_subprocess_kwargs())
+            rc, timed_out, _hung = wait_worker(proc, log, 600)
+        if timed_out or rc != 0:
+            raise RequestError("Planner did not finish; check CLI auth and "
+                               "retry generation", 502)
+        text = log.read_text(encoding="utf-8", errors="replace")
+    matches = re.findall(r"^BEGIN_MANIFEST\s*\n(.*?)^END_MANIFEST\s*$",
+                         text, re.M | re.S)
+    if not matches:
+        raise RequestError("Planner returned no TOML proposal; try regenerating",
+                           502)
+    return matches[-1].strip() + "\n"
+
+
+def _finish_generation(request_id: str, requests_dir: Path,
+                       manifests_dir: Path, runs_dir: Path,
+                       devin_argv: list[str]) -> None:
+    try:
+        rec = _read_request(request_id, requests_dir)
+        text = _planner_response(rec, load_projects(), devin_argv)
+        defaults = tomllib.loads(text).get("defaults", {})
+        if defaults.get("model") != rec["model"] or \
+                defaults.get("effort") != rec["effort"]:
+            raise RequestError("Planner ignored the selected model or effort; "
+                               "regenerate or edit the TOML directly")
+        while True:
+            _wait_writable(runs_dir, requests_dir, manifests_dir)
+            try:
+                with REQUEST_LOCK:
+                    rec = _read_request(request_id, requests_dir)
+                    if rec["status"] == "generating":
+                        _publish_proposal(rec, text, requests_dir,
+                                          manifests_dir, runs_dir)
+                break
+            except RequestError:
+                try:
+                    _assert_unwatched(runs_dir, requests_dir, manifests_dir)
+                except RequestError:
+                    continue
+                raise
+    except Exception as exc:
+        _wait_writable(runs_dir, requests_dir, LOGS_DIR)
+        LOG.warning("request %s generation failed: %s", request_id, exc)
+        with REQUEST_LOCK:
+            rec = _read_request(request_id, requests_dir)
+            if rec["status"] == "generating":
+                rec.update(status="error", error=str(exc)[:300])
+                _save_request(rec, requests_dir)
+    finally:
+        with REQUEST_LOCK:
+            _GENERATING.discard(request_id)
+
+
+def start_generation(request_id: str,
+                     requests_dir: Path = REQUESTS_DIR,
+                     manifests_dir: Path = MANIFESTS_DIR,
+                     runs_dir: Path = RUNS_DIR,
+                     devin_argv: list[str] | None = None,
+                     background: bool = True) -> dict:
+    with REQUEST_LOCK:
+        _assert_unwatched(runs_dir, requests_dir)
+        rec = _read_request(request_id, requests_dir)
+        if _request_status(rec, runs_dir) not in (
+                "draft", "ready", "error", "launch_failed"):
+            raise RequestError("Only drafts or unrun proposals can be generated", 409)
+        rec.update(status="generating", error=None, generation_started_at=now_iso())
+        _save_request(rec, requests_dir)
+        _GENERATING.add(request_id)
+    args = (request_id, requests_dir, manifests_dir, runs_dir,
+            devin_argv or ["devin"])
+    if background:
+        threading.Thread(target=_finish_generation, args=args,
+                         daemon=True).start()
+        return rec
+    _finish_generation(*args)
+    return request_details(request_id, requests_dir, manifests_dir)
+
+
+def _request_run_dir(request_id: str, runs_dir: Path) -> Path | None:
+    for sj in sorted(runs_dir.glob("*/state.json"), reverse=True):
+        try:
+            if json.loads(sj.read_text(encoding="utf-8")).get(
+                    "request_id") == request_id:
+                return sj.parent
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _request_status(rec: dict, runs_dir: Path) -> str:
+    if _request_run_dir(rec["id"], runs_dir):
+        return "launched"
+    if rec["status"] == "generating" and rec["id"] not in _GENERATING \
+            and time.time() - (_iso_ts(rec.get("generation_started_at"))
+                               or time.time()) > 660:
+        return "error"
+    if rec["status"] != "launching":
+        return rec["status"]
+    age = time.time() - (_iso_ts(rec.get("launched_at")) or time.time())
+    if age > 90 and (rec["id"] not in _LAUNCH_PIDS or not pid_alive(
+            _LAUNCH_PIDS[rec["id"]], rec.get("launched_at"))):
+        return "launch_failed"
+    return "launching"
+
+
+def _launch_process(cmd: list[str], log_path: Path) -> int:
+    with open(log_path, "wb") as out:
+        proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=out,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                env=clean_devin_env(),
+                                **hidden_subprocess_kwargs())
+    return proc.pid
+
+
+def launch_request(request_id: str,
+                   requests_dir: Path = REQUESTS_DIR,
+                   manifests_dir: Path = MANIFESTS_DIR,
+                   runs_dir: Path = RUNS_DIR,
+                   devin_argv: list[str] | None = None) -> dict:
+    with REQUEST_LOCK:
+        _assert_unwatched(runs_dir, requests_dir)
+        rec = _read_request(request_id, requests_dir)
+        if _request_status(rec, runs_dir) not in ("ready", "launch_failed") \
+                or rec.get("stale"):
+            raise RequestError("Review and save a current proposal before "
+                               "launching; already launched requests cannot "
+                               "be started again", 409)
+        p = _manifest_path(rec, manifests_dir)
+        try:
+            cfg = validate_proposal(p.read_text(encoding="utf-8"),
+                                    manifests_dir)
+        except OSError as exc:
+            raise RequestError("Proposal TOML is missing", 409) from exc
+        projects = load_projects()
+        targets = {resolve_project(s, projects, manifests_dir)[0].resolve()
+                   for s in cfg.steps}
+        for sj in runs_dir.glob("*/state.json"):
+            try:
+                st = json.loads(sj.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if any(not step.get("branch") and step_live(step) and
+                   Path(step.get("work_dir") or step.get("project") or "").resolve()
+                   in targets for step in (st.get("steps") or {}).values()):
+                raise RequestError("A live agent already works in this project; "
+                                   "wait or isolate work in a worktree", 409)
+        if ROOT.resolve() in targets and any(
+                r.get("status") == "generating" for f in
+                requests_dir.glob("*.json") for r in [json.loads(
+                    f.read_text(encoding="utf-8"))]):
+            raise RequestError("Wait for proposal generation to finish before "
+                               "running work in agent-conductor", 409)
+        rec.update(status="launching", launched_at=now_iso(), error=None)
+        _save_request(rec, requests_dir)
+        cmd = [sys.executable, str(ROOT / "conductor.py"), "run", str(p),
+               "--request-id", request_id, "--runs-dir", str(runs_dir)]
+        if devin_argv and devin_argv != ["devin"]:
+            cmd += ["--devin", shlex.join(devin_argv)]
+        try:
+            _LAUNCH_PIDS[request_id] = _launch_process(
+                cmd, requests_dir / f"{request_id}.run.log")
+        except OSError as exc:
+            rec.update(status="launch_failed", error=str(exc)[:300])
+            _save_request(rec, requests_dir)
+            raise RequestError("Could not start the conductor process", 500) from exc
+        return dict(rec)
+
+
+def discard_request(request_id: str,
+                    requests_dir: Path = REQUESTS_DIR,
+                    manifests_dir: Path = MANIFESTS_DIR,
+                    runs_dir: Path = RUNS_DIR) -> dict:
+    with REQUEST_LOCK:
+        _assert_unwatched(runs_dir, requests_dir, manifests_dir)
+        rec = _read_request(request_id, requests_dir)
+        if _request_status(rec, runs_dir) not in (
+                "draft", "ready", "error", "launch_failed"):
+            raise RequestError("A running or launched proposal cannot be discarded",
+                               409)
+        if rec.get("manifest"):
+            _manifest_path(rec, manifests_dir).unlink(missing_ok=True)
+        rec.update(status="discarded", proposed_steps=[], manifest=None)
+        _save_request(rec, requests_dir)
+        return dict(rec)
+
+
 # ---------------------------------------------------------------- dashboard
 
 SERVE_PORT = 8773    # registered in C:\Projects\AGENTS.md
@@ -1667,6 +2157,10 @@ SERVE_PORT = 8773    # registered in C:\Projects\AGENTS.md
 _STATUS_COLOR = {"done": "#3fb950", "partial": "#d29922", "blocked": "#d29922",
                  "failed": "#f85149", "timed_out": "#f0883e",
                  "running": "#58a6ff", "queued": "#8b949e",
+                 "waiting": "#8b949e", "skipped": "#6e7681",
+                 "planned": "#bc8cff", "ready": "#bc8cff",
+                 "generating": "#bc8cff", "draft": "#8b949e",
+                 "launching": "#58a6ff", "launch_failed": "#f85149",
                  "lost": "#6e7681"}
 
 _AUTH_CACHE = [0.0, "unknown"]        # [checked_at, label]
@@ -1682,7 +2176,8 @@ def auth_status(devin_argv: list[str]) -> str:
         out = subprocess.run(devin_argv + ["auth", "status"],
                              capture_output=True, text=True,
                              encoding="utf-8", errors="replace", timeout=30,
-                             env=clean_devin_env())
+                             env=clean_devin_env(),
+                             **hidden_subprocess_kwargs())
         txt = (out.stdout + out.stderr).lower()
         label = ("NOT LOGGED IN" if out.returncode != 0
                  or "not logged in" in txt else "ok")
@@ -1753,12 +2248,44 @@ def stdout_tail(path: str | None, lines: int = 15) -> str | None:
 SERVE_BOOT = now_iso()
 
 
+def proposal_agent(step: dict, rec: dict, projects: dict, key: str,
+                   status: str, run_dir: str | None = None,
+                   sort_at: str | None = None) -> dict:
+    slug = step["slug"]
+    return {"run": rec.get("run"), "run_dir": run_dir,
+            "run_key": key, "request_id": rec["id"],
+            "step": step["step"], "slug": slug,
+            "work_dir": str(projects.get(slug, {}).get("path") or slug),
+            "status": status,
+            "created_at": sort_at or rec.get("updated_at") or rec.get("created_at"),
+            "started_at": None, "ended_at": None, "elapsed_s": None,
+            "session_id": None, "model": step.get("model"),
+            "effort": step.get("effort"), "mode": step.get("mode"),
+            "task": step.get("task"), "wt": step.get("wt"),
+            "merged": None, "cloud": step.get("cloud"), "tokens": None,
+            "alive": False,
+            "note": "Run ended before this step started" if status == "skipped"
+            else None}
+
+
 def collect_dashboard(runs_dir: Path,
-                      devin_argv: list[str] | None = None) -> dict:
-    """Flatten every run's state.json into the shape the UI renders: one
-    agent row per step record, one run row per state file, newest first.
-    state.json is the single source of truth - this adds no second registry."""
+                      devin_argv: list[str] | None = None,
+                      requests_dir: Path | None = None) -> dict:
+    """Show executed run states alongside saved, not-yet-executed requests.
+    A launched request uses state.json for its rows, not its proposal preview."""
+    requests_dir = requests_dir or runs_dir.parent / "requests"
     sess_by_dir = live_sessions_by_dir(runs_dir, devin_argv or ["devin"])
+    projects = load_projects()
+    requests: dict[str, dict] = {}
+    for rf in requests_dir.glob("*.json"):
+        try:
+            rec = json.loads(rf.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and REQUEST_ID_RE.fullmatch(
+                str(rec.get("id") or "")) and rec.get("status") != "discarded":
+            requests[rec["id"]] = rec
+    launched: set[str] = set()
     runs: list[dict] = []
     agents: list[dict] = []
     for sj in sorted(runs_dir.glob("*/state.json"), reverse=True):
@@ -1766,50 +2293,102 @@ def collect_dashboard(runs_dir: Path,
             st = json.loads(sj.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        if st.get("request_id"):
+            launched.add(st["request_id"])
+        key = (f"request:{st['request_id']}" if st.get("request_id")
+               else str(sj.parent))
         counts: dict[str, int] = {}
         tok_run: dict[str, int] = {}
+        request = requests.get(st.get("request_id"))
+        proposed = {s["step"]: s for s in request.get("proposed_steps", [])} \
+            if request else {}
         eff = effective_statuses(st)
         for name, rec in st.get("steps", {}).items():
+            plan = proposed.get(name) or {}
             t = rec.get("tokens")
             if isinstance(t, dict):
-                for k in ("prompt", "completion", "cached"):
+                for k in ("prompt", "completion", "cached", "llm_steps"):
                     if isinstance(t.get(k), int):
                         tok_run[k] = tok_run.get(k, 0) + t[k]
             status = eff.get(name, rec.get("status", "?"))
             counts[status] = counts.get(status, 0) + 1
             sid = rec.get("session_id")
-            wd = rec.get("work_dir") or rec.get("project")
+            slug = rec.get("slug") or plan.get("slug")
+            wd = (rec.get("work_dir") or rec.get("project") or
+                  str(projects.get(slug, {}).get("path") or ""))
             live = sess_by_dir.get(wd)
             agents.append({
-                "run": st.get("run"), "run_dir": st.get("run_dir"),
-                "step": rec.get("name"), "slug": rec.get("slug"),
-                "work_dir": rec.get("work_dir") or rec.get("project"),
+                "run": st.get("run"), "run_dir": st.get("run_dir") or str(sj.parent),
+                "run_key": key, "request_id": st.get("request_id"),
+                "step": rec.get("name") or name, "slug": slug,
+                "work_dir": wd,
                 "status": status, "started_at": rec.get("started_at"),
                 "ended_at": rec.get("ended_at"),
                 "elapsed_s": rec.get("elapsed_s"),
                 "alive": step_live(rec),
                 "pid": rec.get("pid"), "session_id": rec.get("session_id"),
-                "model": rec.get("model"), "mode": rec.get("mode"),
-                "effort": rec.get("effort"), "task": task_label(rec),
-                "cloud": rec.get("cloud"), "verify_ok": rec.get("verify_ok"),
+                "model": rec.get("model") or plan.get("model"),
+                "mode": rec.get("mode") or plan.get("mode"),
+                "effort": rec.get("effort") or plan.get("effort"),
+                "task": task_label(rec) or plan.get("task"),
+                "cloud": rec.get("cloud", plan.get("cloud")),
+                "verify_ok": rec.get("verify_ok"),
                 "note": rec.get("note"), "next": rec.get("next"),
                 "session_gone": bool(sid and live is not None
                                      and str(sid) not in live),
                 "exit_code": rec.get("exit_code"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
                 "tokens": rec.get("tokens"),
-                "wt": bool(rec.get("branch")),
+                "wt": bool(rec.get("branch") or plan.get("wt")),
                 "stdout_log": rec.get("stdout_log"),
                 "tail": stdout_tail(rec.get("stdout_log")),
                 "export": rec.get("export"), "prompt": rec.get("prompt")})
+        if request:
+            pending = "skipped" if st.get("ended_at") else "waiting"
+            for step in request.get("proposed_steps") or []:
+                if step["step"] in (st.get("steps") or {}):
+                    continue
+                counts[pending] = counts.get(pending, 0) + 1
+                agents.append(proposal_agent(
+                    step, request, projects, key, pending, str(sj.parent),
+                    st.get("started_at")))
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
+                     "key": key, "request_id": st.get("request_id"),
+                     "description": st.get("description") or
+                     (request or {}).get("description"),
                      "started_at": st.get("started_at"),
                      "ended_at": st.get("ended_at"), "counts": counts,
                      "tokens": tok_run or None,
                      "max_parallel": st.get("max_parallel"),
                      "projects": sorted({r.get("slug") for r in
                                          st.get("steps", {}).values()
-                                         if r.get("slug")})})
+                                         if r.get("slug")} |
+                                        {s["slug"] for s in proposed.values()})})
+    for rid, rec in requests.items():
+        if rid in launched:
+            continue
+        stage = (_request_status(rec, runs_dir)
+                 if rec.get("status") in ("launching", "generating")
+                 else rec.get("status"))
+        if stage == "launched":
+            continue
+        steps = rec.get("proposed_steps") or []
+        key = f"request:{rid}"
+        runs.append({"run": rec.get("run") or rec.get("label"),
+                     "key": key, "request_id": rid,
+                     "description": rec.get("description"),
+                     "dir": rec.get("manifest") or "",
+                     "created_at": rec.get("created_at"),
+                     "updated_at": rec.get("updated_at"),
+                     "started_at": None, "ended_at": None,
+                     "counts": {"planned": len(steps)} if steps else {},
+                     "tokens": None, "max_parallel": None,
+                     "stage": stage, "error": rec.get("error"),
+                     "stale": rec.get("stale"),
+                     "projects": sorted({s["slug"] for s in steps})
+                     or ([rec["project"]] if rec.get("project") else [])})
+        for s in steps:
+            agents.append(proposal_agent(s, rec, projects, key, "planned"))
     # session_id is discovered post-spawn (diff of `devin list`); while a
     # step runs the cell is empty. Attribute it live instead: among the
     # unclaimed ids in the step's work_dir, the spawned one is the session
@@ -1827,10 +2406,16 @@ def collect_dashboard(runs_dir: Path,
         a["tail_last"] = next(
             (ln for ln in reversed((a.get("tail") or "").splitlines())
              if ln.strip()), None)
-    agents.sort(key=lambda a: a.get("started_at") or "", reverse=True)
+    agents.sort(key=lambda a: a.get("started_at") or a.get("created_at") or "",
+                reverse=True)
+    runs.sort(key=lambda r: r.get("started_at") or r.get("updated_at") or
+              r.get("created_at") or "", reverse=True)
     return {"generated_at": now_iso(), "serve_boot": SERVE_BOOT,
             "cpu_count": os.cpu_count(),
             "free_ram_gb": free_ram_gb(), "runs": runs, "agents": agents,
+            "project_options": [{"slug": slug, "cloud_ok": p["cloud_ok"]}
+                                for slug, p in sorted(projects.items())],
+            "defaults": dict(zip(("model", "effort"), default_model_effort())),
             "auth": auth_status(devin_argv or ["devin"])}
 
 
@@ -1852,7 +2437,10 @@ th { text-align:left; font-weight:600; color:#8b949e; font-size:11px; text-trans
 td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 td.wrap { white-space:normal; color:#8b949e; font-size:12px; }
 td.step { white-space:normal; }  /* wt/merged chips wrap under a long name */
-tr.agen { cursor:pointer; }
+tr.agen, tr.runrow { cursor:pointer; }
+tr.runrow:hover td { background:#172532; }
+tr.runrow.selected td { background:#1c3041; }
+tr.runrow.selected td:first-child { box-shadow:inset 3px 0 #58a6ff; }
 .dots span { animation:blink 1.2s infinite; color:#58a6ff; }
 .dots span:nth-child(2) { animation-delay:.4s; }
 .dots span:nth-child(3) { animation-delay:.8s; }
@@ -1867,31 +2455,76 @@ td.res.fresh { animation:fresh 1.2s ease-out; }
 @keyframes fresh { 0% { background:rgba(88,166,255,.25); } 100% { background:transparent; } }
 .chip { display:inline-block; border:1px solid #30363d; border-radius:10px; padding:1px 9px; margin:0 5px 5px 0; font-size:12px; cursor:pointer; user-select:none; }
 .chip.off { opacity:.35; }
+.chip.active { background:#1c3041; border-color:#58a6ff; }
+button.chip { background:transparent; font:inherit; color:inherit; }
+button.chip.active { background:#1c3041; }
+button.chip:focus-visible, button:focus-visible, tr.runrow:focus-visible { outline:2px solid #58a6ff; outline-offset:2px; }
+.filter-group { display:inline-block; margin:0 14px 5px 0; }
+.filter-label { color:#8b949e; margin-right:6px; }
 .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
 .dot.run { animation:pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity:.35; } }
 .wrapw { overflow-x:auto; }
 .counts span { background:#161b22; border-radius:8px; padding:1px 8px; margin-right:5px; font-size:12px; }
 a { color:#58a6ff; text-decoration:none; }
+[hidden] { display:none !important; }
+.tok-help { display:inline-block; position:relative; margin-left:6px; vertical-align:middle; }
+.tok-help summary { display:inline-grid; place-items:center; width:18px; height:18px; border:1px solid #6e7681; border-radius:50%; color:#58a6ff; cursor:pointer; list-style:none; }
+.tok-help summary::-webkit-details-marker { display:none; }
+.tok-help .explain { padding:10px 12px; margin-top:7px; border:1px solid #30363d; background:#0d1117; border-radius:6px; font-size:12px; line-height:1.6; }
 #backdrop { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:8; }
-#detail { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); width:min(660px,92vw); max-height:72vh; background:#161b22; border:1px solid #30363d; border-radius:10px; padding:18px 22px; overflow:auto; z-index:9; font-size:13px; }
-#detail h3 { margin:0 0 10px; font-size:14px; }
+#detail { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); width:min(780px,92vw); max-height:82vh; background:#161b22; border:1px solid #30363d; border-radius:10px; padding:18px 22px; overflow:auto; z-index:9; font-size:13px; box-sizing:border-box; }
+#detail h3 { margin:0 80px 10px 0; font-size:14px; }
 #detail .kv { display:grid; grid-template-columns:96px 1fr; gap:4px 12px; }
 #detail .k { color:#8b949e; }
 #detail pre { white-space:pre-wrap; color:#8b949e; background:#0d1117; border-radius:6px; padding:8px 10px; font-size:12px; max-height:180px; overflow:auto; }
-#detail .x { position:absolute; top:10px; right:16px; cursor:pointer; color:#8b949e; }
-@media (max-width:640px) { .hide-s { display:none; } #detail { width:92vw; } }
+#detail .x { position:absolute; top:10px; right:16px; cursor:pointer; color:#8b949e; background:none; border:0; font:inherit; }
+.toolbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.toolbar .sub { margin:0; }
+.stage { display:inline-block; border-radius:9px; padding:1px 7px; font-size:11px; border:1px solid #30363d; white-space:nowrap; }
+.stage.draft { color:#8b949e; background:#1b2027; }
+.stage.ready { color:#bc8cff; border-color:#614b84; background:#251d35; }
+.stage.generating { color:#58a6ff; background:#172638; }
+.stage.launching { color:#58a6ff; background:#172638; }
+.stage.error, .stage.launch_failed { color:#f85149; background:#321c20; }
+.linkbtn { background:none; border:0; color:#58a6ff; cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
+.btn { border:1px solid #388bfd; border-radius:6px; background:#1f6feb; color:#fff; padding:7px 12px; cursor:pointer; font:inherit; }
+.btn.secondary { color:#e6edf3; background:#21262d; border-color:#30363d; }
+.btn.danger { color:#ffb2aa; background:transparent; border-color:#9f3535; }
+.btn:disabled { cursor:not-allowed; opacity:.45; }
+#detail label { display:block; color:#8b949e; margin:12px 0 5px; }
+#detail input, #detail textarea, #detail select { box-sizing:border-box; width:100%; padding:8px 10px; border:1px solid #30363d; border-radius:6px; background:#0d1117; color:#e6edf3; font:inherit; }
+#detail textarea { min-height:145px; resize:vertical; }
+#detail textarea.toml { min-height:270px; font:12px/1.5 ui-monospace,Consolas,monospace; }
+#detail input:disabled, #detail textarea:disabled, #detail select:disabled { opacity:.65; }
+#detail .field-row { display:grid; grid-template-columns:2fr 1fr 1fr; gap:10px; }
+#detail .actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:16px 0 0; }
+#detail .notice { color:#8b949e; background:#0d1117; border-left:3px solid #30363d; padding:8px 10px; margin:10px 0; }
+#detail .notice.warn { border-color:#d29922; color:#e6edf3; }
+#detail .notice.error { border-color:#f85149; color:#ffb2aa; }
+#detail details.proposal { margin-top:14px; }
+#detail details.proposal summary { cursor:pointer; color:#58a6ff; }
+#detail .proposal-list { margin-top:12px; padding-left:20px; }
+#detail .proposal-list li { margin:8px 0; }
+#detail .proposal-list small { color:#8b949e; }
+@media (max-width:640px) { .hide-s { display:none; } #detail { width:92vw; } #detail .field-row { grid-template-columns:1fr; } }
 </style></head><body>
 <h1>agent-conductor</h1>
 <div class="sub" id="meta">loading&hellip;</div>
+<div class="toolbar"><button type="button" class="btn" id="new-request">New request</button><span class="sub">Save draft → generate proposal → review → start when ready. Generating never runs tasks.</span></div>
 <div class="sub" id="filters"></div>
 <h2>runs</h2><div class="wrapw"><table id="runs"></table></div>
 <h2>agents by project</h2><div id="agents"></div>
-<div id="backdrop" hidden><div id="detail"><span class="x" id="dx">[close]</span><div id="dbody"></div></div></div>
+<div id="backdrop" hidden><div id="detail" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button type="button" class="x" id="dx">Close ×</button><div id="dbody"></div></div></div>
 <script>
 const COLORS = {done:'#3fb950',partial:'#d29922',blocked:'#d29922',
 failed:'#f85149',timed_out:'#f0883e',running:'#58a6ff',queued:'#8b949e',
-lost:'#6e7681'};
+waiting:'#8b949e',skipped:'#6e7681',planned:'#bc8cff',ready:'#bc8cff',
+generating:'#bc8cff',draft:'#8b949e',
+launching:'#58a6ff',launch_failed:'#f85149',lost:'#6e7681'};
+const STAGES = {draft:'Draft · unsent',generating:'Preparing proposal',
+  ready:'Ready to run',launching:'Starting run',launch_failed:'Start failed',
+  error:'Planning failed'};
 const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,
   c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const today = new Date().toDateString();
@@ -1911,13 +2544,21 @@ const fmtT = t => (!t||t.prompt==null) ? '-' :
 const tokTitle = t => !t ? '' :
   `prompt ${t.prompt} · completion ${t.completion} · ` +
   `cached ${t.cached} · ${t.llm_steps??'?'} llm steps`;
-const TOK_HELP = 'prompt/completion/cached per step. prompt = input ' +
-  'tokens (system, tools, context, history). cached = the subset of ' +
-  'prompt served from context cache - cheaper, already inside prompt, ' +
-  'never add it on top. completion = output tokens. steps = model ' +
-  'turns. Cost per step = rate(model,effort) x uncached-prompt + ' +
-  'cached-rate x cached + output-rate x completion; a priced column is ' +
-  'planned once model-compare publishes rates.';
+const TOK_HELP = 'prompt / completion / cached; select an agent for details';
+const tokenHelp = `<details class="tok-help"><summary aria-label="Explain tokens and cost">?</summary>` +
+  `<div class="explain"><b>What the numbers mean</b><br>` +
+  `<b>Prompt</b>: all input tokens (instructions, tools, context, history).<br>` +
+  `<b>Cached</b>: the part of prompt served from cache; do not add it to prompt.<br>` +
+  `<b>Completion</b>: output tokens. <b>Steps</b>: model turns. ` +
+  `<b>M</b> in prices means one million tokens.<br><br>` +
+  `<b>Estimated cost</b> = (prompt - cached) × input rate + ` +
+  `cached × cache rate + completion × output rate, each rate per token ` +
+  `for that model and effort.<br><br>` +
+  `<b>Example (illustrative rates, not a quote):</b> 10,000 prompt, ` +
+  `6,000 cached, 1,000 completion; at $2/M input, $0.50/M cached, ` +
+  `$8/M output: 4,000 × $2/M + 6,000 × $0.50/M + 1,000 × $8/M ` +
+  `= $0.008 + $0.003 + $0.008 = <b>$0.019</b>. ` +
+  `Actual rates vary; priced totals await model-compare.</div></details>`;
 function elapsed(a, now){
   if (a.elapsed_s != null) return fmtS(a.elapsed_s);
   if (a.started_at && (a.status==='running'||a.status==='queued'))
@@ -1925,11 +2566,17 @@ function elapsed(a, now){
   return '-'; }
 const expanded = {};      // slug -> true: show all rows, not just latest 10
 const hidden = new Set(); // statuses filtered out via chips
+const facets = new Set();
+let selectedRun = null;
 const prevTail = {};      // run|step -> last tail_last shown; a change
                           // flashes the result cell (.fresh) as logs stream
 const SHOW_N = 10;
-const ORDER = ['running','queued','done','partial','blocked','timed_out',
-               'failed','lost'];
+const ORDER = ['running','queued','waiting','planned','done','partial',
+               'blocked','timed_out','failed','skipped','lost'];
+const FACETS = ['wt','merged','unmerged'];
+const matchesFacet = (a,f) => f==='wt' ? a.wt :
+  f==='merged' ? a.merged===true : a.merged===false;
+const runKey = r => r.key||r.dir;
 let lastData = null;
 let AGENTS = [];          // last payload, for the detail modal
 
@@ -1945,8 +2592,15 @@ const AGENT_COLS = '<colgroup>' +
   '</colgroup>';
 
 let detailIdx = null;
+let modalRequest = null;
+function closeDetail(force=false){
+  if (!force && modalRequest?.dirty && !confirm('Discard unsaved edits?')) return false;
+  detailIdx = null; modalRequest = null;
+  document.getElementById('backdrop').hidden = true;
+  return true;
+}
 function showDetail(i){
-  const a = AGENTS[i]; if(!a) return;
+  const a = AGENTS[i]; if(!a || !closeDetail()) return;
   detailIdx = i;
   const kv = [['step',a.step],['run',a.run],['project',a.slug],
     ['status',a.status],['task',a.task],['result',a.next||a.note],
@@ -1955,18 +2609,197 @@ function showDetail(i){
     ['started',a.started_at],['ended',a.ended_at],
     ['elapsed',a.elapsed_s!=null?fmtS(a.elapsed_s):'-'],
     ['tokens',tokTitle(a.tokens)||'-'],
-    ['tokens?',TOK_HELP],
     ['session',(a.session_id||'-')+(a.session_gone?' (deleted from sidebar)':'')],
     ['verify',a.verify_ok==null?'-':(a.verify_ok?'pass':'FAIL')],
     ['exit',a.exit_code],['work dir',a.work_dir],
     ['branch',a.branch],['merged',a.merged],
     ['prompt',a.prompt],['stdout',a.stdout_log],['export',a.export]];
   document.getElementById('dbody').innerHTML =
-    `<h3>${esc(a.slug)} / ${esc(a.step)}</h3><div class="kv">` +
-    kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">${esc(v??'-')}</div>`).join('') +
+    `<h3 id="modal-title">${esc(a.slug)} / ${esc(a.step)}</h3><div class="kv">` +
+    kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">${esc(v??'-')}` +
+      (k==='tokens'?tokenHelp:'') + '</div>').join('') +
     `</div>` +
+    (a.request_id ? `<div class="actions"><button type="button" class="btn secondary" ` +
+      `data-open-request="${esc(a.request_id)}">View request / runbook</button></div>` : '') +
     (a.tail ? `<h3 style="margin-top:14px">stdout tail</h3><pre id="dtail">${esc(a.tail)}</pre>` : '');
   document.getElementById('backdrop').hidden = false;
+}
+
+function showRunDetails(key){
+  const r = lastData?.runs.find(x=>runKey(x)===key);
+  if (!r || !closeDetail()) return;
+  const kv = [['description',r.description||'-'],['projects',(r.projects||[]).join(', ')],
+    ['started',r.started_at],['ended',r.ended_at],
+    ['steps',Object.entries(r.counts||{}).map(([s,n])=>`${n} ${s}`).join(', ')],
+    ['tokens',tokTitle(r.tokens)||'-'],['manifest / dir',r.dir]];
+  document.getElementById('dbody').innerHTML =
+    `<h3 id="modal-title">${esc(r.run)}</h3>` +
+    (r.stage ? `<span class="stage ${esc(r.stage)}">${esc(STAGES[r.stage]||r.stage)}</span>` : '') +
+    `<div class="kv" style="margin-top:12px">` +
+    kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">${esc(v??'-')}` +
+      (k==='tokens'?tokenHelp:'') + `</div>`).join('') + '</div>' +
+    `<div class="actions"><button type="button" class="btn secondary" ` +
+    `data-filter-run="${esc(key)}">Show only this run</button>` +
+    (r.request_id ? `<button type="button" class="btn secondary" ` +
+      `data-open-request="${esc(r.request_id)}">View original request / TOML</button>` : '') +
+    '</div>';
+  document.getElementById('backdrop').hidden = false;
+}
+async function api(method,path,body){
+  const opt = method==='GET' ? {} : {method,
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})};
+  const res=await fetch(path,opt);
+  const out=await res.json();
+  if (!res.ok) throw new Error(out.error||`HTTP ${res.status}`);
+  return out;
+}
+async function refresh(){ render(await api('GET','/api/state')); }
+function openNew(){
+  if (!closeDetail()) return;
+  const defaults=lastData?.defaults||{model:'swe-2',effort:'max'};
+  modalRequest={id:null,status:'new',dirty:false,originalManifest:''};
+  showRequestForm({status:'new',raw:'',label:'',project:'',...defaults});
+}
+function showRequestForm(rec){
+  const stage=rec.status, editable=!['generating','launching','launched'].includes(stage);
+  const disabled=editable?'':' disabled';
+  const choices=lastData?.project_options||[];
+  const projectOptions=`<option value="">Infer from request</option>` +
+    choices.map(p=>`<option value="${esc(p.slug)}"${p.slug===rec.project?' selected':''}>` +
+      `${esc(p.slug)}${p.cloud_ok?'':' (local only)'}</option>`).join('');
+  const effortOptions=['min','low','medium','high','max'].map(x=>
+    `<option value="${x}"${x===rec.effort?' selected':''}>${x}</option>`).join('');
+  const steps=rec.proposed_steps||[];
+  const canEdit=editable && stage!=='new';
+  document.getElementById('dbody').innerHTML =
+    `<h3 id="modal-title">${stage==='new'?'New request':
+      stage==='ready'?'Review proposed run':
+      stage==='launched'?'Original request': 'Request details'}</h3>` +
+    (stage==='new'?'':`<span class="stage ${esc(stage)}">` +
+      `${esc(STAGES[stage]||stage)}</span>`) +
+    `<div class="notice">Save keeps your request as a draft. Generate asks Devin ` +
+      `to propose a TOML runbook only; no implementation starts. ` +
+      `Starting the run requires a separate, explicit click. Generated TOML ` +
+      `is a tracked file: review it before sharing.</div>` +
+    (rec.error ? `<div class="notice error">${esc(rec.error)}</div>`:'') +
+    (rec.stale ? `<div class="notice warn">Request or model changed since ` +
+      `the proposal. Regenerate tasks, or edit and save the TOML before ` +
+      `starting a run.</div>`:'') +
+    (stage==='generating'?`<div class="notice warn">Planning in progress. ` +
+      `The previous proposal, if any, remains available if generation fails.</div>`:'') +
+    (stage==='launching'||stage==='launched'?`<div class="notice">This ` +
+      `request has already been started; editing and discard are disabled.</div>`:'') +
+    `<label for="rq-label">Short label (optional until planned)</label>` +
+    `<input id="rq-label" maxlength="80" value="${esc(rec.label||'')}"${disabled}>` +
+    `<div class="field-row"><div><label for="rq-project">Project</label>` +
+    `<select id="rq-project"${disabled}>${projectOptions}</select></div>` +
+    `<div><label for="rq-model">Model</label><input id="rq-model" ` +
+    `list="rq-models" value="${esc(rec.model||'')}"${disabled}>` +
+    `<datalist id="rq-models"><option value="swe-2"><option value="gpt-6-luna">` +
+    `</datalist></div><div><label for="rq-effort">Effort</label>` +
+    `<select id="rq-effort"${disabled}>${effortOptions}</select></div></div>` +
+    `<label for="rq-raw">Your request</label><textarea id="rq-raw"${disabled} ` +
+    `placeholder="Describe the work in your own words…">${esc(rec.raw||'')}</textarea>` +
+    (steps.length?`<h3 style="margin:16px 0 0">Proposed steps (${steps.length})</h3>` +
+      `<ol class="proposal-list">${steps.map(s=>`<li><b>${esc(s.step)}</b> ` +
+        `<small>${esc(s.slug)} · ${esc(s.model||'-')} / ${esc(s.effort||'-')}` +
+        `${s.wt?' · worktree':''}</small><br>${esc(s.task||'')}</li>`).join('')}</ol>`:'') +
+    (rec.manifest ? `<details class="proposal"><summary>Edit proposed TOML ` +
+      `(steps, verify, model, effort and description)</summary>` +
+      `<div class="notice">The TOML is the plan that will run. Changes to ` +
+      `the request fields above need regeneration, or an explicit TOML ` +
+      `edit and save. No task executes while you edit.</div>` +
+      `<label for="rq-manifest">Runbook · ${esc(rec.manifest)}</label>` +
+      `<textarea id="rq-manifest" class="toml" spellcheck="false"${disabled}>` +
+      `${esc(rec.manifest_text||'')}</textarea></details>`:'') +
+    `<div id="form-msg" class="notice" hidden></div>` +
+    `<div class="actions">` +
+    (editable?`<button type="button" class="btn secondary" data-action="save">` +
+      `${stage==='new'||stage==='draft'?'Save draft':'Save edits'}</button>` +
+      `<button type="button" class="btn" data-action="generate">` +
+      `${rec.manifest?'Regenerate tasks':'Generate proposal'}</button>`:'') +
+    (stage==='error'&&rec.manifest_text ? `<button type="button" ` +
+      `class="btn secondary" data-action="restore">Keep previous plan</button>`:'') +
+    (stage==='ready'||stage==='launch_failed' ? `<button type="button" ` +
+      `class="btn" data-action="run"${rec.stale?' disabled':''}>` +
+      `${stage==='launch_failed'?'Retry start':'Start run'}</button>`:'') +
+    (canEdit?`<button type="button" class="btn danger" data-action="discard">` +
+      `Discard</button>`:'') +
+    (stage==='launched'?`<button type="button" class="btn secondary" ` +
+      `data-run-details="request:${esc(rec.id)}">View run details</button>`:'') +
+    `</div>`;
+  document.getElementById('backdrop').hidden = false;
+}
+async function openRequest(id){
+  if (!closeDetail()) return;
+  modalRequest={id,status:'loading',dirty:false,originalManifest:''};
+  document.getElementById('dbody').innerHTML =
+    '<h3 id="modal-title">Loading request…</h3>';
+  document.getElementById('backdrop').hidden = false;
+  try {
+    const rec=await api('GET',`/api/requests/${encodeURIComponent(id)}`);
+    if (!modalRequest || modalRequest.id!==id || modalRequest.dirty) return;
+    modalRequest={id,status:rec.status,dirty:false,
+      originalManifest:rec.manifest_text||'',record:rec};
+    showRequestForm(rec);
+  } catch(err){
+    document.getElementById('dbody').innerHTML =
+      `<h3 id="modal-title">Request unavailable</h3><div class="notice error">` +
+      `${esc(err.message)}</div>`;
+  }
+}
+function requestFields(){
+  return Object.fromEntries(['raw','label','project','model','effort'].map(k=>
+    [k,document.getElementById(`rq-${k}`).value]));
+}
+function formError(message){
+  const el=document.getElementById('form-msg');
+  if (el){el.hidden=false;el.className='notice error';el.textContent=message;}
+}
+async function requestAction(action){
+  if (!modalRequest) return;
+  const id=modalRequest.id, rec=modalRequest.record||{};
+  const manifestEl=document.getElementById('rq-manifest');
+  const editedManifest=!!manifestEl &&
+    manifestEl.value!==modalRequest.originalManifest;
+  if (action==='discard' && !confirm('Discard this request, its proposal TOML, and all planned steps?')) return;
+  if (action==='generate' && rec.manifest && !confirm(
+      'Regenerate the proposal? Your current TOML will be replaced only if generation succeeds.')) return;
+  if (action==='run'){
+    if (modalRequest.dirty){ formError('Save and review edits before starting.'); return; }
+    if (!confirm(`Start ${rec.run} now? This will execute ${rec.proposed_steps?.length||0} ` +
+                 `agent steps and make git checkpoints.`)) return;
+  }
+  const buttons=document.querySelectorAll('#detail [data-action]');
+  buttons.forEach(b=>b.disabled=true);
+  try {
+    let rid=id;
+    if (action==='save'||action==='generate'||action==='restore'){
+      const fields=requestFields();
+      if (!rid){
+        const saved=await api('POST','/api/requests',fields);
+        rid=saved.id; modalRequest.id=rid;
+      } else {
+        if (action==='restore'||action==='save'&&editedManifest)
+          fields.manifest=manifestEl.value;
+        await api('POST',`/api/requests/${rid}/save`,fields);
+      }
+      if (action==='generate')
+        await api('POST',`/api/requests/${rid}/generate`,{});
+    } else if (action==='run'){
+      await api('POST',`/api/requests/${rid}/run`,{});
+    } else if (action==='discard'){
+      await api('POST',`/api/requests/${rid}/discard`,{confirm:true});
+      selectedRun=null;
+      closeDetail(true);
+      await refresh();
+      return;
+    }
+    modalRequest.dirty=false;
+    await refresh();
+    await openRequest(rid);
+  } catch(err){ formError(err.message); }
+  finally { buttons.forEach(b=>b.disabled=false); }
 }
 
 let lastSig = null, BOOT = null;
@@ -1981,10 +2814,12 @@ function render(d){
   else if (d.serve_boot !== BOOT){ location.reload(); return; }
   lastData = d; AGENTS = d.agents;
   AGENTS.forEach((a,i)=>a._i=i);   // stable cell ids before the sig check
+  if (selectedRun && !d.runs.some(r=>runKey(r)===selectedRun)) selectedRun=null;
   const now = Date.now();
   const live = d.agents.filter(a=>a.status==='running');
+  const planned = d.agents.filter(a=>a.status==='planned').length;
   document.getElementById('meta').innerHTML =
-    `${d.agents.length} agents | ${live.length} running | ` +
+    `${d.agents.length-planned} agents | ${planned} planned | ${live.length} running | ` +
     `cpu ${d.cpu_count||'?'} cores | free ram ${d.free_ram_gb||'?'} GB | ` +
     `refreshed ${loc(d.generated_at)}` +
     (d.auth && d.auth!=='ok'
@@ -1995,7 +2830,8 @@ function render(d){
   // Only rebuild the tables when the payload actually changes - rebuilding
   // innerHTML every 2s resets animations/hover and looks like a reload.
   // `tail` is excluded: live log growth streams into the open modal instead.
-  const sig = JSON.stringify([d.runs, d.agents.map(({tail,...r})=>r)]);
+  const sig = JSON.stringify([d.runs, d.agents.map(({tail,...r})=>r),
+    selectedRun, [...hidden].sort(), [...facets].sort(), expanded]);
   const tailEl = document.getElementById('dtail');
   if (sig === lastSig){
     tickElapsed(now);
@@ -2007,30 +2843,59 @@ function render(d){
   lastSig = sig;
 
   // status filter chips (click toggles)
+  const scope = d.agents.filter(a=>!selectedRun ||
+    (a.run_key||a.run_dir)===selectedRun);
   const byStatus = {};
-  for (const a of d.agents) byStatus[a.status]=(byStatus[a.status]||0)+1;
-  document.getElementById('filters').innerHTML = 'filter: ' +
+  for (const a of scope) byStatus[a.status]=(byStatus[a.status]||0)+1;
+  const selected = d.runs.find(r=>runKey(r)===selectedRun);
+  const facetCounts = Object.fromEntries(FACETS.map(f=>
+    [f,scope.filter(a=>matchesFacet(a,f)).length]));
+  document.getElementById('filters').innerHTML =
+    (selected?`<span class="filter-group"><span class="filter-label">run:</span>` +
+      `<button type="button" class="chip active" data-clear-run ` +
+      `aria-label="Clear run filter">${esc(selected.run)} ×</button></span>`:'') +
+    `<span class="filter-group"><span class="filter-label">status:</span>` +
     ORDER.filter(s=>byStatus[s]).map(s=>
-      `<span class="chip${hidden.has(s)?' off':''}" data-st="${s}" ` +
-      `style="color:${COLORS[s]}">${byStatus[s]} ${s}</span>`).join('') +
-    (hidden.size?` <a href="#" data-st="__all">reset</a>`:'');
+      `<button type="button" class="chip${hidden.has(s)?' off':''}" data-st="${s}" ` +
+      `aria-pressed="${!hidden.has(s)}" style="color:${COLORS[s]||'#8b949e'}">` +
+      `${byStatus[s]} ${s}</button>`).join('') + '</span>' +
+    `<span class="filter-group"><span class="filter-label">tags:</span>` +
+    FACETS.filter(f=>facetCounts[f]||facets.has(f)).map(f=>
+      `<button type="button" class="chip${facets.has(f)?' active':''}" ` +
+      `data-facet="${f}" aria-pressed="${facets.has(f)}">` +
+      `${facetCounts[f]} ${f}${facets.has(f)?' ×':''}</button>`).join('') +
+    '</span>' +
+    (hidden.size||facets.size?` <button type="button" class="chip" ` +
+      `data-reset>clear filters</button>`:'');
 
   // runs table first - a run can span projects (chips show which)
-  let h = '<colgroup><col style="width:14%"><col style="width:16%">' +
-    '<col style="width:9%"><col style="width:10%"><col style="width:20%">' +
-    '<col style="width:6%"><col class="hide-s" style="width:25%"></colgroup>' +
-    '<tr><th>run</th><th>projects</th><th>started</th><th>ended</th>' +
-    '<th>steps</th><th>max//</th><th class="hide-s">dir</th></tr>';
-  for (const r of d.runs){
+  let h = '<colgroup><col style="width:13%"><col style="width:19%">' +
+    '<col style="width:15%"><col style="width:9%"><col style="width:9%">' +
+    '<col style="width:17%"><col style="width:5%">' +
+    '<col class="hide-s" style="width:13%"></colgroup>' +
+    '<tr><th>run</th><th>description</th><th>projects</th><th>started</th>' +
+    '<th>ended</th><th>steps</th><th>max//</th><th class="hide-s">dir</th></tr>';
+  for (const r of d.runs.filter(r=>!selectedRun||runKey(r)===selectedRun)){
     const counts = Object.entries(r.counts||{})
       .map(([k,v])=>`<span style="color:${COLORS[k]||'#8b949e'}">${v} ${k}</span>`)
       .join('');
-    h += `<tr data-run="${esc(r.dir)}"><td class="wrap"><b>${esc(r.run)}</b><br>` +
-      `<span class="sub">${esc((r.dir||'').split(/[\\/]/).pop())}</span></td>` +
+    h += `<tr class="runrow${runKey(r)===selectedRun?' selected':''}" ` +
+      `data-run-key="${esc(runKey(r))}" tabindex="0" ` +
+      `aria-label="Filter to run ${esc(r.run)}"><td class="wrap">` +
+      `<b>${esc(r.run)}</b><br>` +
+      (r.stage ? `<span class="stage ${esc(r.stage)}">` +
+        `${esc(STAGES[r.stage]||r.stage)}</span>` :
+        `<span class="sub">${esc((r.dir||'').split(/[\\/]/).pop())}</span>`) +
+      (r.stale?` <span class="stage error">Needs review</span>`:'') +
+      `<br><button type="button" class="linkbtn" ` +
+      (r.stage ? `data-open-request="${esc(r.request_id)}">${r.stage==='draft'?'Edit':'Review'}` :
+        `data-run-details="${esc(runKey(r))}">Details`) + `</button></td>` +
+      `<td class="wrap">${r.description?esc(r.description):
+        r.stage?'<span class="sub">Awaiting proposal</span>':'-'}</td>` +
       `<td>${(r.projects||[]).map(p=>`<span class="chip">${esc(p)}</span>`).join('')}</td>` +
       `<td>${loc(r.started_at)}</td>` +
-      `<td>${r.ended_at?loc(r.ended_at):'<b>running</b>'}</td>` +
-      `<td class="counts">${counts}` +
+      `<td>${r.ended_at?loc(r.ended_at):(r.started_at?'<b>running</b>':'-')}</td>` +
+      `<td class="counts">${counts||'<span class="sub">not planned</span>'}` +
       (r.tokens ? `<br><span class="sub" title="${TOK_HELP}">tok ` +
         `${kfmt(r.tokens.prompt)}/${kfmt(r.tokens.completion)}/` +
         `${kfmt(r.tokens.cached)}</span>` : '') +
@@ -2041,12 +2906,15 @@ function render(d){
 
   // one fixed-width table per project slug, ordered by newest activity
   const groups = {};
-  d.agents.forEach(a=>{ (groups[a.slug||'?'] ??= []).push(a); });
+  scope.forEach(a=>{ (groups[a.slug||'?'] ??= []).push(a); });
   const slugs = Object.keys(groups).sort((x,y)=>
-    (groups[y][0].started_at||'') < (groups[x][0].started_at||'') ? -1 : 1);
+    (groups[y][0].started_at||groups[y][0].created_at||'') <
+    (groups[x][0].started_at||groups[x][0].created_at||'') ? -1 : 1);
   h = '';
   for (const slug of slugs){
-    const rows = groups[slug].filter(a=>!hidden.has(a.status));
+    const rows = groups[slug].filter(a=>!hidden.has(a.status) &&
+      [...facets].every(f=>matchesFacet(a,f)));
+    if (!rows.length) continue;
     const all = groups[slug];
     const nRun = all.filter(r=>r.status==='running').length;
     const show = expanded[slug] ? rows : rows.slice(0, SHOW_N);
@@ -2059,7 +2927,7 @@ function render(d){
       '<tr><th></th><th>step</th><th>task</th><th>run</th>' +
       '<th class="hide-s">model</th><th class="hide-s">effort</th>' +
       '<th class="hide-s">mode</th><th>started</th><th>elapsed</th>' +
-      '<th class="hide-s" title="' + TOK_HELP + '">tokens?</th>' +
+      '<th class="hide-s" title="' + TOK_HELP + '">tokens</th>' +
       '<th>ended</th><th class="hide-s">session</th><th>result</th></tr>';
     for (const a of show){
       const c = COLORS[a.status]||'#8b949e';
@@ -2078,18 +2946,20 @@ function render(d){
           `title="live session (inferred - recorded at step end)">` +
           `${esc(sess)}…</td>`
         : `<td class="hide-s"${sess==='…'?' title="recorded when the step ends"':''}>${esc(sess)}</td>`;
-      h += `<tr class="agen" data-i="${a._i}" data-run="${esc(a.run_dir||'')}">` +
+      h += `<tr class="agen" data-i="${a._i}" data-run-key="${esc(a.run_key||a.run_dir||'')}">` +
         `<td><span class="dot${pulse}" style="background:${c}" ` +
         `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>` +
         `${a.status}</td>` +
         `<td class="step"><span ` +
         `style="white-space:nowrap">${esc(a.step)}</span>${a.wt
-          ? ` <span class="chip" style="color:#58a6ff" ` +
-            `title="${esc(a.branch||'')}">wt</span>` +
+          ? ` <button type="button" class="chip" data-facet="wt" ` +
+            `style="color:#58a6ff" title="${esc(a.branch||'worktree')}">wt</button>` +
             (a.merged===true
-             ? ` <span class="chip" style="color:#3fb950">merged</span>`
+             ? ` <button type="button" class="chip" data-facet="merged" ` +
+               `style="color:#3fb950">merged</button>`
              : a.merged===false
-             ? ` <span class="chip" style="color:#f0883e">unmerged</span>`
+             ? ` <button type="button" class="chip" data-facet="unmerged" ` +
+               `style="color:#f0883e">unmerged</button>`
              : '')
           : ''}</td><td class="wrap">${esc(a.task||'')}</td>` +
         `<td>${esc(a.run)}</td>` +
@@ -2114,22 +2984,49 @@ function render(d){
           `show ${rows.length - SHOW_N} older agent(s)`)+`</a></td></tr>`;
     h += '</table></div>';
   }
-  document.getElementById('agents').innerHTML =
-    h || '<span class="sub">no agents yet</span>';
+  document.getElementById('agents').innerHTML = h ||
+    `<span class="sub">${scope.length?'no agents match these filters':
+      selectedRun?'no steps yet; generate the proposal to preview agents':'no agents yet'}</span>`;
   applyHl();
   if (detailIdx != null && !document.getElementById('backdrop').hidden)
     showDetail(detailIdx);        // refresh open modal on real changes
+  const modalRun = modalRequest?.id && d.runs.find(r=>r.request_id===modalRequest.id);
+  const modalStage = modalRun && (modalRun.stage||'launched');
+  if (modalStage && modalRequest.status!=='loading' && !modalRequest.dirty &&
+      modalRequest.status!==modalStage) openRequest(modalRequest.id);
 }
 document.addEventListener('click', async e=>{
   const t = e.target;
   if (t.id==='dx' || t.id==='backdrop'){
-    detailIdx = null;
-    document.getElementById('backdrop').hidden = true; return; }
+    closeDetail(); return; }
+  if (t.id==='new-request'){
+    openNew(); return; }
+  if (t.dataset && t.dataset.action){
+    await requestAction(t.dataset.action); return; }
+  if (t.dataset && t.dataset.openRequest){
+    await openRequest(t.dataset.openRequest); return; }
+  if (t.dataset && t.dataset.runDetails){
+    showRunDetails(t.dataset.runDetails); return; }
+  if (t.dataset && t.dataset.filterRun){
+    selectedRun=t.dataset.filterRun;
+    closeDetail(true); if (lastData) render(lastData); return; }
+  if (t.dataset && t.dataset.clearRun!==undefined){
+    selectedRun=null; if (lastData) render(lastData); return; }
+  if (t.dataset && t.dataset.reset!==undefined){
+    hidden.clear(); facets.clear(); if (lastData) render(lastData); return; }
   if (t.dataset && t.dataset.st){            // status filter chip
-    e.preventDefault();
-    if (t.dataset.st==='__all') hidden.clear();
-    else hidden.has(t.dataset.st) ? hidden.delete(t.dataset.st)
-                                  : hidden.add(t.dataset.st);
+    hidden.has(t.dataset.st) ? hidden.delete(t.dataset.st)
+                             : hidden.add(t.dataset.st);
+    if (lastData) render(lastData); return;
+  }
+  if (t.dataset && t.dataset.facet){
+    const f=t.dataset.facet;
+    if (facets.has(f)) facets.delete(f);
+    else {
+      if (f==='merged') facets.delete('unmerged');
+      if (f==='unmerged') facets.delete('merged');
+      facets.add(f);
+    }
     if (lastData) render(lastData); return;
   }
   if (t.dataset && t.dataset.slug){          // expand/collapse a table
@@ -2140,36 +3037,51 @@ document.addEventListener('click', async e=>{
   if (t.dataset && t.dataset.auth){
     e.preventDefault();
     if (t.dataset.auth==='login'){
-      await fetch('/api/auth/login', {method:'POST'});
+      await fetch('/api/auth/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
       t.outerHTML = ' <span style="color:#8b949e">a terminal opened - ' +
         'sign in at the link, paste the code back; this clears itself</span>';
     } else {
-      await fetch('/api/auth/recheck', {method:'POST'});
+      await fetch('/api/auth/recheck', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
     }
+    return;
+  }
+  const runRow = t.closest && t.closest('tr.runrow');
+  if (runRow){
+    selectedRun = selectedRun===runRow.dataset.runKey ? null : runRow.dataset.runKey;
+    if (lastData) render(lastData);
     return;
   }
   const row = t.closest && t.closest('tr.agen');
   if (row) showDetail(+row.dataset.i);
 });
-document.addEventListener('keydown', e=>{
-  if (e.key==='Escape'){
-    detailIdx = null;
-    document.getElementById('backdrop').hidden = true;
+document.addEventListener('input', e=>{
+  if (modalRequest && e.target.id?.startsWith('rq-')){
+    modalRequest.dirty=true;
+    const msg=document.getElementById('form-msg');
+    if (msg) msg.hidden=true;
   }
+});
+document.addEventListener('keydown', e=>{
+  if ((e.key==='Enter'||e.key===' ') &&
+      e.target.matches && e.target.matches('tr.runrow')){
+    e.preventDefault();
+    selectedRun = selectedRun===e.target.dataset.runKey ? null : e.target.dataset.runKey;
+    if (lastData) render(lastData);
+  }
+  if (e.key==='Escape' && !document.getElementById('backdrop').hidden)
+    closeDetail();
 });
 // hovering a run row highlights its agent rows across all project tables.
 // hoverRun persists across the 2s re-render so the highlight doesn't flicker.
 let hoverRun = null;
 function applyHl(){
-  document.querySelectorAll('tr.hl').forEach(x=>x.classList.remove('hl'));
-  if (hoverRun)
-    document.querySelectorAll(
-      `tr.agen[data-run="${CSS.escape(hoverRun)}"]`)
-      .forEach(x=>x.classList.add('hl'));
+  document.querySelectorAll('tr[data-run-key]').forEach(x=>
+    x.classList.toggle('hl', x.dataset.runKey===selectedRun ||
+      !!hoverRun && x.dataset.runKey===hoverRun));
 }
 document.addEventListener('mouseover', e=>{
-  const tr = e.target.closest && e.target.closest('tr[data-run]');
-  hoverRun = tr && tr.dataset.run || null;
+  const tr = e.target.closest && e.target.closest('tr[data-run-key]');
+  hoverRun = tr && tr.dataset.runKey || null;
   applyHl();
 });
 async function tick(){
@@ -2177,6 +3089,132 @@ async function tick(){
   catch(e){} finally { setTimeout(tick, 2000); } }
 tick();
 </script></body></html>"""
+
+
+def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
+                           requests_dir: Path | None = None,
+                           manifests_dir: Path = MANIFESTS_DIR):
+    requests_dir = requests_dir or runs_dir.parent / "requests"
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, body: bytes, ctype: str, status: int = 200) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, value: dict, status: int = 200) -> None:
+            self._send(json.dumps(value, ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8", status)
+
+        def _check_origin(self) -> None:
+            host = self.headers.get("Host", "")
+            try:
+                parsed = urllib.parse.urlsplit("http://" + host)
+                local = (parsed.hostname in ("127.0.0.1", "localhost")
+                         and parsed.port == self.server.server_port)
+            except ValueError as exc:
+                raise RequestError("Invalid local dashboard host", 403) from exc
+            if not local:
+                raise RequestError("Only local dashboard requests are allowed", 403)
+            origin = self.headers.get("Origin")
+            if origin and origin != f"http://{host}":
+                raise RequestError("Cross-origin requests are not allowed", 403)
+
+        def _body(self) -> dict:
+            if self.headers.get("Content-Type", "").split(";", 1)[0] \
+                    != "application/json":
+                raise RequestError("Send application/json", 415)
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 0 < size <= 524288:
+                    raise RequestError("Request body is too large or empty")
+                value = json.loads(self.rfile.read(size).decode("utf-8"))
+                if not isinstance(value, dict):
+                    raise RequestError("Expected a JSON object")
+                return value
+            except (ValueError, UnicodeError) as exc:
+                if isinstance(exc, RequestError):
+                    raise
+                raise RequestError("Invalid JSON request body") from exc
+
+        def do_GET(self) -> None:                    # noqa: N802 - stdlib name
+            path = urllib.parse.urlsplit(self.path).path
+            try:
+                self._check_origin()
+                if path == "/api/state":
+                    self._json(collect_dashboard(runs_dir, devin_argv,
+                                                 requests_dir))
+                elif (m := re.fullmatch(r"/api/requests/([^/]+)", path)):
+                    rec = request_details(m[1], requests_dir,
+                                          manifests_dir, runs_dir)
+                    if rec["status"] == "discarded":
+                        raise RequestError("Request was discarded", 404)
+                    self._json(rec)
+                elif path in ("/", "/index.html"):
+                    self._send(_DASH_HTML.encode("utf-8"),
+                               "text/html; charset=utf-8")
+                else:
+                    self.send_error(404)
+            except RequestError as exc:
+                self._json({"error": str(exc)}, exc.status)
+            except Exception:
+                LOG.exception("dashboard GET failed")
+                self._json({"error": "Dashboard request failed"}, 500)
+
+        def do_POST(self) -> None:                   # noqa: N802 - stdlib name
+            path = urllib.parse.urlsplit(self.path).path
+            try:
+                self._check_origin()
+                body = self._body()
+                if path == "/api/requests":
+                    self._json(create_request(body, requests_dir, runs_dir), 201)
+                elif (m := re.fullmatch(r"/api/requests/([^/]+)/"
+                                         r"(save|generate|run|discard)", path)):
+                    request_id, action = m.groups()
+                    if action == "save":
+                        self._json(save_request(request_id, body, requests_dir,
+                                                manifests_dir, runs_dir))
+                    elif action == "generate":
+                        self._json(start_generation(request_id, requests_dir,
+                                                    manifests_dir, runs_dir,
+                                                    devin_argv), 202)
+                    elif action == "run":
+                        self._json(launch_request(request_id, requests_dir,
+                                                  manifests_dir, runs_dir,
+                                                  devin_argv), 202)
+                    else:
+                        if body.get("confirm") is not True:
+                            raise RequestError("Confirm discard explicitly")
+                        self._json(discard_request(request_id, requests_dir,
+                                                   manifests_dir, runs_dir))
+                elif path == "/api/auth/login":
+                    # Login is an interactive console flow (trap 3) - the most a
+                    # dashboard button can do is pop a REAL terminal for it.
+                    # logout first: a stale credentials.toml makes plain `login`
+                    # short-circuit with "already logged in" (trap 4).
+                    subprocess.Popen(
+                        'start "" cmd /k "devin auth logout & '
+                        'devin auth login --force-manual-token-flow"',
+                        shell=True, env=clean_devin_env())
+                    _AUTH_CACHE[0] = 0.0      # next tick re-probes
+                    self._json({})
+                elif path == "/api/auth/recheck":
+                    _AUTH_CACHE[0] = 0.0
+                    self._json({"auth": auth_status(devin_argv)})
+                else:
+                    self.send_error(404)
+            except RequestError as exc:
+                self._json({"error": str(exc)}, exc.status)
+            except Exception:
+                LOG.exception("dashboard POST failed")
+                self._json({"error": "Dashboard request failed"}, 500)
+
+        def log_message(self, fmt: str, *a) -> None:
+            LOG.debug("http %s", fmt % a)
+
+    return Handler
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -2189,49 +3227,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     devin_argv = shlex.split(os.environ.get("CONDUCTOR_DEVIN") or "devin")
     for line in sweep_sessions(runs_dir, devin_argv):
         print(f"sweep: {line}")
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def _send(self, body: bytes, ctype: str) -> None:
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self) -> None:                    # noqa: N802 - stdlib name
-            if self.path == "/api/state":
-                self._send(json.dumps(
-                    collect_dashboard(runs_dir, devin_argv)).encode(),
-                    "application/json")
-            elif self.path in ("/", "/index.html"):
-                self._send(_DASH_HTML.encode(), "text/html; charset=utf-8")
-            else:
-                self.send_error(404)
-
-        def do_POST(self) -> None:                   # noqa: N802 - stdlib name
-            if self.path == "/api/auth/login":
-                # Login is an interactive console flow (trap 3) - the most a
-                # dashboard button can do is pop a REAL terminal for it.
-                # logout first: a stale credentials.toml makes plain `login`
-                # short-circuit with "already logged in" (trap 4).
-                subprocess.Popen(
-                    'start "" cmd /k "devin auth logout & '
-                    'devin auth login --force-manual-token-flow"',
-                    shell=True, env=clean_devin_env())
-                _AUTH_CACHE[0] = 0.0      # next tick re-probes
-                self._send(b"{}", "application/json")
-            elif self.path == "/api/auth/recheck":
-                _AUTH_CACHE[0] = 0.0
-                self._send(json.dumps(
-                    {"auth": auth_status(devin_argv)}).encode(),
-                    "application/json")
-            else:
-                self.send_error(404)
-
-        def log_message(self, fmt: str, *a) -> None:
-            LOG.debug("http %s", fmt % a)
-
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    handler = make_dashboard_handler(runs_dir, devin_argv)
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     print(f"conductor dashboard: http://127.0.0.1:{args.port}  "
           f"(watching {runs_dir})")
     try:
@@ -2246,7 +3243,8 @@ def cmd_demo(args: argparse.Namespace) -> int:
     proj = DATA_DIR / "demo-project"
     proj.mkdir(parents=True, exist_ok=True)
     if not is_git_repo(proj):
-        subprocess.run(["git", "init"], cwd=str(proj), capture_output=True)
+        subprocess.run(["git", "init"], cwd=str(proj), capture_output=True,
+                       **hidden_subprocess_kwargs())
     (proj / ".gitignore").write_text(".mock_sessions.json\n", encoding="utf-8")
     (proj / "WORK.txt").write_text("", encoding="utf-8")
     (proj / "AGENTS.md").write_text("# demo project\n", encoding="utf-8")
@@ -2309,6 +3307,7 @@ def main(argv: list[str] | None = None) -> int:
         if name in ("plan", "run"):
             p.add_argument("manifest")
         if name == "run":
+            p.add_argument("--request-id", default=None, help=argparse.SUPPRESS)
             p.add_argument("--resume", nargs="?", const="latest", default=None,
                            help="resume a run dir (default: latest for this manifest)")
             p.add_argument("--max-parallel", type=int, default=None,
