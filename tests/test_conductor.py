@@ -371,6 +371,44 @@ prompt = "first"
             state = json.loads((run_dir / "state.json").read_text())
             self.assertEqual(state["steps"]["one"]["status"], "done")
 
+    def test_resume_late_merges_unmerged_worktree(self):
+        """Conductor dies between worker-exit and merge-back: step is
+        'done' but its branch never merged. --resume must finish the
+        merge instead of skipping the step and stranding the work."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            run_dir = runs / "20260101-000000-t"
+            run_dir.mkdir(parents=True)
+            branch = "conductor/20260101-000000-t/wtstep"
+            # stranded work: a branch commit the main checkout lacks
+            main = git(proj, "rev-parse", "--abbrev-ref",
+                       "HEAD").stdout.strip()
+            git(proj, "checkout", "-b", branch)
+            (proj / "LATE.txt").write_text("worker output\n")
+            git(proj, "add", "-A")
+            git(proj, "commit", "-m", "wt work")
+            git(proj, "checkout", main)
+            state = {"run": "t", "run_dir": str(run_dir),
+                     "started_at": "2026-01-01T00:00:00", "steps": {
+                        "wtstep": {"name": "wtstep", "slug": "proj",
+                                   "status": "done",
+                                   "branch": branch}}}
+            (run_dir / "state.json").write_text(json.dumps(state))
+            m = write_manifest(base, f'''
+[[step]]
+name = "wtstep"
+project = "{proj.as_posix()}"
+prompt = "already done"
+worktree = true
+''')
+            rc = run_manifest(m, runs, resume=str(run_dir))
+            self.assertEqual(rc, 0)
+            self.assertTrue((proj / "LATE.txt").is_file())  # merged late
+            state = json.loads((run_dir / "state.json").read_text())
+            self.assertTrue(state["steps"]["wtstep"]["merged"])
+
     def test_auth_lost_midrun_blocks_remaining(self):
         """Token dying mid-run: the NEXT group's pre-spawn probe fails ->
         remaining steps marked blocked, run aborts cleanly, --resume can

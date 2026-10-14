@@ -896,7 +896,30 @@ def cmd_run(args: argparse.Namespace) -> int:
         for project_dir, slug, step in members:
             prior = state["steps"].get(step.name, {})
             if args.resume is not None and prior.get("status") == "done":
-                print(f"[skip ] {step.name} (done)")
+                # done-but-unmerged worktree step: conductor died between
+                # worker-exit and merge-back. Finalize the merge (manifest
+                # order preserved) instead of skipping, or the branch work
+                # is stranded. Conflict keeps the worktree, marks failed.
+                if prior.get("branch") and prior.get("merged") is not True:
+                    wt = Path(prior["work_dir"]) if prior.get(
+                        "work_dir") else DATA_DIR / "worktrees" / (
+                        run_dir.name) / step.name
+                    if worktree_merge(project_dir, wt, prior["branch"]):
+                        prior["merged"] = True
+                        save_state(run_dir, state)
+                        print(f"[merged] {step.name} (late merge on resume)")
+                    else:
+                        prior.update(status="failed", merged=False,
+                                     note="merge conflict on resume; "
+                                          f"worktree kept at {wt}")
+                        save_state(run_dir, state)
+                        print(f"[ failed] {step.name} (merge conflict "
+                              "on resume)")
+                        if cfg.on_failure == "stop":
+                            stop = True
+                            break
+                else:
+                    print(f"[skip ] {step.name} (done)")
                 continue
             if step.worktree:
                 if cfg.checkpoint and not wave_ckpt_done \
@@ -1367,6 +1390,7 @@ def collect_dashboard(runs_dir: Path,
                                      and str(sid) not in live),
                 "exit_code": rec.get("exit_code"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
+                "wt": bool(rec.get("branch")),
                 "stdout_log": rec.get("stdout_log"),
                 "tail": stdout_tail(rec.get("stdout_log")),
                 "export": rec.get("export"), "prompt": rec.get("prompt")})
@@ -1499,7 +1523,8 @@ function showDetail(i){
     ['elapsed',a.elapsed_s!=null?fmtS(a.elapsed_s):'-'],
     ['session',(a.session_id||'-')+(a.session_gone?' (deleted from sidebar)':'')],
     ['verify',a.verify_ok==null?'-':(a.verify_ok?'pass':'FAIL')],
-    ['exit',a.exit_code],['work dir',a.work_dir],['branch',a.branch],
+    ['exit',a.exit_code],['work dir',a.work_dir],
+    ['branch',a.branch],['merged',a.merged],
     ['prompt',a.prompt],['stdout',a.stdout_log],['export',a.export]];
   document.getElementById('dbody').innerHTML =
     `<h3>${esc(a.slug)} / ${esc(a.step)}</h3><div class="kv">` +
@@ -1613,7 +1638,15 @@ function render(d){
         `<td><span class="dot${pulse}" style="background:${c}" ` +
         `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>` +
         `${a.status}</td>` +
-        `<td>${esc(a.step)}</td><td class="wrap">${esc(a.task||'')}</td>` +
+        `<td>${esc(a.step)}${a.wt
+          ? ` <span class="chip" style="color:#58a6ff" ` +
+            `title="${esc(a.branch||'')}">wt</span>` +
+            (a.merged===true
+             ? ` <span class="chip" style="color:#3fb950">merged</span>`
+             : a.merged===false
+             ? ` <span class="chip" style="color:#f0883e">unmerged</span>`
+             : '')
+          : ''}</td><td class="wrap">${esc(a.task||'')}</td>` +
         `<td>${esc(a.run)}</td>` +
         `<td class="hide-s">${esc(a.model||'-')}</td>` +
         `<td class="hide-s">${esc(a.effort||'-')}</td>` +
