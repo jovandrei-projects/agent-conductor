@@ -189,6 +189,13 @@ Append as they are hit.
    (2026-10-14). `clean_devin_env()` strips those prefixes from EVERY
    spawned devin child: workers, probes, `devin list`, `devin rm`, and
    the dashboard login terminal.
+10. **Don't commit in a repo with a live non-worktree self-run.** A
+    second agent's `git add -A` mid-run sweeps the worker's in-flight
+    edits into the WRONG commit (hit 2026-10-14: a dashboard commit
+    swallowed the favicon worker's icon change; the worker noticed, kept
+    the tree consistent, finished clean). Same-repo concurrency is
+    exactly what `worktree = true` is for - use it whenever another agent
+    (human or not) may commit to the project while a step runs.
 
 ## The task workspace - read before starting work
 
