@@ -235,6 +235,20 @@ Append as they are hit.
     before STATUS (camera-stability's agent knew via apartment-3d's own
     trap notes; a `devin -p` exit-hang on live children is arguably a
     CLI bug - worth reporting upstream if it persists).
+13. **A dev worktree's session whitelist dies with the checkout.**
+    `sessions`/`sweep_sessions` whitelist on ids recorded in
+    `data/runs/*/state.json` - and every checkout has its OWN data/runs.
+    Work done in a worktree of this repo (`git worktree add`, e.g.
+    agent-conductor-wt) spawns sessions that only ITS data/runs knows
+    about. `sessions` on the default runs dir does scan registered
+    worktrees' data/runs too - but `git worktree remove` / `rm -rf` of
+    the checkout erases the whitelist itself, after which spawned
+    sessions are manual `devin rm <id>` only. Rule: before deleting a
+    worktree checkout of THIS repo, either run `sessions --rm
+    --keep-hours 0 --runs-dir <wt>/data/runs` or copy its run dirs into
+    the main checkout's data/runs (that also puts the runs on :8773).
+    Hit 2026-10-14: the dev/merge-tests worktree's lab run left 21
+    sessions in the sidebar; cleaned just before the checkout went away.
 
 ## The task workspace - read before starting work
 

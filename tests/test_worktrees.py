@@ -547,6 +547,32 @@ class SessionCleanupTests(unittest.TestCase):
             got = conductor.collect_sessions(runs, [MOCK])
             self.assertEqual(got, [])   # 'abc' not in mock's list output
 
+    def test_default_runs_dir_also_scans_worktrees(self):
+        """A dev worktree's spawned sessions are whitelisted only in ITS
+        data/runs - collect_sessions on the default RUNS_DIR must reach
+        them (trap 13); a custom runs_dir must NOT."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            wt_runs = base / "wt" / "data" / "runs"
+            (wt_runs / "r2").mkdir(parents=True)
+            (wt_runs / "r2" / "state.json").write_text(json.dumps({
+                "run": "wt", "ended_at": "2026-01-01T00:00:00",
+                "steps": {"s": {"session_id": "wt-sess", "status": "done",
+                                "work_dir": str(base / "deleted-wt")}}}))
+            with mock.patch.object(conductor, "RUNS_DIR",
+                                   base / "main" / "runs"), \
+                    mock.patch.object(conductor,
+                                      "_worktree_checkout_paths",
+                                      lambda: [base / "wt"]):
+                got = conductor.collect_sessions(
+                    Path(conductor.RUNS_DIR), [MOCK])
+                self.assertIn("wt-sess", [g["sid"] for g in got])
+                # ...but a caller pointing at some other runs dir does
+                # not reach into worktree checkouts
+                got = conductor.collect_sessions(base / "other", [MOCK])
+                self.assertNotIn("wt-sess", [g["sid"] for g in got])
+
 
 class TokenMetricTests(unittest.TestCase):
     """ATIF final_metrics -> state.json tokens -> dashboard payload."""
