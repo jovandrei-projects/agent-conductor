@@ -1729,10 +1729,17 @@ const fmtS = s => { if(s==null) return '-';
 const kfmt = n => n==null?'-':(n>=1000
   ? (n/1000).toFixed(n>=100000?0:1).replace(/\.0$/,'')+'k' : String(n));
 const fmtT = t => (!t||t.prompt==null) ? '-' :
-  `${kfmt(t.prompt)}/${kfmt(t.completion)}`;
+  `${kfmt(t.prompt)}/${kfmt(t.completion)}/${kfmt(t.cached)}`;
 const tokTitle = t => !t ? '' :
   `prompt ${t.prompt} · completion ${t.completion} · ` +
   `cached ${t.cached} · ${t.llm_steps??'?'} llm steps`;
+const TOK_HELP = 'prompt/completion/cached per step. prompt = input ' +
+  'tokens (system, tools, context, history). cached = the subset of ' +
+  'prompt served from context cache - cheaper, already inside prompt, ' +
+  'never add it on top. completion = output tokens. steps = model ' +
+  'turns. Cost per step = rate(model,effort) x uncached-prompt + ' +
+  'cached-rate x cached + output-rate x completion; a priced column is ' +
+  'planned once model-compare publishes rates.';
 function elapsed(a, now){
   if (a.elapsed_s != null) return fmtS(a.elapsed_s);
   if (a.started_at && (a.status==='running'||a.status==='queued'))
@@ -1770,6 +1777,7 @@ function showDetail(i){
     ['started',a.started_at],['ended',a.ended_at],
     ['elapsed',a.elapsed_s!=null?fmtS(a.elapsed_s):'-'],
     ['tokens',tokTitle(a.tokens)||'-'],
+    ['tokens?',TOK_HELP],
     ['session',(a.session_id||'-')+(a.session_gone?' (deleted from sidebar)':'')],
     ['verify',a.verify_ok==null?'-':(a.verify_ok?'pass':'FAIL')],
     ['exit',a.exit_code],['work dir',a.work_dir],
@@ -1845,8 +1853,7 @@ function render(d){
       `<td>${loc(r.started_at)}</td>` +
       `<td>${r.ended_at?loc(r.ended_at):'<b>running</b>'}</td>` +
       `<td class="counts">${counts}` +
-      (r.tokens ? `<br><span class="sub" title="run token totals ` +
-        `(prompt/completion/cached)">tok ` +
+      (r.tokens ? `<br><span class="sub" title="${TOK_HELP}">tok ` +
         `${kfmt(r.tokens.prompt)}/${kfmt(r.tokens.completion)}/` +
         `${kfmt(r.tokens.cached)}</span>` : '') +
       `</td><td>${r.max_parallel||'-'}</td>` +
@@ -1874,8 +1881,7 @@ function render(d){
       '<tr><th></th><th>step</th><th>task</th><th>run</th>' +
       '<th class="hide-s">model</th><th class="hide-s">effort</th>' +
       '<th class="hide-s">mode</th><th>started</th><th>elapsed</th>' +
-      '<th class="hide-s" title="prompt/completion tokens (cached in ' +
-      'tooltip)">tokens</th>' +
+      '<th class="hide-s" title="' + TOK_HELP + '">tokens?</th>' +
       '<th>ended</th><th class="hide-s">session</th><th>result</th></tr>';
     for (const a of show){
       const c = COLORS[a.status]||'#8b949e';
