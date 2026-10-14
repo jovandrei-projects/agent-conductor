@@ -132,6 +132,14 @@ Append as they are hit.
    token is rejected). Fix: `devin auth logout` FIRST, then `devin auth
    login`. Hit 2026-10-13: Aug-26-era token; an expired app.devin.ai/auth
    browser tab is leftover and can just be closed.
+   Docs say CLI tokens do NOT expire by default - a dead token was
+   rejected/revoked server-side, not timed out. Hit twice (Aug-26 era, and
+   again ~14h after the 2026-10-13 morning login). If a fresh login dies
+   quickly too, that's an account-side problem for Devin support, not a
+   conductor constraint. The dashboard banner shows the state; its
+   `[log in]` button pops a real terminal running logout+login (the TUI
+   still can't be driven from a pipe - the button just opens the right
+   window for the human).
 5. **Never write into the worker's watched workspace after `Popen`.**
    `cli-user-edit-awareness` treats an external file change in the cwd as a
    user edit and *ends the session itself* - clean `rc 0`, logs stop cold,

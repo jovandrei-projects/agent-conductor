@@ -1291,16 +1291,22 @@ function elapsed(a, now){
   if (a.started_at && (a.status==='running'||a.status==='queued'))
     return fmtS((now - new Date(a.started_at))/1000);
   return '-'; }
+const expanded = {};   // slug -> true: show all rows, not just the latest 10
+const SHOW_N = 10;
+let lastData = null;
 function render(d){
+  lastData = d;
   const now = Date.now();
   const live = d.agents.filter(a=>a.status==='running');
-  const auth = d.auth && d.auth!=='ok'
-    ? ` | AUTH: ${d.auth}` : '';
   document.getElementById('meta').innerHTML =
     `${d.agents.length} agents | ${live.length} running | ` +
     `cpu ${d.cpu_count||'?'} cores | free ram ${d.free_ram_gb||'?'} GB | ` +
     `refreshed ${loc(d.generated_at)}` +
-    (auth ? ` <b style="color:#f85149">${esc(auth)}</b>` : '');
+    (d.auth && d.auth!=='ok'
+      ? ` <b style="color:#f85149">AUTH: ${esc(d.auth)}</b>` +
+        ` <a href="#" data-auth="login">[log in]</a>` +
+        ` <a href="#" data-auth="recheck">[recheck]</a>`
+      : '');
   // one table per project (slug) so each project's agents are visible
   // independently; groups ordered by newest activity first.
   const groups = {};
@@ -1311,15 +1317,18 @@ function render(d){
   for (const slug of slugs){
     const rows = groups[slug];
     const nRun = rows.filter(r=>r.status==='running').length;
+    const show = expanded[slug] ? rows : rows.slice(0, SHOW_N);
     h += `<h3 class="proj">${esc(slug)} <span class="sub">` +
-      `${rows.length} agent(s)${nRun?`, ${nRun} running`:''}</span></h3>` +
+      `${rows.length} agent(s)${nRun?`, ${nRun} running`:''}` +
+      `${show.length<rows.length?`, showing latest ${show.length}`:''}` +
+      `</span></h3>` +
       '<div class="wrapw"><table><tr><th></th><th>step</th>' +
       '<th>task</th><th>run</th>' +
       '<th class="hide-s">model</th><th class="hide-s">effort</th>' +
       '<th class="hide-s">mode</th>' +
       '<th>started</th><th>elapsed</th><th>ended</th>' +
       '<th class="hide-s">session</th><th>note</th></tr>';
-    for (const a of rows){
+    for (const a of show){
       const c = COLORS[a.status]||'#8b949e';
       const pulse = a.status==='running' ? ' run' : '';
       const sess = a.session_id ? String(a.session_id).slice(0,14) : '-';
@@ -1336,6 +1345,10 @@ function render(d){
         `<td class="hide-s">${esc(sess)}</td>` +
         `<td class="wrap">${esc(a.note||'')}</td></tr>`;
     }
+    if (rows.length > SHOW_N)
+      h += `<tr><td colspan="12"><a href="#" data-slug="${esc(slug)}">` +
+        (expanded[slug] ? `show latest ${SHOW_N} only` :
+          `show ${rows.length - SHOW_N} older agent(s)`)+`</a></td></tr>`;
     h += '</table></div>';
   }
   document.getElementById('agents').innerHTML =
@@ -1353,6 +1366,23 @@ function render(d){
   }
   document.getElementById('runs').innerHTML = h;
 }
+document.addEventListener('click', async e=>{
+  const t = e.target;
+  if (t.dataset && t.dataset.slug){          // expand/collapse a table
+    e.preventDefault();
+    expanded[t.dataset.slug] = !expanded[t.dataset.slug];
+    if (lastData) render(lastData);
+  } else if (t.dataset && t.dataset.auth){
+    e.preventDefault();
+    if (t.dataset.auth==='login'){
+      await fetch('/api/auth/login', {method:'POST'});
+      t.outerHTML = ' <span style="color:#8b949e">a terminal opened - ' +
+        'finish the login there; this banner clears itself</span>';
+    } else {
+      await fetch('/api/auth/recheck', {method:'POST'});
+    }
+  }
+});
 async function tick(){
   try { render(await (await fetch('/api/state')).json()); }
   catch(e){} finally { setTimeout(tick, 2000); } }
@@ -1386,6 +1416,25 @@ def cmd_serve(args: argparse.Namespace) -> int:
                     "application/json")
             elif self.path in ("/", "/index.html"):
                 self._send(_DASH_HTML.encode(), "text/html; charset=utf-8")
+            else:
+                self.send_error(404)
+
+        def do_POST(self) -> None:                   # noqa: N802 - stdlib name
+            if self.path == "/api/auth/login":
+                # Login is an interactive console flow (trap 3) - the most a
+                # dashboard button can do is pop a REAL terminal for it.
+                # logout first: a stale credentials.toml makes plain `login`
+                # short-circuit with "already logged in" (trap 4).
+                subprocess.Popen(
+                    'start "" cmd /k "devin auth logout & devin auth login"',
+                    shell=True)
+                _AUTH_CACHE[0] = 0.0      # next tick re-probes
+                self._send(b"{}", "application/json")
+            elif self.path == "/api/auth/recheck":
+                _AUTH_CACHE[0] = 0.0
+                self._send(json.dumps(
+                    {"auth": auth_status(devin_argv)}).encode(),
+                    "application/json")
             else:
                 self.send_error(404)
 

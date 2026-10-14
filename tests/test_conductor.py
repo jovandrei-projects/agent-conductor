@@ -230,9 +230,10 @@ verify = "python -c \\"import pathlib;assert len(pathlib.Path('WORK.txt').read_t
 ''')
             rc = run_manifest(m, runs)
             self.assertEqual(rc, 0)
-            self.assertEqual(
-                (proj / "WORK.txt").read_text().splitlines(),
-                ["mock-step-1", "mock-step-2"])
+            lines = (proj / "WORK.txt").read_text().splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertTrue(lines[0].startswith("mock-step-1-"))
+            self.assertTrue(lines[1].startswith("mock-step-2-"))
             run_dir = next(runs.iterdir())
             state = json.loads((run_dir / "state.json").read_text())
             self.assertEqual(state["steps"]["one"]["status"], "done")
@@ -305,6 +306,70 @@ prompt = "third"
                 (next(runs.iterdir()) / "state.json").read_text())
             self.assertTrue(state["steps"]["p1"]["merged"])
             self.assertTrue(state["steps"]["p2"]["merged"])
+
+    def test_wave_merge_conflict_keeps_worktree(self):
+        """Two worktree steps editing the SAME file in parallel: the first
+        merges, the second conflicts -> step failed, merge aborted, and the
+        worktree+branch are PRESERVED for manual merge (work not lost)."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "p1"
+project = "{proj.as_posix()}"
+prompt = "Append a line to WORK.txt"
+wave = 1
+worktree = true
+
+[[step]]
+name = "p2"
+project = "{proj.as_posix()}"
+prompt = "Also append a line to WORK.txt"
+wave = 1
+worktree = true
+''')
+            rc = run_manifest(m, runs)
+            self.assertEqual(rc, 1)
+            run_dir = next(runs.iterdir())
+            state = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(state["steps"]["p1"]["status"], "done")
+            self.assertTrue(state["steps"]["p1"]["merged"])
+            p2 = state["steps"]["p2"]
+            self.assertEqual(p2["status"], "failed")
+            self.assertFalse(p2["merged"])
+            self.assertIn("merge conflict", p2["note"])
+            wt = Path(p2["work_dir"])               # kept for manual merge
+            self.assertTrue(wt.is_dir())
+            # aborted merge: main checkout has only p1's line, not p2's
+            lines = (proj / "WORK.txt").read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertTrue((proj / ".git" / "MERGE_HEAD").exists() is False)
+
+    def test_resume_reruns_lost_step(self):
+        """A step orphaned when its conductor died (status 'lost') re-runs
+        on --resume, like any non-done step."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            run_manifest(m, runs)
+            run_dir = next(runs.iterdir())
+            state = json.loads((run_dir / "state.json").read_text())
+            state["steps"]["one"]["status"] = "lost"
+            state["ended_at"] = None
+            (run_dir / "state.json").write_text(json.dumps(state))
+            rc = run_manifest(m, runs, resume=str(run_dir))
+            self.assertEqual(rc, 0)
+            state = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(state["steps"]["one"]["status"], "done")
 
     def test_wave_collision_without_worktree_rejected(self):
         with tempfile.TemporaryDirectory() as td:

@@ -83,14 +83,15 @@ def main() -> int:
     if prompt_file:
         body = Path(prompt_file).read_text(encoding="utf-8")
 
+    sid = "mock-" + "".join(random.choices(string.ascii_lowercase, k=6))
     import re
     m = re.search(r"([A-Za-z0-9_]+\.txt)", body)
     work = cwd / (m.group(1) if m else "WORK.txt")
     n = sum(1 for _ in open(work, encoding="utf-8")) if work.is_file() else 0
+    # sid in the line: two parallel worktrees writing the same file produce
+    # different content -> a real merge conflict, not a no-op merge.
     with open(work, "a", encoding="utf-8") as f:
-        f.write(f"mock-step-{n + 1}\n")
-
-    sid = "mock-" + "".join(random.choices(string.ascii_lowercase, k=6))
+        f.write(f"mock-step-{n + 1}-{sid}\n")
     sessions = _registry(cwd)
     sessions.append({"id": sid, "short_id": sid,
                      "working_directory": str(cwd),

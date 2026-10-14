@@ -1,0 +1,48 @@
+# Worktree coordination demo - the CONFLICT case.
+# Wave 1: two worktree steps on demo1 both APPEND to books.csv. Each passes
+# its own verify inside its worktree, but at merge-back the second branch
+# conflicts on the same tail region. Conductor aborts that merge, marks the
+# step failed, and PRESERVES the worktree for manual merge - the work is
+# never lost. on_failure=continue so the report step still runs and you can
+# see the partial merge state.
+
+[run]
+name = "demo-wt-conflict"
+on_failure = "continue"
+checkpoint = true
+
+[defaults]
+model = "gpt-6-luna"
+effort = "min"
+timeout_min = 15
+
+[[step]]
+name = "add-scifi"
+project = "demo1"
+wave = 1
+worktree = true
+prompt = """Append exactly this row to the END of books.csv (same column
+order, no trailing blank line):
+  Solaris,Stanislaw Lem,sci-fi,1961
+Commit the change."""
+verify = 'findstr /c:"Solaris" books.csv'
+
+[[step]]
+name = "add-mystery"
+project = "demo1"
+wave = 1
+worktree = true
+prompt = """Append exactly this row to the END of books.csv (same column
+order, no trailing blank line):
+  The Hound of the Baskervilles,Arthur Conan Doyle,mystery,1902
+Commit the change."""
+verify = 'findstr /c:"Baskervilles" books.csv'
+
+[[step]]
+name = "conflict-report"
+project = "demo1"
+prompt = """Look at books.csv and write CONFLICT-REPORT.md: list which of
+Solaris (sci-fi) and The Hound of the Baskervilles (mystery) are present.
+The other step's work may still sit in a sibling worktree - note that too.
+Commit it."""
+verify = 'findstr /i "Solaris\|Baskervilles" CONFLICT-REPORT.md'

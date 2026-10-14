@@ -1,0 +1,43 @@
+# Worktree coordination demo - the CLEAN case.
+# Wave 1: two worktree steps on demo1 editing DIFFERENT files. Each runs in
+# data/worktrees/<run>/<step> on its own branch; conductor git-merges both
+# back in manifest order. Different files -> no conflict -> both merged.
+# The final step then sees the union of both edits in the main checkout.
+
+[run]
+name = "demo-wt-merge"
+checkpoint = true
+
+[defaults]
+model = "gpt-6-luna"
+effort = "min"
+timeout_min = 15
+
+[[step]]
+name = "add-books"
+project = "demo1"
+wave = 1
+worktree = true
+prompt = """Add exactly these two rows to books.csv (column order
+title,author,genre,year, no trailing blank line):
+  Roadside Picnic,Arkady and Boris Strugatsky,sci-fi,1972
+  The Big Sleep,Raymond Chandler,mystery,1939
+Commit the change."""
+verify = 'findstr /c:"Strugatsky" books.csv'
+
+[[step]]
+name = "authors-list"
+project = "demo1"
+wave = 1
+worktree = true
+prompt = """Read books.csv and write AUTHORS.md: a markdown list of the
+unique authors, alphabetically sorted, one "- Name" line each. Commit it."""
+verify = 'findstr /c:"Bulgakov" AUTHORS.md'
+
+[[step]]
+name = "mergelog"
+project = "demo1"
+prompt = """Both earlier steps were merged into this checkout. Write
+MERGELOG.md: one short paragraph noting which new books and which author
+files are now present. Commit it."""
+verify = 'findstr /i "authors" MERGELOG.md'

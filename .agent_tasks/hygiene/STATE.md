@@ -90,7 +90,19 @@ Doc fix: `devin list` interactive picker is GLOBAL ("all sessions"); only
   Verified `devin -p` is genuinely blocked (auth status isn't lying) and the
   CLI has NO refresh command - interactive login is the only renewal.
 - Dashboard now probes `auth status` (2min cache) and shows a red
-  `AUTH: NOT LOGGED IN` banner in the meta line when expired.
+  `AUTH: NOT LOGGED IN` banner + `[log in]` (pops a real terminal running
+  `devin auth logout & devin auth login` - POST /api/auth/login) and
+  `[recheck]` (POST /api/auth/recheck busts the cache) controls.
+- Dashboard: project tables now show the latest 10 agents each with a
+  "show N older" toggle - history stays in state.json, just not rendered.
+- New manifests: examples/demo-wt-merge.toml (same-project wave, different
+  files -> clean merge) and demo-wt-conflict.toml (same-file wave -> second
+  merge conflicts, step failed, worktree preserved). Regression tests lock
+  both paths + resume-of-lost-step; mock lines are now session-unique so
+  parallel same-file writes actually diverge.
+- Token TTL answered by docs: CLI tokens do NOT expire by default - dead
+  means revoked/rejected server-side. Two observed cases; watch the next
+  login for a pattern.
 
 ## Verification
 
