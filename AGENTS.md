@@ -106,7 +106,10 @@ elapsed, session id, work dir, paths to prompt/stdout/export, and per-step
 the ATIF export's `final_metrics` at step end; they roll up per run on the
 dashboard). The planner session also exports and its metrics accumulate on
 the request as `plan_tokens` (across regenerations and the malformed-TOML
-retry) - the runs table shows them as `plan`/`steps` labels when present.
+retry) - the runs table shows them as `planner:`/`steps:` token lines
+when present, each field labeled (`in / out / cached / turns` - cached
+is a share of `in`, never additive; turns = LLM steps, not manifest
+steps).
 `serve`
 renders it as a live page at `http://127.0.0.1:8773` (loopback only,
 auto-refreshes, shows elapsed time ticking for running agents). The same

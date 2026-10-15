@@ -20,6 +20,11 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-15 (steps-counters-clarity): run/agent token counters
+  name themselves - `fmtT` renders `in X · out Y · cached Z · N turns`
+  (cached always shown; turns = LLM steps, not manifest steps) instead
+  of `X/Y+Zc ·Nst`; run rows read `planner:`/`steps:`; `steps` column
+  header + tooltips + the `?` explainer use the same words.
 - DONE 2026-10-15 (run-control-taxonomy): one name per lifecycle
   action. `Pause run` is now the graceful hold (in-flight steps finish,
   nothing new launches, `aborted='paused'` - the machine-restart case);
