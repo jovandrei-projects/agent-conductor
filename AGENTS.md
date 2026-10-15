@@ -215,6 +215,26 @@ merge loop for parked branches, spawns the `resolve-*` session when the
 manifest opts in, and 409s while any step is live - the fix for "the
 conductor died/conflicted before merging" without `--resume`.
 
+Prompt controls sit beside the lifecycle ones on the agent modal.
+**Edit prompt** (`POST .../steps/<step>/prompt` `{prompt}`) writes a
+`prompt-<key>-<step>` sentinel holding a replacement task body that
+`run_step` folds in at render - allowed only while the step never
+dispatched (no record, or `queued`/`skipped`; the endpoint 409s once a
+prompt exists, and an open form locks on the next refresh). `{prompt:
+null}` reverts to the manifest text. **Resume notes**
+(`POST .../steps/<step>/notes` `{notes}`) on a ran-but-unfinished step
+write `rnote-<key>-<step>` - appended to the next dispatched prompt
+under the original body (INTERRUPTED_NOTE + body + notes), so the
+operator can say "VPN is restored" without rewriting the original
+prompt; empty notes clear it. Both are durable content sentinels that
+survive `clear_run_flags` like `skip-` (the resume they target reads
+them), and `rec.prompt_edited` + a `note` record when an override was
+dispatched. The modal's `task prompt` row shows the full body
+(`prompts/*.md` once dispatched, the manifest body while pending - the
+160-char `task` is only a fallback), and `prompt file` is the on-disk
+path. Rows stay glued to their agent across re-sorts via a run_dir|step
+key, and unsaved form drafts survive the 2s modal rebuild.
+
 Cost display: `serve` fetches self-serve rates from
 `docs.devin.ai/desktop/chat/models.md` (the Mintlify page embeds a
 `modelCostData` JS array; `TEAMS_TIER_PRO` is the self-serve tier),

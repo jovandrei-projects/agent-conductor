@@ -37,3 +37,4 @@ accounted for.
 | agent-conductor / wt-matrix (dev/merge-tests: merge_resolver + resume-finalize + token metrics + 25-test worktree matrix; live lab run resolving real conflicts; 75/75 green) | n/a | n/a | n/a | n/a |
 | agent-conductor / dashboard requests (draft/review/start, filters, token help, headless probes; 98/98 mock tests and demo green) | n/a | n/a | n/a | n/a |
 | agent-conductor / run-control-taxonomy (audit -> graceful-pause merge, stopped no longer trips on_failure, durable skip sentinel, manifest pending rows; 164/164 + demo green) | n/a | n/a | n/a | n/a |
+| agent-conductor / task-prompt-editing (pre-dispatch Edit prompt + resume notes sentinels, full-text modal task field; 172/172 + demo green) | n/a | n/a | n/a | n/a |
