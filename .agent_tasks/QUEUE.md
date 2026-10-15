@@ -91,3 +91,9 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   `body.compact`: wrap cells ellipsize to one line, `.sub` and `<br>`
   hide; persists in `localStorage['ac-density']`. Modal z-index bumped
   above the bar (50/51).
+- DONE 2026-10-15: Run name is the details affordance (the separate
+  Details link is gone; compact mode hid it on the .sub line anyway).
+  Clicking the name opens the run/proposal modal; clicking elsewhere on
+  the row still filters. Resume now pops stale 'aborted'/'ended_at' from
+  state.json - a finished-then-resumed run no longer shows the 'Paused
+  by user' notice forever.
