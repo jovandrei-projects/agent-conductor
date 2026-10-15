@@ -1,0 +1,77 @@
+[run]
+name = "ux-controls"
+description = "Rework agent-conductor run controls, task editing, planner clarifying questions, image attachments, and dashboard affordances into a consistent, self-explanatory UX."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 90
+max_attempts = 3
+verify = "python run_tests.py"
+
+[[step]]
+name = "run-control-taxonomy"
+project = "agent-conductor"
+worktree = true
+timeout_min = 120
+prompt = "Audit the current run-control actions 'pause run', 'stop run now', and 'drain & stop' plus the task-level stop/skip behavior in both the backend state machine and the UI. Then implement ONE consistent naming system covering these distinct scenarios: (a) pause a run gracefully with the intent to resume where it left off, (b) resume a run after an ungraceful interruption such as a forced machine restart, (c) mark a pending step as skipped and unskip it back into its original queue position, and (d) gracefully stop the currently running task while the run proceeds to the next queued task. Rename or merge overlapping controls so every visible action has a distinct self-explanatory name, add tooltips or confirm text that state exactly what each action does, and keep existing mark-failed / rerun-at-end behavior working. Update in-repo docs and help text to match the final names."
+
+[[step]]
+name = "task-prompt-editing"
+project = "agent-conductor"
+worktree = true
+timeout_min = 120
+prompt = "Let the user edit a task's prompt via an edit control only while the task has NOT started; once a task is running, completed, or its prompt has been dispatched, editing must be disabled, and if a task starts while an edit form is open the form must lock. For interrupted/stopped tasks do NOT edit the original prompt: instead provide a 'resume notes' text field whose contents are appended to the resume prompt along with the original prompt and current task state, so the agent can be told things like 'VPN is restored'. Audit the task-details modal: the 'task' field appears trimmed - show the full prompt text and clarify the labeling of 'task' vs 'prompt' fields."
+
+[[step]]
+name = "steps-counters-clarity"
+project = "agent-conductor"
+worktree = true
+timeout_min = 60
+prompt = "The 'plan' label under 'steps' shows only 2 values plus the steps count (possibly hiding a cached value), and the 'steps' label shows 3 values - one pair divided by '/' and one prefixed by '+' - which is confusing. Investigate what each number actually represents in the code, then redesign these labels so every counter is self-evident: use explicit labels (e.g. planned vs cached vs total, done/total, +N queued) or a clearer compact format, and add tooltips if the values must stay terse."
+
+[[step]]
+name = "run-lifecycle-cleanup"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = "Old temp runs (e.g. lab-merge-stress, favicon2, demo, smoke) clutter the dashboard. Implement automatic archival of finished runs older than 48 hours - hidden from the default dashboard view but kept on disk, with the threshold configurable if trivial - and add a 'delete run' action in the run modal that removes the run's row/record, requiring confirmation and disabled while the run is still active."
+
+[[step]]
+name = "planner-questions"
+project = "agent-conductor"
+worktree = true
+timeout_min = 120
+prompt = "Add an 'ask me questions if needed' checkbox to the planner request form. When checked and the planner hits ambiguities while generating a proposal, it should present a questionnaire BEFORE producing the manifest: one question per modal, each offering suggested answer options where sensible plus a free-text answer field and a skip option, similar to the ask_question tool UX. Use the collected answers to refine the generated manifest. When unchecked, or when the planner has no questions, behavior is unchanged - the checkbox grants permission to ask, it must not force the planner to invent questions."
+
+[[step]]
+name = "image-attachments"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = "In the agent-conductor request/prompt input: support drag and drop of image files so the file path is inserted into the text and/or registered as an attachment; support pasting screenshots from the clipboard by saving the image to a sensible location under the project data directory and inserting its path. Show a thumbnail strip of all images attached to the current request with a per-image remove control; attachments must be removable at any point before submitting."
+
+[[step]]
+name = "task-modal-navigation"
+project = "agent-conductor"
+worktree = true
+timeout_min = 60
+prompt = "Add previous/next task navigation inside the task-details modal of the agents-tasks table, following pipeline order. Preferred design: a sticky bar at the top of the modal with previous and next arrows plus position context (e.g. 'Task N of M' or task names); a simpler button row is acceptable if cleaner. Support Left/Right arrow keys for navigation if straightforward."
+
+[[step]]
+name = "run-link-affordance"
+project = "agent-conductor"
+worktree = true
+timeout_min = 45
+prompt = "Run names in the dashboard open the run modal on click but do not look clickable - render run names always in blue and underlined like a link. Also fix the focus bug shown in the screenshot at 'C:/Users/andry/Downloads/Screenshot 2026-10-15 175153.png': after closing the modal with Esc, the run name stays highlighted with a clipped blue focus outline (left side cut off). Remove the persistent highlight or restyle the focus ring so it is not clipped."
+
+[[step]]
+name = "follow-up-plan"
+project = "agent-conductor"
+worktree = true
+timeout_min = 30
+prompt = "Review what this run accomplished against the human request: per-step logs, STATUS/NEXT lines and notes are under C:/Projects/agent-conductor/data/runs in the newest directory ending in 'ux-controls', alongside each project's .agent_tasks files. Then write a NEW conductor TOML manifest proposing only the still-unfinished or newly discovered work, saved as 'C:/Projects/agent-conductor/manifests/ux-controls-followup.toml' using forward slashes. Do NOT launch or implement the follow-up - a human reviews it."
