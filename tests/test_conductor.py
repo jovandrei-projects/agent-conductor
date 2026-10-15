@@ -2626,6 +2626,53 @@ class LifecycleDisplayTests(unittest.TestCase):
             bad.write_text("{no", encoding="utf-8")
             self.assertIsNone(conductor.tail_agent_model(bad))
 
+    def test_trajectory_arc_groups_consecutive_phases(self):
+        """The modal's trajectory section groups an ATIF export's raw
+        steps into labeled phase spans."""
+        steps = [
+            {"step_id": 1, "source": "system", "message": "You are Devin"},
+            {"step_id": 2, "source": "agent",
+             "message": "Let me check the run modal code"},
+            {"step_id": 3, "source": "agent", "message": "",
+             "tool_calls": [{"function_name": "read",
+                             "arguments": {"file_path": "/x/conductor.py"}}]},
+            {"step_id": 4, "source": "agent",
+             "message": "Now add the /skip route"},
+            {"step_id": 5, "source": "agent",
+             "message": "Now run the test suite"},
+            {"step_id": 6, "source": "agent", "message": "",
+             "tool_calls": [{"function_name": "exec",
+                             "arguments": {"command": "python run_tests.py"}}]},
+            {"step_id": 7, "source": "agent",
+             "message": "commit in logical groups"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            ex = Path(td) / "s.export.json"
+            ex.write_text(json.dumps({"steps": steps}), encoding="utf-8")
+            arc = conductor.trajectory_arc(ex)
+        self.assertEqual(arc["steps"], 7)
+        got = [(g["span"], g["phase"]) for g in arc["groups"]]
+        self.assertEqual(got, [("1", "setup"), ("2-3", "audit"),
+                               ("4", "implement"), ("5-6", "test"),
+                               ("7", "commit")])
+        # consecutive same-phase merge keeps the FIRST step's narration
+        self.assertIn("check the run modal", arc["groups"][1]["head"])
+        # empty-message step falls back to a tool-call summary
+        self.assertEqual(conductor._arc_head(steps[5]), "exec")
+
+    def test_trajectory_arc_tolerates_junk(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertIsNone(conductor.trajectory_arc(td))
+            bad = Path(td) / "b.json"
+            bad.write_text("{no", encoding="utf-8")
+            self.assertIsNone(conductor.trajectory_arc(bad))
+            empty = Path(td) / "e.json"
+            empty.write_text('{"steps": []}', encoding="utf-8")
+            self.assertIsNone(conductor.trajectory_arc(empty))
+            # a live step has no export yet -> no arc, no crash
+            self.assertIsNone(conductor.cached_arc(
+                str(Path(td) / "nope.json")))
+
     def test_estimate_cost_resolves_adaptive_actual(self):
         table = {"adaptive": {"label": "Adaptive", "in": 0, "out": 0,
                               "cr": 0},

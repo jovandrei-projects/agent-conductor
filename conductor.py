@@ -881,6 +881,132 @@ def tail_agent_model(export_path: Path) -> str | None:
     return name if isinstance(name, str) and name else None
 
 
+# Trajectory arc: condense an ATIF export's `steps` array into labeled
+# phase spans (setup -> audit -> implement -> test -> ... -> commit) so
+# the task modal can show "what the session did" in ~15 lines instead of
+# 77 raw LLM steps. Heuristic only - the phase tag is cosmetic.
+_ARC_PHASE_RX = [
+    ("commit", re.compile(r"commit|staged|git add|checkpoint", re.I)),
+    ("test", re.compile(r"\btests?\b|suite|pytest|run_tests|unittest|"
+                        r"\bgreen\b|fail(?:ed|ures?)?\b|verify", re.I)),
+    ("docs", re.compile(r"agents\.md|readme|queue\.md|state\.md|roadmap|"
+                        r"changelog|documentation|\bdocs\b", re.I)),
+    ("audit", re.compile(r"check|audit|read|look|examine|inspect|grep|"
+                         r"search|find|review|understand|see ", re.I)),
+    ("implement", re.compile(r"edit|update|add|wire|endpoint|rename|"
+                             r"refactor|\bfix|todo|now ", re.I)),
+]
+_ARC_WRITE_TOOLS = {"edit", "write", "notebook_edit"}
+_ARC_READ_TOOLS = {"read", "grep", "code_search", "web_search", "webfetch",
+                   "get_output", "notebook_read", "ls", "find_file_by_name",
+                   "mcp_read_resource", "mcp_list_tools", "mcp_list_servers",
+                   "skill", "read_subagent"}
+
+
+def _arc_phase(step: dict) -> str:
+    if step.get("source") != "agent":
+        return "setup"
+    calls = [c for c in (step.get("tool_calls") or [])
+             if isinstance(c, dict)]
+    names = [c.get("function_name") or "" for c in calls]
+    msg = (step.get("message") or "").strip()
+    if msg:
+        hay = msg
+    else:
+        # Message-less step: classify on tool names + SHORT args only
+        # (command, file_path). Edit payloads are file contents - pure
+        # keyword noise - and reasoning_content is 4k of free text that
+        # mentions every phase in passing, so neither belongs here.
+        bits = list(names)
+        for c in calls:
+            a = c.get("arguments")
+            if isinstance(a, dict):
+                v = (a.get("command") or a.get("file_path")
+                     or a.get("notebook_path") or a.get("pattern") or "")
+                bits.append(str(v)[:300])
+        hay = " ".join(bits)
+    for phase, rx in _ARC_PHASE_RX:
+        if rx.search(hay):
+            return phase
+    if any(n in _ARC_WRITE_TOOLS for n in names):
+        return "implement"
+    if calls and all(n in _ARC_READ_TOOLS for n in names):
+        return "audit"
+    return "work"
+
+
+def _arc_head(step: dict) -> str:
+    msg = " ".join((step.get("message") or "").split())
+    if msg:
+        return msg[:110]
+    calls = [c.get("function_name") or "?"
+             for c in (step.get("tool_calls") or [])
+             if isinstance(c, dict)]
+    if calls:
+        seen: dict[str, int] = {}
+        for n in calls:
+            seen[n] = seen.get(n, 0) + 1
+        return " + ".join(f"{n}x{k}" if k > 1 else n
+                          for n, k in seen.items())
+    rc = " ".join((step.get("reasoning_content") or "").split())
+    return ("think: " + rc[:100]) if rc else "(no detail)"
+
+
+def trajectory_arc(export_path) -> dict | None:
+    """Phase-grouped timeline of an ATIF export for the task modal.
+    None for missing/corrupt exports, mocks, and live steps (the export
+    is written once when the session ends - there is nothing mid-run)."""
+    try:
+        d = json.loads(Path(export_path).read_text(
+            encoding="utf-8", errors="replace"))
+    except (OSError, ValueError, TypeError):
+        return None
+    steps = d.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return None
+    groups: list[dict] = []
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        phase = _arc_phase(s)
+        sid = s.get("step_id")
+        if groups and groups[-1]["phase"] == phase:
+            groups[-1]["end"] = sid
+            groups[-1]["n"] += 1
+        else:
+            groups.append({"phase": phase, "start": sid, "end": sid,
+                           "n": 1, "head": _arc_head(s)})
+    if not groups:
+        return None
+    return {"steps": len(steps),
+            "groups": [{"span": (str(g["start"]) if g["start"] == g["end"]
+                                 else f"{g['start']}-{g['end']}"),
+                        "phase": g["phase"], "n": g["n"],
+                        "head": g["head"]} for g in groups[:40]]}
+
+
+_ARC_CACHE: dict[str, tuple[float, dict | None]] = {}
+
+
+def cached_arc(path) -> dict | None:
+    """mtime-keyed memo over trajectory_arc - exports land once at
+    session end and never change afterwards, and collect_dashboard runs
+    every refresh, so parsing the JSON per poll would be pure waste."""
+    if not path:
+        return None
+    try:
+        m = os.path.getmtime(path)
+    except OSError:
+        return None
+    key = str(path)
+    hit = _ARC_CACHE.get(key)
+    if hit and hit[0] == m:
+        return hit[1]
+    arc = trajectory_arc(path)
+    _ARC_CACHE[key] = (m, arc)
+    return arc
+
+
 def _merge_tokens(acc: dict[str, int], tok: dict | None) -> dict:
     for k, v in (tok or {}).items():
         if isinstance(v, (int, float)):
@@ -4125,6 +4251,7 @@ def collect_dashboard(runs_dir: Path,
                 "stdout_log": rec.get("stdout_log"),
                 "tail": stdout_tail(rec.get("stdout_log")),
                 "export": rec.get("export"), "prompt": rec.get("prompt"),
+                "arc": cached_arc(rec.get("export")),
                 "state_md": _state_md(
                     wd, rec.get("name") or name,
                     str(projects.get(slug, {}).get("path") or "") or None)})
@@ -4389,6 +4516,18 @@ a { color:#58a6ff; text-decoration:none; }
 #detail .k { color:#8b949e; }
 #detail pre { white-space:pre-wrap; color:#8b949e; background:#0d1117; border-radius:6px; padding:8px 10px; font-size:12px; max-height:180px; overflow:auto; }
 #detail .x { position:absolute; top:10px; right:16px; cursor:pointer; color:#8b949e; background:none; border:0; font:inherit; }
+.arc { font-size:12px; border:1px solid #21262d; border-radius:6px; padding:6px 8px; max-height:280px; overflow-y:auto; background:#0d1117; }
+.arcrow { display:flex; gap:8px; padding:1px 0; }
+.arcspan { color:#8b949e; min-width:44px; text-align:right; flex:none; }
+.arcphase { flex:none; width:78px; }
+.archead { color:#8b949e; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.arcrow:hover .archead { color:#e6edf3; }
+.arc-setup, .arc-work { color:#8b949e; }
+.arc-audit { color:#79c0ff; }
+.arc-implement { color:#d2a8ff; }
+.arc-test { color:#ffa657; }
+.arc-docs { color:#7ee787; }
+.arc-commit { color:#3fb950; }
 
 .stage { display:inline-block; border-radius:9px; padding:1px 7px; font-size:11px; border:1px solid #30363d; white-space:nowrap; }
 .stage.draft { color:#e3b341; border-color:#6b5a1f; background:#2a2317; }
@@ -4704,7 +4843,16 @@ function showDetail(i){
             `Save clears stored notes.</span></div>` : '')) : '') +
     (a.request_id ? `<div class="actions"><button type="button" class="btn secondary" ` +
       `data-open-request="${esc(a.request_id)}">View request / runbook</button></div>` : '') +
-    (a.tail ? `<h3 style="margin-top:14px">stdout tail</h3><pre id="dtail">${esc(a.tail)}</pre>` : '');
+    (a.tail ? `<h3 style="margin-top:14px">stdout tail</h3><pre id="dtail">${esc(a.tail)}</pre>` : '') +
+    (a.arc && a.arc.groups && a.arc.groups.length
+      ? `<h3 style="margin-top:14px">trajectory` +
+        ` <span class="sub" style="margin:0">${a.arc.steps} LLM steps, ` +
+        `grouped by phase (from the session's ATIF export)</span></h3>` +
+        `<div class="arc">` + a.arc.groups.map(g =>
+          `<div class="arcrow"><span class="arcspan">${esc(g.span)}` +
+          `</span><span class="arcphase arc-${esc(g.phase)}">` +
+          `${esc(g.phase)}</span><span class="archead">${esc(g.head)}` +
+          `</span></div>`).join('') + `</div>` : '');
   if (fsel){
     const el = document.getElementById(fid);
     if (el && el.focus){ el.focus();
