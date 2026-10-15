@@ -2213,7 +2213,7 @@ vm.runInContext('render('+JSON.stringify(data)+')',ctx);
 const runs=elem('runs').innerHTML;
 assert.match(runs,/paused - resume ready/);
 assert.match(runs,/interrupted - resume ready/);
-assert.match(runs,/class="stage live">running</);
+assert.match(runs,/class="stage live"[^>]*>running</);
 const cleanRow=runs.split('runrow').find(r=>r.includes('>clean<'));
 assert.ok(cleanRow && !/stage (live|paused|interrupted|halted)/.test(cleanRow));
 const agents=elem('agents').innerHTML;

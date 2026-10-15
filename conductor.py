@@ -3935,7 +3935,8 @@ a { color:#58a6ff; text-decoration:none; }
   animation:pulse 1.2s ease-in-out infinite; }
 .stage.launching { color:#58a6ff; background:#172638; }
 .stage.error, .stage.launch_failed { color:#f85149; background:#321c20; }
-.stage.live { color:#58a6ff; background:#172638; border-color:#1f6feb; }
+.stage.live { color:#58a6ff; background:#172638; border-color:#1f6feb;
+  animation:pulse 1.2s ease-in-out infinite; }
 .stage.paused { color:#e3b341; border-color:#6b5a1f; background:#2a2317; }
 .stage.interrupted { color:#f0883e; border-color:#7a3d12; background:#2d1f14; }
 .stage.halted { color:#8b949e; }
@@ -4560,7 +4561,9 @@ function render(d){
   const runStateChip = r => {
     const c = r.counts||{};
     const live = (c.running||0)+(c.queued||0);
-    if (live) return `<span class="stage live">running</span>`;
+    if (live) return `<span class="stage live" ` +
+      `title="a step in this run is live - Details for controls">` +
+      `running</span>`;
     if (r.aborted==='paused')
       return `<span class="stage paused" title="deliberate hold - ` +
         `Resume continues it">paused - resume ready</span>`;
@@ -4596,7 +4599,7 @@ function render(d){
             ? `<br><span class="sub">planner warming up - ` +
               `devin stays silent for the first minutes; watch the ` +
               `plan-proposal row below</span>` : '') :
-        runStateChip(r) +
+        runStateChip(r) + `<br>` +
         `<span class="sub">${esc((r.dir||'').split(/[\\/]/).pop())}</span>`) +
       (r.stale?` <span class="stage error">Needs review</span>`:'') +
       `<br><button type="button" class="linkbtn" ` +
