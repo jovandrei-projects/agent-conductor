@@ -4021,6 +4021,12 @@ const STAGES = {draft:'Draft · unsent',generating:'Preparing proposal',
   error:'Planning failed'};
 const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,
   c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// basename for win/posix paths. fromCharCode(92) is a backslash - a '\\'
+// literal in this Python-served string is an escaping trap (a '\\' in
+// source reaches JS as '\', silently turning [\\/] into [/]-only).
+const base = p => { const s=String(p||'');
+  const i=Math.max(s.lastIndexOf('/')+1, s.lastIndexOf(String.fromCharCode(92))+1);
+  return s.slice(i); };
 const today = new Date().toDateString();
 const loc = iso => { if(!iso) return '-';
   const d=new Date(iso);
@@ -4166,7 +4172,7 @@ function showDetail(i){
     `</div>` +
     ((a.status==='running'||a.status==='queued') && a.run_dir
       ? `<div class="actions"><button type="button" class="btn danger" ` +
-        `data-stop-agent="${esc(String(a.run_dir).split(/[\\/]/).pop())}" ` +
+        `data-stop-agent="${esc(base(a.run_dir))}" ` +
         `data-step="${esc(a.step)}">Stop this agent</button>` +
         `<span class="sub" style="margin-left:10px">tree-kills the devin ` +
         `process; committed work stays. Resume re-runs the step.</span>` +
@@ -4176,7 +4182,7 @@ function showDetail(i){
         `<input id="d-timeout" type="number" min="1" max="1440" ` +
         `value="${a.timeout_min??''}" style="width:90px">` +
         `<button type="button" class="btn secondary" ` +
-        `data-set-timeout="${esc(String(a.run_dir).split(/[\\/]/).pop())}" ` +
+        `data-set-timeout="${esc(base(a.run_dir))}" ` +
         `data-step="${esc(a.step)}">Save</button>` +
         `<span class="sub">moves the live deadline on the next poll ` +
         `(&lt;15s); a value under elapsed ends the step early, retries ` +
@@ -4237,23 +4243,23 @@ function showRunDetails(key){
     (r.request_id ? `<button type="button" class="btn secondary" ` +
       `data-open-request="${esc(r.request_id)}">View original request / TOML</button>` : '') +
     (pendingMerge ? `<button type="button" class="btn" ` +
-      `data-merge-run="${esc(String(r.dir).split(/[\\/]/).pop())}" ` +
+      `data-merge-run="${esc(base(r.dir))}" ` +
       `data-rk="${esc(key)}">Merge pending branches</button>` : '') +
     (liveSteps.length ? `<button type="button" class="btn" ` +
-      `data-pause-run="${esc(String(r.dir).split(/[\\/]/).pop())}" ` +
+      `data-pause-run="${esc(base(r.dir))}" ` +
       `title="stop the live step now and hold the pipeline - nothing ` +
       `new launches until you Resume (built for machine restarts)">` +
       `Pause run</button>` +
       `<button type="button" class="btn danger" ` +
-      `data-stop-run="${esc(String(r.dir).split(/[\\/]/).pop())}" ` +
+      `data-stop-run="${esc(base(r.dir))}" ` +
       `title="tree-kill every live step now - committed work stays; ` +
       `the run ends and can be resumed">Stop run now</button>` +
       `<button type="button" class="btn secondary" ` +
-      `data-drain-run="${esc(String(r.dir).split(/[\\/]/).pop())}" ` +
+      `data-drain-run="${esc(base(r.dir))}" ` +
       `title="let the in-flight steps finish, then end the run - ` +
       `nothing new launches">Drain &amp; stop</button>` : '') +
     (canResume ? `<button type="button" class="btn" ` +
-      `data-resume-run="${esc(String(r.dir).split(/[\\/]/).pop())}">` +
+      `data-resume-run="${esc(base(r.dir))}">` +
       `Resume unfinished steps</button>` : '') +
     '</div>';
   document.getElementById('backdrop').hidden = false;
@@ -4656,7 +4662,7 @@ function render(d){
               `devin stays silent for the first minutes; watch the ` +
               `plan-proposal row below</span>` : '') :
         runStateChip(r) + `<br>` +
-        `<span class="sub">${esc((r.dir||'').split(/[\\/]/).pop())}</span>`) +
+        `<span class="sub">${esc(base(r.dir))}</span>`) +
       (r.stale?` <span class="stage error">Needs review</span>`:'') +
       `<br><button type="button" class="linkbtn" ` +
       (r.stage ? `data-open-request="${esc(r.request_id)}">${r.stage==='draft'?'Edit':'Review'}` :

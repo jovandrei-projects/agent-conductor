@@ -2299,6 +2299,37 @@ assert.ok(!cls.contains('compact'));          // default = full
                            timeout=10)
         self.assertEqual(p.returncode, 0, p.stderr)
 
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_run_dir_basename_on_windows_paths(self):
+        """Regression: _DASH_HTML is a Python string, so '\\\\' in the
+        source reached JS as '\\' - /[\\\\/]/ split on '/' only and
+        Windows run dirs posted the whole C:\\path to the API
+        (RUN_DIR_RE -> 404 'Invalid run dir' on Resume/Pause/Stop/
+        Merge). base() uses fromCharCode(92): no backslash literal."""
+        html = conductor._DASH_HTML
+        self.assertNotIn("split(/[", html)   # no regex path-split left
+        self.assertIn("fromCharCode(92)", html)
+        js = html.split("<script>\n", 1)[1].split("</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map();
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  addEventListener:()=>{}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const B='String.fromCharCode(92)';   // no raw backslash in the code string
+assert.equal(vm.runInContext(
+  "base('C:'+"+B+"+'a'+"+B+"+'dir-name')",ctx),'dir-name');
+assert.equal(vm.runInContext("base('/x/y/dir-name')",ctx),'dir-name');
+assert.equal(vm.runInContext("base('dir-name')",ctx),'dir-name');
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
 
 class ApplyRequestTests(unittest.TestCase):
     """The deterministic 'Apply options to TOML' path: option fields patch
