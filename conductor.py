@@ -3874,13 +3874,33 @@ _DASH_HTML = """<!doctype html>
 <style>
 :root { color-scheme: dark; }
 body { background:#0d1117; color:#e6edf3; font:14px/1.45 ui-monospace,Consolas,monospace; margin:0; padding:16px; }
-h1 { font-size:18px; margin:0 0 4px; }
+h1 { font-size:18px; margin:0; }
 .sub { color:#8b949e; font-size:12px; margin-bottom:14px; }
 h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:#8b949e; margin:22px 0 8px; }
 h3.proj { font-size:13px; color:#e6edf3; margin:16px 0 4px; }
 h3.proj .sub { margin-bottom:0; font-weight:400; }
+/* Sticky chrome: the topbar (title/meta/actions/density/filters) stays
+   pinned; every table header pins just under it (--topbar-h is measured
+   in JS since the filters row can wrap). .wrapw must NOT set overflow -
+   any overflow ancestor becomes a scroll container and th would stick to
+   it instead of the viewport. */
+.topbar { position:sticky; top:0; z-index:40; background:#0d1117;
+  margin:-16px -16px 0; padding:10px 16px 8px; border-bottom:1px solid #21262d; }
+.tb-row { display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+.tb-row .sub { margin:0; }
+.tb-gap { flex:1; }
+.tb-flow { margin:6px 0 0; }
+#filters { margin-top:8px; }
+.seg { display:inline-flex; border:1px solid #30363d; border-radius:7px;
+  overflow:hidden; }
+.seg button { background:transparent; border:0; color:#8b949e;
+  font:inherit; font-size:12px; padding:5px 11px; cursor:pointer; }
+.seg button.on { background:#1f6feb; color:#fff; }
 table { border-collapse:collapse; width:100%; table-layout:fixed; }
-th { text-align:left; font-weight:600; color:#8b949e; font-size:11px; text-transform:uppercase; padding:4px 10px 4px 0; border-bottom:1px solid #21262d; }
+th { position:sticky; top:var(--topbar-h,110px); z-index:7;
+  background:#0d1117; text-align:left; font-weight:600; color:#8b949e;
+  font-size:11px; text-transform:uppercase; padding:4px 10px 4px 0;
+  border-bottom:1px solid #21262d; }
 td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 td.wrap { white-space:normal; color:#8b949e; font-size:12px; }
 td.step { white-space:normal; }  /* wt/merged chips wrap under a long name */
@@ -3911,7 +3931,15 @@ button.chip:focus-visible, button:focus-visible, tr.runrow:focus-visible { outli
 .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
 .dot.run { animation:pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity:.35; } }
-.wrapw { overflow-x:auto; }
+.wrapw { }  /* overflow here would create a scroll container and break
+   the sticky th - tables are width:100% fixed, nothing overflows */
+/* compact density: one line per row - wrap cells ellipsize, sub-lines
+   (dir path, plan tokens) hide */
+body.compact td { padding-top:2px; padding-bottom:2px; }
+body.compact td.wrap, body.compact td.step, body.compact td.res {
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+body.compact td .sub { display:none; }
+body.compact td br { display:none; }
 .counts span { background:#161b22; border-radius:8px; padding:1px 8px; margin-right:5px; font-size:12px; }
 a { color:#58a6ff; text-decoration:none; }
 [hidden] { display:none !important; }
@@ -3919,15 +3947,14 @@ a { color:#58a6ff; text-decoration:none; }
 .tok-help summary { display:inline-grid; place-items:center; width:18px; height:18px; border:1px solid #6e7681; border-radius:50%; color:#58a6ff; cursor:pointer; list-style:none; }
 .tok-help summary::-webkit-details-marker { display:none; }
 .tok-help .explain { padding:10px 12px; margin-top:7px; border:1px solid #30363d; background:#0d1117; border-radius:6px; font-size:12px; line-height:1.6; }
-#backdrop { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:8; }
-#detail { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); width:min(780px,92vw); max-height:82vh; background:#161b22; border:1px solid #30363d; border-radius:10px; padding:18px 22px; overflow:auto; z-index:9; font-size:13px; box-sizing:border-box; }
+#backdrop { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:50; }
+#detail { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); width:min(780px,92vw); max-height:82vh; background:#161b22; border:1px solid #30363d; border-radius:10px; padding:18px 22px; overflow:auto; z-index:51; font-size:13px; box-sizing:border-box; }
 #detail h3 { margin:0 80px 10px 0; font-size:14px; }
 #detail .kv { display:grid; grid-template-columns:96px 1fr; gap:4px 12px; }
 #detail .k { color:#8b949e; }
 #detail pre { white-space:pre-wrap; color:#8b949e; background:#0d1117; border-radius:6px; padding:8px 10px; font-size:12px; max-height:180px; overflow:auto; }
 #detail .x { position:absolute; top:10px; right:16px; cursor:pointer; color:#8b949e; background:none; border:0; font:inherit; }
-.toolbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
-.toolbar .sub { margin:0; }
+
 .stage { display:inline-block; border-radius:9px; padding:1px 7px; font-size:11px; border:1px solid #30363d; white-space:nowrap; }
 .stage.draft { color:#e3b341; border-color:#6b5a1f; background:#2a2317; }
 .stage.ready { color:#bc8cff; border-color:#614b84; background:#251d35; }
@@ -3965,10 +3992,20 @@ a { color:#58a6ff; text-decoration:none; }
 #detail .proposal-list small { color:#8b949e; }
 @media (max-width:640px) { .hide-s { display:none; } #detail { width:92vw; } #detail .field-row { grid-template-columns:1fr; } }
 </style></head><body>
-<h1>agent-conductor</h1>
-<div class="sub" id="meta">loading&hellip;</div>
-<div class="toolbar"><button type="button" class="btn" id="new-request">New request</button><span class="sub">Save draft → generate proposal → review → start when ready. Generating never runs tasks.</span></div>
-<div class="sub" id="filters"></div>
+<div class="topbar">
+  <div class="tb-row">
+    <h1>agent-conductor</h1>
+    <span class="sub" id="meta">loading&hellip;</span>
+    <span class="tb-gap"></span>
+    <button type="button" class="btn" id="new-request">New request</button>
+    <div class="seg" id="density" role="group" aria-label="Row density">
+      <button type="button" data-density="compact">Compact</button>
+      <button type="button" data-density="full" class="on">Full</button>
+    </div>
+  </div>
+  <div class="sub tb-flow">Save draft &rarr; generate proposal &rarr; review &rarr; start when ready. Generating never runs tasks.</div>
+  <div class="sub" id="filters"></div>
+</div>
 <h2>runs</h2><div class="wrapw"><table id="runs"></table></div>
 <h2>agents by project</h2><div id="agents"></div>
 <div id="backdrop" hidden><div id="detail" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button type="button" class="x" id="dx">Close ×</button><div id="dbody"></div></div></div>
@@ -4011,6 +4048,25 @@ const costTitle = c => !c ? 'no token data yet' :
   (c.label ? `${c.label} (${c.uid||''})` : (c.uid||'')) +
   (c.usd==null ? ' - no self-serve rate for this model'
               : ' - est. self-serve cost');
+// row density + sticky-topbar height (test harness stubs `document`
+// only - guard every browser global)
+const store = (typeof localStorage!=='undefined') ? localStorage :
+  {getItem:()=>null, setItem:()=>{}};
+let density = store.getItem('ac-density') || 'full';
+function syncTopbar(){
+  const tb = document.querySelector && document.querySelector('.topbar');
+  if (tb && document.documentElement)
+    document.documentElement.style.setProperty(
+      '--topbar-h', tb.offsetHeight+'px');
+}
+function setDensity(d){
+  density = d; store.setItem('ac-density', d);
+  if (document.body)
+    document.body.classList.toggle('compact', d==='compact');
+  (document.querySelectorAll ? document.querySelectorAll('#density button')
+    : []).forEach(b=>b.classList.toggle('on', b.dataset.density===d));
+  syncTopbar();
+}
 const TOK_HELP = 'input / output (+cached ·LLM steps); select an agent for details';
 const tokenHelp = `<details class="tok-help"><summary aria-label="Explain tokens and cost">?</summary>` +
   `<div class="explain"><b>What the numbers mean</b><br>` +
@@ -4739,6 +4795,7 @@ function render(d){
   const modalStage = modalRun && (modalRun.stage||'launched');
   if (modalStage && modalRequest.status!=='loading' && !modalRequest.dirty &&
       modalRequest.status!==modalStage) openRequest(modalRequest.id);
+  syncTopbar();      // filter rows can wrap and change the bar height
 }
 document.addEventListener('click', async e=>{
   const t = e.target;
@@ -4746,6 +4803,8 @@ document.addEventListener('click', async e=>{
     closeDetail(); return; }
   if (t.id==='new-request'){
     openNew(); return; }
+  if (t.dataset && t.dataset.density){
+    setDensity(t.dataset.density); return; }
   if (t.dataset && t.dataset.action){
     await requestAction(t.dataset.action); return; }
   if (t.dataset && t.dataset.openRequest){
@@ -4941,6 +5000,9 @@ document.addEventListener('mouseover', e=>{
 async function tick(){
   try { render(await (await fetch('/api/state')).json()); }
   catch(e){} finally { setTimeout(tick, 2000); } }
+setDensity(density);
+if (typeof window!=='undefined' && window.addEventListener)
+  window.addEventListener('resize', syncTopbar);
 tick();
 </script></body></html>"""
 

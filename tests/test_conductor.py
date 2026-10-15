@@ -2250,6 +2250,55 @@ assert.match(agents,/> \+ext</);
             self.assertIsNone(
                 conductor._state_md(str(proj), "nope", str(proj)))
 
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_sticky_topbar_and_density_toggle(self):
+        """The header/filters live in a sticky topbar; every table header
+        pins just under it (--topbar-h measured in JS). A Compact|Full
+        toggle flips body.compact, collapsing wrap cells to one line.
+        No .wrapw may carry overflow - it would become the scroll
+        container and break th stickiness."""
+        html = conductor._DASH_HTML
+        self.assertIn('class="topbar"', html)
+        self.assertIn('id="density"', html)
+        self.assertIn('data-density="compact"', html)
+        self.assertIn('data-density="full"', html)
+        self.assertRegex(html, r'\.topbar \{[^}]*position:sticky')
+        self.assertRegex(html, r'th \{[^}]*position:sticky')
+        self.assertIn('top:var(--topbar-h', html)
+        self.assertIn('body.compact td.wrap', html)
+        self.assertNotRegex(html, r'\.wrapw \{[^}]*overflow')
+        js = html.split("<script>\n", 1)[1].split("</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, props={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true}); return nodes.get(id); };
+const cls={_s:new Set(),toggle(c,on){on?this._s.add(c):this._s.delete(c)},
+  contains(c){return this._s.has(c)}};
+const document={getElementById:elem,
+  querySelector:s=>s==='.topbar'?{offsetHeight:96}:null,
+  querySelectorAll:()=>[],
+  addEventListener:(ev,h)=>{handlers[ev]=h;},
+  body:{classList:cls},
+  documentElement:{style:{setProperty:(k,v)=>{props[k]=v;}}}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+assert.equal(props['--topbar-h'],'96px');     // measured, not hardcoded
+assert.ok(!cls.contains('compact'));          // default = full
+(async()=>{
+  await handlers.click({target:{dataset:{density:'compact'},
+    preventDefault:()=>{}}});
+  assert.ok(cls.contains('compact'));
+  await handlers.click({target:{dataset:{density:'full'},
+    preventDefault:()=>{}}});
+  assert.ok(!cls.contains('compact'));
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
 
 class ApplyRequestTests(unittest.TestCase):
     """The deterministic 'Apply options to TOML' path: option fields patch
