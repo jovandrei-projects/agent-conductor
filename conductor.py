@@ -2383,6 +2383,16 @@ _STATUS_COLOR = {"done": "#3fb950", "partial": "#d29922", "blocked": "#d29922",
 _AUTH_CACHE = [0.0, "unknown"]        # [checked_at, label]
 _SESS_CACHE = [0.0, {}]               # [checked_at, {work_dir: set|None}]
 _MODELS_CACHE = [0.0, {}]             # [checked_at, {family: [suffixes]}]
+_EFFORT_ORDER = ("", "min", "low", "medium", "high", "xhigh", "max")
+
+
+def _effort_rank(suffix: str) -> tuple[int, str]:
+    """Sort effort suffixes by level ('low-fast' with 'low'), unknowns last."""
+    base = suffix.partition("-")[0]
+    try:
+        return (_EFFORT_ORDER.index(base), suffix)
+    except ValueError:
+        return (len(_EFFORT_ORDER), suffix)
 
 
 def auth_status(devin_argv: list[str]) -> str:
@@ -2440,6 +2450,8 @@ def model_options(devin_argv: list[str]) -> dict[str, list[str]]:
                               if vid.startswith(fam + "-") else "")
                     if suffix not in fams[fam]:
                         fams[fam].append(suffix)
+            for suffixes in fams.values():
+                suffixes.sort(key=_effort_rank)
     except (OSError, subprocess.SubprocessError):
         pass
     _MODELS_CACHE[0], _MODELS_CACHE[1] = time.time(), fams
@@ -3013,22 +3025,23 @@ function showRequestForm(rec){
     `<input id="rq-label" maxlength="80" value="${esc(rec.label||'')}"${disabled}>` +
     `<div class="field-row"><div><label for="rq-project">Project</label>` +
     `<select id="rq-project"${disabled}>${projectOptions}</select></div>` +
-    `<div><label for="rq-model">Step model</label><input id="rq-model" ` +
-    `list="rq-models" value="${esc(rec.model||'')}"${disabled}>` +
-    `<datalist id="rq-models">${modelOptions}</datalist>` +
-    `</div><div><label for="rq-effort">Step effort</label>` +
-    `<input id="rq-effort" list="rq-efforts" ` +
-    `value="${esc(rec.effort||'')}"${disabled}>` +
-    `<datalist id="rq-efforts">${effortOptionsFor(rec.model)}</datalist>` +
-    `</div></div>` +
-    `<div class="field-row"><div><label for="rq-plan_model">Planner model ` +
-    `</label><input id="rq-plan_model" list="rq-models" ` +
+    `<div><label for="rq-plan_model">Planner model</label>` +
+    `<input id="rq-plan_model" list="rq-models" ` +
     `value="${esc(rec.plan_model||rec.model||'')}"${disabled}></div>` +
     `<div><label for="rq-plan_effort">Planner effort</label>` +
     `<input id="rq-plan_effort" list="rq-plan_efforts" ` +
     `value="${esc(rec.plan_effort||rec.effort||'')}"${disabled}>` +
     `<datalist id="rq-plan_efforts">` +
     `${effortOptionsFor(rec.plan_model||rec.model)}</datalist>` +
+    `</div></div>` +
+    `<div class="field-row"><div><label for="rq-model">Step model</label>` +
+    `<input id="rq-model" list="rq-models" ` +
+    `value="${esc(rec.model||'')}"${disabled}>` +
+    `<datalist id="rq-models">${modelOptions}</datalist></div>` +
+    `<div><label for="rq-effort">Step effort</label>` +
+    `<input id="rq-effort" list="rq-efforts" ` +
+    `value="${esc(rec.effort||'')}"${disabled}>` +
+    `<datalist id="rq-efforts">${effortOptionsFor(rec.model)}</datalist>` +
     `</div><div></div></div>` +
     `<div class="field-row"><div><label for="rq-on_failure">On step failure</label>` +
     `<select id="rq-on_failure"${disabled}>` +

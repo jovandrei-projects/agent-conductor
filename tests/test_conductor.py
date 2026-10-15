@@ -941,7 +941,14 @@ class DashboardTests(unittest.TestCase):
             "  swe-2-max           SWE-2 Max\n\n"
             "SWE-1.7 Lightning (swe-1.7-lightning)\n"
             "  swe-1-7-lightning          Lightning Max\n"
-            "  swe-1-7-lightning-medium   Lightning Medium\n")
+            "  swe-1-7-lightning-medium   Lightning Medium\n\n"
+            "Claude Opus 5.5 (claude-opus-5.5)\n"
+            "  claude-opus-5-5-high       Opus High\n"
+            "  claude-opus-5-5-low        Opus Low\n"
+            "  claude-opus-5-5-low-fast   Opus Low Fast\n"
+            "  claude-opus-5-5-max        Opus Max\n"
+            "  claude-opus-5-5-medium     Opus Medium\n"
+            "  claude-opus-5-5-xhigh      Opus XHigh\n")
         fake = subprocess.CompletedProcess([], 0, stdout=sample, stderr="")
         with mock.patch.object(conductor.subprocess, "run",
                                return_value=fake), \
@@ -949,6 +956,10 @@ class DashboardTests(unittest.TestCase):
             opts = conductor.model_options(["devin"])
         self.assertEqual(opts["swe-2"], ["high", "max"])
         self.assertEqual(opts["swe-1-7-lightning"], ["", "medium"])
+        # sorted by effort level, not alphabetically; 'low-fast' with 'low'
+        self.assertEqual(opts["claude-opus-5-5"],
+                         ["low", "low-fast", "medium", "high",
+                          "xhigh", "max"])
 
     def test_collect_dashboard(self):
         with tempfile.TemporaryDirectory() as td:
