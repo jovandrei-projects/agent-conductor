@@ -105,7 +105,10 @@ conversation has no history beyond them.
 - Kill any servers/watchers you spawned (vite, `npm run dev`, playwright)
   BEFORE printing STATUS - a live child keeps this CLI process from
   exiting and your step gets killed at the timeout regardless.
-- End your final message with exactly these two lines:
+- End your final message with exactly these two lines, at the start of
+  their own lines, as the LAST thing you print. They are read by a
+  machine parsing your stdout - writing STATUS inside STATE.md, a commit
+  message, or a Markdown bullet does NOT count and marks the step failed:
 
 STATUS: done | partial | blocked
 NEXT: <one line - what the next session should do first>
