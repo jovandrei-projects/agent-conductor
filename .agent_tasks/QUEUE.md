@@ -19,6 +19,19 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-15: Lifecycle controls + recovery. Run modal: `Stop run
+  now` (flags + pid-targeted taskkill of live steps) and `Drain & stop`
+  (finish in-flight, launch nothing new); agent modal: `Stop this agent`.
+  Sentinels live in %TEMP%/agent-conductor-flags (trap-5-safe), polled by
+  wait_worker + the wave loop; killed steps record `stopped`, unlaunched
+  `skipped`, state.aborted=`stopped|drained`. Resume clears sentinels and
+  prepends INTERRUPTED_NOTE for running/lost/timed_out/stopped priors so
+  a fresh session recovers from committed state. Dashboard-launched
+  runs now use CREATE_NEW_PROCESS_GROUP so stopping the server never
+  interrupts work (trap 15). `model = "adaptive"` supported (no effort
+  suffix; export's agent.model_name -> model_actual shown + priced).
+  Modal shows the full task (task_full from the prompt file); running
+  agent 'result' cell is the log TAIL (\r-aware), not the head.
 - First real overnight manifest on a real project (Phase 2 in ROADMAP.md; live smoke already green)
 - Push agent-conductor to GitHub if cloud steps on it are wanted - it has NO remote, and cloud workers clone from origin (human decision: repo name + private/public)
 - Phone access to the :8773 dashboard via lan-bridge proxy (needs mobile-apps change; tasks-ui rows already give coarse progress)

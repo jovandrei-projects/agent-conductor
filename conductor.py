@@ -120,6 +120,19 @@ Its work is already committed in this repo - do NOT redo it. Read the \
 recent git log and .agent_tasks state, then CONTINUE from where it stopped.
 """
 
+# Prepended when --resume re-runs a step whose previous session ended
+# abruptly (user stop, conductor died, connection lost) - the new session
+# is told the prior transcript vanished mid-work so it recovers from the
+# committed state instead of trusting a clean start.
+INTERRUPTED_NOTE = """\
+NOTE FROM THE CONDUCTOR: a previous session attempt at this step ended \
+abruptly (recorded {how}) - it was stopped by the user, the connection \
+dropped, or the conductor process died mid-turn. Partial work may already \
+be committed in this repo - inspect the recent git log and .agent_tasks \
+state, then CONTINUE from where it stopped rather than redoing finished \
+work.
+"""
+
 # Closing review step appended when a request's follow-up checkbox is set -
 # the planner is told to write it, and _publish_proposal appends this block
 # itself when the planner forgot, so the checkbox is a guarantee.
@@ -361,8 +374,10 @@ def devin_cmd(devin_argv: list[str], step: Step, prompt_path: Path,
     if step.model:
         # effort fuses as a model-variant suffix ("swe-1-6-fast" style); an
         # unknown variant makes devin error loudly at spawn instead of
-        # silently running the wrong effort.
-        model = f"{step.model}-{step.effort}" if step.effort else step.model
+        # silently running the wrong effort. 'adaptive' is a routing mode,
+        # not a family - it takes no effort suffix.
+        model = (f"{step.model}-{step.effort}"
+                 if step.effort and step.model != "adaptive" else step.model)
         cmd += ["--model", model]
     cmd += ["--permission-mode", MODE_FLAG[step.mode],
             "--export", str(export_path),
@@ -794,6 +809,19 @@ def tail_metrics(export_path: Path) -> dict | None:
     return out or None
 
 
+def tail_agent_model(export_path: Path) -> str | None:
+    """The model the session ACTUALLY ran (export's agent.model_name) -
+    the resolved pick when a step requests `adaptive`. None for mocks and
+    unfinished steps."""
+    try:
+        d = json.loads(export_path.read_text(encoding="utf-8",
+                                             errors="replace"))
+    except (OSError, ValueError):
+        return None
+    name = (d.get("agent") or {}).get("model_name")
+    return name if isinstance(name, str) and name else None
+
+
 def _merge_tokens(acc: dict[str, int], tok: dict | None) -> dict:
     for k, v in (tok or {}).items():
         if isinstance(v, (int, float)):
@@ -816,32 +844,88 @@ def kill_tree(proc) -> None:
         proc.kill()
 
 
-def wait_worker(proc, stdout_log: Path,
-                timeout_s: float) -> tuple[int | None, bool, bool]:
-    """Wait for the worker; returns (rc, timed_out, hung_after_status).
+# ------------------------------------------------------------------ stops
+# Stop/drain sentinels live in the OS temp dir - NEVER inside run_dir:
+# data/runs sits inside the agent-conductor repo, so writing a flag file
+# there during a self-hosted run would land in the worker's watched cwd
+# and trip user-edit-awareness (trap 5). The temp dir is outside every
+# project's watch set, so a dashboard stop cannot corrupt a live session.
+
+def _flag_dir() -> Path:
+    return Path(tempfile.gettempdir()) / "agent-conductor-flags"
+
+
+def _safe_name(s: str) -> str:
+    return re.sub(r"[^\w.-]", "_", s)
+
+
+def stop_flag(run_name: str, step: str | None = None) -> Path:
+    n = "stop-" + _safe_name(run_name)
+    return _flag_dir() / (n + f"-{_safe_name(step)}" if step else n)
+
+
+def drain_flag(run_name: str) -> Path:
+    return _flag_dir() / f"drain-{_safe_name(run_name)}"
+
+
+def _flag_set(*flags: Path) -> Path | None:
+    return next((f for f in flags if f.is_file()), None)
+
+
+def _flag_raise(name: str) -> None:
+    """Write a stop/drain sentinel. Best-effort: a mkdir/write failure only
+    delays the stop by one poll, so callers don't crash on it."""
+    try:
+        _flag_dir().mkdir(exist_ok=True)
+        (_flag_dir() / name).touch()
+    except OSError:
+        pass
+
+
+def clear_run_flags(run_name: str) -> None:
+    """Remove all sentinels for a run - called on resume/merge so a
+    previously stopped run can actually start work again."""
+    try:
+        for f in _flag_dir().glob(f"*-{_safe_name(run_name)}*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def wait_worker(proc, stdout_log: Path, timeout_s: float,
+                stop_flags: tuple[Path, ...] = ()
+                ) -> tuple[int | None, bool, bool, bool]:
+    """Wait for the worker; returns (rc, timed_out, hung_after_status,
+    user_stopped).
 
     Polls in short slices so a STATUS line in the log is noticed within
     WAIT_POLL_S: the turn is then over, so the remaining wait collapses to
     STATUS_GRACE_S before the tree is killed. hung_after_status tells the
     caller the work completed - run verify and honor the status line
-    rather than reporting a timeout.
-    """
+    rather than reporting a timeout. A stop sentinel appearing mid-wait
+    tree-kills the worker and reports user_stopped."""
     deadline = time.time() + timeout_s
     grace_at = None
     while True:
         try:
-            return proc.wait(timeout=WAIT_POLL_S), False, False
+            return proc.wait(timeout=WAIT_POLL_S), False, False, False
         except subprocess.TimeoutExpired:
             pass
+        if _flag_set(*stop_flags) is not None:
+            kill_tree(proc)
+            return proc.wait(), False, False, True
         if tail_status(stdout_log) is not None:
             if grace_at is None:
                 grace_at = time.time() + STATUS_GRACE_S
             if time.time() >= grace_at:
                 kill_tree(proc)
-                return proc.wait(), False, True
+                return proc.wait(), False, True, False
         elif time.time() >= deadline:
             kill_tree(proc)
-            return proc.wait(), True, False
+            return proc.wait(), True, False, False
 
 
 def _capture_session_id(rec: dict, devin_argv: list[str], work_dir: Path,
@@ -883,8 +967,10 @@ def _capture_session_id(rec: dict, devin_argv: list[str], work_dir: Path,
 def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
              run_dir: Path, devin_argv: list[str], state: dict,
              do_checkpoint: bool = True, branch: str | None = None,
-             post_commit: bool = True) -> str:
-    """Run one step; return final status: done|partial|blocked|failed|timed_out.
+             post_commit: bool = True,
+             resume_note: str | None = None) -> str:
+    """Run one step; return final status: done|partial|blocked|failed|timed_out
+    |stopped|skipped.
 
     work_dir is where the session runs and where checkpoints/verify happen -
     the project dir, or a git worktree for parallel steps. When a worktree is
@@ -902,14 +988,28 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     session (up to max_attempts total) with a "continue from committed
     state" note prepended - an underestimated timeout continues instead of
     dying. Each attempt gets its own prompt/stdout/export artifacts.
+
+    resume_note (an INTERRUPTED_NOTE render) is prepended to the task body -
+    used when --resume restarts a step whose last session died abruptly.
+
+    Stop sentinels (dashboard Stop buttons) are tempdir files polled here:
+    one present before spawn -> 'skipped' (never ran); one appearing
+    mid-wait -> tree-kill and 'stopped'.
     """
-    prompt_path = run_dir / "prompts" / f"{step.name}.md"
-    prompt_path.parent.mkdir(exist_ok=True)
-    prompt_path.write_text(
-        render_prompt(step, slug, work_dir, cfg.path.parent, cfg.preamble),
-        encoding="utf-8")
-    stdout_log = run_dir / f"{step.name}.stdout.log"
-    export_path = run_dir / f"{step.name}.export.json"
+    if _flag_set(stop_flag(run_dir.name),
+                 stop_flag(run_dir.name, step.name)) is not None:
+        per_step = _flag_set(stop_flag(run_dir.name, step.name))
+        if per_step is not None:
+            per_step.unlink(missing_ok=True)
+        with STATE_LOCK:
+            state["steps"].setdefault(step.name, {}).update(
+                name=step.name, slug=slug, status="skipped",
+                ended_at=now_iso(),
+                note="stopped by user before the session spawned")
+            save_state(run_dir, state)
+        log_event(run_dir, event="step_stopped", step=step.name,
+                  phase="before_spawn")
+        return "skipped"
 
     body_src = step.prompt
     if body_src is None and step.prompt_file:
@@ -918,6 +1018,18 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                 encoding="utf-8")
         except OSError:
             body_src = step.prompt_file
+
+    prompt_path = run_dir / "prompts" / f"{step.name}.md"
+    prompt_path.parent.mkdir(exist_ok=True)
+    render_step = (dataclasses.replace(
+        step, prompt=resume_note + (body_src or ""), prompt_file=None)
+        if resume_note else step)
+    prompt_path.write_text(
+        render_prompt(render_step, slug, work_dir, cfg.path.parent,
+                      cfg.preamble), encoding="utf-8")
+    stdout_log = run_dir / f"{step.name}.stdout.log"
+    export_path = run_dir / f"{step.name}.export.json"
+
     with STATE_LOCK:
         rec = state["steps"].setdefault(step.name, {})
         rec.update(name=step.name, slug=slug, project=str(work_dir),
@@ -944,6 +1056,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     t0 = time.time()
     timed_out = False
     hung = False
+    stopped = False
     rc: int | None = None
     status_line = None
     new_sessions: set[str] = set()
@@ -1007,12 +1120,20 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                           watched, proc),
                     daemon=True).start()
                 try:
-                    rc, timed_out, hung = wait_worker(
-                        proc, stdout_log, step.timeout_min * 60)
+                    rc, timed_out, hung, stopped = wait_worker(
+                        proc, stdout_log, step.timeout_min * 60,
+                        stop_flags=(stop_flag(run_dir.name),
+                                    stop_flag(run_dir.name, step.name)))
                 except subprocess.TimeoutExpired:      # unreachable; safety
                     kill_tree(proc)
                     proc.wait()
                     timed_out = True
+                if stopped:
+                    # consume the per-step sentinel; a run-level stop flag
+                    # stays so later waves see it too
+                    stop_flag(run_dir.name, step.name).unlink(
+                        missing_ok=True)
+                    break
             except OSError as exc:
                 LOG.error("step %s spawn failed: %s", step.name, exc)
                 log_event(run_dir, event="spawn_error", step=step.name,
@@ -1033,7 +1154,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     elapsed = round(time.time() - t0, 1)
 
     verify_ok = None
-    if step.verify and not timed_out:
+    if step.verify and not timed_out and not stopped:
         v = subprocess.run(step.verify, cwd=str(work_dir), shell=True,
                            capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=600,
@@ -1043,7 +1164,9 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             (v.stdout or "") + (v.stderr or ""), encoding="utf-8",
             errors="replace")
 
-    if timed_out:
+    if stopped:
+        status = "stopped"
+    elif timed_out:
         status = "timed_out"
     elif (rc is None or rc != 0) and not hung:
         status = "failed"
@@ -1077,11 +1200,15 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             notes.append("STATUS printed but the CLI stayed alive on a "
                          "spawned child (trap 12); tree-killed after "
                          "grace - counted as turn end")
+        if stopped:
+            notes.append("stopped by user via dashboard; --resume "
+                         "re-runs the step")
         if notes:
             rec["note"] = "; ".join(notes)
         rec.update(status=status, ended_at=now_iso(), status_line=status_line,
                    verify_ok=verify_ok, next=tail_next(stdout_log),
                    tokens=tok_acc or None,
+                   model_actual=tail_agent_model(export_path),
                    prompt=str(prompt_path), stdout_log=str(stdout_log),
                    export=str(export_path))
         save_state(run_dir, state)
@@ -1255,6 +1382,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         run_dir = find_resume_dir(cfg, runs_dir, args.resume or "latest")
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
         print(f"[resume] {run_dir.name}")
+        # Resume must be able to start work again: drop any stop/drain
+        # sentinels left by a dashboard Stop click.
+        clear_run_flags(run_dir.name)
     else:
         run_dir = new_run_dir(cfg, runs_dir)
         state = {"run": cfg.name, "description": cfg.description,
@@ -1281,7 +1411,38 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     run_t0 = time.time()
     stop = False
+
+    def halt_remaining(from_gi: int) -> None:
+        """A user stop/drain ended the run mid-loop: every step that never
+        launched is recorded 'skipped' (not just absent) so the dashboard
+        shows the full plan and --resume knows what is left."""
+        halted = stop_flag(run_dir.name).is_file()
+        with STATE_LOCK:
+            for grp in groups[from_gi:]:
+                for _d, _s, s_ in grp:
+                    r = state["steps"].get(s_.name) or {}
+                    if r.get("status") != "done":
+                        state["steps"].setdefault(s_.name, {}).update(
+                            name=s_.name, status="skipped",
+                            note="run stopped by user before this "
+                                 "step ran")
+            state["aborted"] = "stopped" if halted else "drained"
+            state["ended_at"] = now_iso()
+            save_state(run_dir, state)
+
     for gi, members in enumerate(groups):
+        if _flag_set(stop_flag(run_dir.name),
+                     drain_flag(run_dir.name)) is not None:
+            # Dashboard stop: 'stop' also tree-kills live steps via
+            # wait_worker's flag poll; 'drain' lets them finish. Either
+            # way nothing NEW launches - remaining work stays resumable.
+            halted = stop_flag(run_dir.name).is_file()
+            print(f"run {'stopped' if halted else 'drained'} by user - "
+                  f"no further steps launch "
+                  f"(resume with --resume {run_dir.name})")
+            log_event(run_dir, event="run_stop", drain=not halted)
+            halt_remaining(gi)
+            break
         if cfg.max_hours and time.time() - run_t0 > cfg.max_hours * 3600:
             print(f"stopping run: max_hours={cfg.max_hours} reached")
             log_event(run_dir, event="run_deadline", max_hours=cfg.max_hours)
@@ -1362,6 +1523,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             if args.resume is not None and prior.get("status") == "done":
                 print(f"[skip ] {step.name} (done)")
                 continue
+            # Re-running an interrupted step (killed, orphaned, crashed):
+            # tell the fresh session it isn't starting clean.
+            rnote = (INTERRUPTED_NOTE.format(how=prior["status"])
+                     if args.resume is not None and prior.get("status") in
+                     ("running", "lost", "timed_out", "stopped")
+                     else None)
             if step.worktree:
                 if cfg.checkpoint and not wave_ckpt_done \
                         and is_git_repo(project_dir):
@@ -1395,9 +1562,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                         stop = True
                         break
                     continue
-                prepared.append((step, slug, wt, project_dir, branch))
+                prepared.append((step, slug, wt, project_dir, branch, rnote))
             else:
-                prepared.append((step, slug, project_dir, project_dir, None))
+                prepared.append((step, slug, project_dir, project_dir,
+                                 None, rnote))
         if stop:
             break
         if not prepared:
@@ -1406,17 +1574,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Mark members queued up front: the pool may hold them while a
         # max_parallel-sized set runs, and the dashboard shows the queue.
         with STATE_LOCK:
-            for step, _s, _w, _r, _b in prepared:
+            for step, _s, _w, _r, _b, _n in prepared:
                 state["steps"].setdefault(step.name, {}).update(
                     status="queued", name=step.name)
             save_state(run_dir, state)
 
         if len(prepared) == 1:
-            step, slug, work_dir, _repo, branch = prepared[0]
+            step, slug, work_dir, _repo, branch, rnote = prepared[0]
             statuses = {step.name: run_step(step, slug, work_dir, cfg,
                                             run_dir, devin_argv, state,
                                             do_checkpoint=(branch is None),
-                                            branch=branch)}
+                                            branch=branch,
+                                            resume_note=rnote)}
             hub_update(tid, state)
         else:
             statuses = {}
@@ -1425,14 +1594,16 @@ def cmd_run(args: argparse.Namespace) -> int:
                 futs = {ex.submit(run_step, step, slug, work_dir, cfg,
                                   run_dir, devin_argv, state,
                                   do_checkpoint=(branch is None),
-                                  branch=branch): step.name
-                        for step, slug, work_dir, _r, branch in prepared}
+                                  branch=branch,
+                                  resume_note=rnote): step.name
+                        for step, slug, work_dir, _r, branch, rnote
+                        in prepared}
                 for f in concurrent.futures.as_completed(futs):
                     statuses[futs[f]] = f.result()
                     hub_update(tid, state)
 
         # Merge worktree branches back into the main checkout, in order.
-        for step, slug, work_dir, repo_dir, branch in prepared:
+        for step, slug, work_dir, repo_dir, branch, _n in prepared:
             status = statuses.get(step.name)
             print(f"[{status or 'skipped':>8}] {step.name}")
             if branch:
@@ -1475,9 +1646,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         except OSError:
             pass
         if cfg.on_failure == "stop" and any(
-                s in ("failed", "timed_out", "blocked")
+                s in ("failed", "timed_out", "blocked", "stopped")
                 for s in statuses.values()):
             print("stopping run after wave")
+            # A wave-end halt can hide the dashboard-stop bookkeeping:
+            # 'stopped'/'drained' steps trip on_failure before the next
+            # top-of-loop flag check runs, so mark the rest here too.
+            if _flag_set(stop_flag(run_dir.name),
+                         drain_flag(run_dir.name)) is not None:
+                halt_remaining(gi + 1)
             break
 
     state["ended_at"] = now_iso()
@@ -2394,7 +2571,8 @@ STATUS: done
             pe = rec["effort"]
         cmd = devin_argv + [
             "--print", "--prompt-file", str(prompt_path),
-            "--model", f"{pm}-{pe}" if pe else pm,
+            "--model", f"{pm}-{pe}"
+            if pe and pm != "adaptive" else pm,
             "--permission-mode", "normal", "--export", str(export_path),
             "--respect-workspace-trust", "false"]
         with open(log, "ab" if fix_note else "wb") as out:
@@ -2403,7 +2581,7 @@ STATUS: done
                                     stdin=subprocess.DEVNULL,
                                     env=clean_devin_env(),
                                     **hidden_subprocess_kwargs())
-            rc, timed_out, _hung = wait_worker(proc, log, 600)
+            rc, timed_out, _hung, _stopped = wait_worker(proc, log, 600)
         if timed_out or rc != 0:
             raise RequestError("Planner did not finish; check CLI auth and "
                                "retry generation", 502)
@@ -2543,11 +2721,22 @@ def _request_status(rec: dict, runs_dir: Path) -> str:
 
 
 def _launch_process(cmd: list[str], log_path: Path) -> int:
+    """Spawn a conductor `run`/`resume` subprocess from the dashboard.
+
+    CREATE_NEW_PROCESS_GROUP (nt) / start_new_session (posix) keeps the
+    child out of the SERVER's console Ctrl+C/SIGHUP dispatch: closing or
+    interrupting `serve` leaves live runs alone - only the explicit stop
+    endpoints kill them."""
     with open(log_path, "wb") as out:
+        kw = dict(hidden_subprocess_kwargs())
+        if os.name == "nt":
+            kw["creationflags"] = (kw.get("creationflags", 0)
+                                   | subprocess.CREATE_NEW_PROCESS_GROUP)
+        else:
+            kw["start_new_session"] = True
         proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=out,
                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                env=clean_devin_env(),
-                                **hidden_subprocess_kwargs())
+                                env=clean_devin_env(), **kw)
     return proc.pid
 
 
@@ -2633,6 +2822,7 @@ def resume_run(name: str, runs_dir: Path = RUNS_DIR,
            "--resume", str(d), "--runs-dir", str(runs_dir)]
     if devin_argv and devin_argv != ["devin"]:
         cmd += ["--devin", shlex.join(devin_argv)]
+    clear_run_flags(d.name)     # else a stopped run re-stops instantly
     try:
         _RESUME_PIDS[name] = _launch_process(cmd, d / "resume.launch.log")
     except OSError as exc:
@@ -2747,6 +2937,82 @@ def _merge_run(name: str, runs_dir: Path,
     except OSError:
         pass
     return results
+
+
+def _run_dir_checked(name: str, runs_dir: Path) -> tuple[Path, dict]:
+    """Resolve + load a run dir for dashboard mutation endpoints."""
+    if not RUN_DIR_RE.fullmatch(name):
+        raise RequestError("Invalid run dir", 404)
+    d = (runs_dir / name).resolve()
+    if d.parent != runs_dir.resolve() or not (d / "state.json").is_file():
+        raise RequestError("Run not found", 404)
+    try:
+        return d, json.loads((d / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RequestError("Cannot read run state", 500) from exc
+
+
+def _kill_pid(pid: int | None, since: str | None) -> None:
+    """taskkill /T /F a recorded worker pid, guarded by the same
+    creation-time check pid_alive uses (a recycled pid is never ours)."""
+    if not pid or not pid_alive(pid, since):
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, **hidden_subprocess_kwargs())
+    else:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+
+
+def stop_step(run_name: str, step_name: str,
+              runs_dir: Path = RUNS_DIR) -> dict:
+    """Dashboard 'Stop agent': drop a per-step sentinel, then - when the
+    pid is visible - tree-kill it now rather than waiting out the poll.
+    The running conductor notices either way and records 'stopped';
+    a queued-but-unspawned step lands 'skipped'."""
+    if not RUN_DIR_RE.fullmatch(step_name):
+        raise RequestError("Invalid step name", 404)
+    d, st = _run_dir_checked(run_name, runs_dir)
+    rec = (st.get("steps") or {}).get(step_name)
+    if rec is None:
+        raise RequestError("Step not in this run", 404)
+    if rec.get("status") not in ("running", "queued"):
+        raise RequestError(f"Step is {rec.get('status')}, not running", 409)
+    if rec.get("status") == "running" and not step_live(rec):
+        raise RequestError("This step is already dead (its record is "
+                           "stale - sweep will mark it lost)", 409)
+    _flag_raise(stop_flag(run_name, step_name).name)
+    if rec.get("pid"):
+        _kill_pid(rec["pid"], rec.get("started_at"))
+    # NB no log_event here: while a step is live, run_dir can sit inside
+    # the worker's watched cwd (self-hosted run) - writing events.jsonl
+    # would itself trip user-edit-awareness (trap 5). The conductor logs
+    # step_stopped/run_stop itself.
+    return {"stopping": step_name}
+
+
+def stop_run(run_name: str, body: dict,
+             runs_dir: Path = RUNS_DIR) -> dict:
+    """Dashboard run-level stop. {"drain": true} lets live steps finish but
+    launches nothing new; otherwise every live step is flagged + killed.
+    The conductor's wave loop honors the sentinel between waves."""
+    d, st = _run_dir_checked(run_name, runs_dir)
+    if st.get("ended_at"):
+        raise RequestError("This run already ended", 409)
+    if body.get("drain"):
+        _flag_raise(drain_flag(run_name).name)
+        return {"draining": run_name}
+    _flag_raise(stop_flag(run_name).name)
+    live = [n for n, r in (st.get("steps") or {}).items()
+            if r.get("status") == "running" and step_live(r)]
+    for n in live:                       # immediate kill, not just the poll
+        _kill_pid((st["steps"][n]).get("pid"),
+                  st["steps"][n].get("started_at"))
+        _flag_raise(stop_flag(run_name, n).name)
+    return {"stopping": live}
 
 
 def discard_request(request_id: str,
@@ -2953,19 +3219,27 @@ def refresh_prices(runs_dir: Path) -> None:
 
 
 def estimate_cost(tokens: dict | None, model: str | None,
-                  effort: str | None, table: dict) -> dict | None:
+                  effort: str | None, table: dict,
+                  model_actual: str | None = None) -> dict | None:
     """USD estimate for one session's token totals at self-serve rates.
 
     `cached` prices at the cache-read rate and `prompt - cached` is the
     uncached input share (ATIF doesn't split cache write vs read; docs'
     cache-write column is 0 or near-0 for most models anyway). The uid is
     the fused model id the CLI actually ran (model + '-' + effort), falling
-    back to the bare model. Returns {'usd': None} for unpriced models."""
+    back to the bare model; for model='adaptive' the export's recorded
+    model_name is resolved by table label so the rate matches what really
+    ran. Returns {'usd': None} for unpriced models."""
     if not tokens:
         return None
     uid = f"{model}-{effort}" if model and effort else model
     ent = table.get(uid) or table.get(model or "")
     used = uid if uid in table else model
+    if ent is None and model_actual:
+        for cand, e in table.items():
+            if (e.get("label") or "").lower() == model_actual.lower():
+                ent, used = e, cand
+                break
     if not ent or ent.get("in") is None or ent.get("out") is None:
         return {"usd": None, "uid": uid}
     p = tokens.get("prompt") or 0
@@ -3003,33 +3277,42 @@ def live_sessions_by_dir(runs_dir: Path,
     return out
 
 
-def task_label(rec: dict) -> str | None:
-    """What the agent was asked to do. New records store `task` directly;
-    for pre-field records, dig the body out of the rendered prompt file
-    (between the preamble's '## Task' and '## Before you finish' markers)."""
-    if rec.get("task"):
+def task_label(rec: dict, full: bool = False) -> str | None:
+    """What the agent was asked to do. New records store `task` directly
+    (160-char summary); `full` goes back to the prompt file for the
+    untruncated body the detail modal wants - falling back to the stored
+    summary when the file is gone."""
+    if rec.get("task") and not full:
         return rec["task"]
     pf = rec.get("prompt")
     if not pf:
-        return None
+        return rec.get("task")
     try:
         text = Path(pf).read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return None
+        return rec.get("task")
     m = re.search(r"## Task\s*\n+(.*?)\n*## ", text, re.S)
     body = m.group(1) if m else text
-    return " ".join(body.split())[:160] or None
+    one = " ".join(body.split())
+    return (one if full else one[:160]) or rec.get("task")
 
 
 def stdout_tail(path: str | None, lines: int = 15) -> str | None:
-    """Last `lines` of a step's stdout log - the modal's 'how it ended'."""
+    """Last `lines` of a step's stdout log - the modal's 'how it ended'.
+
+    The CLI writes narration as one continuous line - no \n at all - so a
+    naive splitlines returns a single mega-line and the 'tail' reads as
+    the head. Split on lone \r too (progress redraws) so a line-oriented
+    tail still picks the freshest text.
+    """
     if not path:
         return None
     try:
         data = Path(path).read_bytes()[-8192:]
     except OSError:
         return None
-    return "\n".join(data.decode("utf-8", "replace").splitlines()[-lines:])
+    return "\n".join(re.split(r"\r\n|\r|\n",
+                              data.decode("utf-8", "replace"))[-lines:])
 
 
 # serve process boot id - embedded in every payload so an open tab notices
@@ -3050,7 +3333,8 @@ def proposal_agent(step: dict, rec: dict, projects: dict, key: str,
             "started_at": None, "ended_at": None, "elapsed_s": None,
             "session_id": None, "model": step.get("model"),
             "effort": step.get("effort"), "mode": step.get("mode"),
-            "task": step.get("task"), "wt": step.get("wt"),
+            "task": step.get("task"), "task_full": None,
+            "model_actual": None, "wt": step.get("wt"),
             "merged": None, "cloud": step.get("cloud"), "tokens": None,
             "cost": None,
             "alive": False,
@@ -3114,7 +3398,8 @@ def collect_dashboard(runs_dir: Path,
             live = sess_by_dir.get(wd)
             model = rec.get("model") or plan.get("model")
             effort = rec.get("effort") or plan.get("effort")
-            cost = estimate_cost(t, model, effort, prices)
+            cost = estimate_cost(t, model, effort, prices,
+                                 rec.get("model_actual"))
             if isinstance(t, dict):
                 if cost and cost.get("usd") is not None:
                     run_cost += cost["usd"]
@@ -3140,9 +3425,12 @@ def collect_dashboard(runs_dir: Path,
                 "alive": step_live(rec),
                 "pid": rec.get("pid"), "session_id": rec.get("session_id"),
                 "model": model,
+                "model_actual": rec.get("model_actual"),
                 "mode": rec.get("mode") or plan.get("mode"),
                 "effort": effort,
                 "task": task_label(rec) or plan.get("task"),
+                "task_full": task_label(rec, full=True)
+                or plan.get("task"),
                 "cloud": rec.get("cloud", plan.get("cloud")),
                 "verify_ok": rec.get("verify_ok"),
                 "note": rec.get("note"), "next": rec.get("next"),
@@ -3265,9 +3553,16 @@ def collect_dashboard(runs_dir: Path,
                     if str(s) not in claimed and act >= started]
             if len(cand) == 1:
                 a["session_id"], a["session_live"] = cand[0], True
-        a["tail_last"] = next(
-            (ln for ln in reversed((a.get("tail") or "").splitlines())
+        tail_last = next(
+            (ln.strip() for ln in
+             reversed((a.get("tail") or "").splitlines())
              if ln.strip()), None)
+        if tail_last and len(tail_last) > 200:
+            # CLI logs stream narration without newlines - the 'last line'
+            # can be an 8KB blob whose START is stale. The freshest text
+            # is at the END.
+            tail_last = "…" + tail_last[-200:]
+        a["tail_last"] = tail_last
     agents.sort(key=lambda a: a.get("started_at") or a.get("created_at") or "",
                 reverse=True)
     runs.sort(key=lambda r: r.get("started_at") or r.get("updated_at") or
@@ -3391,6 +3686,7 @@ a { color:#58a6ff; text-decoration:none; }
 <div id="backdrop" hidden><div id="detail" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button type="button" class="x" id="dx">Close ×</button><div id="dbody"></div></div></div>
 <script>
 const COLORS = {done:'#3fb950',partial:'#d29922',blocked:'#d29922',
+stopped:'#d29922',
 failed:'#f85149',timed_out:'#f0883e',running:'#58a6ff',queued:'#8b949e',
 waiting:'#8b949e',skipped:'#6e7681',planned:'#bc8cff',ready:'#bc8cff',
 generating:'#bc8cff',draft:'#d29922',
@@ -3468,7 +3764,7 @@ const prevTail = {};      // run|step -> last tail_last shown; a change
 const SHOW_N = 10;
 let runsShown = SHOW_N;   // visible run-table rows; active runs never hide
 const ORDER = ['running','queued','waiting','planned','done','partial',
-               'blocked','timed_out','failed','skipped','lost'];
+               'blocked','stopped','timed_out','failed','skipped','lost'];
 const FACETS = ['wt','merged','unmerged'];
 const matchesFacet = (a,f) => f==='wt' ? a.wt :
   f==='merged' ? a.merged===true : a.merged===false;
@@ -3500,8 +3796,9 @@ function showDetail(i){
   const a = AGENTS[i]; if(!a || !closeDetail()) return;
   detailIdx = i;
   const kv = [['step',a.step],['run',a.run],['project',a.slug],
-    ['status',a.status],['task',a.task],['result',a.next||a.note],
-    ['model',(a.model||'-')+(a.effort?' (effort '+a.effort+')':'')],
+    ['status',a.status],['task',a.task_full||a.task],['result',a.next||a.note],
+    ['model',(a.model||'-')+(a.effort?' (effort '+a.effort+')':'')+
+      (a.model_actual?' → '+a.model_actual:'')],
     ['mode',(a.mode||'-')+(a.cloud?' cloud':'')],
     ['started',a.started_at],['ended',a.ended_at],
     ['elapsed',a.elapsed_s!=null?fmtS(a.elapsed_s):'-'],
@@ -3517,6 +3814,13 @@ function showDetail(i){
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">${esc(v??'-')}` +
       (k==='tokens'?tokenHelp:'') + '</div>').join('') +
     `</div>` +
+    ((a.status==='running'||a.status==='queued') && a.run_dir
+      ? `<div class="actions"><button type="button" class="btn danger" ` +
+        `data-stop-agent="${esc(String(a.run_dir).split(/[\\/]/).pop())}" ` +
+        `data-step="${esc(a.step)}">Stop this agent</button>` +
+        `<span class="sub" style="margin-left:10px">tree-kills the devin ` +
+        `process; committed work stays. Resume re-runs the step.</span>` +
+        `</div>` : '') +
     (a.request_id ? `<div class="actions"><button type="button" class="btn secondary" ` +
       `data-open-request="${esc(a.request_id)}">View request / runbook</button></div>` : '') +
     (a.tail ? `<h3 style="margin-top:14px">stdout tail</h3><pre id="dtail">${esc(a.tail)}</pre>` : '');
@@ -3547,6 +3851,8 @@ function showRunDetails(key){
   const pendingMerge = AGENTS.some(a=>a.branch && a.merged!==true &&
     (a.run_key||a.run_dir)===key &&
     !['running','queued'].includes(a.status));
+  const liveSteps = AGENTS.filter(a=>(a.run_key||a.run_dir)===key &&
+    ['running','queued'].includes(a.status));
   document.getElementById('dbody').innerHTML =
     `<h3 id="modal-title">${esc(r.run)}</h3>` +
     (r.stage ? `<span class="stage ${esc(r.stage)}">${esc(STAGES[r.stage]||r.stage)}</span>` : '') +
@@ -3560,6 +3866,14 @@ function showRunDetails(key){
     (pendingMerge ? `<button type="button" class="btn" ` +
       `data-merge-run="${esc(String(r.dir).split(/[\\/]/).pop())}" ` +
       `data-rk="${esc(key)}">Merge pending branches</button>` : '') +
+    (liveSteps.length ? `<button type="button" class="btn danger" ` +
+      `data-stop-run="${esc(String(r.dir).split(/[\\/]/).pop())}" ` +
+      `title="tree-kill every live step now - committed work stays; ` +
+      `the run ends and can be resumed">Stop run now</button>` +
+      `<button type="button" class="btn secondary" ` +
+      `data-drain-run="${esc(String(r.dir).split(/[\\/]/).pop())}" ` +
+      `title="let the in-flight steps finish, then end the run - ` +
+      `nothing new launches">Drain &amp; stop</button>` : '') +
     (canResume ? `<button type="button" class="btn" ` +
       `data-resume-run="${esc(String(r.dir).split(/[\\/]/).pop())}">` +
       `Resume unfinished steps</button>` : '') +
@@ -3593,10 +3907,11 @@ function showRequestForm(rec){
   const projectOptions=`<option value="">Infer from request</option>` +
     choices.map(p=>`<option value="${esc(p.slug)}"${p.slug===rec.project?' selected':''}>` +
       `${esc(p.slug)}${p.cloud_ok?'':' (local only)'}</option>`).join('');
-  const modelOptions=((lastData?.model_options &&
+  const modelList=(lastData?.model_options &&
     Object.keys(lastData.model_options).length)
-    ? Object.keys(lastData.model_options) : ['swe-2','gpt-6-luna'])
-    .map(m=>`<option value="${esc(m)}">`).join('');
+    ? Object.keys(lastData.model_options) : ['swe-2','gpt-6-luna'];
+  if (!modelList.includes('adaptive')) modelList.push('adaptive');
+  const modelOptions=modelList.map(m=>`<option value="${esc(m)}">`).join('');
   const steps=rec.proposed_steps||[];
   const canEdit=editable && stage!=='new';
   document.getElementById('dbody').innerHTML =
@@ -4016,7 +4331,10 @@ function render(d){
              : '')
           : ''}</td><td class="wrap">${esc(a.task||'')}</td>` +
         `<td>${esc(a.run)}</td>` +
-        `<td class="hide-s">${esc(a.model||'-')}</td>` +
+        `<td class="hide-s" title="${a.model==='adaptive'&&a.model_actual
+          ?esc(`adaptive resolved to ${a.model_actual}`):''}">` +
+        `${esc(a.model||'-')}${a.model==='adaptive'&&a.model_actual
+          ?` → ${esc(a.model_actual)}`:''}</td>` +
         `<td class="hide-s">${esc(a.effort||'-')}</td>` +
         `<td class="hide-s">${esc(a.mode||'-')}${a.cloud?' cloud':''}</td>` +
         `<td>${loc(a.started_at)}</td>` +
@@ -4094,6 +4412,36 @@ document.addEventListener('click', async e=>{
       alert(bits.length ? bits.join(' | ') : 'Nothing pending to merge.');
     } catch(err){ alert('Merge failed: '+err.message); t.disabled=false;
       t.textContent='Merge pending branches'; }
+    return; }
+  if (t.dataset && t.dataset.stopAgent){
+    if(!confirm(`Stop agent '${t.dataset.step}'? The devin process tree ` +
+                `is killed (its committed work stays) and the step records ` +
+                `'stopped' - resume re-runs it.`)) return;
+    t.disabled=true;
+    try {
+      await api('POST',
+        `/api/runs/${encodeURIComponent(t.dataset.stopAgent)}/steps/` +
+        `${encodeURIComponent(t.dataset.step)}/stop`,{});
+      closeDetail(true); await refresh();
+    } catch(err){ alert('Stop failed: '+err.message); t.disabled=false; }
+    return; }
+  if (t.dataset && (t.dataset.stopRun || t.dataset.drainRun)){
+    const drain=!!t.dataset.drainRun, dir=t.dataset.stopRun||t.dataset.drainRun;
+    if(!confirm(drain
+        ? 'Drain this run: let in-flight steps finish, then end the run ' +
+          'without launching more?'
+        : 'Stop this run NOW? Every live step is tree-killed (committed ' +
+          'work stays) and nothing further launches. Resume restarts ' +
+          'unfinished steps.')) return;
+    t.disabled=true;
+    try {
+      const out=await api('POST',
+        `/api/runs/${encodeURIComponent(dir)}/stop`,{drain});
+      closeDetail(true); await refresh();
+      if (!drain) alert(out.stopping?.length
+        ? `Stopping: ${out.stopping.join(', ')}` :
+          'Stop requested - nothing was live.');
+    } catch(err){ alert('Stop failed: '+err.message); t.disabled=false; }
     return; }
   if (t.dataset && t.dataset.filterRun){
     selectedRun=t.dataset.filterRun;
@@ -4306,6 +4654,12 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                                           devin_argv), 202)
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/merge", path)):
                     self._json(merge_run(m.group(1), runs_dir, devin_argv))
+                elif (m := re.fullmatch(r"/api/runs/([^/]+)/stop", path)):
+                    self._json(stop_run(m.group(1), body, runs_dir), 202)
+                elif (m := re.fullmatch(
+                        r"/api/runs/([^/]+)/steps/([^/]+)/stop", path)):
+                    self._json(stop_step(m.group(1), m.group(2), runs_dir),
+                               202)
                 elif path == "/api/auth/login":
                     # Login is an interactive console flow (trap 3) - the most a
                     # dashboard button can do is pop a REAL terminal for it.

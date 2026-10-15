@@ -21,7 +21,10 @@ import os
 import shlex
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -750,6 +753,235 @@ prompt = "first"
             self.assertEqual(out["merged"], [])
             self.assertEqual(out["conflicted"], [])
             self.assertEqual(out["skipped"], [])
+
+
+class StopControlTests(unittest.TestCase):
+    """Dashboard stop controls: tempdir sentinels (never inside run_dir -
+    trap 5) polled by wait_worker + the wave loop. Per-step stop, run stop,
+    drain, pre-spawn skip, and resume clearing + interruption notes."""
+
+    def _flag_soon(self, runs: Path, flag, delay=0.8, watch_for=None):
+        """Raise `flag(rd_name, *rest)` once the run dir (and optionally a
+        step record in state.json) exists - stop requests arrive late."""
+        def work():
+            for _ in range(600):
+                try:
+                    rd = next(runs.iterdir())
+                    st = json.loads(
+                        (rd / "state.json").read_text(encoding="utf-8"))
+                    if watch_for is None or watch_for in (
+                            st.get("steps") or {}):
+                        flag(rd.name)
+                        return
+                except (StopIteration, OSError, ValueError):
+                    pass
+                time.sleep(0.05)
+        threading.Thread(target=work, daemon=True).start()
+
+    def test_step_stop_kills_worker_and_marks_stopped(self):
+        """Flag mid-run: wait_worker tree-kills, status 'stopped', the
+        committed work product survives."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            self._flag_soon(
+                runs, lambda rn: conductor._flag_raise(
+                    conductor.stop_flag(rn, "slow").name),
+                watch_for="slow")
+            m = write_manifest(base, f'''
+[[step]]
+name = "slow"
+project = "{proj.as_posix()}"
+prompt = "sleep_after=30 write A.txt"
+timeout_min = 60
+''')
+            with mock.patch.object(conductor, "WAIT_POLL_S", 0.2):
+                self.assertEqual(run_manifest(m, runs), 1)
+            st, rd = state_of(runs)
+            rec = st["steps"]["slow"]
+            self.assertEqual(rec["status"], "stopped")
+            self.assertIn("stopped by user", rec["note"])
+            # work was committed before the kill - the product survived
+            self.assertTrue((proj / "A.txt").is_file())
+
+    def test_run_stop_flag_halts_between_waves(self):
+        """Run-level stop: the live step is killed 'stopped', the next
+        wave never launches and records 'skipped' for resume."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            self._flag_soon(
+                runs, lambda rn: conductor._flag_raise(
+                    conductor.stop_flag(rn).name),
+                watch_for="one")
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "sleep_after=30 write A.txt"
+timeout_min = 60
+
+[[step]]
+name = "two"
+project = "{proj.as_posix()}"
+prompt = "write B.txt"
+''')
+            with mock.patch.object(conductor, "WAIT_POLL_S", 0.2):
+                self.assertEqual(run_manifest(m, runs), 1)
+            st, rd = state_of(runs)
+            self.assertEqual(st["steps"]["one"]["status"], "stopped")
+            self.assertEqual(st["steps"]["two"]["status"], "skipped")
+            self.assertEqual(st.get("aborted"), "stopped")
+            self.assertFalse((proj / "B.txt").is_file())
+
+    def test_drain_lets_step_finish_but_blocks_the_next_wave(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            self._flag_soon(
+                runs, lambda rn: conductor._flag_raise(
+                    conductor.drain_flag(rn).name),
+                delay=0.1, watch_for="one")
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "sleep_after=1 write A.txt"
+timeout_min = 60
+
+[[step]]
+name = "two"
+project = "{proj.as_posix()}"
+prompt = "write B.txt"
+''')
+            # rc 1: a drained run is intentionally incomplete
+            self.assertEqual(run_manifest(m, runs), 1)
+            st, rd = state_of(runs)
+            self.assertEqual(st["steps"]["one"]["status"], "done")
+            self.assertEqual(st["steps"]["two"]["status"], "skipped")
+            self.assertEqual(st.get("aborted"), "drained")
+            self.assertTrue((proj / "A.txt").is_file())
+            self.assertFalse((proj / "B.txt").is_file())
+
+    def test_queued_step_flag_skips_without_spawning(self):
+        """A flag for a pool-queued step (max_parallel=1) is consumed at
+        run_step entry: 'skipped', no mock session, work never written."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            self._flag_soon(
+                runs, lambda rn: conductor._flag_raise(
+                    conductor.stop_flag(rn, "b").name),
+                watch_for="b")       # 'b' appears in state once queued
+            m = write_manifest(base, wt_steps(proj, [
+                ("a", "sleep=2 write A.txt"), ("b", "write B.txt")]),
+                extra='max_parallel = 1')
+            self.assertEqual(run_manifest(m, runs), 1)
+            st, rd = state_of(runs)
+            self.assertEqual(st["steps"]["a"]["status"], "done")
+            self.assertEqual(st["steps"]["b"]["status"], "skipped")
+            self.assertIn("stopped by user", st["steps"]["b"]["note"])
+            self.assertFalse((proj / "B.txt").is_file())
+
+    def test_resume_after_stop_reruns_with_interruption_note(self):
+        """Stopped step + --resume: flags cleared, fresh session starts,
+        prompt carries the 'ended abruptly' note."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            self._flag_soon(
+                runs, lambda rn: conductor._flag_raise(
+                    conductor.stop_flag(rn, "slow").name),
+                watch_for="slow")
+            m = write_manifest(base, f'''
+[[step]]
+name = "slow"
+project = "{proj.as_posix()}"
+prompt = "sleep_after=30 write A.txt"
+timeout_min = 60
+''')
+            with mock.patch.object(conductor, "WAIT_POLL_S", 0.2):
+                self.assertEqual(run_manifest(m, runs), 1)
+            st, rd = state_of(runs)
+            self.assertEqual(st["steps"]["slow"]["status"], "stopped")
+            self.assertEqual(run_manifest(m, runs, resume=str(rd)), 0)
+            st, _ = state_of(runs)
+            self.assertEqual(st["steps"]["slow"]["status"], "done")
+            prompt = (rd / "prompts" / "slow.md").read_text(
+                encoding="utf-8")
+            self.assertIn("ended abruptly", prompt)
+            # sentinels were cleared by the resume - nothing lingers
+            self.assertFalse(conductor.stop_flag(rd.name).is_file())
+            self.assertFalse(
+                conductor.stop_flag(rd.name, "slow").is_file())
+
+
+class StopEndpointTests(unittest.TestCase):
+    """stop_step/stop_run validation + flag semantics (the HTTP layer is a
+    thin fullmatch -> call; these exercise it directly)."""
+
+    def _state(self, base, run="r1", steps=None):
+        runs = base / "runs"
+        rd = runs / run
+        rd.mkdir(parents=True)
+        (rd / "state.json").write_text(json.dumps(
+            {"run": "t", "steps": steps or {}}))
+        return runs, rd
+
+    def test_stop_step_writes_flag_and_rejects_dead(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs, rd = self._state(base, steps={
+                "s": {"status": "queued", "name": "s"},
+                "d": {"status": "done", "name": "d"}})
+            out = conductor.stop_step(rd.name, "s", runs)
+            self.assertEqual(out["stopping"], "s")
+            self.assertTrue(conductor.stop_flag(rd.name, "s").is_file())
+            conductor.stop_flag(rd.name, "s").unlink()
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.stop_step(rd.name, "d", runs)
+            self.assertEqual(e.exception.status, 409)
+            with self.assertRaises(conductor.RequestError):
+                conductor.stop_step(rd.name, "nope", runs)
+            with self.assertRaises(conductor.RequestError):
+                conductor.stop_step("../x", "s", runs)
+
+    def test_stop_run_drain_and_hard(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs, rd = self._state(base, steps={
+                "s": {"status": "running", "name": "s",
+                      "started_at": conductor.now_iso(),
+                      "timeout_min": 60}})
+            # dead pid-less 'running' record isn't live -> flags only
+            out = conductor.stop_run(rd.name, {"drain": True}, runs)
+            self.assertEqual(out["draining"], rd.name)
+            self.assertTrue(conductor.drain_flag(rd.name).is_file())
+            out = conductor.stop_run(rd.name, {}, runs)
+            # a pid-less 'running' rec is still live to step_live (within
+            # timeout): it is flagged for kill even though there is no pid
+            self.assertEqual(out["stopping"], ["s"])
+            self.assertTrue(conductor.stop_flag(rd.name).is_file())
+            self.assertTrue(conductor.stop_flag(rd.name, "s").is_file())
+            conductor.clear_run_flags(rd.name)
+            self.assertFalse(conductor.drain_flag(rd.name).is_file())
+            self.assertFalse(conductor.stop_flag(rd.name).is_file())
+
+    def test_stop_run_refuses_ended_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs, rd = self._state(base)
+            st = json.loads((rd / "state.json").read_text())
+            st["ended_at"] = conductor.now_iso()
+            (rd / "state.json").write_text(json.dumps(st))
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.stop_run(rd.name, {}, runs)
+            self.assertEqual(e.exception.status, 409)
 
 
 if __name__ == "__main__":

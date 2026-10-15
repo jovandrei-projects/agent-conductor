@@ -159,7 +159,20 @@ where a same-project wave requires them.
 Real runs still use `state.json` as their registry. A run's detail modal
 has a Resume button (`POST /api/runs/<dir>/resume` -> `run <manifest>
 --resume <dir>`) once nothing in it is live - same semantics as the CLI
-flag, fresh attempts for every non-done step. When a run has unmerged
+flag, fresh attempts for every non-done step. While a run IS live the
+modal instead offers `Stop run now` (POST `/stop` - flags + tree-kills
+every live step) and `Drain & stop` (`/stop` `{drain:true}` - live steps
+finish, nothing new launches); an agent modal on a live step gets `Stop
+this agent` (POST `/api/runs/<dir>/steps/<step>/stop`). Stop/drain travel
+as empty sentinel files in `%TEMP%/agent-conductor-flags` (never inside
+run_dir - trap 5), polled by `wait_worker` and the wave loop; `resume`
+clears them via `clear_run_flags` first. A step killed by a stop is
+`stopped` (vs `skipped` = never spawned); both plus `lost`/`timed_out`
+get INTERRUPTED_NOTE prepended on resume so the fresh session recovers
+from committed state instead of trusting a clean start. `model =
+"adaptive"` is a valid step/planner model - it takes no effort suffix,
+and the export's `agent.model_name` lands in `rec.model_actual` so the
+dashboard shows which real model adaptive picked and prices against it. When a run has unmerged
 `conductor/*` branches a `Merge pending branches` button appears
 (`POST /api/runs/<dir>/merge` -> `merge_run`): it replays the post-wave
 merge loop for parked branches, spawns the `resolve-*` session when the
@@ -319,6 +332,18 @@ Append as they are hit.
     `CREATE_NO_WINDOW` on Windows (`hidden_subprocess_kwargs`); keep the
     intentionally interactive `[log in]` button's terminal visible. A
     running `pythonw.exe` server must be restarted to load this fix.
+15. **Stopping `serve` must not stop work - but the shared console betrays
+    that.** Dashboard-launched `run`/`resume` conductors are children of
+    `serve`, and `CREATE_NO_WINDOW` children still share the parent's
+    console: Ctrl+C on the server's console broadcasts CTRL_C_EVENT to
+    EVERY attached process, runs and their workers included. `_launch_process`
+    therefore adds `CREATE_NEW_PROCESS_GROUP` (posix: `start_new_session`)
+    - a console Ctrl+C or a plain server exit leaves runs running and the
+    restarted dashboard picks them up from state.json/pids. Only the stop
+    endpoints (pid-targeted `taskkill /T`) or Ctrl+C inside a terminal that
+    ran `conductor.py run` directly should kill work. Caveat: `taskkill /T`
+    on the SERVER pid still walks into its children - do not tree-kill the
+    dashboard.
 
 ## The task workspace - read before starting work
 

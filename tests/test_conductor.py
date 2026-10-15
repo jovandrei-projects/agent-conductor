@@ -1368,7 +1368,7 @@ prompt = "Review the catalog tests."
 
         with mock.patch.object(conductor.subprocess, "Popen", FakeProc), \
                 mock.patch.object(conductor, "wait_worker",
-                                  return_value=(0, False, False)):
+                                  return_value=(0, False, False, False)):
             text = conductor._planner_response(rec, {}, ["devin"])
         self.assertEqual(text.strip(), proposal.strip())
         self.assertIn("--model", seen["cmd"])
@@ -1411,7 +1411,7 @@ prompt = "Review the catalog tests."
         with mock.patch.object(conductor.subprocess, "Popen",
                                popen_router), \
                 mock.patch.object(conductor, "wait_worker",
-                                  return_value=(0, False, False)):
+                                  return_value=(0, False, False, False)):
             conductor.start_generation(rec["id"], self.requests,
                                        self.manifests, self.runs,
                                        ["devin"], background=False)
@@ -2270,6 +2270,155 @@ prompt = "check the thing"
         self.assertTrue(cfg.merge_resolver)
         self.assertTrue(all(s.worktree for s in cfg.steps))
         self.assertTrue(all(s["wt"] for s in out["proposed_steps"]))
+
+
+class LifecycleDisplayTests(unittest.TestCase):
+    """Display/parsing helpers added for lifecycle + adaptive support."""
+
+    def test_stdout_tail_splits_cr_redraws(self):
+        """The CLI streams narration as one giant line separated by \\r
+        (progress redraws). A naive splitlines tail reads the START of
+        that mega-line; the freshest text is at the END."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "s.stdout.log"
+            log.write_bytes(
+                b"I'll start by reading the repo\rstep 2\rstep 3\r"
+                b"tail-most line")
+            t = conductor.stdout_tail(str(log), lines=2)
+            # \r-separated chunks count as lines: the tail is the END
+            self.assertEqual(t, "step 3\ntail-most line")
+            self.assertNotIn("I'll start", t)
+
+    def test_task_label_full_reads_prompt_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            pf = Path(td) / "s.md"
+            long_task = ("do a very long thing " * 30).strip()
+            pf.write_text(
+                f"# head\n## Task\n\n{long_task}\n\n## Before you finish\nx",
+                encoding="utf-8")
+            rec = {"task": long_task[:160], "prompt": str(pf)}
+            short = conductor.task_label(rec)
+            full = conductor.task_label(rec, full=True)
+            self.assertEqual(short, " ".join(long_task.split())[:160])
+            self.assertEqual(full, long_task)
+            self.assertGreater(len(full), len(short))
+            # file gone -> stored summary survives
+            pf.unlink()
+            self.assertEqual(conductor.task_label(rec, full=True),
+                             rec["task"])
+
+    def test_tail_agent_model_reads_export(self):
+        with tempfile.TemporaryDirectory() as td:
+            ex = Path(td) / "s.export.json"
+            ex.write_text(json.dumps(
+                {"agent": {"model_name": "GPT-6 Astra"},
+                 "final_metrics": {}}), encoding="utf-8")
+            self.assertEqual(conductor.tail_agent_model(ex),
+                             "GPT-6 Astra")
+            self.assertIsNone(conductor.tail_agent_model(
+                Path(td) / "nope.json"))
+            bad = Path(td) / "bad.json"
+            bad.write_text("{no", encoding="utf-8")
+            self.assertIsNone(conductor.tail_agent_model(bad))
+
+    def test_estimate_cost_resolves_adaptive_actual(self):
+        table = {"adaptive": {"label": "Adaptive", "in": 0, "out": 0,
+                              "cr": 0},
+                 "gpt-6-astra": {"label": "GPT-6 Astra", "in": 3.0,
+                                 "out": 15.0, "cr": 0.3}}
+        # 'adaptive' in the table wins for the adaptive row itself
+        c = conductor.estimate_cost(
+            {"prompt": 1000, "completion": 100}, "adaptive", None, table,
+            model_actual="GPT-6 Astra")
+        self.assertEqual(c["uid"], "adaptive")
+        # but with no adaptive entry, the export's resolved name maps by
+        # label so the rate is the model that actually ran
+        del table["adaptive"]
+        c = conductor.estimate_cost(
+            {"prompt": 1_000_000, "completion": 1_000_000},
+            "adaptive", None, table, model_actual="GPT-6 Astra")
+        self.assertEqual(c["uid"], "gpt-6-astra")
+        self.assertAlmostEqual(c["usd"], 18.0, places=3)
+
+    def test_devin_cmd_adaptive_takes_no_effort_suffix(self):
+        st = conductor.Step(name="s", project="p", prompt="x",
+                            model="adaptive", effort="max")
+        cmd = conductor.devin_cmd(["devin"], st, Path("p.md"),
+                                  Path("e.json"))
+        self.assertEqual(cmd[cmd.index("--model") + 1], "adaptive")
+        st2 = conductor.Step(name="s", project="p", prompt="x",
+                             model="swe-2", effort="max")
+        cmd = conductor.devin_cmd(["devin"], st2, Path("p.md"),
+                                  Path("e.json"))
+        self.assertEqual(cmd[cmd.index("--model") + 1], "swe-2-max")
+
+    def test_dashboard_tail_last_is_the_log_end(self):
+        """The running-agent 'result' cell shows the freshest output, not
+        the first line the worker ever wrote."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "runs"
+            rd = runs / "20261014-000000-t"
+            rd.mkdir(parents=True)
+            log = rd / "s.stdout.log"
+            log.write_text("I'll start by reading\r" +
+                           "still working on it " * 60, encoding="utf-8")
+            (rd / "state.json").write_text(json.dumps({
+                "run": "t",
+                "steps": {"s": {
+                    "name": "s", "status": "done",
+                    "stdout_log": str(log),
+                    "task": "the task"}}}))
+            with mock.patch.object(conductor, "refresh_prices"):
+                d = conductor.collect_dashboard(runs, ["no-such-devin"])
+            a = d["agents"][0]
+            self.assertTrue(a["tail_last"].startswith("…"))
+            self.assertIn("working on it", a["tail_last"])
+            self.assertNotIn("I'll start", a["tail_last"])
+            self.assertEqual(a["task_full"], "the task")
+
+    def test_launch_process_detaches_from_server_console(self):
+        """Dashboard-spawned run/resume subprocesses must not share the
+        server's Ctrl+C/SIGHUP fate - CREATE_NEW_PROCESS_GROUP on nt,
+        start_new_session on posix."""
+        with tempfile.TemporaryDirectory() as td:
+            seen = {}
+
+            class _P:
+                pid = 4242
+
+            def fake_popen(cmd, **kw):
+                seen.update(kw)
+                return _P()
+
+            with mock.patch.object(conductor.subprocess, "Popen",
+                                   fake_popen):
+                pid = conductor._launch_process(
+                    ["x"], Path(td) / "l.log")
+            self.assertEqual(pid, 4242)
+            if os.name == "nt":
+                self.assertTrue(
+                    seen["creationflags"] &
+                    subprocess.CREATE_NEW_PROCESS_GROUP)
+            else:
+                self.assertTrue(seen.get("start_new_session"))
+
+    def test_dashboard_surfaces_model_actual(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "runs"
+            rd = runs / "20261014-000000-t"
+            rd.mkdir(parents=True)
+            (rd / "state.json").write_text(json.dumps({
+                "run": "t",
+                "steps": {"s": {"name": "s", "status": "done",
+                                "model": "adaptive",
+                                "model_actual": "GPT-6 Astra"}}}))
+            with mock.patch.object(conductor, "refresh_prices"):
+                d = conductor.collect_dashboard(runs, ["no-such-devin"])
+            self.assertEqual(d["agents"][0]["model"], "adaptive")
+            self.assertEqual(d["agents"][0]["model_actual"],
+                             "GPT-6 Astra")
 
 
 if __name__ == "__main__":
