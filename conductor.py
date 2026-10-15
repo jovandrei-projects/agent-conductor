@@ -934,10 +934,29 @@ def timeout_flag(run_dir: Path, step: str) -> Path:
 
 
 def pause_flag(run_dir: Path) -> Path:
-    """Dashboard 'pause' sentinel: halts the pipeline exactly like stop,
-    but the run records aborted='paused' - deliberate hold for e.g. a
-    machine restart, distinct from a hard abort or a crash."""
+    """Dashboard 'Pause run' sentinel: a GRACEFUL hold - in-flight steps
+    run to completion, then nothing new launches and the run records
+    aborted='paused'. Resume continues where it left off (the deliberate
+    machine-restart case, distinct from a hard stop or a crash)."""
     return _flag_dir() / f"pause-{_flag_key(run_dir)}"
+
+
+def skip_flag(run_dir: Path, step: str) -> Path:
+    """Dashboard 'Skip step' sentinel: the step records 'skipped' instead
+    of spawning while the flag exists. Unlike the halt sentinels it is
+    DELIBERATE and durable - clear_run_flags leaves it alone, so a skip
+    survives --resume until the user clicks Unskip."""
+    return _flag_dir() / f"skip-{_flag_key(run_dir)}-{_safe_name(step)}"
+
+
+def _skip_flagged(run_dir: Path) -> set[str]:
+    """_safe_name'd step names currently carrying a skip sentinel."""
+    prefix = f"skip-{_flag_key(run_dir)}-"
+    try:
+        return {f.name[len(prefix):]
+                for f in _flag_dir().glob(prefix + "*")}
+    except OSError:
+        return set()
 
 
 # Runs launched by an older conductor poll BARE-name sentinels
@@ -994,10 +1013,12 @@ def _flag_raise(name: str) -> None:
 
 
 def clear_run_flags(run_dir: Path) -> None:
-    """Remove all sentinels for a run - called on resume/merge so a
+    """Remove all HALT sentinels for a run - called on resume/merge so a
     previously stopped run can actually start work again. Clears both
     path-keyed names and legacy bare-name ones: a run paused under old
-    code must be resumable by new code."""
+    code must be resumable by new code. Skip sentinels deliberately
+    survive: a user's skip stays in force until they Unskip, or a resume
+    would silently resurrect a step they removed from the queue."""
     name = _safe_name(run_dir.name)
     pats = [f"*{_flag_key(run_dir)}*",
             f"stop-{name}*", f"drain-{name}", f"pause-{name}",
@@ -1005,6 +1026,8 @@ def clear_run_flags(run_dir: Path) -> None:
     try:
         for pat in pats:
             for f in _flag_dir().glob(pat):
+                if f.name.startswith("skip-"):
+                    continue
                 try:
                     f.unlink()
                 except OSError:
@@ -1159,23 +1182,31 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
 
     Stop sentinels (dashboard Stop buttons) are tempdir files polled here:
     one present before spawn -> 'skipped' (never ran); one appearing
-    mid-wait -> tree-kill and 'stopped'.
+    mid-wait -> tree-kill and 'stopped'. A 'Skip step' sentinel lands the
+    same 'skipped' but is NOT consumed - it stays in force (even across
+    --resume) until the user clicks Unskip.
     """
-    if _flag_set(stop_flag(run_dir),
-                 stop_flag(run_dir, step.name)) is not None:
+    halted = _flag_set(stop_flag(run_dir),
+                       stop_flag(run_dir, step.name))
+    user_skip = halted is None and skip_flag(run_dir, step.name).is_file()
+    if halted is not None or user_skip:
         per_step = _flag_set(stop_flag(run_dir, step.name))
         if per_step is not None:
             per_step.unlink(missing_ok=True)
+        if user_skip:
+            note = "skipped by user (Skip step)"
+        elif pause_flag(run_dir).is_file():
+            note = "run paused"
+        else:
+            note = "stopped by user"
         with STATE_LOCK:
             state["steps"].setdefault(step.name, {}).update(
                 name=step.name, slug=slug, status="skipped",
                 ended_at=now_iso(),
-                note=("run paused" if pause_flag(run_dir).is_file()
-                      else "stopped by user") +
-                     " before the session spawned")
+                note=note + " before the session spawned")
             save_state(run_dir, state)
         log_event(run_dir, event="step_stopped", step=step.name,
-                  phase="before_spawn")
+                  phase="before_spawn", user_skip=user_skip)
         return "skipped"
 
     body_src = step.prompt
@@ -1392,8 +1423,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                          "spawned child (trap 12); tree-killed after "
                          "grace - counted as turn end")
         if stopped:
-            notes.append("stopped by user via dashboard; --resume "
-                         "re-runs the step")
+            notes.append("stopped by user via dashboard; the run "
+                         "proceeds without it, --resume re-runs the step")
         if notes:
             rec["note"] = "; ".join(notes)
         rec.update(status=status, ended_at=now_iso(), status_line=status_line,
@@ -1616,32 +1647,40 @@ def cmd_run(args: argparse.Namespace) -> int:
     stop = False
 
     def halt_remaining(from_gi: int) -> None:
-        """A user stop/drain ended the run mid-loop: every step that never
-        launched is recorded 'skipped' (not just absent) so the dashboard
-        shows the full plan and --resume knows what is left."""
+        """A user pause/stop/drain ended the run mid-loop: every step that
+        never launched is recorded 'skipped' (not just absent) so the
+        dashboard shows the full plan and --resume knows what is left."""
         halted = stop_flag(run_dir).is_file()
         paused = pause_flag(run_dir).is_file()
         with STATE_LOCK:
             for grp in groups[from_gi:]:
                 for _d, _s, s_ in grp:
                     r = state["steps"].get(s_.name) or {}
-                    if r.get("status") != "done":
-                        state["steps"].setdefault(s_.name, {}).update(
-                            name=s_.name, status="skipped",
-                            note=("run paused" if paused else
-                                  "run stopped by user") +
-                                  " before this step ran")
+                    if r.get("status") == "done":
+                        continue
+                    if skip_flag(run_dir, s_.name).is_file():
+                        why = "skipped by user (Skip step)"
+                    elif paused:
+                        why = "run paused"
+                    elif halted:
+                        why = "run stopped by user"
+                    else:
+                        why = "run drained"
+                    state["steps"].setdefault(s_.name, {}).update(
+                        name=s_.name, status="skipped",
+                        note=why + " before this step ran")
             state["aborted"] = ("paused" if paused else
                                 "stopped" if halted else "drained")
             state["ended_at"] = now_iso()
             save_state(run_dir, state)
 
     for gi, members in enumerate(groups):
-        if _flag_set(stop_flag(run_dir),
-                     drain_flag(run_dir)) is not None:
-            # Dashboard stop: 'stop' also tree-kills live steps via
-            # wait_worker's flag poll; 'drain' lets them finish. Either
-            # way nothing NEW launches - remaining work stays resumable.
+        if _flag_set(stop_flag(run_dir), drain_flag(run_dir),
+                     pause_flag(run_dir)) is not None:
+            # Dashboard run controls: 'stop' also tree-kills live steps
+            # via wait_worker's flag poll; 'drain'/'pause' let them
+            # finish. Either way nothing NEW launches - remaining work
+            # stays resumable.
             halted = stop_flag(run_dir).is_file()
             paused = pause_flag(run_dir).is_file()
             kind = "paused" if paused else "stopped" if halted else "drained"
@@ -1853,16 +1892,26 @@ def cmd_run(args: argparse.Namespace) -> int:
         except OSError:
             pass
         if cfg.on_failure == "stop" and any(
-                s in ("failed", "timed_out", "blocked", "stopped")
+                s in ("failed", "timed_out", "blocked")
                 for s in statuses.values()):
             print("stopping run after wave")
-            # A wave-end halt can hide the dashboard-stop bookkeeping:
-            # 'stopped'/'drained' steps trip on_failure before the next
-            # top-of-loop flag check runs, so mark the rest here too.
-            if _flag_set(stop_flag(run_dir),
-                         drain_flag(run_dir)) is not None:
+            # 'stopped' is deliberately absent: a per-step 'Stop this
+            # step' is the user vetoing ONE task, not a failure - the run
+            # proceeds to the next queued step. Run-level stops still halt
+            # regardless of on_failure because the stop/pause/drain
+            # sentinel itself persists to the next top-of-loop check.
+            if _flag_set(stop_flag(run_dir), drain_flag(run_dir),
+                         pause_flag(run_dir)) is not None:
                 halt_remaining(gi + 1)
             break
+
+    # A halt sentinel landing in the FINAL wave never re-enters the
+    # loop's flag check - stamp the same bookkeeping here so the run
+    # still records aborted + skipped leftovers.
+    if state.get("aborted") is None and _flag_set(
+            stop_flag(run_dir), drain_flag(run_dir),
+            pause_flag(run_dir)) is not None:
+        halt_remaining(len(groups))
 
     state["ended_at"] = now_iso()
     save_state(run_dir, state)
@@ -3195,10 +3244,11 @@ def _kill_pid(pid: int | None, since: str | None) -> None:
 
 def stop_step(run_name: str, step_name: str,
               runs_dir: Path = RUNS_DIR) -> dict:
-    """Dashboard 'Stop agent': drop a per-step sentinel, then - when the
-    pid is visible - tree-kill it now rather than waiting out the poll.
-    The running conductor notices either way and records 'stopped';
-    a queued-but-unspawned step lands 'skipped'."""
+    """Dashboard 'Stop this step': drop a per-step sentinel, then - when
+    the pid is visible - tree-kill it now rather than waiting out the
+    poll. The running conductor notices either way and records 'stopped';
+    a queued-but-unspawned step lands 'skipped'. The RUN proceeds to the
+    next queued step - only run-level controls halt the pipeline."""
     if not RUN_DIR_RE.fullmatch(step_name):
         raise RequestError("Invalid step name", 404)
     d, st = _run_dir_checked(run_name, runs_dir)
@@ -3221,24 +3271,100 @@ def stop_step(run_name: str, step_name: str,
     return {"stopping": step_name}
 
 
+def skip_step(run_name: str, step_name: str, body: dict,
+              runs_dir: Path = RUNS_DIR) -> dict:
+    """Dashboard 'Skip step'/'Unskip step': a persistent per-step sentinel
+    the conductor checks right before spawn. Skipping keeps the step in
+    the run but it never launches while marked ('skipped' when its turn
+    comes); unskipping restores it in its original queue position - if
+    the turn already passed, it re-runs on --resume like any skipped
+    step. The flag survives resume on purpose (clear_run_flags leaves
+    it), so a skip is undone only by an explicit Unskip."""
+    if not RUN_DIR_RE.fullmatch(step_name):
+        raise RequestError("Invalid step name", 404)
+    d, st = _run_dir_checked(run_name, runs_dir)
+    steps = st.get("steps") or {}
+    rec = steps.get(step_name)
+    if rec is None and step_name not in _manifest_step_names(st):
+        raise RequestError("Step not in this run", 404)
+    if body.get("skip", True):
+        status = (rec or {}).get("status")
+        if status == "running":
+            raise RequestError(
+                "Step already launched - use Stop this step to end it", 409)
+        if status not in (None, "queued", "skipped", "lost"):
+            raise RequestError(
+                f"Step already finished ({status}) - skipping only "
+                "works on steps that have not run", 409)
+        _flag_raise(skip_flag(d, step_name).name)
+        # Same trap-5 rule as stop_step: flag files only, never state.json.
+        return {"skipped": step_name}
+    skip_flag(d, step_name).unlink(missing_ok=True)
+    return {"unskipped": step_name,
+            "turn_passed": (rec or {}).get("status") == "skipped"}
+
+
+_MANIFEST_CACHE: dict[str, tuple[float, "Manifest"]] = {}
+
+
+def _manifest_cached(path_str: str) -> "Manifest | None":
+    """load_manifest keyed on (path, mtime) - collect_dashboard calls it
+    once per run per refresh and manifests are small, but the parse is
+    still pointless work when nothing changed."""
+    try:
+        mt = Path(path_str).stat().st_mtime
+    except OSError:
+        return None
+    ent = _MANIFEST_CACHE.get(path_str)
+    if ent and ent[0] == mt:
+        return ent[1]
+    try:
+        cfg = load_manifest(Path(path_str))
+    except (OSError, ManifestError, ValueError):
+        # TOMLDecodeError is a ValueError - a corrupt manifest just means
+        # no pending rows, never a dead dashboard refresh.
+        return None
+    _MANIFEST_CACHE[path_str] = (mt, cfg)
+    return cfg
+
+
+def _manifest_step_names(st: dict) -> set[str]:
+    """Step names declared by the run's manifest - for validating a
+    Skip on a step that has no state.json record yet."""
+    cfg = _manifest_cached(st.get("manifest") or "")
+    return {s.name for s in cfg.steps} if cfg else set()
+
+
 def stop_run(run_name: str, body: dict,
              runs_dir: Path = RUNS_DIR) -> dict:
-    """Dashboard run-level halt. {"drain": true} lets live steps finish
-    but launches nothing new; {"pause": true} is a hard stop that the
-    run records as aborted='paused' (deliberate hold - the machine-restart
-    case); otherwise every live step is flagged + killed. The conductor's
-    wave loop honors the sentinels between waves, so no later step
+    """Dashboard run-level controls.
+
+    {"pause": true}  - 'Pause run': graceful hold. In-flight steps run to
+    completion, nothing new launches, the run records aborted='paused'
+    (the deliberate-hold / machine-restart case; resume continues it).
+    {"drain": true}  - legacy alias of the same graceful halt, recorded
+    aborted='drained'. Otherwise - 'Stop run now': every live step's
+    process tree is killed now, nothing new launches, aborted='stopped'.
+    The wave loop honors the sentinels between waves, so no later step
     launches regardless of on_failure."""
     d, st = _run_dir_checked(run_name, runs_dir)
     if st.get("ended_at"):
         raise RequestError("This run already ended", 409)
+    if body.get("pause"):
+        for f in pause_flags_for(d, st):
+            _flag_raise(f.name)
+        if st.get("flags") != "v2":
+            # Old-code drivers only poll stop/drain at the wave boundary -
+            # the graceful-hold shape they understand is drain.
+            for f in drain_flags_for(d, st):
+                _flag_raise(f.name)
+        live = [n for n, r in (st.get("steps") or {}).items()
+                if r.get("status") == "running" and step_live(r)]
+        return {"pausing": live}
     if body.get("drain"):
         for f in drain_flags_for(d, st):
             _flag_raise(f.name)
         return {"draining": run_name}
-    if body.get("pause"):
-        for f in pause_flags_for(d, st):
-            _flag_raise(f.name)
     for f in stop_flags_for(d, st):
         _flag_raise(f.name)
     live = [n for n, r in (st.get("steps") or {}).items()
@@ -3248,7 +3374,7 @@ def stop_run(run_name: str, body: dict,
                   st["steps"][n].get("started_at"))
         for f in stop_flags_for(d, st, n):
             _flag_raise(f.name)
-    return {"stopping": live, "paused": bool(body.get("pause"))}
+    return {"stopping": live}
 
 
 def set_step_timeout(run_name: str, step_name: str, body: dict,
@@ -3636,6 +3762,55 @@ def proposal_agent(step: dict, rec: dict, projects: dict, key: str,
             else None}
 
 
+def _manifest_pending(st: dict, projects: dict) -> list[dict]:
+    """Steps the run's manifest declares but state.json has no record for -
+    CLI-launched runs get the same pending placeholder rows request runs
+    already had, so a not-yet-spawned step is visible (and skippable)."""
+    cfg = _manifest_cached(st.get("manifest") or "")
+    if cfg is None:
+        return []
+    have = st.get("steps") or {}
+    out = []
+    manifest_dir = Path(st["manifest"]).parent
+    for step in cfg.steps:
+        if step.name in have:
+            continue
+        try:
+            pdir, slug = resolve_project(step, projects, manifest_dir)
+            wd = str(pdir)
+        except ManifestError:
+            slug = wd = step.project
+        task = " ".join((step.prompt or "").split())[:160]
+        if not task and step.prompt_file:
+            task = step.prompt_file
+        out.append({"name": step.name, "slug": slug, "work_dir": wd,
+                    "task": task, "model": step.model,
+                    "effort": step.effort, "mode": step.mode,
+                    "cloud": step.cloud, "wt": step.worktree,
+                    "timeout_min": step.timeout_min})
+    return out
+
+
+def _pending_agent(st: dict, sd: dict, key: str, run_dir: str,
+                   sort_at: str | None) -> dict:
+    """Placeholder row for a manifest step with no state.json record yet -
+    same shape proposal_agent returns so the UI treats both alike."""
+    return {"run": st.get("run"), "run_dir": run_dir, "run_key": key,
+            "request_id": st.get("request_id"),
+            "step": sd["name"], "slug": sd["slug"],
+            "work_dir": sd["work_dir"], "status": "waiting",
+            "created_at": sort_at or st.get("started_at"),
+            "started_at": None, "ended_at": None, "elapsed_s": None,
+            "session_id": None, "model": sd.get("model"),
+            "effort": sd.get("effort"), "mode": sd.get("mode"),
+            "task": sd.get("task"), "task_full": None,
+            "model_actual": None, "wt": sd.get("wt"),
+            "timeout_min": sd.get("timeout_min"),
+            "attempts": None, "max_attempts": None,
+            "merged": None, "cloud": sd.get("cloud"), "tokens": None,
+            "cost": None, "alive": False, "note": None}
+
+
 def collect_dashboard(runs_dir: Path,
                       devin_argv: list[str] | None = None,
                       requests_dir: Path | None = None) -> dict:
@@ -3676,6 +3851,7 @@ def collect_dashboard(runs_dir: Path,
         proposed = {s["step"]: s for s in request.get("proposed_steps", [])} \
             if request else {}
         eff = effective_statuses(st)
+        flagged = _skip_flagged(sj.parent)     # 'Skip step' marks in place
         for name, rec in st.get("steps", {}).items():
             plan = proposed.get(name) or {}
             t = rec.get("tokens")
@@ -3743,6 +3919,8 @@ def collect_dashboard(runs_dir: Path,
                 or plan.get("task"),
                 "cloud": rec.get("cloud", plan.get("cloud")),
                 "verify_ok": rec.get("verify_ok"),
+                "skipped_by_user": _safe_name(
+                    rec.get("name") or name) in flagged,
                 "note": rec.get("note"), "next": rec.get("next"),
                 "session_gone": session_gone,
                 "exit_code": rec.get("exit_code"),
@@ -3759,15 +3937,30 @@ def collect_dashboard(runs_dir: Path,
                 "state_md": _state_md(
                     wd, rec.get("name") or name,
                     str(projects.get(slug, {}).get("path") or "") or None)})
-        if request:
-            pending = "skipped" if st.get("ended_at") else "waiting"
-            for step in request.get("proposed_steps") or []:
-                if step["step"] in (st.get("steps") or {}):
-                    continue
-                counts[pending] = counts.get(pending, 0) + 1
-                agents.append(proposal_agent(
-                    step, request, projects, key, pending, str(sj.parent),
-                    st.get("started_at")))
+        # Pending rows: declared steps with no record yet. Request runs
+        # use the proposal's richer step dicts; CLI runs fall back to the
+        # manifest itself. A live run shows them 'waiting', an ended one
+        # 'skipped'; a user-placed Skip mark forces 'skipped' either way.
+        pend = ([proposal_agent(step, request, projects, key, "waiting",
+                                str(sj.parent), st.get("started_at"))
+                 for step in request.get("proposed_steps") or []
+                 if step["step"] not in (st.get("steps") or {})]
+                if request else
+                [_pending_agent(st, sd, key, str(sj.parent),
+                                st.get("started_at"))
+                 for sd in _manifest_pending(st, projects)])
+        for row in pend:
+            if _safe_name(row["step"]) in flagged:
+                row["status"] = "skipped"
+                row["skipped_by_user"] = True
+                row["note"] = ("skipped by user (Skip step) - Unskip "
+                               "restores its queue position")
+            else:
+                row["status"] = "skipped" if st.get("ended_at") else "waiting"
+                if row["status"] == "skipped":
+                    row["note"] = "Run ended before this step started"
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+            agents.append(row)
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
                      "key": key, "request_id": st.get("request_id"),
                      "description": st.get("description") or
@@ -4207,23 +4400,45 @@ function showDetail(i){
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">${esc(v??'-')}` +
       (k==='tokens'?tokenHelp:'') + '</div>').join('') +
     `</div>` +
-    ((a.status==='running'||a.status==='queued') && a.run_dir
-      ? `<div class="actions"><button type="button" class="btn danger" ` +
-        `data-stop-agent="${esc(base(a.run_dir))}" ` +
-        `data-step="${esc(a.step)}">Stop this agent</button>` +
-        `<span class="sub" style="margin-left:10px">tree-kills the devin ` +
-        `process; committed work stays. Resume re-runs the step.</span>` +
-        `</div>` +
-        `<div class="actions"><label for="d-timeout" ` +
-        `style="margin:0">timeout (min)</label>` +
-        `<input id="d-timeout" type="number" min="1" max="1440" ` +
-        `value="${a.timeout_min??''}" style="width:90px">` +
-        `<button type="button" class="btn secondary" ` +
-        `data-set-timeout="${esc(base(a.run_dir))}" ` +
-        `data-step="${esc(a.step)}">Save</button>` +
-        `<span class="sub">moves the live deadline on the next poll ` +
-        `(&lt;15s); a value under elapsed ends the step early, retries ` +
-        `use it too.</span></div>` : '') +
+    (a.run_dir
+      ? ((a.status==='running'
+          ? `<div class="actions"><button type="button" class="btn danger" ` +
+            `data-stop-agent="${esc(base(a.run_dir))}" ` +
+            `data-step="${esc(a.step)}" ` +
+            `title="kill this agent's process tree now - the run ` +
+            `proceeds to the next step">Stop this step</button>` +
+            `<span class="sub" style="margin-left:10px">tree-kills the ` +
+            `devin process; committed work stays. The run continues; ` +
+            `Resume re-runs the step.</span></div>` : '') +
+        (((a.status==='queued'||a.status==='waiting') && !a.skipped_by_user)
+          ? `<div class="actions"><button type="button" ` +
+            `class="btn secondary" ` +
+            `data-skip-step="${esc(base(a.run_dir))}" ` +
+            `data-step="${esc(a.step)}" ` +
+            `title="never launch this step while marked - it keeps its ` +
+            `queue position and stays skipped (even across resume) ` +
+            `until you Unskip">Skip step</button>` +
+            `<span class="sub" style="margin-left:10px">the step records ` +
+            `'skipped' when its turn comes - nothing is launched.</span>` +
+            `</div>` : '') +
+        (a.skipped_by_user
+          ? `<div class="actions"><button type="button" class="btn" ` +
+            `data-unskip-step="${esc(base(a.run_dir))}" ` +
+            `data-step="${esc(a.step)}" ` +
+            `title="remove the skip mark - the step runs in its original ` +
+            `queue position (if its turn already passed, on the next ` +
+            `resume)">Unskip step</button></div>` : '') +
+        ((a.status==='running'||a.status==='queued')
+          ? `<div class="actions"><label for="d-timeout" ` +
+            `style="margin:0">timeout (min)</label>` +
+            `<input id="d-timeout" type="number" min="1" max="1440" ` +
+            `value="${a.timeout_min??''}" style="width:90px">` +
+            `<button type="button" class="btn secondary" ` +
+            `data-set-timeout="${esc(base(a.run_dir))}" ` +
+            `data-step="${esc(a.step)}">Save</button>` +
+            `<span class="sub">moves the live deadline on the next poll ` +
+            `(&lt;15s); a value under elapsed ends the step early, ` +
+            `retries use it too.</span></div>` : '')) : '') +
     (a.request_id ? `<div class="actions"><button type="button" class="btn secondary" ` +
       `data-open-request="${esc(a.request_id)}">View request / runbook</button></div>` : '') +
     (a.tail ? `<h3 style="margin-top:14px">stdout tail</h3><pre id="dtail">${esc(a.tail)}</pre>` : '');
@@ -4256,14 +4471,16 @@ function showRunDetails(key){
     !['running','queued'].includes(a.status));
   const liveSteps = AGENTS.filter(a=>(a.run_key||a.run_dir)===key &&
     ['running','queued'].includes(a.status));
-  // Paused vs interrupted: 'paused' means someone clicked Pause (a clean,
-  // deliberate hold); a run with no ended_at and nothing live means the
-  // conductor itself died (crash/reboot) - resumable either way.
+  // Paused vs interrupted: 'paused' means someone clicked Pause run (a
+  // graceful hold - in-flight steps finished first); a run with no
+  // ended_at and nothing live means the conductor itself died (crash or
+  // reboot). Both resume from committed state.
   const interrupted = !r.ended_at && !r.aborted && !liveSteps.length &&
     Object.keys(r.counts||{}).some(s=>s!=='done');
   const notice = (r.aborted==='paused' && canResume)
-    ? `<div class="notice warn">Paused by user - no live steps, nothing ` +
-      `new launches. Resume continues it (safe across a restart).</div>`
+    ? `<div class="notice warn">Paused - in-flight steps finished and ` +
+      `nothing new launched. Resume continues where it left off ` +
+      `(safe across a restart).</div>`
     : interrupted
     ? `<div class="notice warn">Interrupted - the conductor process is ` +
       `gone (crash or machine restart). Resume picks up unfinished ` +
@@ -4284,19 +4501,17 @@ function showRunDetails(key){
       `data-rk="${esc(key)}">Merge pending branches</button>` : '') +
     (liveSteps.length ? `<button type="button" class="btn" ` +
       `data-pause-run="${esc(base(r.dir))}" ` +
-      `title="stop the live step now and hold the pipeline - nothing ` +
-      `new launches until you Resume (built for machine restarts)">` +
-      `Pause run</button>` +
+      `title="let in-flight steps finish, then hold the run - nothing ` +
+      `new launches until Resume">Pause run</button>` +
       `<button type="button" class="btn danger" ` +
       `data-stop-run="${esc(base(r.dir))}" ` +
-      `title="tree-kill every live step now - committed work stays; ` +
-      `the run ends and can be resumed">Stop run now</button>` +
-      `<button type="button" class="btn secondary" ` +
-      `data-drain-run="${esc(base(r.dir))}" ` +
-      `title="let the in-flight steps finish, then end the run - ` +
-      `nothing new launches">Drain &amp; stop</button>` : '') +
+      `title="kill every live step's process tree now - committed work ` +
+      `stays; nothing new launches; Resume restarts unfinished steps">` +
+      `Stop run now</button>` : '') +
     (canResume ? `<button type="button" class="btn" ` +
-      `data-resume-run="${esc(base(r.dir))}">` +
+      `data-resume-run="${esc(base(r.dir))}" ` +
+      `title="re-run every non-done step in a fresh session - covers ` +
+      `paused, stopped and interrupted runs">` +
       `Resume unfinished steps</button>` : '') +
     '</div>';
   document.getElementById('backdrop').hidden = false;
@@ -4668,8 +4883,9 @@ function render(d){
     const left = Object.keys(c).some(s=>s!=='done');
     if (!left) return '';
     if (r.aborted==='paused')
-      return `<span class="stage paused" title="deliberate hold - ` +
-        `Resume continues it">paused - resume ready</span>`;
+      return `<span class="stage paused" title="deliberate hold after ` +
+        `in-flight steps finished - Resume continues it">paused - ` +
+        `resume ready</span>`;
     if (!r.ended_at && Object.keys(c).length)
       return `<span class="stage interrupted" title="conductor process ` +
         `died (crash/reboot) - Resume continues it">interrupted - ` +
@@ -4871,8 +5087,9 @@ document.addEventListener('click', async e=>{
   if (runDetEl){
     showRunDetails(runDetEl.dataset.runDetails); return; }
   if (t.dataset && t.dataset.resumeRun){
-    if(!confirm('Resume this run? Non-done steps re-run in fresh sessions ' +
-                'with fresh timeouts.')) return;
+    if(!confirm('Resume this run? Every non-done step re-runs in a fresh ' +
+                'session with a fresh timeout - covers paused, stopped ' +
+                'and interrupted (crashed) runs alike.')) return;
     t.disabled=true; t.textContent='Resuming…';
     try {
       await api('POST',`/api/runs/${encodeURIComponent(t.dataset.resumeRun)}/resume`,{});
@@ -4902,10 +5119,33 @@ document.addEventListener('click', async e=>{
     } catch(err){ alert('Merge failed: '+err.message); t.disabled=false;
       t.textContent='Merge pending branches'; }
     return; }
+  if (t.dataset && (t.dataset.skipStep || t.dataset.unskipStep)){
+    const un = !!t.dataset.unskipStep;
+    const dir = t.dataset.skipStep || t.dataset.unskipStep;
+    if(!confirm(un
+        ? `Unskip '${t.dataset.step}'? It runs in its original queue ` +
+          `position - if its turn already passed this run, on the ` +
+          `next resume.`
+        : `Skip '${t.dataset.step}'? It keeps its place in the run but ` +
+          `never launches while marked - the mark stays in force even ` +
+          `across resume until you Unskip.`)) return;
+    t.disabled=true;
+    try {
+      const out=await api('POST',
+        `/api/runs/${encodeURIComponent(dir)}/steps/` +
+        `${encodeURIComponent(t.dataset.step)}/skip`,{skip:!un});
+      closeDetail(true); await refresh();
+      if (un && out.turn_passed)
+        alert(`Unskipped - '${t.dataset.step}' already passed its turn ` +
+              `this run, so it re-runs on the next resume.`);
+    } catch(err){ alert((un?'Unskip':'Skip')+' failed: '+err.message);
+      t.disabled=false; }
+    return; }
   if (t.dataset && t.dataset.stopAgent){
-    if(!confirm(`Stop agent '${t.dataset.step}'? The devin process tree ` +
-                `is killed (its committed work stays) and the step records ` +
-                `'stopped' - resume re-runs it.`)) return;
+    if(!confirm(`Stop step '${t.dataset.step}'? Its devin process tree ` +
+                `is killed (committed work stays) and the step records ` +
+                `'stopped'. The run proceeds to the next step; resume ` +
+                `re-runs it.`)) return;
     t.disabled=true;
     try {
       await api('POST',
@@ -4928,18 +5168,20 @@ document.addEventListener('click', async e=>{
       t.disabled=false; }
     return; }
   if (t.dataset && t.dataset.pauseRun){
-    if(!confirm('Pause this run? The live step is tree-killed now ' +
-                '(committed work stays) and NO further step launches - ' +
-                'regardless of on_failure. The run stays resumable ' +
-                'across a dashboard or machine restart.')) return;
+    if(!confirm('Pause this run? In-flight steps run to completion, ' +
+                'then the run holds - NO further step launches ' +
+                'regardless of on_failure. It stays resumable across a ' +
+                'dashboard or machine restart. To kill live work ' +
+                'immediately, use Stop run now instead.')) return;
     t.disabled=true;
     try {
       const out=await api('POST',
         `/api/runs/${encodeURIComponent(t.dataset.pauseRun)}/pause`,{});
       closeDetail(true); await refresh();
-      alert(out.stopping?.length
-        ? `Pausing: ${out.stopping.join(', ')}` :
-          'Pause requested - nothing was live.');
+      alert(out.pausing?.length
+        ? `Pause set: ${out.pausing.join(', ')} finishes first, ` +
+          `then the run holds.` :
+          'Pause set - nothing was in flight; the run is held.');
     } catch(err){ alert('Pause failed: '+err.message); t.disabled=false; }
     return; }
   if (t.dataset && (t.dataset.stopRun || t.dataset.drainRun)){
@@ -4948,8 +5190,9 @@ document.addEventListener('click', async e=>{
         ? 'Drain this run: let in-flight steps finish, then end the run ' +
           'without launching more?'
         : 'Stop this run NOW? Every live step is tree-killed (committed ' +
-          'work stays) and nothing further launches. Resume restarts ' +
-          'unfinished steps.')) return;
+          'work stays) and nothing further launches; Resume restarts ' +
+          'unfinished steps. To hold only after in-flight steps finish, ' +
+          'use Pause run instead.')) return;
     t.disabled=true;
     try {
       const out=await api('POST',
@@ -5183,6 +5426,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                         r"/api/runs/([^/]+)/steps/([^/]+)/stop", path)):
                     self._json(stop_step(m.group(1), m.group(2), runs_dir),
                                202)
+                elif (m := re.fullmatch(
+                        r"/api/runs/([^/]+)/steps/([^/]+)/skip", path)):
+                    self._json(skip_step(m.group(1), m.group(2), body,
+                                         runs_dir), 202)
                 elif (m := re.fullmatch(
                         r"/api/runs/([^/]+)/steps/([^/]+)/timeout", path)):
                     self._json(set_step_timeout(

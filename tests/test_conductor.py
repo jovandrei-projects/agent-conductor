@@ -2726,30 +2726,43 @@ class LifecycleDisplayTests(unittest.TestCase):
                              "GPT-6 Astra")
 
 
-class PauseRunTests(unittest.TestCase):
-    """Run-level Pause: hold the pipeline for a deliberate restart.
+class _RunControlBase(unittest.TestCase):
+    """Shared helpers for driving a manifest run in a thread and poking
+    its sentinels from the 'dashboard'."""
 
-    Pause = hard stop of the live step + a 'paused' label on the run, and
-    no later step launches regardless of on_failure. Resume picks it back
-    up - the interrupted step re-runs in a fresh session with the
-    'previous session ended abruptly' note."""
+    def _start_run(self, m: Path, runs: Path):
+        rc_box: list[int] = []
+        t = threading.Thread(
+            target=lambda: rc_box.append(run_manifest(m, runs)),
+            daemon=True)
+        t.start()
+        return t, rc_box
 
-    def _wait_status(self, run_dir: Path, step: str, want: str,
-                     timeout: float = 10.0) -> dict:
+    def _wait_run_dir(self, runs: Path, step: str,
+                      timeout: float = 10.0) -> Path:
+        """The run dir once `step` shows 'running' in state.json."""
         t0 = time.time()
         while time.time() - t0 < timeout:
-            st = json.loads((run_dir / "state.json").read_text())
-            rec = (st.get("steps") or {}).get(step) or {}
-            if rec.get("status") == want:
-                return st
+            dirs = [d for d in runs.glob("*/state.json")] \
+                if runs.exists() else []
+            for d in dirs:
+                st = json.loads(d.read_text())
+                if (st.get("steps") or {}).get(step, {}).get(
+                        "status") == "running":
+                    return d.parent
             time.sleep(0.05)
-        self.fail(f"{step} never reached {want}: "
-                  f"{(st.get('steps') or {}).keys()}")
+        self.fail(f"{step} never reached running")
 
-    def test_pause_mid_step_halts_regardless_of_on_failure(self):
-        """on_failure='continue' must NOT advance past a pause: s1 is
-        tree-killed -> 'stopped', s2/s3 never launch -> 'skipped', and
-        the run records aborted='paused'."""
+
+class PauseRunTests(_RunControlBase):
+    """Run-level controls - 'Pause run' is a GRACEFUL hold: in-flight
+    steps finish, nothing new launches, the run records aborted='paused'
+    (the deliberate machine-restart case). 'Stop run now' is the hard
+    variant: live steps are tree-killed, aborted='stopped'. Both resume."""
+
+    def test_pause_lets_inflight_finish_then_holds(self):
+        """Pause mid-run: s1 completes -> 'done', s2/s3 never launch ->
+        'skipped', aborted='paused' - even under on_failure='continue'."""
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             proj = make_project(base)
@@ -2758,7 +2771,7 @@ class PauseRunTests(unittest.TestCase):
 [[step]]
 name = "s1"
 project = "{proj.as_posix()}"
-prompt = "sleep=30 then work"
+prompt = "sleep=3 then work"
 
 [[step]]
 name = "s2"
@@ -2770,38 +2783,21 @@ name = "s3"
 project = "{proj.as_posix()}"
 prompt = "third"
 ''', 'on_failure = "continue"\n')
-            rc_box: list[int] = []
-            t = threading.Thread(
-                target=lambda: rc_box.append(run_manifest(m, runs)),
-                daemon=True)
-            t.start()
-            run_dir = None
-            t0 = time.time()
-            while time.time() - t0 < 10:
-                dirs = [d for d in runs.glob("*/state.json")] \
-                    if runs.exists() else []
-                if dirs:
-                    run_dir = dirs[0].parent
-                    st = json.loads(dirs[0].read_text())
-                    if (st.get("steps") or {}).get("s1", {}).get(
-                            "status") == "running":
-                        break
-                time.sleep(0.05)
-            self.assertIsNotNone(run_dir, "run never started")
+            t, _rc = self._start_run(m, runs)
+            run_dir = self._wait_run_dir(runs, "s1")
             out = conductor.stop_run(run_dir.name, {"pause": True}, runs)
-            self.assertTrue(out["paused"])
-            self.assertIn("s1", out["stopping"])
+            self.assertEqual(out["pausing"], ["s1"])
             t.join(timeout=30)
             st = json.loads((run_dir / "state.json").read_text())
             self.assertEqual(st.get("aborted"), "paused")
-            self.assertEqual(st["steps"]["s1"]["status"], "stopped")
+            self.assertEqual(st["steps"]["s1"]["status"], "done")
             self.assertEqual(st["steps"]["s2"]["status"], "skipped")
             self.assertEqual(st["steps"]["s3"]["status"], "skipped")
             self.assertTrue(st.get("ended_at"))
 
     def test_pause_then_resume_finishes_the_run(self):
-        """A paused run resumes: the interrupted step re-runs (with the
-        abrupt-ending note in its prompt) and queued steps proceed."""
+        """A paused run resumes: the held steps launch in fresh sessions
+        (skipped is not an interruption - no abrupt-ending note)."""
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             proj = make_project(base)
@@ -2810,47 +2806,31 @@ prompt = "third"
 [[step]]
 name = "s1"
 project = "{proj.as_posix()}"
-prompt = "sleep=30 then work"
+prompt = "sleep=3 then work"
 
 [[step]]
 name = "s2"
 project = "{proj.as_posix()}"
 prompt = "second"
 ''')
-            rc_box: list[int] = []
-            t = threading.Thread(
-                target=lambda: rc_box.append(run_manifest(m, runs)),
-                daemon=True)
-            t.start()
-            run_dir = None
-            t0 = time.time()
-            while time.time() - t0 < 10:
-                dirs = [d for d in runs.glob("*/state.json")] \
-                    if runs.exists() else []
-                if dirs:
-                    run_dir = dirs[0].parent
-                    st = json.loads(dirs[0].read_text())
-                    if (st.get("steps") or {}).get("s1", {}).get(
-                            "status") == "running":
-                        break
-                time.sleep(0.05)
+            t, _rc = self._start_run(m, runs)
+            run_dir = self._wait_run_dir(runs, "s1")
             conductor.stop_run(run_dir.name, {"pause": True}, runs)
             t.join(timeout=30)
-            # --resume: s1 re-runs (its prompt carries the interruption
-            # note), s2 proceeds, run ends clean.
+            st = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(st["steps"]["s1"]["status"], "done")
+            self.assertEqual(st["steps"]["s2"]["status"], "skipped")
+            # --resume: s2 proceeds, run ends clean.
             rc = run_manifest(m, runs, resume=str(run_dir))
             self.assertEqual(rc, 0)
             st = json.loads((run_dir / "state.json").read_text())
             self.assertEqual(st["steps"]["s1"]["status"], "done")
             self.assertEqual(st["steps"]["s2"]["status"], "done")
             # resume drops the stale 'aborted'/'ended_at' from the pause -
-            # the dashboard would otherwise keep showing 'Paused by user'
-            # on a finished run.
+            # the dashboard would otherwise keep showing the 'Paused'
+            # notice on a finished run.
             self.assertNotIn("aborted", st)
             self.assertIn("ended_at", st)
-            prompt = (run_dir / "prompts" / "s1.md").read_text(
-                encoding="utf-8")
-            self.assertIn("previous session attempt", prompt)
 
     def test_pause_before_launch_skips_everything(self):
         """Pause landing before the first wave: no worker ever spawns."""
@@ -2876,8 +2856,7 @@ prompt = "work"
 
             with mock.patch.object(conductor, "new_run_dir",
                                    side_effect=_fixed_run_dir):
-                for f in conductor.pause_flags_for(fixed, {}) + \
-                        conductor.stop_flags_for(fixed, {}):
+                for f in conductor.pause_flags_for(fixed, {}):
                     conductor._flag_raise(f.name)
                 rc = run_manifest(m, runs)
             self.assertEqual(rc, 1)
@@ -2886,9 +2865,48 @@ prompt = "work"
             self.assertEqual(st["steps"]["s1"]["status"], "skipped")
             self.assertFalse(list(fixed.glob("*.stdout.log")))
 
+    def test_stop_run_now_kills_then_resumes(self):
+        """'Stop run now' is the hard stop: s1 dies mid-sleep -> 'stopped',
+        s2 -> 'skipped', aborted='stopped'. Resume re-runs the stopped
+        step with the abrupt-ending note and finishes the run."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "sleep=30 then work"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "second"
+''')
+            t, _rc = self._start_run(m, runs)
+            run_dir = self._wait_run_dir(runs, "s1")
+            out = conductor.stop_run(run_dir.name, {}, runs)
+            self.assertEqual(out["stopping"], ["s1"])
+            t.join(timeout=30)
+            st = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(st.get("aborted"), "stopped")
+            self.assertEqual(st["steps"]["s1"]["status"], "stopped")
+            self.assertEqual(st["steps"]["s2"]["status"], "skipped")
+            rc = run_manifest(m, runs, resume=str(run_dir))
+            self.assertEqual(rc, 0)
+            st = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(st["steps"]["s1"]["status"], "done")
+            self.assertEqual(st["steps"]["s2"]["status"], "done")
+            prompt = (run_dir / "prompts" / "s1.md").read_text(
+                encoding="utf-8")
+            self.assertIn("previous session attempt", prompt)
+
     def test_stop_run_dual_writes_legacy_flag_names(self):
         """A run launched by OLD code (no state['flags']='v2' marker)
-        polls bare-name sentinels - a new dashboard must write both."""
+        polls bare-name sentinels - a new dashboard must write both.
+        Pause also raises drain flags: that is the graceful-hold shape
+        an old-code driver understands."""
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             runs = base / "runs"
@@ -2897,21 +2915,262 @@ prompt = "work"
             (d / "state.json").write_text(json.dumps(
                 {"run": "t", "steps": {}}))
             conductor.stop_run(d.name, {"pause": True}, runs)
-            legacy = conductor._flag_dir() / f"stop-{d.name}"
-            self.assertTrue(legacy.is_file(),
-                            "legacy bare-name flag not written")
+            self.assertTrue(conductor.pause_flag(d).is_file())
             self.assertTrue(
-                (conductor._flag_dir() / f"pause-{d.name}").is_file())
-            self.assertTrue(conductor.stop_flag(d).is_file())
+                (conductor._flag_dir() / f"pause-{d.name}").is_file(),
+                "legacy bare-name pause flag not written")
+            self.assertTrue(conductor.drain_flag(d).is_file(),
+                            "old drivers halt gracefully on drain")
+            self.assertFalse(conductor.stop_flag(d).is_file(),
+                             "graceful pause must not raise a stop flag")
             conductor.clear_run_flags(d)
-            self.assertFalse(legacy.exists())
+            self.assertFalse(conductor.pause_flag(d).exists())
+            self.assertFalse(conductor.drain_flag(d).exists())
             # a v2 run writes ONLY the path-keyed name
+            legacy = conductor._flag_dir() / f"stop-{d.name}"
             (d / "state.json").write_text(json.dumps(
                 {"run": "t", "flags": "v2", "steps": {}}))
             conductor.stop_run(d.name, {}, runs)
             self.assertFalse(legacy.exists())
             self.assertTrue(conductor.stop_flag(d).is_file())
             conductor.clear_run_flags(d)
+            self.assertFalse(conductor.stop_flag(d).exists())
+
+
+class StepControlTests(_RunControlBase):
+    """Step-level controls - 'Stop this step' ends one task while the run
+    proceeds; 'Skip step' marks a pending step so it never launches
+    (durable across resume); 'Unskip step' puts it back."""
+
+    def test_stop_this_step_lets_the_run_proceed(self):
+        """A per-step stop is a veto on ONE task, not a failure: even
+        under on_failure='stop' the run proceeds to the next step."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "sleep=30 then work"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "second"
+
+[[step]]
+name = "s3"
+project = "{proj.as_posix()}"
+prompt = "third"
+''')
+            t, _rc = self._start_run(m, runs)
+            run_dir = self._wait_run_dir(runs, "s1")
+            # stop_step kills by recorded pid - wait for it to land.
+            t0 = time.time()
+            while time.time() - t0 < 10:
+                st = json.loads((run_dir / "state.json").read_text())
+                if (st.get("steps") or {}).get("s1", {}).get("pid"):
+                    break
+                time.sleep(0.05)
+            out = conductor.stop_step(run_dir.name, "s1", runs)
+            self.assertEqual(out["stopping"], "s1")
+            t.join(timeout=30)
+            st = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(st["steps"]["s1"]["status"], "stopped")
+            self.assertEqual(st["steps"]["s2"]["status"], "done")
+            self.assertEqual(st["steps"]["s3"]["status"], "done")
+            self.assertNotIn("aborted", st)
+
+    def test_skip_pending_step_keeps_queue_position(self):
+        """Skip on a not-yet-spawned step: it records 'skipped' when its
+        turn comes while the rest of the run proceeds in order."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "sleep=3 then work"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "second"
+
+[[step]]
+name = "s3"
+project = "{proj.as_posix()}"
+prompt = "third"
+''')
+            t, _rc = self._start_run(m, runs)
+            run_dir = self._wait_run_dir(runs, "s1")
+            out = conductor.skip_step(run_dir.name, "s2",
+                                      {"skip": True}, runs)
+            self.assertEqual(out["skipped"], "s2")
+            t.join(timeout=30)
+            st = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(st["steps"]["s1"]["status"], "done")
+            self.assertEqual(st["steps"]["s2"]["status"], "skipped")
+            self.assertIn("skipped by user",
+                          st["steps"]["s2"].get("note") or "")
+            self.assertEqual(st["steps"]["s3"]["status"], "done")
+            self.assertNotIn("aborted", st)
+            self.assertTrue(
+                conductor.skip_flag(run_dir, "s2").is_file())
+            conductor.skip_flag(run_dir, "s2").unlink(missing_ok=True)
+
+    def test_skip_survives_resume_until_unskipped(self):
+        """The skip mark is durable: a plain --resume keeps the step
+        skipped (clear_run_flags leaves it); only Unskip restores it,
+        and the restored step re-runs on the next resume."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "sleep=3 then work"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "second"
+''')
+            t, _rc = self._start_run(m, runs)
+            run_dir = self._wait_run_dir(runs, "s1")
+            conductor.skip_step(run_dir.name, "s2", {"skip": True}, runs)
+            t.join(timeout=30)
+            st = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(st["steps"]["s2"]["status"], "skipped")
+            # resume WITHOUT unskipping: s2 is skipped again, not run.
+            rc = run_manifest(m, runs, resume=str(run_dir))
+            self.assertEqual(rc, 1)
+            st = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(st["steps"]["s2"]["status"], "skipped")
+            # Unskip: the flag lifts; the next resume runs it in place.
+            out = conductor.skip_step(run_dir.name, "s2",
+                                      {"skip": False}, runs)
+            self.assertTrue(out["turn_passed"])
+            self.assertFalse(
+                conductor.skip_flag(run_dir, "s2").exists())
+            rc = run_manifest(m, runs, resume=str(run_dir))
+            self.assertEqual(rc, 0)
+            st = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(st["steps"]["s2"]["status"], "done")
+
+    def test_skip_endpoint_validation(self):
+        """Skip only works on steps that have not launched: a running
+        step wants 'Stop this step' instead; a finished step is 409;
+        a name the run does not know is 404."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "work"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "two"
+''')
+            d = runs / "20260101-000000-t"
+            d.mkdir(parents=True)
+            (d / "state.json").write_text(json.dumps({
+                "run": "t", "manifest": str(m), "ended_at": "x",
+                "steps": {
+                    "s1": {"name": "s1", "status": "done"},
+                    "s2": {"name": "s2", "status": "running"}}}),
+                encoding="utf-8")
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.skip_step(d.name, "s1", {"skip": True}, runs)
+            self.assertEqual(e.exception.status, 409)
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.skip_step(d.name, "s2", {"skip": True}, runs)
+            self.assertEqual(e.exception.status, 409)
+            self.assertIn("Stop this step", str(e.exception))
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.skip_step(d.name, "nope", {"skip": True}, runs)
+            self.assertEqual(e.exception.status, 404)
+
+    def test_dashboard_shows_manifest_pending_and_skip_mark(self):
+        """CLI-launched runs show declared-but-unlaunched steps as
+        'waiting' (live) / 'skipped' (ended); a Skip mark forces
+        'skipped' with skipped_by_user so the modal offers Unskip."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "first"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "second"
+
+[[step]]
+name = "s3"
+project = "{proj.as_posix()}"
+prompt = "third"
+''')
+            d = runs / "20260101-000000-t"
+            d.mkdir(parents=True)
+            live_state = {"run": "t", "manifest": str(m),
+                          "started_at": "2026-01-01T00:00:00",
+                          "steps": {"s1": {"name": "s1",
+                                           "status": "done"}}}
+            (d / "state.json").write_text(
+                json.dumps(live_state), encoding="utf-8")
+            conductor._flag_raise(conductor.skip_flag(d, "s3").name)
+            try:
+                with mock.patch.object(conductor, "refresh_prices"):
+                    dash = conductor.collect_dashboard(
+                        runs, ["no-such-devin"],
+                        requests_dir=base / "requests")
+                by_step = {a["step"]: a for a in dash["agents"]}
+                self.assertEqual(by_step["s2"]["status"], "waiting")
+                self.assertFalse(by_step["s2"].get("skipped_by_user"))
+                self.assertEqual(by_step["s3"]["status"], "skipped")
+                self.assertTrue(by_step["s3"]["skipped_by_user"])
+                self.assertEqual(dash["runs"][0]["counts"],
+                                 {"done": 1, "waiting": 1, "skipped": 1})
+                # ended run: pending rows render 'skipped'
+                live_state["ended_at"] = "2026-01-01T01:00:00"
+                (d / "state.json").write_text(
+                    json.dumps(live_state), encoding="utf-8")
+                with mock.patch.object(conductor, "refresh_prices"):
+                    dash = conductor.collect_dashboard(
+                        runs, ["no-such-devin"],
+                        requests_dir=base / "requests")
+                by_step = {a["step"]: a for a in dash["agents"]}
+                self.assertEqual(by_step["s2"]["status"], "skipped")
+                self.assertFalse(by_step["s2"].get("skipped_by_user"))
+            finally:
+                conductor.skip_flag(d, "s3").unlink(missing_ok=True)
+
+    def test_control_names_in_dashboard_html(self):
+        """One name per action: Pause run / Stop run now / Resume
+        unfinished steps / Stop this step / Skip step / Unskip step.
+        The merged-away names are gone."""
+        html = conductor._DASH_HTML
+        for name in ("Pause run", "Stop run now", "Resume unfinished",
+                     "Stop this step", "Skip step", "Unskip step"):
+            self.assertIn(name, html)
+        self.assertNotIn("Drain &amp; stop", html)
+        self.assertNotIn("Stop this agent", html)
 
 
 if __name__ == "__main__":
