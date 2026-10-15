@@ -35,6 +35,11 @@ model = "swe"          # cheap model for grind phases; use "opus"/"gpt" for plan
                        # fails loudly at spawn. Column on the dashboard.
 mode = "bypass"        # unattended: no human to answer prompts
 timeout_min = 60
+# max_attempts = 3     # a step hitting timeout_min is committed as-is, then
+                       # retried in a FRESH session (a "continue from committed
+                       # state" note is prepended to its prompt) up to this
+                       # many attempts total - an underestimated timeout keeps
+                       # going instead of ending the step. Default: 1.
 
 [[step]]
 name = "next-queue-task"

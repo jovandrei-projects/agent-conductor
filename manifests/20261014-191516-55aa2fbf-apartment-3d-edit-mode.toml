@@ -1,0 +1,56 @@
+[run]
+name = "apartment-3d-views-editmode"
+description = "Fix camera modes and geometry, declutter props, and add a full edit mode with saving, versioning, and avatar options in apartment-3d, then port to mobile."
+on_failure = "stop"
+checkpoint = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 180
+
+[[step]]
+name = "camera-views"
+project = "apartment-3d"
+prompt = '''Improve camera/view modes in the apartment-3d project. (1) In bird's-eye mode, pressing and dragging the middle mouse button (the scroll wheel) must pan the view around. (2) Add a new view mode: a true top-down bird's view with the camera perfectly perpendicular to the floor plane, looking straight down so the apartment reads like a 2D floor plan and only the top of the avatar's head is visible; wire it into the existing view switcher under an appropriate name. Keep all existing view modes working.'''
+
+[[step]]
+name = "camera-follow-fixes"
+project = "apartment-3d"
+prompt = '''Fix the follow cameras in the apartment-3d project. (1) The first-person POV camera currently keeps facing a fixed world direction while moving; it must rotate with the avatar so turning left or right rotates the view accordingly. (2) The third-person camera is quirky: when rotating, the character feels unstable and all over the place — stabilize the follow and rotation logic, and since walls already become transparent when the avatar is behind a wall relative to the camera, consider a smoother collision-aware camera movement style for that situation. Verify by walking and turning through the apartment in both modes.'''
+
+[[step]]
+name = "geometry-accuracy"
+project = "apartment-3d"
+prompt = '''Correct the apartment geometry in the apartment-3d project against the source reference and new user photos. (1) The black spots in the source reference floor plan are pillars and places with artistic wall layering — model and render all of them correctly. (2) Study the annotated image at 'C:/Users/andry/Downloads/annotely_images2/annotely/page_3.png' together with the unannotated photos in 'C:/Users/andry/Downloads/annotely_images2/annotely': the bathroom wall is not perfectly continuous (it bumps out slightly, less than the exaggeration in the annotation), and the wall on the side of the kitchen is continuous and ends in a door that connects to the pantry — update the model to match. (3) Check and fix the kitchen cabinets above the sink and the oven, and add the ceiling light in the kitchen.'''
+
+[[step]]
+name = "declutter-and-prop-fixes"
+project = "apartment-3d"
+prompt = '''Clean up and correct props in the apartment-3d project. Remove all random or improperly rendered clutter: unidentifiable objects, objects with nonsensical textures, objects intersecting or perforating walls in the living room, and misaligned items. Remove the white pillow from the brown couch (the brown couch itself stays). Keep exactly one roborock on the floor — remove the second white circle in the living room. Clear the coffee table except for a couple of stacked books. Remove the wine bottles and random items where the sink should be. Keep the stock items: fridge, dishwasher, washer and dryer, clothes hanger with clothes, cabinets, and microwave. Make the kitchen island smaller and on wheels, with only knives on top. Fix the wheels on the green chair model. Render the computer desktop as one tidy unit including the monitors, and fix the monitor arm so there is no floating invisible arm. Audit every remaining prop for realism and add a few sensible new props such as plants.'''
+
+[[step]]
+name = "edit-mode-placement"
+project = "apartment-3d"
+prompt = '''Add an 'edit mode' to the apartment-3d project for placing items in the world. Users can drag and drop items (e.g. the green chair or a red couch) into the apartment; provide rotation and alignment tools including a grid and a rotate control. Enforce collision so objects cannot perforate walls but can be pushed flush against them. Furniture dropped into the world must settle onto the floor (no floating couches), while wall items such as paintings must stick to walls. Make the existing extra items in the apartment editable and removable through this mode.'''
+
+[[step]]
+name = "edit-mode-stacking-grouping"
+project = "apartment-3d"
+prompt = '''Extend edit mode in the apartment-3d project: support placing items on top of other items (e.g. a lamp on a nightstand next to the bed), grouping placed items so they can be dragged and moved together, and per-instance resizing so scaling one instance does not change the shared model or other instances. Also offer pre-grouped bundles in the catalog (e.g. a nightstand with a lamp already centered on it) so users do not have to align pieces manually.'''
+
+[[step]]
+name = "edit-mode-ui-catalog"
+project = "apartment-3d"
+prompt = '''Build the edit-mode UI for the apartment-3d project so the whole interface feels like a game. Include panels for a categorized drag-and-drop item catalog that is not limited to items currently in the apartment (expand the list of possibilities), and a panel for editing an object before dropping it into the world — adjusting width, height and depth, and saving modified objects under new names. In the models gallery, label dynamic and interactive items such as the roborock, lamps, the TV, and chairs that can be sat in. Add selectable floor types with different colors or patterns. Add custom texture support for items like paintings, letting the user upload an image to use as the texture instead of the current inferred texture.'''
+
+[[step]]
+name = "save-versioning-avatars"
+project = "apartment-3d"
+prompt = '''Add persistence, versioning, and avatar customization to the apartment-3d project. Add a global save button that serializes the world layout so the saved version can be loaded next time the world is rendered. Support named versions of the apartment layout (e.g. one version with the bed against the wall, another with it facing the window) with a version list/browser for switching between them, and include a version containing the app's own suggested furniture placement. Architect the versioning so other spaces besides the apartment can be added later. Add the ability to choose between different avatar models and edit appearance such as hair color — a separate screen is acceptable.'''
+
+[[step]]
+name = "mobile-port"
+project = "mobile-apps"
+prompt = '''Implement the full apartment experience in the mobile version, adapted to touch controls and mobile UI patterns: all camera modes (a pan gesture equivalent to the middle-button pan in bird's-eye mode, the perpendicular top-down 2D view, the fixed POV follow camera, and the stabilized third-person camera), the corrected apartment geometry, the decluttered and corrected prop set, edit mode (drag-and-drop placement, rotate and align tools, wall collision, floor and wall snapping, stacking on top of items, grouping, and per-instance resizing), the editing UI panels and categorized catalog, texture upload for items like paintings, floor type options, save/load with named layout versions, and avatar model selection with appearance editing. Reuse shared assets and data formats from the apartment-3d implementation where possible.'''

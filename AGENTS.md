@@ -79,6 +79,17 @@ hub.db row, `--no-keep-awake` allow system sleep (runs request
 `SetThreadExecutionState` by default so overnight work survives),
 `--max-parallel N` concurrency cap (overrides `run.max_parallel`).
 
+Retries: `max_attempts = N` (per step or `[defaults]`, 1-10, default 1)
+re-runs a step that hits `timeout_min` in a FRESH session - each attempt's
+work is committed before the next spawns and the retry prompt is prepended
+a "continue from committed state" note, so an underestimated timeout
+continues instead of ending the step. Attempts get their own
+`prompts/*.attemptN.md`, `*.attemptN.stdout.log`, `*.attemptN.export.json`;
+`elapsed_s` covers all attempts, `attempts`/`session_ids` land in the rec
+(every attempt's session joins the whitelist, not just the last). Retries
+fire on `timed_out` only - a post-STATUS hang (trap 12) already counts as
+turn end, and `failed`/`blocked` stay terminal.
+
 Concurrency: `run.max_parallel` caps how many agents run at once across the
 whole run; wave members beyond the cap wait in a queue (marked `queued` in
 state). Default is conservative: ~1 agent per 4 logical cores, max 4 -
@@ -117,11 +128,16 @@ UI-generated `<YYYYMMDD-HHMMSS>-<random>-<run>.toml`, flat; see its README);
 (shlex-split; use forward slashes or quotes - posix shlex eats unquoted
 backslashes). The :8773 dashboard's New request saves raw drafts in ignored
 `data/requests/`, generates/validates a reviewable TOML with a planning-only
-Devin CLI session, and shows its steps as `planned`. Saving or generating NEVER
+Devin CLI session, and shows its steps as `planned`. The planner's own stdout
+streams to `data/requests/<id>.gen.log` (outside its tempdir cwd, so trap-5
+safe) and appears live as a `plan-proposal` agent row while generating. Saving or generating NEVER
 launches implementation: only the separate Start run button does. Editing
 request/model after generation marks the plan stale; regenerate or edit+save
-TOML before launching. Discard removes only an unrun, app-owned proposal and
-its planned rows. Real runs still use `state.json` as their registry.
+TOML before launching. The form's follow-up checkbox asks the planner for a
+closing `follow-up-plan` step that drafts `<run>-followup.toml` into
+`manifests/` for review; if the planner omits it, `_publish_proposal`
+appends the step itself. Discard removes only an unrun, app-owned proposal
+and its planned rows. Real runs still use `state.json` as their registry.
 
 Requires `devin` on PATH and `devin auth login` to have been run once
 (`devin auth status` is checked at run start; conductor aborts cleanly if

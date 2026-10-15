@@ -104,6 +104,28 @@ STATUS: done | partial | blocked
 NEXT: <one line - what the next session should do first>
 """
 
+# Prepended to the task body on retry attempts (max_attempts > 1): the
+# previous session hit timeout_min, its work was committed, and this fresh
+# session must continue from that state instead of starting over.
+RETRY_NOTE = """\
+NOTE FROM THE CONDUCTOR: a previous session attempt at this same step hit \
+its {timeout:g}-minute limit and was stopped (attempt {prev} of {total}). \
+Its work is already committed in this repo - do NOT redo it. Read the \
+recent git log and .agent_tasks state, then CONTINUE from where it stopped.
+"""
+
+# Closing review step appended when a request's follow-up checkbox is set -
+# the planner is told to write it, and _publish_proposal appends this block
+# itself when the planner forgot, so the checkbox is a guarantee.
+FOLLOWUP_STEP = '''
+
+[[step]]
+name = "follow-up-plan"
+project = "{slug}"
+timeout_min = 30
+prompt = 'This run just ended. Review what it accomplished against the request it ran from: per-step logs, STATUS/NEXT lines and notes are under {runs} (the newest dir ending in -{run}), and progress files live under this project .agent_tasks/. Then write a NEW conductor TOML manifest proposing ONLY the still-unfinished or newly discovered work, saved as {manifests}/{run}-followup.toml. Do not implement or launch that manifest - a human reviews it first.'
+'''
+
 RESOLVE_BODY = """\
 <!-- conductor-purpose: resolve-merge -->
 A git merge is in progress in this repo and needs a human-style
@@ -153,6 +175,9 @@ class Step:
                                        # session in the main checkout to
                                        # finish the merge instead of only
                                        # parking the worktree for a human
+    max_attempts: int = 1              # a step hitting timeout_min is committed
+                                       # and retried in a fresh session until
+                                       # this many total attempts ran
 
 
 @dataclasses.dataclass
@@ -211,6 +236,13 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
         mr = merged.get("merge_resolver")
         if mr is None:
             mr = run.get("merge_resolver", False)
+        try:
+            ma = int(merged.get("max_attempts", 1))
+        except (TypeError, ValueError):
+            ma = 0
+        if not 1 <= ma <= 10:
+            raise ManifestError(
+                f"step {merged['name']!r}: max_attempts must be 1-10")
         steps.append(Step(
             name=merged["name"], project=merged["project"],
             prompt=merged.get("prompt"),
@@ -223,7 +255,7 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
             wave=merged.get("wave"),
             worktree=bool(merged.get("worktree", False)),
             effort=merged.get("effort") or None,
-            merge_resolver=bool(mr)))
+            merge_resolver=bool(mr), max_attempts=ma))
     if not steps:
         raise ManifestError("manifest has no [[step]] entries")
     max_parallel = run.get("max_parallel")
@@ -848,6 +880,11 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     status/started_at are set while it queues, pid once the child process
     exists, and ended_at/elapsed_s/session_id when it finishes. The dashboard
     reads exactly this.
+
+    A step that hits timeout_min is committed as-is and retried in a fresh
+    session (up to max_attempts total) with a "continue from committed
+    state" note prepended - an underestimated timeout continues instead of
+    dying. Each attempt gets its own prompt/stdout/export artifacts.
     """
     prompt_path = run_dir / "prompts" / f"{step.name}.md"
     prompt_path.parent.mkdir(exist_ok=True)
@@ -887,55 +924,98 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         git_commit(work_dir, f"conductor: checkpoint before {step.name}",
                    allow_empty=True)
 
-    before = session_ids(devin_argv, work_dir) or set()
-    cmd = devin_cmd(devin_argv, step, prompt_path, export_path)
-    LOG.info("step %s: %s (cwd=%s)", step.name, " ".join(cmd), work_dir)
     t0 = time.time()
     timed_out = False
     hung = False
     rc: int | None = None
-    with open(stdout_log, "wb") as out:
-        try:
-            proc = subprocess.Popen(cmd, cwd=str(work_dir), stdout=out,
-                                    stderr=subprocess.STDOUT,
-                                    stdin=subprocess.DEVNULL,
-                                    env=clean_devin_env(),
-                                    **hidden_subprocess_kwargs())
-            # Writing state.json into run_dir mid-spawn lands inside the
-            # worker's watched workspace on self-hosted runs, and the
-            # CLI's user-edit awareness ends the fresh session mid-init
-            # (trap 5) - there the pid stays memory-only until the final
-            # save_state below. Anywhere else the write is invisible to
-            # the worker, so persist now: a live pid is what lets the
-            # dashboard and sweep tell 'running' from 'orphaned'.
-            with STATE_LOCK:
-                rec["pid"] = proc.pid
-                try:
-                    watched = run_dir.resolve().is_relative_to(
-                        Path(work_dir).resolve())
-                except OSError:
-                    watched = True
-                if not watched:
-                    save_state(run_dir, state)
-            threading.Thread(
-                target=_capture_session_id,
-                args=(rec, devin_argv, work_dir, before, state, run_dir,
-                      watched, proc),
-                daemon=True).start()
+    status_line = None
+    new_sessions: set[str] = set()
+    all_sessions: set[str] = set()
+    tok_acc: dict[str, int] = {}
+    attempt = 0
+    while True:
+        attempt += 1
+        if attempt > 1:
+            # The timed-out attempt's work was committed at the bottom of
+            # this loop; the retry is a fresh session pointed at that state.
+            # Per-attempt files keep every transcript and export.
+            prompt_path = run_dir / "prompts" / \
+                f"{step.name}.attempt{attempt}.md"
+            stdout_log = run_dir / f"{step.name}.attempt{attempt}.stdout.log"
+            export_path = run_dir / f"{step.name}.attempt{attempt}.export.json"
+            retry_step = dataclasses.replace(
+                step, prompt=RETRY_NOTE.format(
+                    timeout=step.timeout_min, prev=attempt - 1,
+                    total=step.max_attempts) + "\n" + (body_src or ""))
+            prompt_path.write_text(
+                render_prompt(retry_step, slug, work_dir, cfg.path.parent,
+                              cfg.preamble), encoding="utf-8")
+            log_event(run_dir, event="step_retry", step=step.name,
+                      attempt=attempt)
+
+        before = session_ids(devin_argv, work_dir) or set()
+        cmd = devin_cmd(devin_argv, step, prompt_path, export_path)
+        LOG.info("step %s attempt %d/%d: %s (cwd=%s)", step.name, attempt,
+                 step.max_attempts, " ".join(cmd), work_dir)
+        timed_out = hung = False
+        rc = None
+        spawn_failed = False
+        with open(stdout_log, "wb") as out:
             try:
-                rc, timed_out, hung = wait_worker(
-                    proc, stdout_log, step.timeout_min * 60)
-            except subprocess.TimeoutExpired:      # unreachable; safety
-                kill_tree(proc)
-                proc.wait()
-                timed_out = True
-        except OSError as exc:
-            LOG.error("step %s spawn failed: %s", step.name, exc)
-            log_event(run_dir, event="spawn_error", step=step.name, error=str(exc))
+                proc = subprocess.Popen(cmd, cwd=str(work_dir), stdout=out,
+                                        stderr=subprocess.STDOUT,
+                                        stdin=subprocess.DEVNULL,
+                                        env=clean_devin_env(),
+                                        **hidden_subprocess_kwargs())
+                # Writing state.json into run_dir mid-spawn lands inside the
+                # worker's watched workspace on self-hosted runs, and the
+                # CLI's user-edit awareness ends the fresh session mid-init
+                # (trap 5) - there the pid stays memory-only until the final
+                # save_state below. Anywhere else the write is invisible to
+                # the worker, so persist now: a live pid is what lets the
+                # dashboard and sweep tell 'running' from 'orphaned'.
+                with STATE_LOCK:
+                    rec["pid"] = proc.pid
+                    rec["attempts"] = attempt
+                    try:
+                        watched = run_dir.resolve().is_relative_to(
+                            Path(work_dir).resolve())
+                    except OSError:
+                        watched = True
+                    if not watched:
+                        save_state(run_dir, state)
+                threading.Thread(
+                    target=_capture_session_id,
+                    args=(rec, devin_argv, work_dir, before, state, run_dir,
+                          watched, proc),
+                    daemon=True).start()
+                try:
+                    rc, timed_out, hung = wait_worker(
+                        proc, stdout_log, step.timeout_min * 60)
+                except subprocess.TimeoutExpired:      # unreachable; safety
+                    kill_tree(proc)
+                    proc.wait()
+                    timed_out = True
+            except OSError as exc:
+                LOG.error("step %s spawn failed: %s", step.name, exc)
+                log_event(run_dir, event="spawn_error", step=step.name,
+                          error=str(exc))
+                spawn_failed = True
+
+        new_sessions = (session_ids(devin_argv, work_dir) or set()) - before
+        all_sessions |= new_sessions
+        status_line = tail_status(stdout_log)
+        for k, v in (tail_metrics(export_path) or {}).items():
+            tok_acc[k] = tok_acc.get(k, 0) + int(v)
+        # Commit each attempt's product BEFORE deciding to retry - the next
+        # session resumes from committed state, not the working tree.
+        if post_commit and cfg.checkpoint and is_git_repo(work_dir) \
+                and git_dirty(work_dir):
+            git_commit(work_dir, f"conductor: work from {step.name}")
+        if spawn_failed or not timed_out or attempt >= step.max_attempts:
+            break
     elapsed = round(time.time() - t0, 1)
 
-    new_sessions = (session_ids(devin_argv, work_dir) or set()) - before
-    status_line = tail_status(stdout_log)
     verify_ok = None
     if step.verify and not timed_out:
         v = subprocess.run(step.verify, cwd=str(work_dir), shell=True,
@@ -946,10 +1026,6 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         (run_dir / f"{step.name}.verify.log").write_text(
             (v.stdout or "") + (v.stderr or ""), encoding="utf-8",
             errors="replace")
-
-    if post_commit and cfg.checkpoint and is_git_repo(work_dir) \
-            and git_dirty(work_dir):
-        git_commit(work_dir, f"conductor: work from {step.name}")
 
     if timed_out:
         status = "timed_out"
@@ -969,21 +1045,33 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     with STATE_LOCK:
         rec["session_id"] = (sorted(new_sessions)[-1] if new_sessions
                              else tail_session_ref(stdout_log))
+        if all_sessions:
+            rec["session_ids"] = sorted(all_sessions)
         rec["exit_code"] = rc
         rec["elapsed_s"] = elapsed
+        rec["attempts"] = attempt
+        notes = []
+        if attempt > 1:
+            notes.append(f"retried after timeout: {attempt} attempts total, "
+                         "each attempt's work committed before the next")
         if status_line is None and rc == 0:
-            rec["note"] = ("worker exited 0 without a STATUS line "
-                           "(no-op run - nothing was done)")
+            notes.append("worker exited 0 without a STATUS line "
+                         "(no-op run - nothing was done)")
         if hung:
-            rec["note"] = ("STATUS printed but the CLI stayed alive on a "
-                           "spawned child (trap 12); tree-killed after "
-                           "grace - counted as turn end")
+            notes.append("STATUS printed but the CLI stayed alive on a "
+                         "spawned child (trap 12); tree-killed after "
+                         "grace - counted as turn end")
+        if notes:
+            rec["note"] = "; ".join(notes)
         rec.update(status=status, ended_at=now_iso(), status_line=status_line,
                    verify_ok=verify_ok, next=tail_next(stdout_log),
-                   tokens=tail_metrics(export_path))
+                   tokens=tok_acc or None,
+                   prompt=str(prompt_path), stdout_log=str(stdout_log),
+                   export=str(export_path))
         save_state(run_dir, state)
     log_event(run_dir, event="step_end", step=step.name, status=status,
-              exit_code=rc, elapsed_s=elapsed, session=rec.get("session_id"))
+              exit_code=rc, elapsed_s=elapsed, session=rec.get("session_id"),
+              attempts=attempt)
     return status
 
 
@@ -1410,8 +1498,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
         tags = cloud + (" [worktree]" if s.worktree else "") \
             + (f" [wave {s.wave}]" if s.wave is not None else "") \
             + (" [resolver]" if s.merge_resolver else "")
+        tries = f" x{s.max_attempts}" if s.max_attempts > 1 else ""
         print(f"  {s.name:<20} {slug:<22} model={s.model or '-':<10} "
-              f"mode={s.mode:<8} timeout={s.timeout_min:g}m{tags}")
+              f"mode={s.mode:<8} timeout={s.timeout_min:g}m{tries}{tags}")
         print(f"    verify: {s.verify or '-'}")
         print(f"    $ {' '.join(devin_cmd(shlex.split(args.devin or 'devin'), s, Path('<pf>'), Path('<exp>')))}")
     return 0
@@ -1594,15 +1683,16 @@ def collect_sessions(runs_dir: Path, devin_argv: list[str]) -> list[dict]:
         except (OSError, ValueError):
             continue
         for name, rec in (st.get("steps") or {}).items():
-            sid = rec.get("session_id")
-            if not sid or "/" in str(sid):
-                continue            # cloud URL refs aren't local sessions
-            spawned[str(sid)] = {
-                "run": st.get("run"), "step": name,
-                "status": rec.get("status"),
-                "ended": rec.get("ended_at") or st.get("ended_at"),
-                "run_ended": bool(st.get("ended_at")),
-                "work_dir": rec.get("work_dir") or rec.get("project")}
+            for sid in ([rec.get("session_id")]
+                        + list(rec.get("session_ids") or [])):
+                if not sid or "/" in str(sid):
+                    continue        # cloud URL refs aren't local sessions
+                spawned[str(sid)] = {
+                    "run": st.get("run"), "step": name,
+                    "status": rec.get("status"),
+                    "ended": rec.get("ended_at") or st.get("ended_at"),
+                    "run_ended": bool(st.get("ended_at")),
+                    "work_dir": rec.get("work_dir") or rec.get("project")}
     by_dir: dict[str, list[str]] = {}
     gone: list[str] = []
     for sid, info in spawned.items():
@@ -1729,7 +1819,8 @@ def _save_request(rec: dict, requests_dir: Path) -> None:
 
 def _request_fields(payload: dict, rec: dict | None = None) -> dict:
     if not isinstance(payload, dict) or set(payload) - {
-            "raw", "label", "project", "model", "effort", "manifest"}:
+            "raw", "label", "project", "model", "effort", "manifest",
+            "followup"}:
         raise RequestError("Invalid request fields")
     model, effort = default_model_effort()
     fields = {k: (rec or {}).get(k, v) for k, v in (
@@ -1740,6 +1831,11 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
             if not isinstance(payload[key], str):
                 raise RequestError(f"{key} must be text")
             fields[key] = payload[key].strip()
+    fields["followup"] = bool((rec or {}).get("followup"))
+    if "followup" in payload:
+        v = payload["followup"]
+        fields["followup"] = (v.strip().lower() in ("1", "true", "on", "yes")
+                              if isinstance(v, str) else bool(v))
     if not fields["raw"] or len(fields["raw"]) > 100_000:
         raise RequestError("Request text must be 1–100,000 characters")
     if len(fields["label"]) > 80:
@@ -1857,6 +1953,15 @@ def validate_proposal(text: str, manifests_dir: Path = MANIFESTS_DIR) -> Manifes
 def _publish_proposal(rec: dict, text: str, requests_dir: Path,
                       manifests_dir: Path, runs_dir: Path) -> dict:
     cfg = validate_proposal(text, manifests_dir)
+    if rec.get("followup") and not any(
+            s.name == "follow-up-plan" for s in cfg.steps):
+        # The planner was told to close with a review step but forgot -
+        # append it so the checkbox is a guarantee, not a hint.
+        slug = rec.get("project") or cfg.steps[-1].project
+        text = text.rstrip() + FOLLOWUP_STEP.format(
+            slug=slug, run=cfg.name, runs=RUNS_DIR.as_posix(),
+            manifests=MANIFESTS_DIR.as_posix())
+        cfg = validate_proposal(text, manifests_dir)
     if not manifests_dir.is_dir():
         raise RequestError(f"Missing manifests directory: {manifests_dir}", 409)
     _assert_unwatched(runs_dir, requests_dir, manifests_dir)
@@ -1889,7 +1994,7 @@ def save_request(request_id: str, payload: dict,
         rec["status"] = stage
         fields = _request_fields(payload, rec)
         changed = any(fields[k] != rec.get(k) for k in
-                      ("raw", "project", "model", "effort"))
+                      ("raw", "project", "model", "effort", "followup"))
         rec.update(fields)
         if "manifest" in payload:
             return _publish_proposal(rec, payload["manifest"],
@@ -1911,6 +2016,9 @@ def request_details(request_id: str, requests_dir: Path = REQUESTS_DIR,
                                     if p.is_file() else "")
         else:
             rec["manifest_text"] = ""
+        log = requests_dir / f"{request_id}.gen.log"
+        rec["gen_tail"] = (stdout_tail(str(log), 40)
+                           if log.is_file() else None)
         if runs_dir:
             status = _request_status(rec, runs_dir)
             if status == "error" and rec["status"] == "generating":
@@ -1920,8 +2028,28 @@ def request_details(request_id: str, requests_dir: Path = REQUESTS_DIR,
 
 
 def _planner_response(rec: dict, projects: dict,
-                      devin_argv: list[str]) -> str:
+                      devin_argv: list[str],
+                      log_path: Path | None = None,
+                      fix_note: str | None = None) -> str:
     slugs = ", ".join(sorted(projects))
+    fix = (f"A previous draft of this proposal failed TOML parsing: "
+           f"{fix_note}. Re-emit the full corrected TOML.\n\n"
+           if fix_note else "")
+    followup = ""
+    if rec.get("followup"):
+        followup = (
+            "The human also asked for a closing review step: append a final "
+            "sequential [[step]] named 'follow-up-plan' on the main project "
+            "slug, with a modest timeout_min. Its prompt must direct the "
+            "worker to review what this run accomplished against the human "
+            "request - per-step logs, STATUS/NEXT lines and notes will be "
+            f"under {RUNS_DIR.as_posix()} in the newest dir ending in your "
+            "run's name, alongside each project's .agent_tasks files - then "
+            "write a NEW conductor TOML manifest proposing only the "
+            "still-unfinished or newly discovered work, saved as "
+            f"'{MANIFESTS_DIR.as_posix()}/<your run name>-followup.toml' "
+            "using forward slashes. The step must NOT launch or implement "
+            "the follow-up - a human reviews it.\n\n")
     prompt = f"""You are writing a proposed agent-conductor TOML runbook, not doing the work.
 Do not edit files, invoke tools, run commands, inspect projects, or start a run.
 Reply with exactly one TOML document between BEGIN_MANIFEST and END_MANIFEST,
@@ -1933,6 +2061,8 @@ Preferred project (if supplied): {rec['project'] or '(infer from request)'}
 on_failure (stop or continue), and checkpoint = true.
 [defaults] needs model = {json.dumps(rec['model'])}, effort =
 {json.dumps(rec['effort'])}, mode = "bypass", and timeout_min.
+Set max_attempts = 3 in [defaults]: a step that underestimates its
+timeout_min is then continued by a fresh session instead of ending early.
 Each [[step]] needs a unique name, a registered project slug, and a concrete
 prompt describing only that step. Prefer sequential steps. If using waves on
 one project, every member needs worktree = true. Cloud steps require explicit
@@ -1941,8 +2071,11 @@ Do not guess verification commands; include verify only when known.
 Do not reproduce credentials or private data in the tracked manifest; refer
 agents to the project files containing those details instead.
 The proposal must NOT start work; the human will edit it and launch later.
-
-HUMAN REQUEST:
+Windows paths belong in TOML literal strings (single quotes) or use forward
+slashes - a backslash inside a double-quoted string is a TOML escape and
+breaks parsing.
+{followup}
+{fix}HUMAN REQUEST:
 {rec['raw']}
 
 BEGIN_MANIFEST
@@ -1954,12 +2087,12 @@ STATUS: done
             tempfile.TemporaryDirectory(prefix="conductor-planner-log-") as ld:
         prompt_path = Path(wd) / "request.md"
         prompt_path.write_text(prompt, encoding="utf-8")
-        log = Path(ld) / "planner.stdout.log"
+        log = log_path or Path(ld) / "planner.stdout.log"
         cmd = devin_argv + [
             "--print", "--prompt-file", str(prompt_path),
             "--model", f"{rec['model']}-{rec['effort']}",
             "--permission-mode", "normal", "--respect-workspace-trust", "false"]
-        with open(log, "wb") as out:
+        with open(log, "ab" if fix_note else "wb") as out:
             proc = subprocess.Popen(cmd, cwd=wd, stdout=out,
                                     stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL,
@@ -1983,8 +2116,18 @@ def _finish_generation(request_id: str, requests_dir: Path,
                        devin_argv: list[str]) -> None:
     try:
         rec = _read_request(request_id, requests_dir)
-        text = _planner_response(rec, load_projects(), devin_argv)
-        defaults = tomllib.loads(text).get("defaults", {})
+        log_path = requests_dir / f"{request_id}.gen.log"
+        projects = load_projects()
+        text = _planner_response(rec, projects, devin_argv, log_path)
+        try:
+            defaults = tomllib.loads(text).get("defaults", {})
+        except tomllib.TOMLDecodeError as exc:
+            # A malformed draft (e.g. a Windows path's \U inside a double-
+            # quoted string) is trivially fixable - retry once with the
+            # parse error fed back.
+            text = _planner_response(rec, projects, devin_argv, log_path,
+                                     fix_note=str(exc))
+            defaults = tomllib.loads(text).get("defaults", {})
         if defaults.get("model") != rec["model"] or \
                 defaults.get("effort") != rec["effort"]:
             raise RequestError("Planner ignored the selected model or effort; "
@@ -2007,10 +2150,12 @@ def _finish_generation(request_id: str, requests_dir: Path,
     except Exception as exc:
         _wait_writable(runs_dir, requests_dir, LOGS_DIR)
         LOG.warning("request %s generation failed: %s", request_id, exc)
+        msg = (f"Planner returned malformed TOML ({exc})"
+               if isinstance(exc, tomllib.TOMLDecodeError) else str(exc))
         with REQUEST_LOCK:
             rec = _read_request(request_id, requests_dir)
             if rec["status"] == "generating":
-                rec.update(status="error", error=str(exc)[:300])
+                rec.update(status="error", error=msg[:300])
                 _save_request(rec, requests_dir)
     finally:
         with REQUEST_LOCK:
@@ -2159,7 +2304,7 @@ _STATUS_COLOR = {"done": "#3fb950", "partial": "#d29922", "blocked": "#d29922",
                  "running": "#58a6ff", "queued": "#8b949e",
                  "waiting": "#8b949e", "skipped": "#6e7681",
                  "planned": "#bc8cff", "ready": "#bc8cff",
-                 "generating": "#bc8cff", "draft": "#8b949e",
+                 "generating": "#bc8cff", "draft": "#d29922",
                  "launching": "#58a6ff", "launch_failed": "#f85149",
                  "lost": "#6e7681"}
 
@@ -2374,6 +2519,12 @@ def collect_dashboard(runs_dir: Path,
             continue
         steps = rec.get("proposed_steps") or []
         key = f"request:{rid}"
+        log_p = requests_dir / f"{rid}.gen.log"
+        gen_tail = (stdout_tail(str(log_p))
+                    if stage in ("generating", "error") and log_p.is_file()
+                    else None)
+        gen_last = next((ln for ln in reversed((gen_tail or "").splitlines())
+                         if ln.strip()), None)
         runs.append({"run": rec.get("run") or rec.get("label"),
                      "key": key, "request_id": rid,
                      "description": rec.get("description"),
@@ -2384,9 +2535,33 @@ def collect_dashboard(runs_dir: Path,
                      "counts": {"planned": len(steps)} if steps else {},
                      "tokens": None, "max_parallel": None,
                      "stage": stage, "error": rec.get("error"),
-                     "stale": rec.get("stale"),
+                     "stale": rec.get("stale"), "gen_last": gen_last,
                      "projects": sorted({s["slug"] for s in steps})
                      or ([rec["project"]] if rec.get("project") else [])})
+        if stage == "generating":
+            # The planner IS an agent while it runs - surface it like a
+            # worker row so its live stdout streams into the agents table
+            # and detail modal. work_dir is a tempdir, never a watched dir.
+            agents.append({
+                "run": rec.get("run") or rec.get("label"),
+                "run_dir": None, "run_key": key, "request_id": rid,
+                "step": "plan-proposal",
+                "slug": rec.get("project") or "agent-conductor",
+                "work_dir": "planner tempdir (auto-cleaned)",
+                "status": "running",
+                "created_at": rec.get("generation_started_at")
+                or rec.get("updated_at"),
+                "started_at": rec.get("generation_started_at"),
+                "ended_at": None, "elapsed_s": None, "alive": False,
+                "pid": None, "session_id": None, "session_gone": False,
+                "model": rec.get("model"), "effort": rec.get("effort"),
+                "mode": "planner", "cloud": False, "verify_ok": None,
+                "task": "Propose a TOML runbook for: " + " ".join(
+                    (rec.get("raw") or "").split())[:120],
+                "note": None, "next": None, "exit_code": None,
+                "branch": None, "merged": None, "tokens": None, "wt": False,
+                "stdout_log": str(log_p) if log_p.is_file() else None,
+                "tail": gen_tail, "export": None, "prompt": None})
         for s in steps:
             agents.append(proposal_agent(s, rec, projects, key, "planned"))
     # session_id is discovered post-spawn (diff of `devin list`); while a
@@ -2482,9 +2657,10 @@ a { color:#58a6ff; text-decoration:none; }
 .toolbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
 .toolbar .sub { margin:0; }
 .stage { display:inline-block; border-radius:9px; padding:1px 7px; font-size:11px; border:1px solid #30363d; white-space:nowrap; }
-.stage.draft { color:#8b949e; background:#1b2027; }
+.stage.draft { color:#e3b341; border-color:#6b5a1f; background:#2a2317; }
 .stage.ready { color:#bc8cff; border-color:#614b84; background:#251d35; }
-.stage.generating { color:#58a6ff; background:#172638; }
+.stage.generating { color:#58a6ff; background:#172638;
+  animation:pulse 1.2s ease-in-out infinite; }
 .stage.launching { color:#58a6ff; background:#172638; }
 .stage.error, .stage.launch_failed { color:#f85149; background:#321c20; }
 .linkbtn { background:none; border:0; color:#58a6ff; cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
@@ -2494,6 +2670,8 @@ a { color:#58a6ff; text-decoration:none; }
 .btn:disabled { cursor:not-allowed; opacity:.45; }
 #detail label { display:block; color:#8b949e; margin:12px 0 5px; }
 #detail input, #detail textarea, #detail select { box-sizing:border-box; width:100%; padding:8px 10px; border:1px solid #30363d; border-radius:6px; background:#0d1117; color:#e6edf3; font:inherit; }
+#detail label.check { display:flex; align-items:flex-start; gap:8px; margin:12px 0 4px; font-size:13px; cursor:pointer; }
+#detail label.check input[type=checkbox] { width:auto; margin-top:2px; }
 #detail textarea { min-height:145px; resize:vertical; }
 #detail textarea.toml { min-height:270px; font:12px/1.5 ui-monospace,Consolas,monospace; }
 #detail input:disabled, #detail textarea:disabled, #detail select:disabled { opacity:.65; }
@@ -2520,7 +2698,7 @@ a { color:#58a6ff; text-decoration:none; }
 const COLORS = {done:'#3fb950',partial:'#d29922',blocked:'#d29922',
 failed:'#f85149',timed_out:'#f0883e',running:'#58a6ff',queued:'#8b949e',
 waiting:'#8b949e',skipped:'#6e7681',planned:'#bc8cff',ready:'#bc8cff',
-generating:'#bc8cff',draft:'#8b949e',
+generating:'#bc8cff',draft:'#d29922',
 launching:'#58a6ff',launch_failed:'#f85149',lost:'#6e7681'};
 const STAGES = {draft:'Draft · unsent',generating:'Preparing proposal',
   ready:'Ready to run',launching:'Starting run',launch_failed:'Start failed',
@@ -2543,13 +2721,13 @@ const fmtT = t => (!t||t.prompt==null) ? '-' :
   `${kfmt(t.prompt)}/${kfmt(t.completion)}/${kfmt(t.cached)}`;
 const tokTitle = t => !t ? '' :
   `prompt ${t.prompt} · completion ${t.completion} · ` +
-  `cached ${t.cached} · ${t.llm_steps??'?'} llm steps`;
+  `cached ${t.cached} · ${t.llm_steps??'?'} LLM steps`;
 const TOK_HELP = 'prompt / completion / cached; select an agent for details';
 const tokenHelp = `<details class="tok-help"><summary aria-label="Explain tokens and cost">?</summary>` +
   `<div class="explain"><b>What the numbers mean</b><br>` +
   `<b>Prompt</b>: all input tokens (instructions, tools, context, history).<br>` +
   `<b>Cached</b>: the part of prompt served from cache; do not add it to prompt.<br>` +
-  `<b>Completion</b>: output tokens. <b>Steps</b>: model turns. ` +
+  `<b>Completion</b>: output tokens. <b>LLM steps</b>: model turns. ` +
   `<b>M</b> in prices means one million tokens.<br><br>` +
   `<b>Estimated cost</b> = (prompt - cached) × input rate + ` +
   `cached × cache rate + completion × output rate, each rate per token ` +
@@ -2564,6 +2742,16 @@ function elapsed(a, now){
   if (a.started_at && (a.status==='running'||a.status==='queued'))
     return fmtS((now - new Date(a.started_at))/1000);
   return '-'; }
+// While a request generates, its planner row carries the live stdout tail -
+// stream it into the open request modal's <pre id="gtail">.
+function streamGenTail(){
+  const gel = document.getElementById('gtail');
+  if (!gel || !modalRequest) return;
+  const pa = AGENTS.find(a=>a.request_id===modalRequest.id &&
+                          a.step==='plan-proposal');
+  const t = (pa && pa.tail) || '';
+  if (gel.textContent !== t){ gel.textContent = t; gel.scrollTop = gel.scrollHeight; }
+}
 const expanded = {};      // slug -> true: show all rows, not just latest 10
 const hidden = new Set(); // statuses filtered out via chips
 const facets = new Set();
@@ -2571,6 +2759,7 @@ let selectedRun = null;
 const prevTail = {};      // run|step -> last tail_last shown; a change
                           // flashes the result cell (.fresh) as logs stream
 const SHOW_N = 10;
+let runsShown = SHOW_N;   // visible run-table rows; active runs never hide
 const ORDER = ['running','queued','waiting','planned','done','partial',
                'blocked','timed_out','failed','skipped','lost'];
 const FACETS = ['wt','merged','unmerged'];
@@ -2687,6 +2876,9 @@ function showRequestForm(rec){
       `starting a run.</div>`:'') +
     (stage==='generating'?`<div class="notice warn">Planning in progress. ` +
       `The previous proposal, if any, remains available if generation fails.</div>`:'') +
+    (rec.gen_tail && (stage==='generating'||stage==='error')
+      ? `<label>Planner output${stage==='generating'?' (live)':''}</label>` +
+        `<pre id="gtail">${esc(rec.gen_tail)}</pre>`:'') +
     (stage==='launching'||stage==='launched'?`<div class="notice">This ` +
       `request has already been started; editing and discard are disabled.</div>`:'') +
     `<label for="rq-label">Short label (optional until planned)</label>` +
@@ -2700,6 +2892,10 @@ function showRequestForm(rec){
     `<select id="rq-effort"${disabled}>${effortOptions}</select></div></div>` +
     `<label for="rq-raw">Your request</label><textarea id="rq-raw"${disabled} ` +
     `placeholder="Describe the work in your own words…">${esc(rec.raw||'')}</textarea>` +
+    `<label class="check"><input type="checkbox" id="rq-followup"` +
+      `${rec.followup?' checked':''}${disabled}> End the run with a ` +
+      `planning step that drafts a follow-up manifest into manifests/ ` +
+      `for anything unfinished</label>` +
     (steps.length?`<h3 style="margin:16px 0 0">Proposed steps (${steps.length})</h3>` +
       `<ol class="proposal-list">${steps.map(s=>`<li><b>${esc(s.step)}</b> ` +
         `<small>${esc(s.slug)} · ${esc(s.model||'-')} / ${esc(s.effort||'-')}` +
@@ -2749,8 +2945,11 @@ async function openRequest(id){
   }
 }
 function requestFields(){
-  return Object.fromEntries(['raw','label','project','model','effort'].map(k=>
+  const f=Object.fromEntries(['raw','label','project','model','effort'].map(k=>
     [k,document.getElementById(`rq-${k}`).value]));
+  const fup=document.getElementById('rq-followup');
+  if (fup) f.followup=fup.checked;
+  return f;
 }
 function formError(message){
   const el=document.getElementById('form-msg');
@@ -2831,13 +3030,15 @@ function render(d){
   // innerHTML every 2s resets animations/hover and looks like a reload.
   // `tail` is excluded: live log growth streams into the open modal instead.
   const sig = JSON.stringify([d.runs, d.agents.map(({tail,...r})=>r),
-    selectedRun, [...hidden].sort(), [...facets].sort(), expanded]);
+    selectedRun, [...hidden].sort(), [...facets].sort(), expanded,
+    runsShown===Infinity?'all':runsShown]);
   const tailEl = document.getElementById('dtail');
   if (sig === lastSig){
     tickElapsed(now);
     if (tailEl && detailIdx!=null && AGENTS[detailIdx]
         && tailEl.textContent !== AGENTS[detailIdx].tail)
       tailEl.textContent = AGENTS[detailIdx].tail;   // live stdout stream
+    streamGenTail();
     return;
   }
   lastSig = sig;
@@ -2874,8 +3075,18 @@ function render(d){
     '<col style="width:17%"><col style="width:5%">' +
     '<col class="hide-s" style="width:13%"></colgroup>' +
     '<tr><th>run</th><th>description</th><th>projects</th><th>started</th>' +
-    '<th>ended</th><th>steps</th><th>max//</th><th class="hide-s">dir</th></tr>';
-  for (const r of d.runs.filter(r=>!selectedRun||runKey(r)===selectedRun)){
+    '<th>ended</th><th>steps</th>' +
+    '<th title="parallel-agent cap for this run (run.max_parallel)">cap</th>' +
+    '<th class="hide-s">dir</th></tr>';
+  // rows are newest-first; active runs and unlaunched requests always show,
+  // finished history is capped at SHOW_N until "show more"/"show all"
+  const allRuns = d.runs.filter(r=>!selectedRun||runKey(r)===selectedRun);
+  const actRuns = allRuns.filter(r=>!r.ended_at);
+  const finRuns = allRuns.filter(r=>r.ended_at);
+  const finShow = Math.max(runsShown - actRuns.length, 0);
+  const shownRuns = actRuns.concat(finRuns.slice(0, finShow));
+  const hiddenRuns = finRuns.length - Math.min(finShow, finRuns.length);
+  for (const r of shownRuns){
     const counts = Object.entries(r.counts||{})
       .map(([k,v])=>`<span style="color:${COLORS[k]||'#8b949e'}">${v} ${k}</span>`)
       .join('');
@@ -2884,7 +3095,11 @@ function render(d){
       `aria-label="Filter to run ${esc(r.run)}"><td class="wrap">` +
       `<b>${esc(r.run)}</b><br>` +
       (r.stage ? `<span class="stage ${esc(r.stage)}">` +
-        `${esc(STAGES[r.stage]||r.stage)}</span>` :
+        `${esc(STAGES[r.stage]||r.stage)}` +
+        (r.stage==='generating'
+          ? `<span class="dots"><span>.</span><span>.</span><span>.</span></span>`
+          : '') + `</span>` +
+        (r.gen_last ? `<br><span class="sub">${esc(r.gen_last)}</span>` : '') :
         `<span class="sub">${esc((r.dir||'').split(/[\\/]/).pop())}</span>`) +
       (r.stale?` <span class="stage error">Needs review</span>`:'') +
       `<br><button type="button" class="linkbtn" ` +
@@ -2902,6 +3117,13 @@ function render(d){
       `</td><td>${r.max_parallel||'-'}</td>` +
       `<td class="hide-s wrap">${esc(r.dir)}</td></tr>`;
   }
+  if (hiddenRuns > 0)
+    h += `<tr><td colspan="8"><a href="#" data-rmore>show more ` +
+      `(${hiddenRuns} finished run${hiddenRuns===1?'':'s'})</a> · ` +
+      `<a href="#" data-rall>show all ${allRuns.length}</a></td></tr>`;
+  else if (runsShown > SHOW_N)
+    h += `<tr><td colspan="8"><a href="#" data-rless>` +
+      `show latest ${SHOW_N} only</a></td></tr>`;
   document.getElementById('runs').innerHTML = h;
 
   // one fixed-width table per project slug, ordered by newest activity
@@ -2988,6 +3210,7 @@ function render(d){
     `<span class="sub">${scope.length?'no agents match these filters':
       selectedRun?'no steps yet; generate the proposal to preview agents':'no agents yet'}</span>`;
   applyHl();
+  streamGenTail();
   if (detailIdx != null && !document.getElementById('backdrop').hidden)
     showDetail(detailIdx);        // refresh open modal on real changes
   const modalRun = modalRequest?.id && d.runs.find(r=>r.request_id===modalRequest.id);
@@ -3034,6 +3257,15 @@ document.addEventListener('click', async e=>{
     expanded[t.dataset.slug] = !expanded[t.dataset.slug];
     if (lastData) render(lastData); return;
   }
+  if (t.dataset && t.dataset.rmore!==undefined){   // runs list paging
+    e.preventDefault(); runsShown += SHOW_N;
+    if (lastData) render(lastData); return; }
+  if (t.dataset && t.dataset.rall!==undefined){
+    e.preventDefault(); runsShown = Infinity;
+    if (lastData) render(lastData); return; }
+  if (t.dataset && t.dataset.rless!==undefined){
+    e.preventDefault(); runsShown = SHOW_N;
+    if (lastData) render(lastData); return; }
   if (t.dataset && t.dataset.auth){
     e.preventDefault();
     if (t.dataset.auth==='login'){

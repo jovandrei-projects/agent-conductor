@@ -871,6 +871,65 @@ prompt = "p"
             self.assertEqual(st, "failed")
             self.assertIn("STATUS", state["steps"]["a"]["note"])
 
+    def test_timeout_retries_in_fresh_session(self):
+        """max_attempts>1: a timed-out step is committed then respawned in a
+        fresh session whose prompt carries the continue-from-state note -
+        the step can still end done."""
+        calls = {"n": 0}
+        rendered = []
+        commits = []
+
+        class Flaky(self._NeverExits):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                calls["n"] += 1
+                if calls["n"] > 1:
+                    self._out.write(b"STATUS: done\nNEXT: n\n")
+                    self._out.flush()
+
+            def wait(self, timeout=None):
+                if calls["n"] > 1:
+                    return 0
+                return super().wait(timeout)
+
+        with tempfile.TemporaryDirectory() as td:
+            proj, run_dir, cfg, state = self._fixture(
+                Path(td), step_extra="timeout_min = 0.001\n"
+                                     "max_attempts = 2")
+            orig_render = conductor.render_prompt
+
+            def capture(*a, **kw):
+                text = orig_render(*a, **kw)
+                rendered.append(text)
+                return text
+
+            with mock.patch.object(conductor.subprocess, "Popen", Flaky), \
+                    mock.patch.object(conductor, "kill_tree",
+                                      lambda p: p.kill()), \
+                    mock.patch.object(conductor, "session_ids",
+                                      lambda *a, **k: set()), \
+                    mock.patch.object(conductor, "is_git_repo",
+                                      lambda p: True), \
+                    mock.patch.object(conductor, "git_commit",
+                                      lambda *a, **k:
+                                      commits.append(a[1]) or True), \
+                    mock.patch.object(conductor, "git_dirty",
+                                      lambda p: True), \
+                    mock.patch.object(conductor, "STATUS_GRACE_S", 0.05), \
+                    mock.patch.object(conductor, "WAIT_POLL_S", 0.01), \
+                    mock.patch.object(conductor, "render_prompt", capture):
+                st = conductor.run_step(cfg.steps[0], "s", proj, cfg,
+                                        run_dir, ["devin"], state)
+            rec = state["steps"]["a"]
+            self.assertEqual(st, "done")
+            self.assertEqual(calls["n"], 2)
+            self.assertEqual(rec["attempts"], 2)
+            self.assertIn("attempt2", rec["prompt"])
+            self.assertIn("retried after timeout", rec["note"])
+            self.assertIn("CONTINUE from where it stopped", rendered[-1])
+            self.assertEqual(
+                sum("work from" in m for m in commits), 2)
+
 
 class DashboardTests(unittest.TestCase):
     def test_collect_dashboard(self):
