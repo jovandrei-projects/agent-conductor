@@ -138,6 +138,15 @@ state, then CONTINUE from where it stopped rather than redoing finished \
 work.
 """
 
+# Appended to the task body when the dashboard's 'resume notes' field
+# carries text: operator context for the next dispatch ("VPN is back").
+# The step's original prompt is never rewritten post-dispatch - notes
+# ride along under it instead.
+RESUME_NOTES = """\
+NOTE FROM THE OPERATOR (saved on the conductor dashboard for this step):
+{notes}
+"""
+
 # Closing review step appended when a request's follow-up checkbox is set -
 # the planner is told to write it, and _publish_proposal appends this block
 # itself when the planner forgot, so the checkbox is a guarantee.
@@ -959,6 +968,30 @@ def _skip_flagged(run_dir: Path) -> set[str]:
         return set()
 
 
+def prompt_flag(run_dir: Path, step: str) -> Path:
+    """Dashboard 'Edit prompt' override: while a step has never been
+    dispatched, this file holds the replacement task body; run_step
+    reads it right before rendering. Durable like skip- - it survives
+    clear_run_flags so an edit placed on a pending step is still honored
+    when a later resume dispatches it."""
+    return _flag_dir() / f"prompt-{_flag_key(run_dir)}-{_safe_name(step)}"
+
+
+def rnote_flag(run_dir: Path, step: str) -> Path:
+    """Dashboard 'resume notes': operator text appended to the step's
+    next dispatched prompt (after the task body), so a resumed session
+    can be told things like 'VPN is restored'. For steps that already
+    ran the original prompt is never edited - notes are the add-on."""
+    return _flag_dir() / f"rnote-{_flag_key(run_dir)}-{_safe_name(step)}"
+
+
+def _flag_text(flag: Path) -> str | None:
+    try:
+        return flag.read_text(encoding="utf-8") if flag.is_file() else None
+    except OSError:
+        return None
+
+
 # Runs launched by an older conductor poll BARE-name sentinels
 # (stop-<run>, drain-<run>, timeout-<run>-<step>) - the path-keyed names
 # above only exist in new code. state["flags"]="v2" marks a run whose
@@ -1018,7 +1051,9 @@ def clear_run_flags(run_dir: Path) -> None:
     path-keyed names and legacy bare-name ones: a run paused under old
     code must be resumable by new code. Skip sentinels deliberately
     survive: a user's skip stays in force until they Unskip, or a resume
-    would silently resurrect a step they removed from the queue."""
+    would silently resurrect a step they removed from the queue. The
+    prompt-edit and resume-notes sentinels survive too - the resume is
+    exactly when run_step reads them."""
     name = _safe_name(run_dir.name)
     pats = [f"*{_flag_key(run_dir)}*",
             f"stop-{name}*", f"drain-{name}", f"pause-{name}",
@@ -1026,7 +1061,11 @@ def clear_run_flags(run_dir: Path) -> None:
     try:
         for pat in pats:
             for f in _flag_dir().glob(pat):
-                if f.name.startswith("skip-"):
+                # skip- stays in force until Unskip; prompt-/rnote- are
+                # the pending step's edited prompt and resume notes -
+                # both are meant to survive the resume that is about to
+                # read them, so none of the three are halt sentinels.
+                if f.name.startswith(("skip-", "prompt-", "rnote-")):
                     continue
                 try:
                     f.unlink()
@@ -1217,11 +1256,31 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         except OSError:
             body_src = step.prompt_file
 
+    # Dashboard prompt edits / resume notes are tempdir sentinels (trap-5
+    # safe): an override replaces the task body for every dispatch while
+    # it exists; notes append operator context under it. Both are durable
+    # (clear_run_flags leaves them) so they also apply on resume.
+    prompt_edited = False
+    try:
+        over = prompt_flag(run_dir, step.name)
+        if over.is_file():
+            body_src = over.read_text(encoding="utf-8")
+            prompt_edited = True
+    except OSError:
+        pass
+    rnotes = _flag_text(rnote_flag(run_dir, step.name))
+    if rnotes and rnotes.strip():
+        body_src = (body_src or "").rstrip() + "\n\n" + \
+            RESUME_NOTES.format(notes=rnotes.strip())
+
     prompt_path = run_dir / "prompts" / f"{step.name}.md"
     prompt_path.parent.mkdir(exist_ok=True)
-    render_step = (dataclasses.replace(
-        step, prompt=resume_note + (body_src or ""), prompt_file=None)
-        if resume_note else step)
+    # Always render from body_src: it is the resolved body - manifest
+    # prompt or prompt_file contents - with any dashboard prompt override
+    # and resume notes already folded in.
+    render_step = dataclasses.replace(
+        step, prompt=(resume_note or "") + (body_src or ""),
+        prompt_file=None)
     prompt_path.write_text(
         render_prompt(render_step, slug, work_dir, cfg.path.parent,
                       cfg.preamble), encoding="utf-8")
@@ -1425,6 +1484,12 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         if stopped:
             notes.append("stopped by user via dashboard; the run "
                          "proceeds without it, --resume re-runs the step")
+        if prompt_edited:
+            notes.append("prompt body was overridden via the dashboard "
+                         "edit control before dispatch")
+        if rnotes and rnotes.strip():
+            notes.append("dashboard resume notes were appended to the "
+                         "prompt")
         if notes:
             rec["note"] = "; ".join(notes)
         rec.update(status=status, ended_at=now_iso(), status_line=status_line,
@@ -1432,6 +1497,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                    timeout_extended_s=round(ext_s) if ext_s > 1 else None,
                    tokens=tok_acc or None,
                    model_actual=tail_agent_model(export_path),
+                   prompt_edited=prompt_edited or None,
                    prompt=str(prompt_path), stdout_log=str(stdout_log),
                    export=str(export_path))
         save_state(run_dir, state)
@@ -3409,6 +3475,81 @@ def set_step_timeout(run_name: str, step_name: str, body: dict,
     return {"timeout_min": minutes}
 
 
+def set_step_prompt(run_name: str, step_name: str, body: dict,
+                    runs_dir: Path = RUNS_DIR) -> dict:
+    """Dashboard 'Edit prompt': the replacement task body lives in a
+    tempdir sentinel that run_step reads just before rendering - the
+    manifest file stays untouched and the dispatched prompts/*.md records
+    exactly what was sent. Only a step that never dispatched is editable
+    (pending manifest steps have no record; 'queued'/'skipped' records
+    are pre-spawn); once the prompt is dispatched the control locks and
+    resume notes are the follow-up channel. {"prompt": null} reverts to
+    the manifest text."""
+    if not RUN_DIR_RE.fullmatch(step_name):
+        raise RequestError("Invalid step name", 404)
+    d, st = _run_dir_checked(run_name, runs_dir)
+    rec = (st.get("steps") or {}).get(step_name)
+    if rec is None and step_name not in _manifest_step_names(st):
+        raise RequestError("Step not in this run", 404)
+    if rec is not None and rec.get("status") not in ("queued", "skipped"):
+        raise RequestError(
+            f"Step is {rec.get('status')} - its prompt was already "
+            "dispatched; leave resume notes instead", 409)
+    flag = prompt_flag(d, step_name)
+    try:
+        _flag_dir().mkdir(exist_ok=True)
+        if body.get("prompt") is None:
+            flag.unlink(missing_ok=True)
+            return {"prompt_override": None}
+        if not isinstance(body["prompt"], str):
+            raise RequestError("prompt must be text")
+        if not 1 <= len(body["prompt"]) <= 100_000:
+            raise RequestError("prompt must be 1-100,000 characters", 422)
+        flag.write_text(body["prompt"], encoding="utf-8")
+    except OSError as exc:
+        raise RequestError(f"Could not write the prompt flag: {exc}",
+                           500) from exc
+    return {"prompt_override": body["prompt"]}
+
+
+def set_step_notes(run_name: str, step_name: str, body: dict,
+                   runs_dir: Path = RUNS_DIR) -> dict:
+    """Dashboard 'resume notes': operator text in a tempdir sentinel that
+    run_step appends to the step's next dispatched prompt - the original
+    prompt itself is never edited post-dispatch. For steps that ran and
+    will re-run (stopped/failed/timed_out/lost/blocked/partial); a queued
+    orphan counts too, though a never-dispatched step wants Edit prompt.
+    {"notes": ""} clears the field."""
+    if not RUN_DIR_RE.fullmatch(step_name):
+        raise RequestError("Invalid step name", 404)
+    d, st = _run_dir_checked(run_name, runs_dir)
+    rec = (st.get("steps") or {}).get(step_name)
+    if rec is None:
+        raise RequestError("Step not in this run", 404)
+    eff = effective_statuses(st).get(step_name, rec.get("status"))
+    if eff not in ("blocked", "partial", "failed", "timed_out",
+                   "stopped", "lost"):
+        raise RequestError(
+            f"Step is {eff} - resume notes apply to steps that already "
+            "ran; a pending step takes Edit prompt instead", 409)
+    flag = rnote_flag(d, step_name)
+    try:
+        _flag_dir().mkdir(exist_ok=True)
+        if body.get("notes") in (None, ""):
+            flag.unlink(missing_ok=True)
+            return {"resume_notes": None}
+        if not isinstance(body["notes"], str):
+            raise RequestError("notes must be text")
+        if len(body["notes"]) > 20_000:
+            raise RequestError("notes must be at most 20,000 characters",
+                               422)
+        flag.write_text(body["notes"], encoding="utf-8")
+    except OSError as exc:
+        raise RequestError(f"Could not write the notes flag: {exc}",
+                           500) from exc
+    return {"resume_notes": body["notes"]}
+
+
 def discard_request(request_id: str,
                     requests_dir: Path = REQUESTS_DIR,
                     manifests_dir: Path = MANIFESTS_DIR,
@@ -3685,10 +3826,18 @@ def task_label(rec: dict, full: bool = False) -> str | None:
         text = Path(pf).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return rec.get("task")
-    m = re.search(r"## Task\s*\n+(.*?)\n*## ", text, re.S)
+    # The prompt file is PREAMBLE-shaped: '## Task' ... '## Before you
+    # finish'. Anchor the body capture on the trailer heading itself - a
+    # task that embeds its own '## ' sections must not be cut at the
+    # first one; when the trailer is absent (custom preamble) take the
+    # rest of the file so nothing is ever trimmed.
+    m = re.search(r"## Task[^\n]*\n+(.*?)(?:\n+## Before you finish|\Z)",
+                  text, re.S)
     body = m.group(1) if m else text
+    if full:
+        return body.strip() or rec.get("task")
     one = " ".join(body.split())
-    return (one if full else one[:160]) or rec.get("task")
+    return one[:160] or rec.get("task")
 
 
 def stdout_tail(path: str | None, lines: int = 15) -> str | None:
@@ -3791,6 +3940,28 @@ def _manifest_pending(st: dict, projects: dict) -> list[dict]:
     return out
 
 
+def _manifest_bodies(st: dict) -> dict[str, str]:
+    """Full task bodies from the run's manifest, keyed by step name.
+
+    state.json only stores a 160-char summary, so the detail modal and
+    the prompt edit form read the real text from the manifest - the same
+    prompt/prompt_file resolution run_step applies at dispatch."""
+    cfg = _manifest_cached(st.get("manifest") or "")
+    if cfg is None:
+        return {}
+    out = {}
+    for s in cfg.steps:
+        b = s.prompt
+        if b is None and s.prompt_file:
+            try:
+                b = (cfg.path.parent / s.prompt_file).read_text(
+                    encoding="utf-8")
+            except OSError:
+                b = s.prompt_file
+        out[s.name] = b or ""
+    return out
+
+
 def _pending_agent(st: dict, sd: dict, key: str, run_dir: str,
                    sort_at: str | None) -> dict:
     """Placeholder row for a manifest step with no state.json record yet -
@@ -3852,6 +4023,7 @@ def collect_dashboard(runs_dir: Path,
             if request else {}
         eff = effective_statuses(st)
         flagged = _skip_flagged(sj.parent)     # 'Skip step' marks in place
+        mbodies = _manifest_bodies(st)         # full text per step name
         for name, rec in st.get("steps", {}).items():
             plan = proposed.get(name) or {}
             t = rec.get("tokens")
@@ -3885,6 +4057,12 @@ def collect_dashboard(runs_dir: Path,
             # trap 5) still wait out the grace window.
             start_ts = _iso_ts(rec.get("started_at"))
             rec_pid = rec.get("pid")
+            # The modal's full 'task' text: the dispatched prompt body
+            # when a prompt file exists, else the manifest's untruncated
+            # body (state.json's 160-char summary is only the fallback).
+            tfull = task_label(rec, full=True)
+            if tfull == rec.get("task"):
+                tfull = mbodies.get(name) or tfull
             worker_alive = bool(rec_pid) and pid_alive(
                 rec_pid, rec.get("started_at"))
             session_gone = bool(
@@ -3915,8 +4093,21 @@ def collect_dashboard(runs_dir: Path,
                 "mode": rec.get("mode") or plan.get("mode"),
                 "effort": effort,
                 "task": task_label(rec) or plan.get("task"),
-                "task_full": task_label(rec, full=True)
-                or plan.get("task"),
+                "task_full": tfull or plan.get("task"),
+                # The edit control exists only while the step never
+                # dispatched (queued/skipped records are pre-spawn);
+                # anything that ran takes resume notes instead - the
+                # original prompt is left untouched on purpose.
+                "prompt_editable": rec.get("status") in
+                ("queued", "skipped"),
+                "notes_enabled": status in
+                ("blocked", "partial", "failed", "timed_out", "stopped",
+                 "lost"),
+                "prompt_override": _flag_text(
+                    prompt_flag(sj.parent, rec.get("name") or name)),
+                "resume_notes": _flag_text(
+                    rnote_flag(sj.parent, rec.get("name") or name)),
+                "prompt_edited": bool(rec.get("prompt_edited")),
                 "cloud": rec.get("cloud", plan.get("cloud")),
                 "verify_ok": rec.get("verify_ok"),
                 "skipped_by_user": _safe_name(
@@ -3959,6 +4150,17 @@ def collect_dashboard(runs_dir: Path,
                 row["status"] = "skipped" if st.get("ended_at") else "waiting"
                 if row["status"] == "skipped":
                     row["note"] = "Run ended before this step started"
+            # Never dispatched: the prompt edit control is live, and the
+            # manifest body - not the 160-char summary - is the modal's
+            # full text and the form's prefill.
+            row["task_full"] = mbodies.get(row["step"]) or row.get("task")
+            row["prompt_editable"] = True
+            row["notes_enabled"] = False
+            row["prompt_override"] = _flag_text(
+                prompt_flag(sj.parent, row["step"]))
+            row["resume_notes"] = _flag_text(
+                rnote_flag(sj.parent, row["step"]))
+            row["prompt_edited"] = row["prompt_override"] is not None
             counts[row["status"]] = counts.get(row["status"], 0) + 1
             agents.append(row)
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
@@ -4048,8 +4250,13 @@ def collect_dashboard(runs_dir: Path,
                 "cost": None,
                 "stdout_log": str(log_p) if log_p.is_file() else None,
                 "tail": gen_tail, "export": None, "prompt": None})
+        pbodies = _manifest_bodies(rec)
         for s in steps:
-            agents.append(proposal_agent(s, rec, projects, key, "planned"))
+            a = proposal_agent(s, rec, projects, key, "planned")
+            a["task_full"] = pbodies.get(s["step"]) or a.get("task")
+            a["prompt_editable"] = False      # edited via the TOML review
+            a["notes_enabled"] = False
+            agents.append(a)
     # session_id is discovered post-spawn (diff of `devin list`); while a
     # step runs the cell is empty. Attribute it live instead: among the
     # unclaimed ids in the step's work_dir, the spawned one is the session
@@ -4365,19 +4572,35 @@ const AGENT_COLS = '<colgroup>' +
   '</colgroup>';
 
 let detailIdx = null;
+let detailKey = null;       // run_dir|step of the open agent modal - the
+                            // payload re-sorts each tick, so the index is
+                            // re-resolved by key before every re-render
 let modalRequest = null;
+const promptDrafts = {};    // key -> unsaved 'Edit prompt' text
+const notesDrafts = {};     // key -> unsaved 'resume notes' text
+const agentKey = a => (a.run_dir||'') + '|' + a.step;
 function closeDetail(force=false){
   if (!force && modalRequest?.dirty && !confirm('Discard unsaved edits?')) return false;
-  detailIdx = null; modalRequest = null;
+  detailIdx = null; detailKey = null; modalRequest = null;
   document.getElementById('backdrop').hidden = true;
   return true;
 }
 function showDetail(i){
   const a = AGENTS[i]; if(!a || !closeDetail()) return;
-  detailIdx = i;
+  detailIdx = i; detailKey = agentKey(a);
+  // The modal is rebuilt on every refresh tick - carry the focused
+  // textarea's draft text and caret across the rebuild so typing in
+  // Edit prompt / resume notes isn't eaten.
+  const f0 = document.activeElement;
+  const fid = f0 && f0.id;
+  const fsel = (fid==='d-prompt'||fid==='d-rnotes')
+    ? [f0.selectionStart, f0.selectionEnd] : null;
+  const pk = detailKey;
+  const pd = promptDrafts[pk];   // unsaved edit (undefined = none open)
+  const nd = notesDrafts[pk];
   const kv = [['step',a.step],['run',a.run],['project',a.slug],
-    ['status',a.status],['task',a.task_full||a.task],['result',a.next],
-    ['note',a.note],['log tail',a.tail_last],
+    ['status',a.status],['task prompt',a.task_full||a.task],
+    ['result',a.next],['note',a.note],['log tail',a.tail_last],
     ['model',(a.model||'-')+(a.effort?' (effort '+a.effort+')':'')+
       (a.model_actual?' → '+a.model_actual:'')],
     ['mode',(a.mode||'-')+(a.cloud?' cloud':'')],
@@ -4393,11 +4616,12 @@ function showDetail(i){
     ['verify',a.verify_ok==null?'-':(a.verify_ok?'pass':'FAIL')],
     ['exit',a.exit_code],['work dir',a.work_dir],
     ['branch',a.branch],['merged',a.merged],
-    ['prompt',a.prompt],['stdout',a.stdout_log],['export',a.export],
+    ['prompt file',a.prompt],['stdout',a.stdout_log],['export',a.export],
     ['state file',a.state_md]];
   document.getElementById('dbody').innerHTML =
     `<h3 id="modal-title">${esc(a.slug)} / ${esc(a.step)}</h3><div class="kv">` +
-    kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">${esc(v??'-')}` +
+    kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">` +
+      (k==='task prompt' ? `<pre>${esc(v??'-')}</pre>` : esc(v??'-')) +
       (k==='tokens'?tokenHelp:'') + '</div>').join('') +
     `</div>` +
     (a.run_dir
@@ -4438,10 +4662,54 @@ function showDetail(i){
             `data-step="${esc(a.step)}">Save</button>` +
             `<span class="sub">moves the live deadline on the next poll ` +
             `(&lt;15s); a value under elapsed ends the step early, ` +
-            `retries use it too.</span></div>` : '')) : '') +
+            `retries use it too.</span></div>` : '') +
+        (a.prompt_editable
+          ? `<h3 style="margin-top:14px">Edit prompt` +
+            (a.prompt_edited || a.prompt_override!=null
+              ? ` <span class="sub">(override saved - the manifest ` +
+                `itself is unchanged)</span>` : '') + `</h3>` +
+            `<textarea id="d-prompt" style="min-height:120px" ` +
+            `spellcheck="false">${esc(pd!==undefined?pd:
+              (a.prompt_override ?? a.task_full ?? a.task ?? ''))}` +
+            `</textarea><div class="actions">` +
+            `<button type="button" class="btn secondary" ` +
+            `data-save-prompt="${esc(base(a.run_dir))}" ` +
+            `data-step="${esc(a.step)}">Save prompt</button>` +
+            (a.prompt_override!=null
+              ? `<button type="button" class="btn secondary" ` +
+                `data-revert-prompt="${esc(base(a.run_dir))}" ` +
+                `data-step="${esc(a.step)}">Revert to manifest</button>` : '') +
+            `<span class="sub">what this step's next session is ` +
+            `dispatched with; locks the moment the step starts.</span>` +
+            `</div>` : '') +
+        (!a.prompt_editable && pd!==undefined
+          ? `<div class="notice warn">This step started while the edit ` +
+            `was open - its prompt was already dispatched, so the edit ` +
+            `was NOT applied. The unsaved text is kept below` +
+            (a.notes_enabled ? ` - put follow-up context in resume ` +
+              `notes instead.` : ` - copy it out before closing.`) +
+            `</div><textarea disabled style="min-height:70px">` +
+            `${esc(pd)}</textarea>` : '') +
+        (a.notes_enabled
+          ? `<h3 style="margin-top:14px">Resume notes</h3>` +
+            `<textarea id="d-rnotes" style="min-height:70px" ` +
+            `spellcheck="false" placeholder="context for the resume, ` +
+            `e.g. VPN is restored">${esc(nd!==undefined?nd:
+              (a.resume_notes||''))}</textarea><div class="actions">` +
+            `<button type="button" class="btn secondary" ` +
+            `data-save-notes="${esc(base(a.run_dir))}" ` +
+            `data-step="${esc(a.step)}">Save notes</button>` +
+            `<span class="sub">appended to this step's next dispatched ` +
+            `prompt - the original prompt is never edited. Empty + ` +
+            `Save clears stored notes.</span></div>` : '')) : '') +
     (a.request_id ? `<div class="actions"><button type="button" class="btn secondary" ` +
       `data-open-request="${esc(a.request_id)}">View request / runbook</button></div>` : '') +
     (a.tail ? `<h3 style="margin-top:14px">stdout tail</h3><pre id="dtail">${esc(a.tail)}</pre>` : '');
+  if (fsel){
+    const el = document.getElementById(fid);
+    if (el && el.focus){ el.focus();
+      try{ el.setSelectionRange(fsel[0],fsel[1]); } catch(e){} }
+  }
   document.getElementById('backdrop').hidden = false;
 }
 
@@ -5060,8 +5328,15 @@ function render(d){
       selectedRun?'no steps yet; generate the proposal to preview agents':'no agents yet'}</span>`;
   applyHl();
   streamGenTail();
-  if (detailIdx != null && !document.getElementById('backdrop').hidden)
-    showDetail(detailIdx);        // refresh open modal on real changes
+  if (detailIdx != null && !document.getElementById('backdrop').hidden){
+    // agent rows re-sort as steps start/finish - keep the modal (and
+    // its prompt form) on the SAME agent, not whatever row now sits at
+    // the old index
+    const j = detailKey==null ? detailIdx
+      : AGENTS.findIndex(x=>agentKey(x)===detailKey);
+    if (j >= 0 && AGENTS[j]) showDetail(j);
+    else closeDetail(true);
+  }
   const modalRun = modalRequest?.id && d.runs.find(r=>r.request_id===modalRequest.id);
   const modalStage = modalRun && (modalRun.stage||'launched');
   if (modalStage && modalRequest.status!=='loading' && !modalRequest.dirty &&
@@ -5167,6 +5442,34 @@ document.addEventListener('click', async e=>{
     } catch(err){ alert('Timeout update failed: '+err.message);
       t.disabled=false; }
     return; }
+  if (t.dataset && (t.dataset.savePrompt || t.dataset.revertPrompt)){
+    const dir=t.dataset.savePrompt||t.dataset.revertPrompt;
+    const ta=document.getElementById('d-prompt');
+    const revert = !!t.dataset.revertPrompt;
+    t.disabled=true;
+    try {
+      await api('POST',
+        `/api/runs/${encodeURIComponent(dir)}/steps/` +
+        `${encodeURIComponent(t.dataset.step)}/prompt`,
+        {prompt:revert?null:(ta?ta.value:null)});
+      delete promptDrafts[detailKey];
+      await refresh();
+    } catch(err){ alert((revert?'Revert':'Prompt save')+' failed: ' +
+      err.message); t.disabled=false; }
+    return; }
+  if (t.dataset && t.dataset.saveNotes){
+    const ta=document.getElementById('d-rnotes');
+    t.disabled=true;
+    try {
+      await api('POST',
+        `/api/runs/${encodeURIComponent(t.dataset.saveNotes)}/steps/` +
+        `${encodeURIComponent(t.dataset.step)}/notes`,
+        {notes:ta?ta.value:''});
+      delete notesDrafts[detailKey];
+      await refresh();
+    } catch(err){ alert('Notes save failed: '+err.message);
+      t.disabled=false; }
+    return; }
   if (t.dataset && t.dataset.pauseRun){
     if(!confirm('Pause this run? In-flight steps run to completion, ' +
                 'then the run holds - NO further step launches ' +
@@ -5260,6 +5563,12 @@ document.addEventListener('click', async e=>{
   if (row) showDetail(+row.dataset.i);
 });
 document.addEventListener('input', e=>{
+  // unsaved prompt/notes text survives the 2s modal rebuild - keyed by
+  // run_dir|step so a re-sorted row never inherits another step's draft
+  if ((e.target.id==='d-prompt'||e.target.id==='d-rnotes')
+      && detailKey!=null)
+    (e.target.id==='d-prompt'?promptDrafts:notesDrafts)[detailKey]=
+      e.target.value;
   if (modalRequest && e.target.id?.startsWith('rq-')){
     modalRequest.dirty=true;
     const msg=document.getElementById('form-msg');
@@ -5433,6 +5742,14 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 elif (m := re.fullmatch(
                         r"/api/runs/([^/]+)/steps/([^/]+)/timeout", path)):
                     self._json(set_step_timeout(
+                        m.group(1), m.group(2), body, runs_dir), 202)
+                elif (m := re.fullmatch(
+                        r"/api/runs/([^/]+)/steps/([^/]+)/prompt", path)):
+                    self._json(set_step_prompt(
+                        m.group(1), m.group(2), body, runs_dir), 202)
+                elif (m := re.fullmatch(
+                        r"/api/runs/([^/]+)/steps/([^/]+)/notes", path)):
+                    self._json(set_step_notes(
                         m.group(1), m.group(2), body, runs_dir), 202)
                 elif path == "/api/auth/login":
                     # Login is an interactive console flow (trap 3) - the most a

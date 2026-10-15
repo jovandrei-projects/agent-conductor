@@ -3173,5 +3173,350 @@ prompt = "third"
         self.assertNotIn("Stop this agent", html)
 
 
+class PromptEditingTests(_RunControlBase):
+    """Prompt edit control (pre-dispatch only) + resume notes (post-start
+    follow-up) - both ride tempdir sentinels that run_step folds into
+    the prompt body, so the manifest stays untouched."""
+
+    def _run_dir(self, runs: Path, manifest: Path,
+                 steps: dict) -> Path:
+        d = runs / "20260101-000000-t"
+        d.mkdir(parents=True)
+        (d / "state.json").write_text(json.dumps(
+            {"run": "t", "manifest": str(manifest), "ended_at": "x",
+             "steps": steps}), encoding="utf-8")
+        return d
+
+    def test_prompt_edit_gated_to_never_dispatched(self):
+        """queued/skipped records and rec-less manifest steps are editable;
+        running/done 409 - the prompt was already dispatched."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "one"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "two"
+
+[[step]]
+name = "s3"
+project = "{proj.as_posix()}"
+prompt = "three"
+
+[[step]]
+name = "s4"
+project = "{proj.as_posix()}"
+prompt = "four"
+''')
+            d = self._run_dir(runs, m, {
+                "s1": {"name": "s1", "status": "done"},
+                "s2": {"name": "s2", "status": "queued"},
+                "s4": {"name": "s4", "status": "running",
+                       "started_at": "2026-01-01T00:00:00"}})
+            try:
+                out = conductor.set_step_prompt(
+                    d.name, "s2", {"prompt": "edited body"}, runs)
+                self.assertEqual(out["prompt_override"], "edited body")
+                self.assertEqual(
+                    conductor.prompt_flag(d, "s2").read_text(
+                        encoding="utf-8"), "edited body")
+                # a manifest step with no record at all is pending too
+                conductor.set_step_prompt(d.name, "s3",
+                                          {"prompt": "third edit"}, runs)
+                self.assertTrue(
+                    conductor.prompt_flag(d, "s3").is_file())
+                # dispatched already -> locked
+                for step in ("s1", "s4"):
+                    with self.assertRaises(conductor.RequestError) as e:
+                        conductor.set_step_prompt(
+                            d.name, step, {"prompt": "x"}, runs)
+                    self.assertEqual(e.exception.status, 409)
+                with self.assertRaises(conductor.RequestError) as e:
+                    conductor.set_step_prompt(d.name, "nope",
+                                              {"prompt": "x"}, runs)
+                self.assertEqual(e.exception.status, 404)
+                # revert deletes the override
+                conductor.set_step_prompt(d.name, "s2",
+                                          {"prompt": None}, runs)
+                self.assertFalse(
+                    conductor.prompt_flag(d, "s2").exists())
+            finally:
+                for s in ("s2", "s3"):
+                    conductor.prompt_flag(d, s).unlink(missing_ok=True)
+
+    def test_resume_notes_gate_and_clear(self):
+        """Notes attach to ran-but-unfinished steps; done/running 409 and
+        a pending step is told to use Edit prompt instead."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "one"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "two"
+''')
+            d = self._run_dir(runs, m, {
+                "s1": {"name": "s1", "status": "done"},
+                "s2": {"name": "s2", "status": "stopped"}})
+            try:
+                out = conductor.set_step_notes(
+                    d.name, "s2", {"notes": "VPN is restored"}, runs)
+                self.assertEqual(out["resume_notes"], "VPN is restored")
+                with self.assertRaises(conductor.RequestError) as e:
+                    conductor.set_step_notes(d.name, "s1",
+                                             {"notes": "x"}, runs)
+                self.assertEqual(e.exception.status, 409)
+                with self.assertRaises(conductor.RequestError) as e:
+                    conductor.set_step_notes(d.name, "nope",
+                                             {"notes": "x"}, runs)
+                self.assertEqual(e.exception.status, 404)
+                # empty clears
+                conductor.set_step_notes(d.name, "s2", {"notes": ""}, runs)
+                self.assertFalse(
+                    conductor.rnote_flag(d, "s2").exists())
+            finally:
+                conductor.rnote_flag(d, "s2").unlink(missing_ok=True)
+
+    def test_edit_and_notes_survive_clear_run_flags(self):
+        """Resume clears halt sentinels only - a pending prompt override
+        and stored resume notes must reach the resume they were set for."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "one"
+''')
+            d = self._run_dir(runs, m, {})
+            try:
+                conductor.prompt_flag(d, "s1").parent.mkdir(exist_ok=True)
+                conductor.prompt_flag(d, "s1").write_text("edit")
+                conductor.rnote_flag(d, "s1").write_text("notes")
+                conductor._flag_raise(conductor.stop_flag(d).name)
+                conductor._flag_raise(conductor.skip_flag(d, "s1").name)
+                conductor.clear_run_flags(d)
+                self.assertTrue(conductor.prompt_flag(d, "s1").is_file())
+                self.assertTrue(conductor.rnote_flag(d, "s1").is_file())
+                self.assertTrue(conductor.skip_flag(d, "s1").is_file())
+                self.assertFalse(conductor.stop_flag(d).exists())
+            finally:
+                for f in (conductor.prompt_flag(d, "s1"),
+                          conductor.rnote_flag(d, "s1"),
+                          conductor.skip_flag(d, "s1"),
+                          conductor.stop_flag(d)):
+                    f.unlink(missing_ok=True)
+
+    def test_edited_prompt_is_what_dispatches(self):
+        """An override saved while the step is pending replaces the task
+        body the session actually receives."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "first task"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "ORIGINAL body"
+''')
+            d = self._run_dir(runs, m, {
+                "s1": {"name": "s1", "status": "done"},
+                "s2": {"name": "s2", "status": "skipped"}})
+            try:
+                conductor.set_step_prompt(d.name, "s2",
+                                          {"prompt": "EDITED body"}, runs)
+                rc = run_manifest(m, runs, resume=str(d))
+                self.assertEqual(rc, 0)
+                sent = (d / "prompts" / "s2.md").read_text(
+                    encoding="utf-8")
+                self.assertIn("EDITED body", sent)
+                self.assertNotIn("ORIGINAL body", sent)
+                st = json.loads((d / "state.json").read_text())
+                self.assertEqual(st["steps"]["s2"]["status"], "done")
+                self.assertTrue(st["steps"]["s2"]["prompt_edited"])
+            finally:
+                conductor.prompt_flag(d, "s2").unlink(missing_ok=True)
+
+    def test_resume_notes_append_under_original(self):
+        """On resume the step gets the original prompt + INTERRUPTED_NOTE
+        + the operator's notes block appended - the manifest prompt is
+        never rewritten."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "first task"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "ORIGINAL body"
+''')
+            d = self._run_dir(runs, m, {
+                "s1": {"name": "s1", "status": "done"},
+                "s2": {"name": "s2", "status": "failed",
+                       "work_dir": str(proj)}})
+            try:
+                conductor.set_step_notes(
+                    d.name, "s2", {"notes": "VPN is restored"}, runs)
+                rc = run_manifest(m, runs, resume=str(d))
+                self.assertEqual(rc, 0)
+                sent = (d / "prompts" / "s2.md").read_text(
+                    encoding="utf-8")
+                self.assertIn("ORIGINAL body", sent)
+                self.assertIn("ended abruptly", sent)   # INTERRUPTED_NOTE
+                self.assertIn("NOTE FROM THE OPERATOR", sent)
+                self.assertIn("VPN is restored", sent)
+                self.assertLess(sent.index("ORIGINAL body"),
+                                sent.index("VPN is restored"))
+                self.assertIn('prompt = "ORIGINAL body"',
+                              m.read_text(encoding="utf-8"))
+            finally:
+                conductor.rnote_flag(d, "s2").unlink(missing_ok=True)
+
+    def test_dashboard_editability_and_full_body(self):
+        """The payload tells the modal which control is legal: pending
+        rows are editable with the FULL manifest body (not the 160-char
+        summary); a stopped step takes notes instead."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            long_prompt = "do the long thing " * 30     # >160 chars
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "first"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "{long_prompt}"
+
+[[step]]
+name = "s3"
+project = "{proj.as_posix()}"
+prompt = "third"
+''')
+            d = self._run_dir(runs, m, {
+                "s1": {"name": "s1", "status": "stopped"}})
+            try:
+                conductor.set_step_notes(d.name, "s1",
+                                         {"notes": "n-note"}, runs)
+                with mock.patch.object(conductor, "refresh_prices"):
+                    dash = conductor.collect_dashboard(
+                        runs, ["no-such-devin"],
+                        requests_dir=base / "requests")
+                by = {a["step"]: a for a in dash["agents"]}
+                self.assertFalse(by["s1"]["prompt_editable"])
+                self.assertTrue(by["s1"]["notes_enabled"])
+                self.assertEqual(by["s1"]["resume_notes"], "n-note")
+                self.assertTrue(by["s2"]["prompt_editable"])
+                self.assertFalse(by["s2"]["notes_enabled"])
+                self.assertEqual(by["s2"]["task_full"], long_prompt)
+                self.assertGreater(len(by["s2"]["task_full"]), 160)
+            finally:
+                conductor.rnote_flag(d, "s1").unlink(missing_ok=True)
+
+    def test_task_label_full_keeps_body_sections_and_lines(self):
+        """A task body containing its own '## ' section was cut at the
+        first heading; full mode now keeps the whole body (and its
+        line breaks) up to the prompt file's real trailer."""
+        with tempfile.TemporaryDirectory() as td:
+            pf = Path(td) / "s.md"
+            body = "first line\n\n## Own section\nsecond line"
+            pf.write_text(
+                f"# head\n\n## Task\n\n{body}\n\n## Before you finish\nx",
+                encoding="utf-8")
+            rec = {"task": "summary", "prompt": str(pf)}
+            self.assertEqual(conductor.task_label(rec, full=True), body)
+            self.assertIn("\n", conductor.task_label(rec, full=True))
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_modal_edit_form_locks_when_step_starts(self):
+        """The edit control exists only pre-dispatch: a waiting step gets
+        the textarea + Save; when the same row re-renders 'running' the
+        form is gone and the unsaved draft is kept read-only with a
+        'not applied' notice."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,textContent:''}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  addEventListener:(event,handler)=>{handlers[event]=handler;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'t',agents:[
+  {step:'s1',run:'r',run_dir:'/r',slug:'p',status:'waiting',
+   task:'a long prompt',task_full:'the whole task body',
+   prompt_editable:true,notes_enabled:false},
+  {step:'s2',run:'r',run_dir:'/r',slug:'p',status:'stopped',
+   task:'ran before',task_full:'dispatched body',
+   prompt_editable:false,notes_enabled:true,resume_notes:'old note'}],
+  runs:[{run:'r',dir:'/r',counts:{waiting:1,stopped:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const row=i=>({dataset:{},closest:sel=>sel==='tr.agen'?{dataset:{i:String(i)}}:null,preventDefault:()=>{}});
+(async()=>{
+  // pending step: full prompt text, editable form, labels disambiguated
+  await handlers.click({target:row(0)});
+  let html=elem('dbody').innerHTML;
+  assert.match(html,/id="d-prompt"/);
+  assert.match(html,/Save prompt/);
+  assert.match(html,/the whole task body/);
+  assert.match(html,/<div class="k">prompt file<\/div>/);
+  assert.match(html,/<div class="k">task prompt<\/div>/);
+  // typing records a draft keyed to this agent
+  handlers.input({target:{id:'d-prompt',value:'unsaved edit text'}});
+  // the step starts while the form is open -> the 2s rebuild locks it
+  data.agents[0].status='running'; data.agents[0].prompt_editable=false;
+  vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+  html=elem('dbody').innerHTML;
+  assert.doesNotMatch(html,/id="d-prompt"/);
+  assert.match(html,/NOT applied/);
+  assert.match(html,/unsaved edit text/);
+  // a stopped step: no edit form, a resume-notes field instead
+  await handlers.click({target:row(1)});
+  html=elem('dbody').innerHTML;
+  assert.doesNotMatch(html,/id="d-prompt"/);
+  assert.match(html,/id="d-rnotes"/);
+  assert.match(html,/old note/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
