@@ -136,8 +136,14 @@ request/model after generation marks the plan stale; regenerate or edit+save
 TOML before launching. The form's follow-up checkbox asks the planner for a
 closing `follow-up-plan` step that drafts `<run>-followup.toml` into
 `manifests/` for review; if the planner omits it, `_publish_proposal`
-appends the step itself. Discard removes only an unrun, app-owned proposal
-and its planned rows. Real runs still use `state.json` as their registry.
+appends the step itself. `On step failure` and `Attempts/step` map to
+`run.on_failure` and `[defaults].max_attempts`; generation fails closed
+when the planner ignores them (edit the TOML directly to override).
+Discard removes only an unrun, app-owned proposal and its planned rows.
+Real runs still use `state.json` as their registry. A run's detail modal
+has a Resume button (`POST /api/runs/<dir>/resume` -> `run <manifest>
+--resume <dir>`) once nothing in it is live - same semantics as the CLI
+flag, fresh attempts for every non-done step.
 
 Requires `devin` on PATH and `devin auth login` to have been run once
 (`devin auth status` is checked at run start; conductor aborts cleanly if

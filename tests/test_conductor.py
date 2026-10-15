@@ -1142,6 +1142,7 @@ class RequestWorkflowTests(unittest.TestCase):
         return f'''[run]
 name = "catalog-cleanup"
 description = "{description}"
+on_failure = "continue"
 checkpoint = true
 
 [defaults]
@@ -1149,6 +1150,7 @@ project = "proj"
 model = "swe-2"
 effort = "max"
 mode = "bypass"
+max_attempts = 3
 
 [[step]]
 name = "organize"
@@ -1241,6 +1243,36 @@ prompt = "Run the relevant checks."
             self.new()
         self.assertEqual(error.exception.status, 409)
         self.assertFalse(self.requests.exists())
+
+    def test_resume_run_respawns_manifest_against_same_dir(self):
+        manifest = self.manifests / "m.toml"
+        manifest.write_text(self.proposal(), encoding="utf-8")
+        run_dir = self.runs / "20261014-000000-x"
+        run_dir.mkdir(parents=True)
+        (run_dir / "state.json").write_text(json.dumps({
+            "run": "x", "manifest": str(manifest), "ended_at": "t",
+            "steps": {"s": {"status": "timed_out"}}}))
+        with mock.patch.object(conductor, "_launch_process",
+                               return_value=4321) as launch:
+            out = conductor.resume_run(run_dir.name, self.runs, ["devin"])
+        self.assertEqual(out["resumed"], run_dir.name)
+        cmd = launch.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("run") + 1], str(manifest))
+        self.assertEqual(cmd[cmd.index("--resume") + 1], str(run_dir))
+
+    def test_resume_run_refuses_a_live_step(self):
+        manifest = self.manifests / "m.toml"
+        manifest.write_text(self.proposal(), encoding="utf-8")
+        run_dir = self.runs / "20261014-000000-live"
+        run_dir.mkdir(parents=True)
+        (run_dir / "state.json").write_text(json.dumps({
+            "manifest": str(manifest),
+            "steps": {"s": {"status": "running",
+                            "started_at": conductor.now_iso(),
+                            "timeout_min": 60, "work_dir": str(self.base)}}}))
+        with self.assertRaises(conductor.RequestError) as error:
+            conductor.resume_run(run_dir.name, self.runs, ["devin"])
+        self.assertEqual(error.exception.status, 409)
 
     def test_generator_changes_only_a_proposal_until_explicit_launch(self):
         rec = self.new()

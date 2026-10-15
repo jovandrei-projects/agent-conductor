@@ -1776,7 +1776,9 @@ def cmd_sessions(args: argparse.Namespace) -> int:
 
 REQUEST_LOCK = threading.RLock()
 REQUEST_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}$")
+RUN_DIR_RE = re.compile(r"^[A-Za-z0-9][\w.-]*$")
 _LAUNCH_PIDS: dict[str, int] = {}
+_RESUME_PIDS: dict[str, int] = {}
 _GENERATING: set[str] = set()
 
 
@@ -1820,11 +1822,11 @@ def _save_request(rec: dict, requests_dir: Path) -> None:
 def _request_fields(payload: dict, rec: dict | None = None) -> dict:
     if not isinstance(payload, dict) or set(payload) - {
             "raw", "label", "project", "model", "effort", "manifest",
-            "followup"}:
+            "followup", "on_failure", "max_attempts"}:
         raise RequestError("Invalid request fields")
     model, effort = default_model_effort()
     fields = {k: (rec or {}).get(k, v) for k, v in (
-        ("raw", ""), ("label", ""), ("project", ""),
+        ("raw", ""), ("label", ""), ("project", ""), ("on_failure", "continue"),
         ("model", model), ("effort", effort))}
     for key in fields:
         if key in payload:
@@ -1836,6 +1838,15 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
         v = payload["followup"]
         fields["followup"] = (v.strip().lower() in ("1", "true", "on", "yes")
                               if isinstance(v, str) else bool(v))
+    try:
+        fields["max_attempts"] = int(payload.get("max_attempts") or
+                                     (rec or {}).get("max_attempts") or 3)
+    except (TypeError, ValueError):
+        raise RequestError("max_attempts must be a number 1-10") from None
+    if not 1 <= fields["max_attempts"] <= 10:
+        raise RequestError("max_attempts must be 1-10")
+    if fields["on_failure"] not in ("stop", "continue"):
+        raise RequestError("on_failure must be stop or continue")
     if not fields["raw"] or len(fields["raw"]) > 100_000:
         raise RequestError("Request text must be 1–100,000 characters")
     if len(fields["label"]) > 80:
@@ -1994,7 +2005,8 @@ def save_request(request_id: str, payload: dict,
         rec["status"] = stage
         fields = _request_fields(payload, rec)
         changed = any(fields[k] != rec.get(k) for k in
-                      ("raw", "project", "model", "effort", "followup"))
+                      ("raw", "project", "model", "effort", "followup",
+                       "on_failure", "max_attempts"))
         rec.update(fields)
         if "manifest" in payload:
             return _publish_proposal(rec, payload["manifest"],
@@ -2058,11 +2070,13 @@ The ONLY task specification is the human request below; do not invent repo detai
 Registered project slugs (use these, never paths): {slugs}
 Preferred project (if supplied): {rec['project'] or '(infer from request)'}
 [run] needs name (short safe slug), description (one useful sentence),
-on_failure (stop or continue), and checkpoint = true.
+on_failure = {json.dumps(rec.get('on_failure') or 'continue')}, and
+checkpoint = true.
 [defaults] needs model = {json.dumps(rec['model'])}, effort =
 {json.dumps(rec['effort'])}, mode = "bypass", and timeout_min.
-Set max_attempts = 3 in [defaults]: a step that underestimates its
-timeout_min is then continued by a fresh session instead of ending early.
+Set max_attempts = {int(rec.get('max_attempts') or 3)} in [defaults]: a step
+that underestimates its timeout_min is then continued by a fresh session
+instead of ending early (1 = no retries).
 Each [[step]] needs a unique name, a registered project slug, and a concrete
 prompt describing only that step. Prefer sequential steps. If using waves on
 one project, every member needs worktree = true. Cloud steps require explicit
@@ -2131,6 +2145,17 @@ def _finish_generation(request_id: str, requests_dir: Path,
         if defaults.get("model") != rec["model"] or \
                 defaults.get("effort") != rec["effort"]:
             raise RequestError("Planner ignored the selected model or effort; "
+                               "regenerate or edit the TOML directly")
+        run_doc = tomllib.loads(text).get("run", {})
+        if run_doc.get("on_failure") != (rec.get("on_failure") or "continue"):
+            raise RequestError("Planner ignored the selected on_failure; "
+                               "regenerate or edit the TOML directly")
+        try:
+            planner_attempts = int(defaults.get("max_attempts") or 0)
+        except (TypeError, ValueError):
+            planner_attempts = 0
+        if planner_attempts != int(rec.get("max_attempts") or 3):
+            raise RequestError("Planner ignored the selected max_attempts; "
                                "regenerate or edit the TOML directly")
         while True:
             _wait_writable(runs_dir, requests_dir, manifests_dir)
@@ -2275,6 +2300,41 @@ def launch_request(request_id: str,
             _save_request(rec, requests_dir)
             raise RequestError("Could not start the conductor process", 500) from exc
         return dict(rec)
+
+
+def resume_run(name: str, runs_dir: Path = RUNS_DIR,
+               devin_argv: list[str] | None = None) -> dict:
+    """Re-enter an ended run: `conductor.py run <manifest> --resume <dir>`
+    skips done steps and re-runs the rest, in fresh sessions with fresh
+    timeout budgets. Refused while anything in the run is still live."""
+    if not RUN_DIR_RE.fullmatch(name):
+        raise RequestError("Invalid run dir", 404)
+    d = (runs_dir / name).resolve()
+    if d.parent != runs_dir.resolve() or not (d / "state.json").is_file():
+        raise RequestError("Run not found", 404)
+    try:
+        st = json.loads((d / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RequestError("Cannot read run state", 500) from exc
+    if any(step_live(r) for r in (st.get("steps") or {}).values()):
+        raise RequestError("This run still has a live agent - wait for it "
+                           "or let it die first", 409)
+    pid = _RESUME_PIDS.get(name)
+    if pid and pid_alive(pid):
+        raise RequestError("A resume is already starting for this run", 409)
+    manifest = st.get("manifest")
+    if not manifest or not Path(manifest).is_file():
+        raise RequestError("Run's manifest is gone; resume from the CLI: "
+                           "conductor.py run <manifest> --resume", 409)
+    cmd = [sys.executable, str(ROOT / "conductor.py"), "run", manifest,
+           "--resume", str(d), "--runs-dir", str(runs_dir)]
+    if devin_argv and devin_argv != ["devin"]:
+        cmd += ["--devin", shlex.join(devin_argv)]
+    try:
+        _RESUME_PIDS[name] = _launch_process(cmd, d / "resume.launch.log")
+    except OSError as exc:
+        raise RequestError("Could not start the conductor process", 500) from exc
+    return {"resumed": name, "pid": _RESUME_PIDS[name]}
 
 
 def discard_request(request_id: str,
@@ -2821,6 +2881,9 @@ function showRunDetails(key){
     ['started',r.started_at],['ended',r.ended_at],
     ['steps',Object.entries(r.counts||{}).map(([s,n])=>`${n} ${s}`).join(', ')],
     ['tokens',tokTitle(r.tokens)||'-'],['manifest / dir',r.dir]];
+  const canResume = Object.keys(r.counts||{}).length &&
+    !Object.keys(r.counts).some(s=>['running','queued'].includes(s)) &&
+    Object.keys(r.counts).some(s=>s!=='done');
   document.getElementById('dbody').innerHTML =
     `<h3 id="modal-title">${esc(r.run)}</h3>` +
     (r.stage ? `<span class="stage ${esc(r.stage)}">${esc(STAGES[r.stage]||r.stage)}</span>` : '') +
@@ -2831,6 +2894,9 @@ function showRunDetails(key){
     `data-filter-run="${esc(key)}">Show only this run</button>` +
     (r.request_id ? `<button type="button" class="btn secondary" ` +
       `data-open-request="${esc(r.request_id)}">View original request / TOML</button>` : '') +
+    (canResume ? `<button type="button" class="btn" ` +
+      `data-resume-run="${esc(String(r.dir).split(/[\\/]/).pop())}">` +
+      `Resume unfinished steps</button>` : '') +
     '</div>';
   document.getElementById('backdrop').hidden = false;
 }
@@ -2890,6 +2956,15 @@ function showRequestForm(rec){
     `<datalist id="rq-models"><option value="swe-2"><option value="gpt-6-luna">` +
     `</datalist></div><div><label for="rq-effort">Effort</label>` +
     `<select id="rq-effort"${disabled}>${effortOptions}</select></div></div>` +
+    `<div class="field-row"><div><label for="rq-on_failure">On step failure</label>` +
+    `<select id="rq-on_failure"${disabled}>` +
+      `<option value="continue"${rec.on_failure!=='stop'?' selected':''}>` +
+      `continue - keep the run going</option>` +
+      `<option value="stop"${rec.on_failure==='stop'?' selected':''}>` +
+      `stop - halt the run</option></select></div>` +
+    `<div><label for="rq-attempts">Attempts/step</label>` +
+    `<input id="rq-attempts" type="number" min="1" max="10" ` +
+      `value="${esc(rec.max_attempts??3)}"${disabled}></div><div></div></div>` +
     `<label for="rq-raw">Your request</label><textarea id="rq-raw"${disabled} ` +
     `placeholder="Describe the work in your own words…">${esc(rec.raw||'')}</textarea>` +
     `<label class="check"><input type="checkbox" id="rq-followup"` +
@@ -2945,10 +3020,13 @@ async function openRequest(id){
   }
 }
 function requestFields(){
-  const f=Object.fromEntries(['raw','label','project','model','effort'].map(k=>
+  const f=Object.fromEntries(
+    ['raw','label','project','model','effort','on_failure'].map(k=>
     [k,document.getElementById(`rq-${k}`).value]));
   const fup=document.getElementById('rq-followup');
   if (fup) f.followup=fup.checked;
+  const att=document.getElementById('rq-attempts');
+  if (att) f.max_attempts=att.value;
   return f;
 }
 function formError(message){
@@ -3230,6 +3308,16 @@ document.addEventListener('click', async e=>{
     await openRequest(t.dataset.openRequest); return; }
   if (t.dataset && t.dataset.runDetails){
     showRunDetails(t.dataset.runDetails); return; }
+  if (t.dataset && t.dataset.resumeRun){
+    if(!confirm('Resume this run? Non-done steps re-run in fresh sessions ' +
+                'with fresh timeouts.')) return;
+    t.disabled=true; t.textContent='Resuming…';
+    try {
+      await api('POST',`/api/runs/${encodeURIComponent(t.dataset.resumeRun)}/resume`,{});
+      await refresh();
+    } catch(err){ alert('Resume failed: '+err.message); t.disabled=false;
+      t.textContent='Resume unfinished steps'; }
+    return; }
   if (t.dataset && t.dataset.filterRun){
     selectedRun=t.dataset.filterRun;
     closeDetail(true); if (lastData) render(lastData); return; }
@@ -3421,6 +3509,9 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                             raise RequestError("Confirm discard explicitly")
                         self._json(discard_request(request_id, requests_dir,
                                                    manifests_dir, runs_dir))
+                elif (m := re.fullmatch(r"/api/runs/([^/]+)/resume", path)):
+                    self._json(resume_run(m.group(1), runs_dir,
+                                          devin_argv), 202)
                 elif path == "/api/auth/login":
                     # Login is an interactive console flow (trap 3) - the most a
                     # dashboard button can do is pop a REAL terminal for it.
