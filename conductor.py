@@ -24,6 +24,7 @@ import argparse
 import concurrent.futures
 import dataclasses
 import datetime as dt
+import hashlib
 import http.server
 import json
 import logging
@@ -198,6 +199,10 @@ class Step:
     max_attempts: int = 1              # a step hitting timeout_min is committed
                                        # and retried in a fresh session until
                                        # this many total attempts ran
+    stall_min: float = 20              # past timeout_min a still-talking log
+                                       # auto-extends; this much stdout silence
+                                       # (or the 4x ceiling) ends it. 0 = hard
+                                       # deadline, no extension
 
 
 @dataclasses.dataclass
@@ -275,7 +280,8 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
             wave=merged.get("wave"),
             worktree=bool(merged.get("worktree", False)),
             effort=merged.get("effort") or None,
-            merge_resolver=bool(mr), max_attempts=ma))
+            merge_resolver=bool(mr), max_attempts=ma,
+            stall_min=float(merged.get("stall_min", 20))))
     if not steps:
         raise ManifestError("manifest has no [[step]] entries")
     max_parallel = run.get("max_parallel")
@@ -880,23 +886,36 @@ def _safe_name(s: str) -> str:
     return re.sub(r"[^\w.-]", "_", s)
 
 
-def stop_flag(run_name: str, step: str | None = None) -> Path:
-    n = "stop-" + _safe_name(run_name)
+def _flag_key(run_dir: Path) -> str:
+    """Sentinel names pin the run's resolved path, not just its dir name -
+    the flag dir is machine-global, and the same `<ts>-<name>` can live in
+    two checkouts' data/runs (or two test sandboxes) at once."""
+    h = hashlib.sha256(
+        os.path.normcase(str(run_dir.resolve())).encode()).hexdigest()[:8]
+    return f"{_safe_name(run_dir.name)}-{h}"
+
+
+def stop_flag(run_dir: Path, step: str | None = None) -> Path:
+    n = "stop-" + _flag_key(run_dir)
     return _flag_dir() / (n + f"-{_safe_name(step)}" if step else n)
 
 
-def drain_flag(run_name: str) -> Path:
-    return _flag_dir() / f"drain-{_safe_name(run_name)}"
+def drain_flag(run_dir: Path) -> Path:
+    return _flag_dir() / f"drain-{_flag_key(run_dir)}"
 
 
-def timeout_flag(run_name: str, step: str) -> Path:
+def timeout_flag(run_dir: Path, step: str) -> Path:
     """Minutes override written by the dashboard's timeout editor;
     wait_worker re-reads it each poll and moves the deadline."""
-    return _flag_dir() / f"timeout-{_safe_name(run_name)}-{_safe_name(step)}"
+    return _flag_dir() / f"timeout-{_flag_key(run_dir)}-{_safe_name(step)}"
 
 
 def _flag_set(*flags: Path) -> Path | None:
     return next((f for f in flags if f.is_file()), None)
+
+
+def _append_note(rec: dict, text: str) -> None:
+    rec["note"] = (rec["note"] + "; " + text) if rec.get("note") else text
 
 
 def _flag_raise(name: str) -> None:
@@ -909,11 +928,11 @@ def _flag_raise(name: str) -> None:
         pass
 
 
-def clear_run_flags(run_name: str) -> None:
+def clear_run_flags(run_dir: Path) -> None:
     """Remove all sentinels for a run - called on resume/merge so a
     previously stopped run can actually start work again."""
     try:
-        for f in _flag_dir().glob(f"*-{_safe_name(run_name)}*"):
+        for f in _flag_dir().glob(f"*{_flag_key(run_dir)}*"):
             try:
                 f.unlink()
             except OSError:
@@ -922,12 +941,17 @@ def clear_run_flags(run_name: str) -> None:
         pass
 
 
+TIMEOUT_MAX_EXT = 3        # a live log auto-extends past timeout_min up to
+                           # this many extra floor units: ceiling = 4x
+
+
 def wait_worker(proc, stdout_log: Path, timeout_s: float,
                 stop_flags: tuple[Path, ...] = (),
-                timeout_flag: Path | None = None
-                ) -> tuple[int | None, bool, bool, bool]:
+                timeout_flag: Path | None = None,
+                stall_s: float | None = None
+                ) -> tuple[int | None, bool, bool, bool, float]:
     """Wait for the worker; returns (rc, timed_out, hung_after_status,
-    user_stopped).
+    user_stopped, extended_s).
 
     Polls in short slices so a STATUS line in the log is noticed within
     WAIT_POLL_S: the turn is then over, so the remaining wait collapses to
@@ -936,33 +960,65 @@ def wait_worker(proc, stdout_log: Path, timeout_s: float,
     rather than reporting a timeout. A stop sentinel appearing mid-wait
     tree-kills the worker and reports user_stopped. timeout_flag, if it
     appears, carries minutes set from the dashboard - the deadline moves
-    to start+that value (a value under elapsed kills next poll)."""
+    to start+that value (a value under elapsed kills next poll).
+
+    timeout_s is a floor, not a guillotine, when stall_s is set: past the
+    deadline the worker keeps running while the stdout log grew within the
+    last stall_s - a live turn is never rushed - but silence >= stall_s or
+    the hard ceiling at (1+TIMEOUT_MAX_EXT)x the floor ends it. extended_s
+    reports how far past the floor the step actually ran."""
     t_start = time.time()
-    deadline = t_start + timeout_s
+    floor_s = timeout_s
+    deadline = t_start + floor_s
+    ceiling = t_start + floor_s * (1 + TIMEOUT_MAX_EXT)
     grace_at = None
+    last_change = t_start
+    last_stat = None
+
+    def ext() -> float:
+        return max(0.0, time.time() - (t_start + floor_s))
+
     while True:
         try:
-            return proc.wait(timeout=WAIT_POLL_S), False, False, False
+            rc = proc.wait(timeout=WAIT_POLL_S)
+            # The stop endpoint can kill the pid directly between its
+            # flag-write and our next poll - the sentinel must still win
+            # over a bare nonzero rc, or a user stop records as 'failed'.
+            if _flag_set(*stop_flags) is not None:
+                return rc, False, False, True, ext()
+            return rc, False, False, False, ext()
         except subprocess.TimeoutExpired:
             pass
+        now = time.time()
+        try:
+            stat = stdout_log.stat()
+            cur = (stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            cur = None
+        if cur is not None and cur != last_stat:
+            last_stat, last_change = cur, now
         if timeout_flag is not None:
             try:
-                deadline = t_start + float(
-                    timeout_flag.read_text().strip()) * 60
+                floor_s = float(timeout_flag.read_text().strip()) * 60
+                deadline = t_start + floor_s
+                ceiling = t_start + floor_s * (1 + TIMEOUT_MAX_EXT)
             except (OSError, ValueError):
                 pass
         if _flag_set(*stop_flags) is not None:
             kill_tree(proc)
-            return proc.wait(), False, False, True
+            return proc.wait(), False, False, True, ext()
         if tail_status(stdout_log) is not None:
             if grace_at is None:
-                grace_at = time.time() + STATUS_GRACE_S
-            if time.time() >= grace_at:
+                grace_at = now + STATUS_GRACE_S
+            if now >= grace_at:
                 kill_tree(proc)
-                return proc.wait(), False, True, False
-        elif time.time() >= deadline:
+                return proc.wait(), False, True, False, ext()
+        elif now >= deadline:
+            if stall_s is not None and now < ceiling \
+                    and now - last_change < stall_s:
+                continue           # log still growing - silently extended
             kill_tree(proc)
-            return proc.wait(), True, False, False
+            return proc.wait(), True, False, False, ext()
 
 
 def _capture_session_id(rec: dict, devin_argv: list[str], work_dir: Path,
@@ -1033,9 +1089,9 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     one present before spawn -> 'skipped' (never ran); one appearing
     mid-wait -> tree-kill and 'stopped'.
     """
-    if _flag_set(stop_flag(run_dir.name),
-                 stop_flag(run_dir.name, step.name)) is not None:
-        per_step = _flag_set(stop_flag(run_dir.name, step.name))
+    if _flag_set(stop_flag(run_dir),
+                 stop_flag(run_dir, step.name)) is not None:
+        per_step = _flag_set(stop_flag(run_dir, step.name))
         if per_step is not None:
             per_step.unlink(missing_ok=True)
         with STATE_LOCK:
@@ -1095,6 +1151,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     timed_out = False
     hung = False
     stopped = False
+    ext_s = 0.0
     rc: int | None = None
     status_line = None
     new_sessions: set[str] = set()
@@ -1158,19 +1215,21 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                           watched, proc),
                     daemon=True).start()
                 try:
-                    rc, timed_out, hung, stopped = wait_worker(
+                    rc, timed_out, hung, stopped, ext_s = wait_worker(
                         proc, stdout_log, step.timeout_min * 60,
-                        stop_flags=(stop_flag(run_dir.name),
-                                    stop_flag(run_dir.name, step.name)),
-                        timeout_flag=timeout_flag(run_dir.name, step.name))
+                        stop_flags=(stop_flag(run_dir),
+                                    stop_flag(run_dir, step.name)),
+                        timeout_flag=timeout_flag(run_dir, step.name),
+                        stall_s=(step.stall_min * 60
+                                 if step.stall_min > 0 else None))
                 except subprocess.TimeoutExpired:      # unreachable; safety
                     kill_tree(proc)
                     proc.wait()
-                    timed_out = True
+                    timed_out, ext_s = True, 0.0
                 if stopped:
                     # consume the per-step sentinel; a run-level stop flag
                     # stays so later waves see it too
-                    stop_flag(run_dir.name, step.name).unlink(
+                    stop_flag(run_dir, step.name).unlink(
                         missing_ok=True)
                     break
             except OSError as exc:
@@ -1232,6 +1291,12 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         if attempt > 1:
             notes.append(f"retried after timeout: {attempt} attempts total, "
                          "each attempt's work committed before the next")
+        if timed_out and ext_s > 1:
+            notes.append(f"log kept growing past the "
+                         f"{step.timeout_min:g}min deadline so the step ran "
+                         f"+{ext_s / 60:g}min extra before a "
+                         f"{step.stall_min:g}min silence or the "
+                         f"{1 + TIMEOUT_MAX_EXT}x cap ended it")
         if status_line is None and rc == 0:
             if tok_acc:
                 notes.append("worker exited 0 without a STATUS: line - "
@@ -1252,6 +1317,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             rec["note"] = "; ".join(notes)
         rec.update(status=status, ended_at=now_iso(), status_line=status_line,
                    verify_ok=verify_ok, next=tail_next(stdout_log),
+                   timeout_extended_s=round(ext_s) if ext_s > 1 else None,
                    tokens=tok_acc or None,
                    model_actual=tail_agent_model(export_path),
                    prompt=str(prompt_path), stdout_log=str(stdout_log),
@@ -1429,13 +1495,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"[resume] {run_dir.name}")
         # Resume must be able to start work again: drop any stop/drain
         # sentinels left by a dashboard Stop click.
-        clear_run_flags(run_dir.name)
+        clear_run_flags(run_dir)
     else:
         run_dir = new_run_dir(cfg, runs_dir)
         state = {"run": cfg.name, "description": cfg.description,
                  "request_id": getattr(args, "request_id", None),
                  "manifest": str(manifest_path),
                  "started_at": now_iso(), "devin": " ".join(devin_argv),
+                 "devin_argv": devin_argv,
                  "run_dir": str(run_dir), "max_parallel": cap,
                  "free_ram_gb": free_ram_gb(), "steps": {}}
         save_state(run_dir, state)
@@ -1461,7 +1528,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         """A user stop/drain ended the run mid-loop: every step that never
         launched is recorded 'skipped' (not just absent) so the dashboard
         shows the full plan and --resume knows what is left."""
-        halted = stop_flag(run_dir.name).is_file()
+        halted = stop_flag(run_dir).is_file()
         with STATE_LOCK:
             for grp in groups[from_gi:]:
                 for _d, _s, s_ in grp:
@@ -1476,12 +1543,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             save_state(run_dir, state)
 
     for gi, members in enumerate(groups):
-        if _flag_set(stop_flag(run_dir.name),
-                     drain_flag(run_dir.name)) is not None:
+        if _flag_set(stop_flag(run_dir),
+                     drain_flag(run_dir)) is not None:
             # Dashboard stop: 'stop' also tree-kills live steps via
             # wait_worker's flag poll; 'drain' lets them finish. Either
             # way nothing NEW launches - remaining work stays resumable.
-            halted = stop_flag(run_dir.name).is_file()
+            halted = stop_flag(run_dir).is_file()
             print(f"run {'stopped' if halted else 'drained'} by user - "
                   f"no further steps launch "
                   f"(resume with --resume {run_dir.name})")
@@ -1540,15 +1607,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                             step, slug, project_dir, wt, prior["branch"],
                             cfg, run_dir, devin_argv, state)
                     if ok:
-                        prior.update(status="done", merged=True,
-                                     note="merged on resume (was "
-                                          f"{prior.get('status')})")
+                        was = prior.get('status')
+                        prior.update(status="done", merged=True)
+                        _append_note(prior, f"merged on resume (was {was})")
                         save_state(run_dir, state)
                         print(f"[merged] {step.name} (merge on resume)")
                     elif prior.get("status") == "done":
-                        prior.update(status="failed", merged=False,
-                                     note="merge conflict on resume; "
-                                          f"worktree kept at {wt}")
+                        prior.update(status="failed", merged=False)
+                        _append_note(prior, "merge conflict on resume; "
+                                            f"worktree kept at {wt}")
                         save_state(run_dir, state)
                         print(f"[ failed] {step.name} (merge conflict "
                               "on resume)")
@@ -1556,12 +1623,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                             stop = True
                             break
                     else:
-                        prior.update(
-                            merged=False,
-                            note="merge still conflicts; resolve the kept "
-                                 "worktree by hand or enable merge_resolver "
-                                 "- re-running the same branch cannot fix "
-                                 "a conflict")
+                        prior["merged"] = False
+                        _append_note(prior, "merge still conflicts; "
+                                            "resolve the kept worktree by "
+                                            "hand or enable merge_resolver "
+                                            "- re-running the same branch "
+                                            "cannot fix a conflict")
                         save_state(run_dir, state)
                         print(f"[conflict] {step.name} still unmerged")
                     continue
@@ -1659,13 +1726,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                     elif step.merge_resolver and resolve_merge_conflict(
                             step, slug, repo_dir, work_dir, branch, cfg,
                             run_dir, devin_argv, state):
-                        rec.update(merged=True,
-                                   note="merge conflict resolved by "
-                                        f"resolve-{step.name}")
+                        rec["merged"] = True
+                        _append_note(rec, "merge conflict resolved by "
+                                          f"resolve-{step.name}")
                     else:
-                        rec.update(status="failed",
-                                   note="merge conflict; worktree kept at "
-                                        f"{work_dir}", merged=False)
+                        rec.update(status="failed", merged=False)
+                        _append_note(rec, "merge conflict; worktree kept "
+                                          f"at {work_dir}")
                         status = "failed"
                         statuses[step.name] = "failed"
                     save_state(run_dir, state)
@@ -1675,14 +1742,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                     # leaving orphan debris in the target repo.
                     worktree_remove(repo_dir, work_dir, branch)
                     rec = state["steps"].get(step.name, {})
-                    rec.setdefault("note", "worktree removed: step failed "
-                                           "with no work product")
+                    _append_note(rec, "worktree removed: step failed "
+                                      "with no work product")
                     save_state(run_dir, state)
                 else:
                     rec = state["steps"].get(step.name, {})
-                    rec.setdefault("note", "worktree kept at "
-                                           f"{work_dir} - branch has "
-                                           "unmerged work")
+                    _append_note(rec, f"worktree kept at {work_dir} - "
+                                      "branch has unmerged work")
                     save_state(run_dir, state)
         # Once every member merged or was removed, the per-run worktree
         # dir is an empty husk - drop it (kept worktrees keep it alive).
@@ -1697,8 +1763,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             # A wave-end halt can hide the dashboard-stop bookkeeping:
             # 'stopped'/'drained' steps trip on_failure before the next
             # top-of-loop flag check runs, so mark the rest here too.
-            if _flag_set(stop_flag(run_dir.name),
-                         drain_flag(run_dir.name)) is not None:
+            if _flag_set(stop_flag(run_dir),
+                         drain_flag(run_dir)) is not None:
                 halt_remaining(gi + 1)
             break
 
@@ -2103,6 +2169,8 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
                 r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", fields[key]):
             raise RequestError(f"Invalid {key}")
     for mk, ek in (("model", "effort"), ("plan_model", "plan_effort")):
+        if (fields[mk] or "").lower() == "adaptive":
+            fields[ek] = ""          # adaptive is a routing mode - no effort
         if fields[mk] == "swe-2" and fields[ek] not in {
                 "medium", "high", "max"}:
             raise RequestError("SWE-2 supports medium, high or max effort")
@@ -2626,7 +2694,7 @@ STATUS: done
                                     stdin=subprocess.DEVNULL,
                                     env=clean_devin_env(),
                                     **hidden_subprocess_kwargs())
-            rc, timed_out, _hung, _stopped = wait_worker(proc, log, 600)
+            rc, timed_out, _hung, _stopped, _ext = wait_worker(proc, log, 600)
         if timed_out or rc != 0:
             raise RequestError("Planner did not finish; check CLI auth and "
                                "retry generation", 502)
@@ -2865,9 +2933,14 @@ def resume_run(name: str, runs_dir: Path = RUNS_DIR,
                            "conductor.py run <manifest> --resume", 409)
     cmd = [sys.executable, str(ROOT / "conductor.py"), "run", manifest,
            "--resume", str(d), "--runs-dir", str(runs_dir)]
-    if devin_argv and devin_argv != ["devin"]:
-        cmd += ["--devin", shlex.join(devin_argv)]
-    clear_run_flags(d.name)     # else a stopped run re-stops instantly
+    # The run's own worker binary wins over the server's env default - a
+    # run launched with --devin <mock> must resume on the same binary.
+    dv = (st.get("devin_argv")
+          or (shlex.split(st["devin"]) if st.get("devin") else None)
+          or devin_argv)
+    if dv and dv != ["devin"]:
+        cmd += ["--devin", shlex.join(dv)]
+    clear_run_flags(d)     # else a stopped run re-stops instantly
     try:
         _RESUME_PIDS[name] = _launch_process(cmd, d / "resume.launch.log")
     except OSError as exc:
@@ -2955,8 +3028,11 @@ def _merge_run(name: str, runs_dir: Path,
                       project=str(repo_dir))
         ok = worktree_merge(repo_dir, wt, branch)
         if not ok and step.merge_resolver:
+            dv = (st.get("devin_argv")
+                  or (shlex.split(st["devin"]) if st.get("devin") else None)
+                  or devin_argv or ["devin"])
             ok = resolve_merge_conflict(step, slug, repo_dir, wt, branch,
-                                        cfg, d, devin_argv or ["devin"], st)
+                                        cfg, d, dv, st)
         if ok:
             rec.update(status="done" if rec.get("status") == "failed"
                        else rec.get("status"),
@@ -3029,7 +3105,7 @@ def stop_step(run_name: str, step_name: str,
     if rec.get("status") == "running" and not step_live(rec):
         raise RequestError("This step is already dead (its record is "
                            "stale - sweep will mark it lost)", 409)
-    _flag_raise(stop_flag(run_name, step_name).name)
+    _flag_raise(stop_flag(d, step_name).name)
     if rec.get("pid"):
         _kill_pid(rec["pid"], rec.get("started_at"))
     # NB no log_event here: while a step is live, run_dir can sit inside
@@ -3048,15 +3124,15 @@ def stop_run(run_name: str, body: dict,
     if st.get("ended_at"):
         raise RequestError("This run already ended", 409)
     if body.get("drain"):
-        _flag_raise(drain_flag(run_name).name)
+        _flag_raise(drain_flag(d).name)
         return {"draining": run_name}
-    _flag_raise(stop_flag(run_name).name)
+    _flag_raise(stop_flag(d).name)
     live = [n for n, r in (st.get("steps") or {}).items()
             if r.get("status") == "running" and step_live(r)]
     for n in live:                       # immediate kill, not just the poll
         _kill_pid((st["steps"][n]).get("pid"),
                   st["steps"][n].get("started_at"))
-        _flag_raise(stop_flag(run_name, n).name)
+        _flag_raise(stop_flag(d, n).name)
     return {"stopping": live}
 
 
@@ -3084,7 +3160,7 @@ def set_step_timeout(run_name: str, step_name: str, body: dict,
         raise RequestError("minutes must be 1-1440", 422)
     try:
         _flag_dir().mkdir(exist_ok=True)
-        timeout_flag(run_name, step_name).write_text(
+        timeout_flag(d, step_name).write_text(
             str(minutes), encoding="utf-8")
     except OSError as exc:
         raise RequestError(f"Could not write the timeout flag: {exc}",
@@ -3504,7 +3580,7 @@ def collect_dashboard(runs_dir: Path,
             # A dashboard-edited timeout overrides the manifest value for
             # display - wait_worker applies the same flag on its next poll.
             try:
-                tf = timeout_flag(sj.parent.name, rec.get("name") or name)
+                tf = timeout_flag(sj.parent, rec.get("name") or name)
                 timeout_min = (float(tf.read_text().strip())
                                if tf.is_file() else rec.get("timeout_min"))
             except (OSError, ValueError):
@@ -3533,6 +3609,7 @@ def collect_dashboard(runs_dir: Path,
                 "exit_code": rec.get("exit_code"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
                 "timeout_min": timeout_min,
+                "timeout_ext_s": rec.get("timeout_extended_s"),
                 "attempts": rec.get("attempts"),
                 "max_attempts": rec.get("max_attempts"),
                 "tokens": rec.get("tokens"), "cost": cost,
@@ -3901,7 +3978,9 @@ function showDetail(i){
     ['mode',(a.mode||'-')+(a.cloud?' cloud':'')],
     ['started',a.started_at],['ended',a.ended_at],
     ['elapsed',a.elapsed_s!=null?fmtS(a.elapsed_s):'-'],
-    ['timeout',a.timeout_min!=null?a.timeout_min+' min':'-'],
+    ['timeout',a.timeout_min!=null?a.timeout_min+' min'+
+      (a.timeout_ext_s?` (+${fmtS(a.timeout_ext_s)} active past it)`:
+      ''):'-'],
     ['attempt',a.attempts!=null?`${a.attempts} of ${a.max_attempts||'?'}`:'-'],
     ['tokens',tokTitle(a.tokens)||'-'],
     ['est cost',(fmtC(a.cost)!=='-'?fmtC(a.cost)+' - ':'')+costTitle(a.cost)],
@@ -4004,6 +4083,25 @@ function effortOptionsFor(model){
   const e=(lastData?.model_options||{})[model];
   return (e && e.length ? e : ['min','low','medium','high','max'])
     .map(x=>`<option value="${esc(x)}">`).join('');
+}
+// 'adaptive' is a routing mode with no effort variant - the effort field is
+// cleared and greyed out. Any other model switch re-checks the current
+// effort against that family's suffixes and drops a value it no longer has.
+function syncEffort(modelInp, inputId, listId){
+  const inp=document.getElementById(inputId), dl=document.getElementById(listId);
+  const model=(modelInp?.value||'').trim();
+  if (!inp) return;
+  if (model.toLowerCase()==='adaptive'){
+    inp.value=''; inp.disabled=true;
+    inp.placeholder='n/a - adaptive chooses its own effort';
+    if (dl) dl.innerHTML='';
+    return;
+  }
+  inp.disabled=modelInp?modelInp.disabled:false;
+  inp.placeholder='';
+  const opts=(lastData?.model_options||{})[model]||[];
+  if (dl) dl.innerHTML=effortOptionsFor(model);
+  if (inp.value && opts.length && !opts.includes(inp.value)) inp.value='';
 }
 function openNew(){
   if (!closeDetail()) return;
@@ -4132,6 +4230,9 @@ function showRequestForm(rec){
       `data-run-details="request:${esc(rec.id)}">View run details</button>`:'') +
     `</div>`;
   document.getElementById('backdrop').hidden = false;
+  syncEffort(document.getElementById('rq-model'),'rq-effort','rq-efforts');
+  syncEffort(document.getElementById('rq-plan_model'),
+             'rq-plan_effort','rq-plan_efforts');
 }
 async function openRequest(id){
   if (!closeDetail()) return;
@@ -4634,11 +4735,10 @@ document.addEventListener('input', e=>{
       document.querySelectorAll(
         '#detail [data-action=generate],#detail [data-action=apply]')
         .forEach(b=>b.classList.add('attn'));
-    if (e.target.id==='rq-model' || e.target.id==='rq-plan_model'){
-      const dl=document.getElementById(
-        e.target.id==='rq-model'?'rq-efforts':'rq-plan_efforts');
-      if (dl) dl.innerHTML=effortOptionsFor(e.target.value.trim());
-    }
+    if (e.target.id==='rq-model' || e.target.id==='rq-plan_model')
+      syncEffort(e.target,
+                 e.target.id==='rq-model'?'rq-effort':'rq-plan_effort',
+                 e.target.id==='rq-model'?'rq-efforts':'rq-plan_efforts');
   }
 });
 document.addEventListener('keydown', e=>{

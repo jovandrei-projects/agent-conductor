@@ -36,7 +36,11 @@ The failure mode is an unattended agent doing damage overnight, so:
    false. A `cloud=true` step on them fails validation, not just warns.
    Cloud workers see *origin*, not local state - unpushed work is invisible
    to them.
-4. **A stalled step dies at `timeout_min`.** No hanging till morning.
+4. **A stalled step dies; a working one isn't rushed.** `timeout_min` is
+   a floor: past it the worker may keep running while its stdout log
+   keeps growing, killed only after `stall_min` (default 20, per step or
+   `[defaults]`, 0 disables) of silence or at the 4x hard ceiling. The
+   dashboard timeout editor still moves the floor live.
 5. **Run state lives in `data/runs/<ts>-<name>/`** (gitignored): `state.json`
    for resume, `events.jsonl`, per-step `*.stdout.log`, `*.export.json`,
    `prompts/*.md`. Never write run artifacts into the target project.

@@ -1414,7 +1414,7 @@ prompt = "Review the catalog tests."
 
         with mock.patch.object(conductor.subprocess, "Popen", FakeProc), \
                 mock.patch.object(conductor, "wait_worker",
-                                  return_value=(0, False, False, False)):
+                                  return_value=(0, False, False, False, 0.0)):
             text = conductor._planner_response(rec, {}, ["devin"])
         self.assertEqual(text.strip(), proposal.strip())
         self.assertIn("--model", seen["cmd"])
@@ -1457,7 +1457,7 @@ prompt = "Review the catalog tests."
         with mock.patch.object(conductor.subprocess, "Popen",
                                popen_router), \
                 mock.patch.object(conductor, "wait_worker",
-                                  return_value=(0, False, False, False)):
+                                  return_value=(0, False, False, False, 0.0)):
             conductor.start_generation(rec["id"], self.requests,
                                        self.manifests, self.runs,
                                        ["devin"], background=False)

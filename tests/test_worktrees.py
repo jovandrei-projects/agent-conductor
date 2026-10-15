@@ -772,7 +772,7 @@ class StopControlTests(unittest.TestCase):
                         (rd / "state.json").read_text(encoding="utf-8"))
                     if watch_for is None or watch_for in (
                             st.get("steps") or {}):
-                        flag(rd.name)
+                        flag(rd)
                         return
                 except (StopIteration, OSError, ValueError):
                     pass
@@ -917,9 +917,9 @@ timeout_min = 60
                 encoding="utf-8")
             self.assertIn("ended abruptly", prompt)
             # sentinels were cleared by the resume - nothing lingers
-            self.assertFalse(conductor.stop_flag(rd.name).is_file())
+            self.assertFalse(conductor.stop_flag(rd).is_file())
             self.assertFalse(
-                conductor.stop_flag(rd.name, "slow").is_file())
+                conductor.stop_flag(rd, "slow").is_file())
 
 
 class StopEndpointTests(unittest.TestCase):
@@ -942,8 +942,8 @@ class StopEndpointTests(unittest.TestCase):
                 "d": {"status": "done", "name": "d"}})
             out = conductor.stop_step(rd.name, "s", runs)
             self.assertEqual(out["stopping"], "s")
-            self.assertTrue(conductor.stop_flag(rd.name, "s").is_file())
-            conductor.stop_flag(rd.name, "s").unlink()
+            self.assertTrue(conductor.stop_flag(rd, "s").is_file())
+            conductor.stop_flag(rd, "s").unlink()
             with self.assertRaises(conductor.RequestError) as e:
                 conductor.stop_step(rd.name, "d", runs)
             self.assertEqual(e.exception.status, 409)
@@ -962,16 +962,16 @@ class StopEndpointTests(unittest.TestCase):
             # dead pid-less 'running' record isn't live -> flags only
             out = conductor.stop_run(rd.name, {"drain": True}, runs)
             self.assertEqual(out["draining"], rd.name)
-            self.assertTrue(conductor.drain_flag(rd.name).is_file())
+            self.assertTrue(conductor.drain_flag(rd).is_file())
             out = conductor.stop_run(rd.name, {}, runs)
             # a pid-less 'running' rec is still live to step_live (within
             # timeout): it is flagged for kill even though there is no pid
             self.assertEqual(out["stopping"], ["s"])
-            self.assertTrue(conductor.stop_flag(rd.name).is_file())
-            self.assertTrue(conductor.stop_flag(rd.name, "s").is_file())
-            conductor.clear_run_flags(rd.name)
-            self.assertFalse(conductor.drain_flag(rd.name).is_file())
-            self.assertFalse(conductor.stop_flag(rd.name).is_file())
+            self.assertTrue(conductor.stop_flag(rd).is_file())
+            self.assertTrue(conductor.stop_flag(rd, "s").is_file())
+            conductor.clear_run_flags(rd)
+            self.assertFalse(conductor.drain_flag(rd).is_file())
+            self.assertFalse(conductor.stop_flag(rd).is_file())
 
     def test_stop_run_refuses_ended_runs(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1009,7 +1009,8 @@ class TimeoutOverrideTests(unittest.TestCase):
                 [sys.executable, "-c", "import time; time.sleep(60)"])
             try:
                 with mock.patch.object(conductor, "WAIT_POLL_S", 0.1):
-                    rc, timed_out, _hung, stopped = conductor.wait_worker(
+                    rc, timed_out, _hung, stopped, _ext = \
+                        conductor.wait_worker(
                         proc, log, 600, timeout_flag=flag)
                 self.assertTrue(timed_out)
                 self.assertFalse(stopped)
@@ -1030,7 +1031,7 @@ class TimeoutOverrideTests(unittest.TestCase):
                 rd.name, "s", {"minutes": 45}, runs)
             self.assertEqual(out["timeout_min"], 45.0)
             self.assertEqual(conductor.timeout_flag(
-                rd.name, "s").read_text().strip(), "45.0")
+                rd, "s").read_text().strip(), "45.0")
             with self.assertRaises(conductor.RequestError):
                 conductor.set_step_timeout(rd.name, "s",
                                            {"minutes": 0}, runs)
@@ -1041,6 +1042,109 @@ class TimeoutOverrideTests(unittest.TestCase):
             with self.assertRaises(conductor.RequestError):
                 conductor.set_step_timeout("../x", "s",
                                            {"minutes": 45}, runs)
+
+    def _sleeper(self):
+        return subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            **conductor.hidden_subprocess_kwargs())
+
+    def test_active_log_extends_past_deadline_then_silence_kills(self):
+        """timeout_min is a floor: a still-appending log keeps the worker
+        alive past it; once output stops, stall_min ends it."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "l.log"
+            log.write_text("", encoding="utf-8")
+            proc = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import time,sys,pathlib;"
+                 "p=pathlib.Path(sys.argv[1]);t0=time.time();"
+                 "exec('while time.time()-t0<3:\\n"
+                 " p.open(\"a\").write(\"x\");time.sleep(0.15)');"
+                 "time.sleep(300)", str(log)],
+                **conductor.hidden_subprocess_kwargs())
+            try:
+                with mock.patch.object(conductor, "WAIT_POLL_S", 0.05):
+                    t0 = time.time()
+                    rc, timed_out, _h, stopped, ext = \
+                        conductor.wait_worker(proc, log, 1.0, stall_s=1.0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+            self.assertTrue(timed_out)
+            self.assertFalse(stopped)
+            # floor 1s + writing till ~3s + 1s silence -> died ~4s in
+            self.assertGreater(ext, 1.5)
+            self.assertLess(time.time() - t0, 15)
+
+    def test_direct_pid_kill_still_reports_stopped(self):
+        """The stop endpoint kills the pid immediately - proc.wait can
+        return before the next sentinel poll, and the step must record
+        'stopped', not a bare-rc 'failed'."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "l.log"
+            log.write_text("", encoding="utf-8")
+            rd = Path(td) / "runs" / "20260101-000000-r"
+            rd.mkdir(parents=True)
+            flag = conductor.stop_flag(rd)
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.touch()
+            proc = self._sleeper()
+            try:
+                proc.kill()                    # the endpoint's _kill_pid
+                with mock.patch.object(conductor, "WAIT_POLL_S", 0.05):
+                    rc, timed_out, _h, stopped, _e = conductor.wait_worker(
+                        proc, log, 60, stop_flags=(flag,))
+            finally:
+                flag.unlink(missing_ok=True)
+                if proc.poll() is None:
+                    proc.kill()
+            self.assertTrue(stopped)
+            self.assertFalse(timed_out)
+            self.assertNotEqual(rc, 0)
+
+    def test_silent_worker_dies_at_the_floor(self):
+        """A worker that never writes gets deadline + one stall window,
+        not a full extra floor."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "l.log"
+            log.write_text("", encoding="utf-8")
+            proc = self._sleeper()
+            try:
+                with mock.patch.object(conductor, "WAIT_POLL_S", 0.05):
+                    t0 = time.time()
+                    rc, timed_out, _h, _s, ext = conductor.wait_worker(
+                        proc, log, 0.5, stall_s=1.0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+            self.assertTrue(timed_out)
+            self.assertLess(time.time() - t0, 8)
+
+    def test_ceiling_caps_an_always_active_log(self):
+        """Even a nonstop log dies at the (1+TIMEOUT_MAX_EXT)x ceiling -
+        activity is never an infinite lease."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "l.log"
+            log.write_text("", encoding="utf-8")
+            proc = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import time,sys,pathlib;"
+                 "p=pathlib.Path(sys.argv[1]);"
+                 "exec('while True:\\n p.open(\"a\").write(\"x\");"
+                 "time.sleep(0.1)')", str(log)],
+                **conductor.hidden_subprocess_kwargs())
+            try:
+                with mock.patch.object(conductor, "WAIT_POLL_S", 0.05):
+                    t0 = time.time()
+                    rc, timed_out, _h, _s, ext = conductor.wait_worker(
+                        proc, log, 1.0, stall_s=1.0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+            self.assertTrue(timed_out)
+            # ceiling = 4x the 1s floor -> dead around 4s, never 60s+
+            self.assertLess(time.time() - t0, 10)
+            self.assertGreaterEqual(ext, 2.5)
 
     def test_override_flag_visible_in_dashboard_timeout(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1053,13 +1157,13 @@ class TimeoutOverrideTests(unittest.TestCase):
                 d = conductor.collect_dashboard(runs, ["no-such-devin"])
             self.assertEqual(d["agents"][0]["timeout_min"], 60)
             conductor._flag_dir().mkdir(exist_ok=True)
-            conductor.timeout_flag(rd.name, "s").write_text("90")
+            conductor.timeout_flag(rd, "s").write_text("90")
             try:
                 with mock.patch.object(conductor, "refresh_prices"):
                     d = conductor.collect_dashboard(runs, ["no-such-devin"])
                 self.assertEqual(d["agents"][0]["timeout_min"], 90.0)
             finally:
-                conductor.timeout_flag(rd.name, "s").unlink(
+                conductor.timeout_flag(rd, "s").unlink(
                     missing_ok=True)
 
 

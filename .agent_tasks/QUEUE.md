@@ -41,7 +41,12 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   distinguishes a token-bearing export (real work ran - check commits)
   from a true no-op; agent modal gains separate 'note' + 'log tail'
   rows (a set `next` no longer masks the failure note); --resume
-  prepends the interrupted-state note to `failed` steps too.
+  prepends the interrupted-state note to `failed` steps too. Next:
+  `timeout_min` is now a floor with activity extension (`stall_min`,
+  4x ceiling, `timeout_extended_s` recorded); lifecycle sentinels are
+  keyed by run-path hash (cross-checkout collisions gone); resume/merge
+  prefer the run's recorded worker binary; `adaptive` clears/disables
+  the effort field (form + server-side normalization).
 - First real overnight manifest on a real project (Phase 2 in ROADMAP.md; live smoke already green)
 - Push agent-conductor to GitHub if cloud steps on it are wanted - it has NO remote, and cloud workers clone from origin (human decision: repo name + private/public)
 - Phone access to the :8773 dashboard via lan-bridge proxy (needs mobile-apps change; tasks-ui rows already give coarse progress)
