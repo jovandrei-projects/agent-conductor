@@ -2197,10 +2197,13 @@ assert.match(elem('runs').innerHTML,/>1 running</);
 assert.match(elem('runs').innerHTML,/>1 done</);
 assert.match(elem('runs').innerHTML,/class="dot run"/);
 assert.match(elem('runs').innerHTML,/est \$1\.50/);
-// agent row: cost cell; tokens show in/out without a trailing /0
+// run row: step-token line names every field under the 'steps:' label
+assert.match(elem('runs').innerHTML,/steps: in 1k · out 200 · cached 0 · 2 turns · \$1\.50/);
+// agent row: cost cell; tokens render as labeled fields (in/out/cached/
+// turns) - the bare '1k/200 ·2st' compact form is gone.
 assert.match(elem('agents').innerHTML,/\$0\.12/);
-assert.match(elem('agents').innerHTML,/1k\/200 ·2st/);
-assert.doesNotMatch(elem('agents').innerHTML,/1k\/200\/0/);
+assert.match(elem('agents').innerHTML,/in 1k · out 200 · cached 0 · 2 turns/);
+assert.doesNotMatch(elem('agents').innerHTML,/1k\/200/);
 const click=async(t)=>handlers.click({target:t,preventDefault:()=>{}});
 (async()=>{
   // clicking 'running' shows ONLY running agents and ONLY their run

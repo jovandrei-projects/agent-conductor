@@ -4476,15 +4476,18 @@ const fmtS = s => { if(s==null) return '-';
   return (h? h+'h':'') + (m? m+'m':'') + (s%60)+'s'; };
 const kfmt = n => n==null?'-':(n>=1000
   ? (n/1000).toFixed(n>=100000?0:1).replace(/\.0$/,'')+'k' : String(n));
-// tokens render as 'input/output+cached' - a bare trailing 0 read as a
-// bug, so the cached share only shows when nonzero (title has the rest).
+// tokens render as labeled fields so every counter names itself:
+// in = all input (prompt) tokens, out = completion, cached = the share
+// of `in` served from cache (a part of it, never added on top - always
+// shown so no value can hide), turns = LLM steps/model turns, which are
+// NOT manifest steps (the counts chips count those).
 const fmtT = t => (!t||t.prompt==null) ? '-' :
-  `${kfmt(t.prompt)}/${kfmt(t.completion)}` +
-  (t.cached ? `+${kfmt(t.cached)}c` : '') +
-  (t.llm_steps ? ` ·${t.llm_steps}st` : '');
+  `in ${kfmt(t.prompt)} · out ${kfmt(t.completion)}` +
+  ` · cached ${kfmt(t.cached||0)}` +
+  (t.llm_steps ? ` · ${t.llm_steps} turns` : '');
 const tokTitle = t => !t ? '' :
-  `prompt ${t.prompt} · completion ${t.completion} · ` +
-  `cached ${t.cached} · ${t.llm_steps??'?'} LLM steps`;
+  `in ${t.prompt} (of which cached ${t.cached}) · out ${t.completion} · ` +
+  `${t.llm_steps??'?'} LLM steps (model turns)`;
 const fmtC = c => !c ? '-' : c.usd==null ? 'n/a' :
   '$'+(c.usd===0 ? '0' : c.usd<0.01 ? c.usd.toFixed(4) : c.usd.toFixed(2));
 const costTitle = c => !c ? 'no token data yet' :
@@ -4510,12 +4513,16 @@ function setDensity(d){
     : []).forEach(b=>b.classList.toggle('on', b.dataset.density===d));
   syncTopbar();
 }
-const TOK_HELP = 'input / output (+cached ·LLM steps); select an agent for details';
+const TOK_HELP = 'tokens: in / out / cached (a share of in, never extra)' +
+  ' · turns = LLM steps; select an agent for details';
 const tokenHelp = `<details class="tok-help"><summary aria-label="Explain tokens and cost">?</summary>` +
   `<div class="explain"><b>What the numbers mean</b><br>` +
-  `<b>Prompt</b>: all input tokens (instructions, tools, context, history).<br>` +
-  `<b>Cached</b>: the part of prompt served from cache; do not add it to prompt.<br>` +
-  `<b>Completion</b>: output tokens. <b>LLM steps</b>: model turns. ` +
+  `<b>in</b>: all input (prompt) tokens - instructions, tools, context, ` +
+  `history.<br>` +
+  `<b>out</b>: output (completion) tokens.<br>` +
+  `<b>cached</b>: the part of <b>in</b> served from cache - a share of ` +
+  `it, never added on top.<br>` +
+  `<b>turns</b>: LLM steps - model turns, not manifest steps. ` +
   `<b>M</b> in prices means one million tokens.<br><br>` +
   `<b>Estimated cost</b> = (prompt - cached) × input rate + ` +
   `cached × cache rate + completion × output rate, each rate per token ` +
@@ -5117,7 +5124,9 @@ function render(d){
     '<col style="width:17%"><col style="width:5%">' +
     '<col class="hide-s" style="width:13%"></colgroup>' +
     '<tr><th>run</th><th>description</th><th>projects</th><th>started</th>' +
-    '<th>ended</th><th>steps</th>' +
+    '<th>ended</th><th title="per-status step counts, then token sums ' +
+    'for the planner session and the worker steps, then estimated ' +
+    'cost">steps</th>' +
     '<th title="parallel-agent cap for this run (run.max_parallel)">cap</th>' +
     '<th class="hide-s">dir</th></tr>';
   // rows are newest-first; active runs and unlaunched requests always show,
@@ -5163,7 +5172,6 @@ function render(d){
     return '';
   };
   for (const r of shownRuns){
-    const total = Object.values(r.counts||{}).reduce((s,n)=>s+n,0);
     const counts = Object.entries(r.counts||{})
       .map(([k,v])=>`<span style="color:${COLORS[k]||'#8b949e'}">${v} ${k}</span>`)
       .join('');
@@ -5208,11 +5216,11 @@ function render(d){
       `<td class="counts">` +
       `${counts||'<span class="sub">not planned</span>'}` +
       (r.plan_tokens ? `<br><span class="sub" ` +
-        `title="${esc(tokTitle(r.plan_tokens))}">plan ` +
+        `title="${esc(tokTitle(r.plan_tokens))}">planner: ` +
         `${fmtT(r.plan_tokens)}` +
         (r.plan_cost?` · ${fmtC(r.plan_cost)}`:'') + `</span>` : '') +
       (r.tokens ? `<br><span class="sub" ` +
-        `title="${esc(tokTitle(r.tokens))}">steps ${fmtT(r.tokens)}` +
+        `title="${esc(tokTitle(r.tokens))}">steps: ${fmtT(r.tokens)}` +
         (r.cost?` · ${fmtC(r.cost)}`:'') + `</span>` : '') +
       (runUsd!=null ? `<br><span class="sub" title="estimated self-serve ` +
         `cost, plan + steps${r.cost&&r.cost.unpriced
