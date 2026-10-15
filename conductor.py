@@ -1327,14 +1327,21 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
 
     verify_ok = None
     if step.verify and not timed_out and not stopped:
-        v = subprocess.run(step.verify, cwd=str(work_dir), shell=True,
-                           capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=600,
-                           **hidden_subprocess_kwargs())
-        verify_ok = v.returncode == 0
-        (run_dir / f"{step.name}.verify.log").write_text(
-            (v.stdout or "") + (v.stderr or ""), encoding="utf-8",
-            errors="replace")
+        try:
+            v = subprocess.run(step.verify, cwd=str(work_dir), shell=True,
+                               capture_output=True, text=True,
+                               encoding="utf-8", errors="replace",
+                               timeout=600, **hidden_subprocess_kwargs())
+            verify_ok = v.returncode == 0
+            (run_dir / f"{step.name}.verify.log").write_text(
+                (v.stdout or "") + (v.stderr or ""), encoding="utf-8",
+                errors="replace")
+        except subprocess.TimeoutExpired:
+            # A hung gate must not crash the conductor - it is a failed
+            # verify like any other red run.
+            verify_ok = False
+            (run_dir / f"{step.name}.verify.log").write_text(
+                "verify timed out after 600s\n", encoding="utf-8")
 
     if stopped:
         status = "stopped"
