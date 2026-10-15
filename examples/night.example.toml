@@ -4,7 +4,9 @@
 # Semantics:
 #  - steps run in file order, each in a FRESH `devin -p` session
 #  - on_failure = "stop" halts the run on failed/timed_out/blocked steps
-#    ("continue" keeps going; partial/done never stop the run)
+#    ("continue" keeps going; partial/done never stop the run; a
+#    dashboard 'Stop this step' vetoes one task but the run proceeds -
+#    only run-level Pause/Stop halt it)
 #  - checkpoint = true: conductor commits the project before AND after each
 #    step, so every worker starts from a clean committed state and any
 #    damage is one `git revert/reset` away

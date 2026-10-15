@@ -165,20 +165,33 @@ applied to `cloud=true` steps; wave-required members always keep
 `_apply_fields_to_toml` syncs run-level keys + per-step overrides the
 form owns, so an unchecked `worktrees` strips planner-added flags except
 where a same-project wave requires them.
-Real runs still use `state.json` as their registry. A run's detail modal
-has a Resume button (`POST /api/runs/<dir>/resume` -> `run <manifest>
---resume <dir>`) once nothing in it is live - same semantics as the CLI
-flag, fresh attempts for every non-done step. While a run IS live the
-modal instead offers `Pause run` (POST `/pause` - same hard stop of live
-steps, but the run records `aborted="paused"`: the deliberate-hold case
-for machine restarts), `Stop run now` (POST `/stop` - flags + tree-kills
-every live step) and `Drain & stop` (`/stop` `{drain:true}` - live steps
-finish, nothing new launches); an agent modal on a live step gets `Stop
-this agent` (POST `/api/runs/<dir>/steps/<step>/stop`). Stop/drain/pause
-travel
-as empty sentinel files in `%TEMP%/agent-conductor-flags` (never inside
-run_dir - trap 5), polled by `wait_worker` and the wave loop; `resume`
-clears them via `clear_run_flags` first. Sentinels are path-keyed
+Real runs still use `state.json` as their registry. Run controls use one
+naming system - each visible name a distinct semantics: **Pause run**
+(POST `/api/runs/<dir>/pause`) is the graceful hold - in-flight steps
+finish, nothing new launches, the run records `aborted="paused"` (the
+deliberate machine-restart case); **Stop run now** (POST `/stop`)
+tree-kills every live step and records `aborted="stopped"`; **Resume
+unfinished steps** (POST `/resume` -> `run <manifest> --resume <dir>`,
+offered once nothing is live) re-runs every non-done step in fresh
+attempts - same semantics as the CLI flag, covering paused, stopped and
+interrupted runs alike. `POST /stop {drain:true}` survives as the legacy
+alias of the graceful halt (`aborted="drained"`), and a pause on a
+pre-flags-v2 run raises drain flags too - that is the graceful-hold
+shape an old-code driver polls. Step controls sit on the agent modal:
+**Stop this step** (`POST .../steps/<step>/stop`) kills just that agent
+while the run proceeds to the next queued step - `stopped` deliberately
+does NOT trip `on_failure`, only run-level sentinels halt the pipeline -
+and **Skip step**/**Unskip step** (`POST .../steps/<step>/skip`
+`{skip:bool}`) marks a pending (queued/waiting) step so it records
+`skipped` instead of spawning: a persistent `skip-<key>-<step>` sentinel
+that keeps the step's queue position and stays in force across resume
+until unskipped (if its turn already passed, unskip takes effect on the
+next resume). Stop/drain/pause/timeout flags are polled by `wait_worker`
+and the wave loop; skip flags are checked in run_step's pre-spawn gate
+and are NOT consumed. Sentinels travel as empty files in
+`%TEMP%/agent-conductor-flags` (never inside run_dir - trap 5); `resume`
+clears the halt ones via `clear_run_flags` (skip marks survive on
+purpose). Sentinels are path-keyed
 (`<name>-<hash>`); runs launched by pre-namespacing code lack
 `state["flags"]="v2"` so endpoints dual-write the legacy bare names too -
 a new dashboard can still stop a run its older self spawned.

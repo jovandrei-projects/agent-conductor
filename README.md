@@ -67,6 +67,29 @@ progress, and the original request remains viewable. Raw drafts live only in
 gitignored `data/requests/`; accepted TOML lives in `manifests/`. Clicking a
 run row filters both tables; click its filter chip × to clear it.
 
+## Run controls (dashboard)
+
+Open a run by clicking its name; open a step by clicking its row. Each
+control does exactly one thing:
+
+- **Pause run** (live run): let in-flight steps finish, then hold - nothing
+  new launches. The run stays resumable across a dashboard or machine
+  restart.
+- **Stop run now** (live run): kill every live step's process tree
+  immediately - committed work stays, nothing new launches.
+- **Resume unfinished steps** (ended/interrupted run): re-run every non-done
+  step in a fresh session - covers paused, stopped and interrupted
+  (crashed) runs alike.
+- **Stop this step** (running step): kill just this agent; the run proceeds
+  to the next step. The stopped step re-runs on the next resume.
+- **Skip step** (queued/waiting step): the step keeps its queue position
+  but never launches while marked. The mark stays in force across resume
+  until **Unskip step** lifts it - if its turn already passed, it runs on
+  the next resume.
+
+Steps declared by the manifest but not launched yet appear as **waiting**
+while the run is live and **skipped** once it has ended without them.
+
 ## Commands
 
 ```

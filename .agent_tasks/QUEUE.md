@@ -19,6 +19,20 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-15 (run-control-taxonomy): one name per lifecycle
+  action. `Pause run` is now the graceful hold (in-flight steps finish,
+  nothing new launches, `aborted='paused'` - the machine-restart case);
+  `Stop run now` stays the hard kill (`aborted='stopped'`); `Drain &
+  stop` merged into Pause (`POST /stop {drain:true}` kept for
+  back-compat, `/pause` raises drain flags for pre-v2 drivers); `Resume
+  unfinished steps` covers paused/stopped/interrupted. Step-level: `Stop
+  this step` kills one agent while the run proceeds (`stopped` no longer
+  trips on_failure), and `Skip step`/`Unskip step` is a new durable
+  `skip-<key>-<step>` sentinel - pending steps keep their queue
+  position, stays in force across resume until unskipped, takes effect
+  on the next resume if the turn already passed. CLI-launched runs now
+  show manifest-declared pending rows (waiting/skipped) like request
+  runs already did.
 - DONE 2026-10-15: Lifecycle controls + recovery. Run modal: `Stop run
   now` (flags + pid-targeted taskkill of live steps) and `Drain & stop`
   (finish in-flight, launch nothing new); agent modal: `Stop this agent`.
