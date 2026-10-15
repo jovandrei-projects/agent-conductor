@@ -1855,8 +1855,12 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
         raise RequestError("Label must be at most 80 characters")
     if fields["project"] and fields["project"] not in load_projects():
         raise RequestError("Choose a registered project from projects.toml")
-    for key in ("model", "effort", "plan_model", "plan_effort"):
+    for key in ("model", "plan_model"):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", fields[key]):
+            raise RequestError(f"Invalid {key}")
+    for key in ("effort", "plan_effort"):   # '' = the family's bare variant
+        if fields[key] and not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", fields[key]):
             raise RequestError(f"Invalid {key}")
     for mk, ek in (("model", "effort"), ("plan_model", "plan_effort")):
         if fields[mk] == "swe-2" and fields[ek] not in {
@@ -1945,7 +1949,7 @@ def validate_proposal(text: str, manifests_dir: Path = MANIFESTS_DIR) -> Manifes
             if not 0 < step.timeout_min <= 1440:
                 raise RequestError(f"{step.name}: invalid timeout_min")
             for val in (step.model, step.effort):
-                if val is not None and not re.fullmatch(
+                if val and not re.fullmatch(
                         r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", val):
                     raise RequestError(f"{step.name}: invalid model or effort")
             if step.model == "swe-2" and step.effort not in (
@@ -2106,10 +2110,13 @@ STATUS: done
         prompt_path = Path(wd) / "request.md"
         prompt_path.write_text(prompt, encoding="utf-8")
         log = log_path or Path(ld) / "planner.stdout.log"
+        pm = rec.get("plan_model") or rec["model"]
+        pe = rec.get("plan_effort")          # '' = bare variant, no suffix
+        if pe is None:
+            pe = rec["effort"]
         cmd = devin_argv + [
             "--print", "--prompt-file", str(prompt_path),
-            "--model", f"{rec.get('plan_model') or rec['model']}-"
-                       f"{rec.get('plan_effort') or rec['effort']}",
+            "--model", f"{pm}-{pe}" if pe else pm,
             "--permission-mode", "normal", "--respect-workspace-trust", "false"]
         with open(log, "ab" if fix_note else "wb") as out:
             proc = subprocess.Popen(cmd, cwd=wd, stdout=out,
@@ -2375,6 +2382,7 @@ _STATUS_COLOR = {"done": "#3fb950", "partial": "#d29922", "blocked": "#d29922",
 
 _AUTH_CACHE = [0.0, "unknown"]        # [checked_at, label]
 _SESS_CACHE = [0.0, {}]               # [checked_at, {work_dir: set|None}]
+_MODELS_CACHE = [0.0, {}]             # [checked_at, {family: [suffixes]}]
 
 
 def auth_status(devin_argv: list[str]) -> str:
@@ -2395,6 +2403,47 @@ def auth_status(devin_argv: list[str]) -> str:
         label = "devin missing"
     _AUTH_CACHE[0], _AUTH_CACHE[1] = time.time(), label
     return label
+
+
+def model_options(devin_argv: list[str]) -> dict[str, list[str]]:
+    """`devin models list` parsed into {family slug: [effort suffixes]},
+    cached 10min - the suffix list is what `-<effort>` may legitimately be
+    fused onto the family (e.g. swe-2 -> high/medium/max). A bare variant
+    id yields the '' suffix meaning "no effort flag". Empty when the CLI is
+    unavailable or logged out - the dashboard then falls back to a fixed
+    list."""
+    if time.time() - _MODELS_CACHE[0] < 600:
+        return _MODELS_CACHE[1]
+    fams: dict[str, list[str]] = {}
+    try:
+        out = subprocess.run(devin_argv + ["models", "list"],
+                             capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=30,
+                             env=clean_devin_env(),
+                             **hidden_subprocess_kwargs())
+        if out.returncode == 0:
+            fam = None
+            for line in out.stdout.splitlines():
+                m = re.match(r"^\S.*\(([a-z0-9][a-z0-9._-]*)\)\s*$", line)
+                if m:
+                    # variant ids dash where the printed family slug dots
+                    # (swe-1.7-lightning -> swe-1-7-lightning-*)
+                    fam = m.group(1).replace(".", "-")
+                    fams.setdefault(fam, [])
+                    continue
+                if fam is None:
+                    continue
+                v = re.match(r"^  ([a-z0-9][a-z0-9._-]*)\s{2,}", line)
+                if v:
+                    vid = v.group(1)
+                    suffix = (vid[len(fam) + 1:]
+                              if vid.startswith(fam + "-") else "")
+                    if suffix not in fams[fam]:
+                        fams[fam].append(suffix)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    _MODELS_CACHE[0], _MODELS_CACHE[1] = time.time(), fams
+    return fams
 
 
 def live_sessions_by_dir(runs_dir: Path,
@@ -2656,6 +2705,7 @@ def collect_dashboard(runs_dir: Path,
             "project_options": [{"slug": slug, "cloud_ok": p["cloud_ok"]}
                                 for slug, p in sorted(projects.items())],
             "defaults": dict(zip(("model", "effort"), default_model_effort())),
+            "model_options": model_options(devin_argv or ["devin"]),
             "auth": auth_status(devin_argv or ["devin"])}
 
 
@@ -2914,6 +2964,11 @@ async function api(method,path,body){
   return out;
 }
 async function refresh(){ render(await api('GET','/api/state')); }
+function effortOptionsFor(model){
+  const e=(lastData?.model_options||{})[model];
+  return (e && e.length ? e : ['min','low','medium','high','max'])
+    .map(x=>`<option value="${esc(x)}">`).join('');
+}
 function openNew(){
   if (!closeDetail()) return;
   const defaults=lastData?.defaults||{model:'swe-2',effort:'max'};
@@ -2927,11 +2982,10 @@ function showRequestForm(rec){
   const projectOptions=`<option value="">Infer from request</option>` +
     choices.map(p=>`<option value="${esc(p.slug)}"${p.slug===rec.project?' selected':''}>` +
       `${esc(p.slug)}${p.cloud_ok?'':' (local only)'}</option>`).join('');
-  const effortOptions=['min','low','medium','high','max'].map(x=>
-    `<option value="${x}"${x===rec.effort?' selected':''}>${x}</option>`).join('');
-  const planEffortOptions=['min','low','medium','high','max'].map(x=>
-    `<option value="${x}"${x===(rec.plan_effort||rec.effort)?' selected':''}>` +
-    `${x}</option>`).join('');
+  const modelOptions=((lastData?.model_options &&
+    Object.keys(lastData.model_options).length)
+    ? Object.keys(lastData.model_options) : ['swe-2','gpt-6-luna'])
+    .map(m=>`<option value="${esc(m)}">`).join('');
   const steps=rec.proposed_steps||[];
   const canEdit=editable && stage!=='new';
   document.getElementById('dbody').innerHTML =
@@ -2961,15 +3015,21 @@ function showRequestForm(rec){
     `<select id="rq-project"${disabled}>${projectOptions}</select></div>` +
     `<div><label for="rq-model">Step model</label><input id="rq-model" ` +
     `list="rq-models" value="${esc(rec.model||'')}"${disabled}>` +
-    `<datalist id="rq-models"><option value="swe-2"><option value="gpt-6-luna">` +
-    `</datalist></div><div><label for="rq-effort">Step effort</label>` +
-    `<select id="rq-effort"${disabled}>${effortOptions}</select></div></div>` +
+    `<datalist id="rq-models">${modelOptions}</datalist>` +
+    `</div><div><label for="rq-effort">Step effort</label>` +
+    `<input id="rq-effort" list="rq-efforts" ` +
+    `value="${esc(rec.effort||'')}"${disabled}>` +
+    `<datalist id="rq-efforts">${effortOptionsFor(rec.model)}</datalist>` +
+    `</div></div>` +
     `<div class="field-row"><div><label for="rq-plan_model">Planner model ` +
     `</label><input id="rq-plan_model" list="rq-models" ` +
     `value="${esc(rec.plan_model||rec.model||'')}"${disabled}></div>` +
     `<div><label for="rq-plan_effort">Planner effort</label>` +
-    `<select id="rq-plan_effort"${disabled}>${planEffortOptions}</select></div>` +
-    `<div></div></div>` +
+    `<input id="rq-plan_effort" list="rq-plan_efforts" ` +
+    `value="${esc(rec.plan_effort||rec.effort||'')}"${disabled}>` +
+    `<datalist id="rq-plan_efforts">` +
+    `${effortOptionsFor(rec.plan_model||rec.model)}</datalist>` +
+    `</div><div></div></div>` +
     `<div class="field-row"><div><label for="rq-on_failure">On step failure</label>` +
     `<select id="rq-on_failure"${disabled}>` +
       `<option value="continue"${rec.on_failure!=='stop'?' selected':''}>` +
@@ -3394,6 +3454,11 @@ document.addEventListener('input', e=>{
     modalRequest.dirty=true;
     const msg=document.getElementById('form-msg');
     if (msg) msg.hidden=true;
+    if (e.target.id==='rq-model' || e.target.id==='rq-plan_model'){
+      const dl=document.getElementById(
+        e.target.id==='rq-model'?'rq-efforts':'rq-plan_efforts');
+      if (dl) dl.innerHTML=effortOptionsFor(e.target.value.trim());
+    }
   }
 });
 document.addEventListener('keydown', e=>{

@@ -932,6 +932,24 @@ prompt = "p"
 
 
 class DashboardTests(unittest.TestCase):
+    def test_model_options_parse(self):
+        sample = (
+            "Available models (2 families)\n\n"
+            "SWE-2 (swe-2)\n"
+            "  aliases: swe\n"
+            "  swe-2-high          SWE-2 High  [262K context]\n"
+            "  swe-2-max           SWE-2 Max\n\n"
+            "SWE-1.7 Lightning (swe-1.7-lightning)\n"
+            "  swe-1-7-lightning          Lightning Max\n"
+            "  swe-1-7-lightning-medium   Lightning Medium\n")
+        fake = subprocess.CompletedProcess([], 0, stdout=sample, stderr="")
+        with mock.patch.object(conductor.subprocess, "run",
+                               return_value=fake), \
+                mock.patch.object(conductor, "_MODELS_CACHE", [0.0, {}]):
+            opts = conductor.model_options(["devin"])
+        self.assertEqual(opts["swe-2"], ["high", "max"])
+        self.assertEqual(opts["swe-1-7-lightning"], ["", "medium"])
+
     def test_collect_dashboard(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)

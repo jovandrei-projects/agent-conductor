@@ -141,7 +141,10 @@ appends the step itself. `On step failure` and `Attempts/step` map to
 when the planner ignores them (edit the TOML directly to override).
 `Step model/effort` feed `[defaults]` (the workers); `Planner
 model/effort` feed only the `--model` of the planning session itself, so
-an expensive planner can write a runbook cheap workers execute.
+an expensive planner can write a runbook cheap workers execute. The model
+fields autocomplete from `devin models list` (cached 10min, parsed into
+per-family effort suffixes - an empty effort picks the family's bare
+variant); the fixed fallback list is all you get while logged out.
 Discard removes only an unrun, app-owned proposal and its planned rows.
 Real runs still use `state.json` as their registry. A run's detail modal
 has a Resume button (`POST /api/runs/<dir>/resume` -> `run <manifest>
