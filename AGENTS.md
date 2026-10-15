@@ -373,6 +373,18 @@ Append as they are hit.
     ran `conductor.py run` directly should kill work. Caveat: `taskkill /T`
     on the SERVER pid still walks into its children - do not tree-kill the
     dashboard.
+16. **Every backslash inside `_DASH_HTML` is double-trapped.** The dashboard
+    HTML/JS lives in a plain Python `"""` string, so a `\\` written in the
+    source reaches the browser as a single `\`. Hit 2026-10-15: the JS
+    path splitter `/[\\/]/` arrived as `/[\/]/` - matched `/` only - so
+    Windows run dirs POSTed their full `C:\...` path and every lifecycle
+    button 404'd ('Invalid run dir'), while `git`/`pytest` happily passed
+    the mangled-but-valid JS. When a JS/regex/CSS literal in
+    `_DASH_HTML` needs a backslash, either write `\\\\` (browser sees `\\`)
+    or dodge the literal entirely - `String.fromCharCode(92)` is what
+    `base()` uses. Verify with `grep -n '\\\\' conductor.py` and mentally
+    halve what you see; the Node harness tests catch breakage only if a
+    test exercises that code path.
 
 ## The task workspace - read before starting work
 
