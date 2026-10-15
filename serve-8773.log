@@ -1,0 +1,3 @@
+sweep: 20261015-182057-ux-controls/steps-counters-clarity: running -> lost
+sweep: 20261015-182057-ux-controls: run closed (no live steps)
+conductor dashboard: http://127.0.0.1:8773  (watching C:\Projects\agent-conductor\data\runs)
