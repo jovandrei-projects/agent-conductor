@@ -1,0 +1,317 @@
+[run]
+name = "apartment-play-edit"
+description = "Correct apartment geometry, cameras and props, add a versioned game-like world editor, and bring the verified experience to phones."
+on_failure = "continue"
+checkpoint = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 120
+max_attempts = 3
+
+[[step]]
+name = "baseline-and-reference-audit"
+project = "apartment-3d"
+timeout_min = 90
+prompt = '''
+Inspect the project's instructions, current implementation, existing tests, scene assets, camera controllers, persistence and phone delivery target. Discover verification commands from project files rather than guessing them. Preserve existing user changes and saved layouts. Reproduce the reported camera, prop and placement problems using available local tooling.
+
+Locate the original source reference through project files. Inspect C:/Users/andry/Downloads/annotely_images2/annotely/page_3.png and the other photos in C:/Users/andry/Downloads/annotely_images2/annotely. Distinguish original evidence from exaggerated annotations, particularly the bathroom wall offset. Do not copy private reference photos or credentials into tracked artifacts.
+
+Create a requirement-to-acceptance checklist and implementation handoff in the project's .agent_tasks files covering cameras, structural accuracy, prop cleanup, editor capabilities, persistence, avatars and full phone parity. Identify the actual mobile architecture without assuming Expo, a native application, or ownership by the mobile-apps project. Record inaccessible references and uncertain dimensions rather than inventing them. This step is discovery and reproduction only. Finish with truthful STATUS/NEXT lines.
+'''
+
+[[step]]
+name = "reference-geometry-corrections"
+project = "apartment-3d"
+timeout_min = 150
+prompt = '''
+Use the reference audit and available original images to correct the apartment's fixed structure. Render all evidenced black marks that represent pillars, structural projections or decorative architectural layering; do not mistake these for removable clutter. Correct the bathroom wall's slight outward offset using the unannotated source rather than copying the exaggerated annotation. Make the kitchen-side wall continuous, with the pantry connection door at its evidenced end.
+
+Update associated collision geometry and openings alongside visible geometry so corrected walls and pillars do not leave invisible barriers or allow penetration. Preserve legitimate door clearances and existing wall-transparency behavior. Do not invent measurements or silently resolve contradictory references; record remaining uncertainty and complete only supported corrections.
+
+Compare the affected areas against the references from multiple views and run relevant discovered checks. Record evidence, changed areas, unresolved questions and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "bird-eye-and-plan-views"
+project = "apartment-3d"
+timeout_min = 90
+prompt = '''
+Implement middle-mouse-button drag panning in the existing bird's-eye mode. Suppress browser middle-button autoscroll only where appropriate for the viewport, preserve wheel zoom and other intentional camera controls, and handle pointer release, cancellation and loss of focus without leaving a stuck drag.
+
+Add a separate clearly named Top-down or Plan view with an orthographic camera looking exactly perpendicular to the floor. Keep its vertical orientation locked so the apartment reads like a 2D plan and the avatar is seen from directly above, not obliquely. Provide pan, zoom and useful initial framing without replacing the existing oblique bird's-eye mode. Ensure ceilings or roofs do not obscure this view, using the project's visibility mechanisms.
+
+Add targeted input and camera regression coverage using the discovered infrastructure. Verify repeated view switching, viewport resizing and uninterrupted existing controls. Update .agent_tasks with results and STATUS/NEXT.
+'''
+
+[[step]]
+name = "first-person-heading"
+project = "apartment-3d"
+timeout_min = 90
+prompt = '''
+Reproduce the first-person camera staying pointed in one world direction while the avatar turns. Trace avatar heading, movement input and camera transforms before changing them, and add a failing regression where the existing harness permits.
+
+Make first-person orientation follow actual avatar turns while preserving deliberate mouse-look behavior. Define and consistently apply the relationship between body heading and look offset so keyboard/controller turns and mouse input do not fight each other. Distinguish turning from strafing; translation alone must not introduce unwanted rotation.
+
+Verify turning in place, moving while turning, reversing direction, strafing, angle wraparound, view switching and movement near walls. Check that the camera remains anchored correctly to the avatar and that the fix does not introduce third-person or aerial-view regressions. Record actual checks, limitations and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "third-person-camera-stability"
+project = "apartment-3d"
+prompt = '''
+Reproduce the remaining third-person instability and determine whether it comes from the camera, avatar movement/orientation, or feedback between them. Use the existing transparent-wall behavior when choosing a steadier follow/orbit approach, rather than repeatedly swinging the camera around the character to avoid every wall.
+
+Implement a predictable character pivot, stable follow behavior and coherent movement relative to the selected camera/control convention. Keep intentional user look input responsive and avoid automatic recentering that fights it. Prevent jitter, oscillation, abrupt angle-wrap jumps, sudden zoom changes and frame-rate-dependent movement. Wall transparency must not remove physical collision, and the camera must still avoid invalid positions.
+
+Exercise tight corners, doorways, reverse movement, repeated full turns, rapid direction changes, standing still and transitions between views. Add relevant regressions and record before/after evidence, remaining limitations and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "editable-world-data"
+project = "apartment-3d"
+timeout_min = 150
+prompt = '''
+Establish the shared scene-state foundation needed by the editor, following the project's actual architecture rather than introducing an assumed framework. Separate reusable object definitions from placed instances, with stable identifiers and instance-specific transforms, dimensions and material overrides. Represent fixed structure separately from editable props.
+
+Provide serializable relationships for groups, wall attachments and supported objects such as lamps on tables. Define category, placement and interaction-capability metadata for the catalog. Design world identity and layout revision data so the apartment is the first world without hard-coding the system to only one future space. Reuse or migrate existing state contracts where possible.
+
+Preserve a recoverable pre-cleanup layout before later steps remove scene instances. Make initialization and resumed execution idempotent so retries do not duplicate objects or starter layouts. Test independent instance edits, serialization round trips, invalid references and relationship cycles. Record the contracts, recovery mechanism, verification and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "kitchen-and-scene-cleanup"
+project = "apartment-3d"
+prompt = '''
+Require the editable scene foundation and recoverable starting layout. Remove unwanted scene clutter without deleting reusable source assets: the white pillow on the brown couch, the extra unexplained white floor circle, random sink-area bottles, malformed decorations and unexplained objects protruding through living-room walls. Leave exactly one Roborock in the starter layout. Clear the coffee table, or retain only a small deliberate book stack.
+
+Handle the ambiguous stock-fixture wording reversibly: make the fridge, dishwasher, washer, dryer, clothes rack with clothes, cabinets and microwave editable/removable catalog-backed objects. Preserve their recoverable reference arrangement and offer a stock-free clean starter option rather than permanently discarding models or structural geometry.
+
+Check upper kitchen cabinets above the sink and oven, and kitchen ceiling lights, against the supplied photos. Replace the oversized island with the evidenced smaller wheeled island, with only an appropriate knife arrangement on top. Keep these optional props editable. Validate scale, alignment, support and wall clearance. Update .agent_tasks with omissions, reference evidence, checks and STATUS/NEXT.
+'''
+
+[[step]]
+name = "furniture-and-prop-quality"
+project = "apartment-3d"
+prompt = '''
+Audit the remaining prop models individually against available photographs and the cleanup handoff. Preserve the brown couch without its white pillow. Correct the green chair's casters and wheel geometry. Make the glass-top desk and monitors one coherent, tidy placeable asset, with visible connected monitor supports and no floating arms, random papers or unexplained clutter.
+
+Correct inappropriate textures, implausible proportions, misalignment, floating parts and wall penetration across the remaining props. Give reusable models consistent placement anchors and useful collision/support shapes through the shared scene foundation.
+
+Expand the optional catalog beyond the apartment's current contents with a small coherent selection, including plants, a nightstand and a lamp; support the requested red couch through an appropriate model or appearance variant. Keep suggested additions out of the clean default layout. Clearly distinguish reference-matched assets from proposed additions. Record the per-prop audit, visual checks, incomplete assets and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "editor-shell-and-catalog"
+project = "apartment-3d"
+prompt = '''
+Build a coherent game-like Play/Edit interface around the existing application and shared scene state. Provide categorized object browsing, a model preview/customization panel before placement, and a selected-instance inspector. Support clear selection highlighting and placement previews while keeping the world viewport usable. Make the current mode and available actions understandable without relying on hover alone.
+
+Connect the real catalog models, including optional appliances, furniture and proposed additions. Display truthful capability labels for dynamic and interactive objects such as the Roborock, lamps, TV and chairs with supported sitting behavior. Distinguish dynamic, toggleable and sit-able capabilities instead of advertising interactions that do not exist.
+
+Separate editor input from avatar movement and object interaction so editing does not accidentally walk, sit or trigger a device. Establish working selection, catalog and inspector state for subsequent placement tools; do not present placeholder actions as completed functionality. Verify panel and mode transitions, keyboard focus and existing play interactions. Update .agent_tasks and STATUS/NEXT.
+'''
+
+[[step]]
+name = "floor-placement-and-alignment"
+project = "apartment-3d"
+timeout_min = 150
+prompt = '''
+Require the shared scene foundation and usable editor shell. Implement catalog-to-world placement and repositioning for floor-standing objects, with a visible preview and explicit valid/invalid feedback. A dropped couch or chair must resolve onto the actual floor using its support anchor, not float because its model origin is misplaced.
+
+Provide grid snapping, rotation controls and useful alignment tools. Allow furniture to be pushed flush against walls while preventing penetration through walls, pillars and other blocking geometry. Account for rotated and scaled collision shapes, corners, thin walls and large drag movements rather than checking only an object's center. Do not introduce an unnecessary visible gap at valid wall contact.
+
+Handle cancellation and invalid drops without corrupting the last valid scene state. Keep middle-button camera panning distinct from object manipulation. Test placement in oblique, top-down and other supported editor views, including doorways and the corrected structural geometry. Record checks, limitations and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "wall-and-supported-placement"
+project = "apartment-3d"
+timeout_min = 150
+prompt = '''
+Extend the working placement system with distinct wall-mounted and supported-surface placement rules. Paintings must attach flush to a valid wall with correct orientation and thickness instead of falling to the floor or passing through the wall. Lamps and similar props must be placeable on valid furniture surfaces such as a nightstand.
+
+Use explicit support/attachment relationships so moving or rotating a support carries its attached objects coherently. Validate contact, available surface area and surrounding obstacles without treating valid surface contact as an invalid collision. Prevent self-support, relationship cycles and attachments to nonexistent surfaces.
+
+Handle support resizing, removal or detachment without leaving silent dangling references or floating props; require a valid repositioning or clearly communicated corrective action. Exercise floor-to-table placement, adjacent walls, rotated supports, wall art dimensions and failed drops. Reuse the same placement validation rather than creating contradictory rules. Record evidence and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "groups-scaling-and-presets"
+project = "apartment-3d"
+timeout_min = 150
+prompt = '''
+Build grouping and per-instance resizing on top of the verified placement and support relationships. Allow selecting several objects, grouping and ungrouping them, and translating or rotating a group while preserving relative arrangement and valid support contacts. Validate the whole group's movement against the apartment's blocking geometry.
+
+Expose sensible instance size controls without modifying the reusable object definition or other placed instances. Ensure scaling updates collision shapes, support surfaces and attachment offsets consistently. Reject invalid or non-finite dimensions and prevent resizing from silently causing wall penetration or unsupported children.
+
+Offer a reusable, correctly centered nightstand-with-lamp preset so the user can place the combination without manually aligning each component. Test independent copies, nested relationship handling, grouping an already supported lamp, moving/rotating/scaling the combination and serialization round trips. Record the supported behavior, tests, unresolved edge cases and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "object-variants-and-artwork"
+project = "apartment-3d"
+prompt = '''
+Complete pre-placement object customization and named reusable variants in the catalog. Let users adjust supported dimensions and appearances, preview the result, and save it under a different name without changing the original definition or existing unrelated instances. Preserve useful category and capability metadata.
+
+For paintings, expose width, height and depth plus local image selection to replace the inferred artwork texture. Provide predictable image fitting/aspect behavior and ensure geometry, texture orientation and wall attachment agree. Validate supported file types and reasonable sizes, handle failed decoding cleanly, and do not upload personal images to external services.
+
+Make custom variants and uploaded-media references serializable and suitable for durable world saving; do not rely on temporary object URLs as the saved identity. Verify that two instances can have different art and dimensions without shared-material leakage. Record implemented storage contracts, checks and any persistence integration still needed in .agent_tasks with STATUS/NEXT.
+'''
+
+[[step]]
+name = "floor-material-controls"
+project = "apartment-3d"
+timeout_min = 90
+prompt = '''
+Add floor-finish editing through the existing material pipeline and editor interface. Allow the user to rotate the floor pattern and choose supported colors or patterns without rotating floor geometry, changing room dimensions or altering collision.
+
+Provide a small set of clearly labeled proposed finishes alongside the reference-based appearance. Preserve plausible texture scale and orientation, and avoid seams or unintended material changes on unrelated surfaces. Keep the appropriate floor selection and material overrides in serializable world state.
+
+Verify rotation, color/pattern changes, reset behavior, switching between views and independent state across layout copies. Use actual project checks and visual inspection rather than claiming verification from UI presence alone. Update .agent_tasks with supported options, evidence and STATUS/NEXT.
+'''
+
+[[step]]
+name = "world-saving-and-layout-versions"
+project = "apartment-3d"
+timeout_min = 150
+prompt = '''
+Implement durable world saving using the project's verified storage architecture. Provide a prominent global Save action, clear dirty/saving/saved/error states, named layout variants and a way to browse and load saved revisions after restarting or reloading the application. Loading or saving one variant must not silently overwrite another or destroy the recoverable starting layout.
+
+Persist object instances, transforms, groups, support attachments, material and floor overrides, custom catalog variants and durable uploaded-image references. Namespace data by world identity so future spaces are possible without building additional worlds now. Handle incomplete writes, incompatible or corrupt data, missing media and unsaved-change transitions safely.
+
+Expose the recoverable reference arrangement and cleaned starter choices. Add a clearly labeled optional suggested arrangement only where validated geometry and clearances support it; do not claim it matches the real apartment. Test distinct furniture arrangements, save/reload round trips, media restoration, failed saves and retry idempotence. Do not introduce cloud synchronization without authorization. Record evidence and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "avatar-selection-and-customization"
+project = "apartment-3d"
+timeout_min = 90
+prompt = '''
+Add an accessible avatar-selection/customization screen or panel that fits the game-like interface. Provide meaningful selectable avatar appearances or models and hair-color customization using the project's actual asset and animation pipeline. Do not present nonfunctional options or tint unrelated body parts as a substitute for hair customization.
+
+Keep locomotion, collision, sitting behavior where supported, and camera anchor heights consistent across choices. Integrate preference persistence with the existing saved-state approach, making clear whether avatar preferences are global or part of a layout.
+
+Verify switching avatars while idle and moving, first-person heading, third-person tracking, the directly overhead view, play/edit transitions and restoration after reload. Avoid changing shared materials for unrelated avatar instances. Record verified options, unavailable capabilities and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "desktop-integration-and-regressions"
+project = "apartment-3d"
+timeout_min = 180
+prompt = '''
+Integrate the desktop work and assess it against the request checklist. Run the verification commands actually discovered in the project, add missing focused regression coverage, and fix cross-feature defects within this desktop scope. Review structural and prop changes against the available references.
+
+Exercise middle-button aerial panning, the perpendicular orthographic view, heading-correct first person, stable third person and transparent walls. Test a couch flush against a wall; valid and invalid floor drops; wall art with custom dimensions and an uploaded image; a lamp on a nightstand; grouping and instance scaling; named custom objects; floor finishes; avatar changes; interaction labels; and repeated save/load of different layouts.
+
+Check cancellation, view/mode changes during manipulation, relationship restoration and absence of accidental duplicate starter props. Record actual automated and manual evidence separately, including unavailable checks. Produce an explicit desktop readiness gate in .agent_tasks: required functionality must be implemented and verified before phone implementation begins. Missing features or failed checks must remain visible with honest STATUS/NEXT, not be described as complete.
+'''
+
+[[step]]
+name = "mobile-play-and-cameras"
+project = "apartment-3d"
+timeout_min = 150
+prompt = '''
+Begin phone implementation only after the desktop readiness gate passes. Confirm the actual mobile target identified in the audit and use its existing runtime and delivery approach. Do not assume Expo, invent a separate native application, or edit another registered project merely because its name suggests mobile. If the target or desktop prerequisites are unresolved, record a blocker instead of improvising a different product.
+
+Adapt the play HUD, avatar movement and every camera view to touch. Provide discoverable equivalents for aerial panning, zooming and looking, including the locked perpendicular plan view. Preserve heading-correct first person and stable third person. Ensure touch controls do not conflict with scrolling, browser gestures or UI buttons.
+
+Handle portrait/landscape changes, safe areas, pointer cancellation and interrupted touches. Preserve desktop mouse behavior and use shared camera logic rather than a divergent phone implementation. Verify on available local targets, clearly distinguish emulation from real-device evidence, and update .agent_tasks with STATUS/NEXT.
+'''
+
+[[step]]
+name = "mobile-editor-and-placement"
+project = "apartment-3d"
+timeout_min = 150
+prompt = '''
+Require the verified desktop placement system and usable phone input layer. Adapt the editor shell, categorized catalog, previews and selection to phone-sized screens using the project's actual UI technology. Use appropriately sized touch targets and panels or sheets that do not make the placement surface unusable.
+
+Support adding an item from the catalog, positioning it in the world, rotating it, snapping/alignment, repositioning an existing item and cancelling a placement without requiring a mouse or hover. Expose the existing floor, wall and supported-surface rules on touch; do not weaken collision validation for phones. Ensure gestures distinguish object dragging, camera movement, panel scrolling and ordinary play interaction.
+
+Test a couch against a wall, a painting on a wall and a lamp on a table in multiple camera views. Cover fingers leaving the viewport, interrupted gestures, orientation changes and UI overlays intercepting input. Record actual checks, blockers and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "mobile-groups-and-instance-editing"
+project = "apartment-3d"
+prompt = '''
+Require the phone editor and shared grouping/scaling functionality. Provide touch-accessible multi-selection, grouping, ungrouping, group rotation and movement, and per-instance dimension editing without relying on desktop modifier keys or hover handles.
+
+Make numeric controls, rotation buttons and snapping options usable with the on-screen keyboard and a small viewport. Preserve support relationships and validate whole-group movement and resizing through the same rules used on desktop. Include the ready-to-place nightstand-with-lamp preset and keep changes isolated to the selected instance or group.
+
+Test creating, moving, rotating, resizing and ungrouping a supported combination, including invalid sizes, wall contact, cancellation, interrupted touch and accidental selection of a support instead of its child. Verify that keyboard and panel resizing do not move objects unexpectedly. Record evidence, remaining limitations and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "mobile-customization-and-media"
+project = "apartment-3d"
+prompt = '''
+Adapt object previews, named reusable variants, artwork customization, floor finishes and avatar selection to the verified phone target. Expose catalog categories and truthful dynamic/interaction labels without requiring hover. Ensure the expanded catalog remains usable on a small screen.
+
+Implement the phone-appropriate local image selection flow for painting textures, using supported platform APIs rather than assuming desktop file behavior. Cover cancellation, unsupported formats, decoding failures, image orientation, aspect fitting and memory-sensitive image handling. Preserve privacy and do not send images to external services.
+
+Make painting dimensions, floor pattern rotation/colors, avatar choices and hair-color controls practical with touch and the on-screen keyboard. Use the shared customization model so phone changes do not mutate unrelated instances or create incompatible saved data. Test these flows with available local tools and record real-device limitations, evidence and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "mobile-save-versions-and-recovery"
+project = "apartment-3d"
+prompt = '''
+Require the shared world/version persistence and usable phone editor. Make global Save, named layout selection, saving a new variant and restoring a revision discoverable and usable on phones. Show meaningful dirty, saving, saved and failure states, and handle unsaved changes before switching layouts or leaving the editor.
+
+Verify durable storage and uploaded-image restoration for the actual phone runtime, including reload/relaunch, backgrounding or interruption where supported, unavailable media and storage failures. Preserve groups, support attachments, custom variants, floor finishes and avatar preferences. Use the desktop-compatible schema; do not invent cross-device synchronization or a new backend.
+
+Exercise two different furniture arrangements and the optional suggested arrangement without silently overwriting either. Test recovery after an interrupted or failed save and make resumed operations idempotent. Record which persistence scenarios were truly tested, unresolved platform limitations and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "mobile-performance-and-interactions"
+project = "apartment-3d"
+prompt = '''
+Profile the completed phone experience on the available verified target, using measured evidence rather than assumed bottlenecks. Investigate responsiveness and memory during camera movement, transparent-wall updates, catalog browsing, placement previews, group transforms and image-texture changes.
+
+Optimize demonstrated problems using the existing rendering and asset pipeline while preserving the corrected geometry, prop appearance, placement accuracy and shared behavior. Check for unnecessary redraws, excessive hit testing and leaked resources from previews or repeated texture replacements. Do not introduce a new renderer or unrelated framework migration.
+
+Verify supported dynamic/interactable props remain usable with touch, particularly the Roborock, lamps, TV and sit-able chairs where those capabilities exist. Their controls must not fire during editing gestures. Record the environment, before/after observations, actual checks and any limitations of emulated performance evidence in .agent_tasks with STATUS/NEXT.
+'''
+
+[[step]]
+name = "mobile-parity-validation"
+project = "apartment-3d"
+timeout_min = 180
+prompt = '''
+Run a phone-focused end-to-end acceptance pass after the mobile implementation steps. Use discovered project checks and available local device, simulator or browser tooling; do not provision cloud resources. Cover representative supported phone layouts, portrait/landscape behavior, safe areas and touch interruption. Clearly separate automated, emulated and real-device evidence.
+
+Verify all requested camera views and movement; reference geometry and clean props; catalog browsing and labels; floor/wall/support placement; flush wall contact without penetration; grouping and per-instance sizing; named variants; artwork upload; floor finishes; avatar customization; and durable named layout saving/loading. Include failure and cancellation cases, not only happy paths.
+
+Re-run relevant desktop checks to catch shared-code regressions. Fix integration defects within this scope and update the acceptance checklist with explicit pass, fail or unverified outcomes. Missing real-device access or unavailable platform tests must not be reported as passes. Record a phone release-readiness gate, remaining work and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "mobile-release-staging"
+project = "apartment-3d"
+timeout_min = 75
+prompt = '''
+Prepare release-ready sections using the project's verified phone delivery workflow, without publishing anything. Organize acceptance and rollout gates for play/cameras, editor placement/manipulation, customization/catalog/media, and layout persistence. These are logical rollout sections; do not invent separate services, applications or deployment infrastructure merely to split the work.
+
+Use existing local build or packaging commands only when discovered in project files. Produce local release candidates only for functionality that passes the recorded readiness gates, and document actual artifact locations, required configuration references, installation/preview steps and rollback or compatibility considerations in .agent_tasks.
+
+Do not push, submit to app stores, publish updates, deploy to external services, invoke cloud builds or copy credentials/private photos into artifacts or notes. Record the exact approvals, environment access or failed checks that prevent a real deployment. Distinguish locally built, locally tested and not-yet-published outcomes, and finish with truthful STATUS/NEXT.
+'''
+
+[[step]]
+name = "follow-up-plan"
+project = "apartment-3d"
+timeout_min = 25
+prompt = '''
+Review what this run actually accomplished against the human request and the recorded acceptance checklist. Read per-step logs, STATUS/NEXT lines and notes under C:/Projects/agent-conductor/data/runs in the newest directory whose name ends with apartment-play-edit, together with each participating project's .agent_tasks files. Include failed, interrupted and retried steps. Check recorded implementation and verification evidence rather than treating an optimistic status line as proof of completion.
+
+Write a NEW conductor TOML manifest at C:/Projects/agent-conductor/manifests/apartment-play-edit-followup.toml proposing only still-unfinished or newly discovered actionable work. Cover remaining desktop, reference-accuracy, editing, persistence, phone parity, testing and release-readiness gaps as warranted by evidence. Do not repeat verified completed tasks or invent work to fill the proposal.
+
+Use registered project slugs, sequential concrete steps, appropriate timeouts and the verified conductor schema. Include the required run/default settings, including on_failure = "continue", checkpoint = true and max_attempts = 3. Do not guess verification commands, authorize cloud execution, or include credentials or private data; refer to the relevant project files instead. If nothing remains, make that explicit without adding artificial implementation work. Do not overwrite an existing follow-up file silently.
+
+This step is review and proposal writing only: do not implement follow-up fixes, launch the manifest, start another run or publish anything. Leave the new manifest for human review and record its location, any blockers and truthful STATUS/NEXT.
+'''

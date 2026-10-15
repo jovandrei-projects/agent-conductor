@@ -2678,7 +2678,9 @@ def collect_dashboard(runs_dir: Path,
                      "dir": rec.get("manifest") or "",
                      "created_at": rec.get("created_at"),
                      "updated_at": rec.get("updated_at"),
-                     "started_at": None, "ended_at": None,
+                     "started_at": (rec.get("generation_started_at")
+                                    if stage == "generating" else None),
+                     "ended_at": None,
                      "counts": {"planned": len(steps)} if steps else {},
                      "tokens": None,
                      "plan_tokens": rec.get("plan_tokens"),
@@ -3291,7 +3293,11 @@ function render(d){
         (r.stage==='generating'
           ? `<span class="dots"><span>.</span><span>.</span><span>.</span></span>`
           : '') + `</span>` +
-        (r.gen_last ? `<br><span class="sub">${esc(r.gen_last)}</span>` : '') :
+        (r.gen_last ? `<br><span class="sub">${esc(r.gen_last)}</span>` :
+          r.stage==='generating'
+            ? `<br><span class="sub">planner warming up - ` +
+              `devin stays silent for the first minutes; watch the ` +
+              `plan-proposal row below</span>` : '') :
         `<span class="sub">${esc((r.dir||'').split(/[\\/]/).pop())}</span>`) +
       (r.stale?` <span class="stage error">Needs review</span>`:'') +
       `<br><button type="button" class="linkbtn" ` +
