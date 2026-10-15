@@ -54,7 +54,12 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   (state['flags']='v2' marks new-code drivers); run modal warns on
   'Interrupted' (no ended_at, nothing alive = conductor died);
   tail_status/tail_next now scan the whole log (8KB tail could miss a
-  STATUS: before a long closing report).
+  STATUS: before a long closing report); STATUS contract text hardened
+  ("print it to stdout - filing it in STATE.md does not count" after a
+  live worker did exactly that); run rows carry a state chip
+  (running/paused/interrupted/halted - the resume-worthy ones say so);
+  agent rows mark xN retry attempts and +ext timeout extensions; agent
+  modal links the project's .agent_tasks/<step>/STATE.md.
 - First real overnight manifest on a real project (Phase 2 in ROADMAP.md; live smoke already green)
 - Push agent-conductor to GitHub if cloud steps on it are wanted - it has NO remote, and cloud workers clone from origin (human decision: repo name + private/public)
 - Phone access to the :8773 dashboard via lan-bridge proxy (needs mobile-apps change; tasks-ui rows already give coarse progress)
