@@ -149,10 +149,34 @@ fields autocomplete from `devin models list` (cached 10min, parsed into
 per-family effort suffixes - an empty effort picks the family's bare
 variant); the fixed fallback list is all you get while logged out.
 Discard removes only an unrun, app-owned proposal and its planned rows.
+The `worktrees`/`merge resolver` checkboxes reach the planner prompt and
+are guaranteed into the TOML at publish (`_guarantee_isolation` - never
+applied to `cloud=true` steps; wave-required members always keep
+`worktree = true`); Review's `Apply` button is the deterministic path -
+`_apply_fields_to_toml` syncs run-level keys + per-step overrides the
+form owns, so an unchecked `worktrees` strips planner-added flags except
+where a same-project wave requires them.
 Real runs still use `state.json` as their registry. A run's detail modal
 has a Resume button (`POST /api/runs/<dir>/resume` -> `run <manifest>
 --resume <dir>`) once nothing in it is live - same semantics as the CLI
-flag, fresh attempts for every non-done step.
+flag, fresh attempts for every non-done step. When a run has unmerged
+`conductor/*` branches a `Merge pending branches` button appears
+(`POST /api/runs/<dir>/merge` -> `merge_run`): it replays the post-wave
+merge loop for parked branches, spawns the `resolve-*` session when the
+manifest opts in, and 409s while any step is live - the fix for "the
+conductor died/conflicted before merging" without `--resume`.
+
+Cost display: `serve` fetches self-serve rates from
+`docs.devin.ai/desktop/chat/models.md` (the Mintlify page embeds a
+`modelCostData` JS array; `TEAMS_TIER_PRO` is the self-serve tier),
+disk-caches them in `data/pricing.json` beside `runs/`, and refetches in
+a thread every 24h - offline/failed fetches just keep the last good
+table, and an unpriced model renders `-` while a real $0 (promo) renders
+`$0`. Formula: `(prompt - cached) * in_rate + cached * cache_rate +
+completion * out_rate` (cached is a component of prompt, never added on
+top). The session column also tolerates `devin list` propagation lag: a
+recorded id missing from the listing is `deleted by user` only after the
+step ended or `SESSION_GONE_GRACE_S` (5min) passed.
 
 Requires `devin` on PATH and `devin auth login` to have been run once
 (`devin auth status` is checked at run start; conductor aborts cleanly if

@@ -38,6 +38,7 @@ import threading
 import time
 import tomllib
 import urllib.parse
+import urllib.request
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -72,6 +73,11 @@ MODE_FLAG = {"normal": "auto", "auto": "auto", "accept-edits": "accept-edits",
 # a completed turn (verify still runs) instead of a timeout.
 STATUS_GRACE_S = 120.0
 WAIT_POLL_S = 15.0        # wait() slice between STATUS checks on the log
+# A recorded session_id can briefly vanish from `devin list` right after
+# spawn (registration lags seconds-to-a-minute, and the dashboard's own
+# listing cache is 120s stale) - don't read that as 'deleted' for the
+# first few minutes of a step.
+SESSION_GONE_GRACE_S = 300.0
 
 PREAMBLE = """\
 This session was spawned unattended by agent-conductor
@@ -663,7 +669,11 @@ def worktree_debris(repo_dir: Path, wt_path: Path, branch: str) -> bool:
 
 def worktree_merge(repo_dir: Path, wt_path: Path, branch: str) -> bool:
     """Merge the step's branch into the main checkout. On conflict, abort the
-    merge and LEAVE the worktree+branch for a human - the work is not lost."""
+    merge and LEAVE the worktree+branch for a human - the work is not lost.
+    A merge already in progress (someone else's - abort_own_merge cleared
+    ours) makes this refuse instead of `merge --abort`-ing a foreign merge."""
+    if merge_in_progress(repo_dir):
+        return False
     r = _git(repo_dir, "merge", "--no-edit", branch)
     if r.returncode != 0:
         _git(repo_dir, "merge", "--abort")
@@ -1829,7 +1839,8 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
     if not isinstance(payload, dict) or set(payload) - {
             "raw", "label", "project", "model", "effort", "manifest",
             "followup", "on_failure", "max_attempts",
-            "plan_model", "plan_effort"}:
+            "plan_model", "plan_effort",
+            "worktrees", "merge_resolver"}:
         raise RequestError("Invalid request fields")
     model, effort = default_model_effort()
     fields = {k: (rec or {}).get(k, v) for k, v in (
@@ -1841,11 +1852,12 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
             if not isinstance(payload[key], str):
                 raise RequestError(f"{key} must be text")
             fields[key] = payload[key].strip()
-    fields["followup"] = bool((rec or {}).get("followup"))
-    if "followup" in payload:
-        v = payload["followup"]
-        fields["followup"] = (v.strip().lower() in ("1", "true", "on", "yes")
-                              if isinstance(v, str) else bool(v))
+    for bkey in ("followup", "worktrees", "merge_resolver"):
+        fields[bkey] = bool((rec or {}).get(bkey))
+        if bkey in payload:
+            v = payload[bkey]
+            fields[bkey] = (v.strip().lower() in ("1", "true", "on", "yes")
+                            if isinstance(v, str) else bool(v))
     try:
         fields["max_attempts"] = int(payload.get("max_attempts") or
                                      (rec or {}).get("max_attempts") or 3)
@@ -1974,6 +1986,209 @@ def validate_proposal(text: str, manifests_dir: Path = MANIFESTS_DIR) -> Manifes
         raise RequestError(f"Invalid proposal: {exc}") from exc
 
 
+# ------------------------------------------------ deterministic TOML edits
+# The request form's option fields (model/effort/attempts/on_failure/
+# worktrees/merge_resolver/followup) map to known TOML keys, so review-time
+# changes can be patched into the proposal without a planner round-trip.
+# Everything written here is re-validated by _publish_proposal before it
+# touches disk, so a bad patch can never produce a bad manifest.
+
+def _toml_tables(lines: list[str]) -> list[tuple[str, int, int]]:
+    """(kind, header_idx, end_idx) for the three proposal tables.
+    Other-looking bracket lines inside a multiline prompt never match a
+    bare header line."""
+    heads: list[tuple[str, int]] = []
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if re.fullmatch(r"\[\[\s*step\s*\]\]", s):
+            heads.append(("step", i))
+        elif re.fullmatch(r"\[\s*run\s*\]", s):
+            heads.append(("run", i))
+        elif re.fullmatch(r"\[\s*defaults\s*\]", s):
+            heads.append(("defaults", i))
+    return [(k, i, heads[j + 1][1] if j + 1 < len(heads) else len(lines))
+            for j, (k, i) in enumerate(heads)]
+
+
+def _toml_keys(lines: list[str], start: int, end: int) -> list[tuple[int, str]]:
+    """(line_idx, key) for 'key =' lines in a table, skipping lines inside
+    a multiline ''' or \"\"\" literal (a prompt could contain 'worktree =')."""
+    out: list[tuple[int, str]] = []
+    in_str = None
+    for i in range(start + 1, end):
+        s = lines[i]
+        if in_str:
+            if in_str in s:
+                in_str = None
+            continue
+        m = re.match(r"^\s*([A-Za-z_][\w-]*)\s*=\s*(.*)$", s)
+        if not m:
+            continue
+        val = m.group(2)
+        for q in ("'''", '"""'):
+            if val.startswith(q) and s.count(q) == 1:
+                in_str = q
+        out.append((i, m.group(1)))
+    return out
+
+
+def _toml_key_at(lines: list[str], start: int, end: int,
+                 key: str) -> int | None:
+    return next((i for i, k in _toml_keys(lines, start, end) if k == key),
+                None)
+
+
+def _toml_set(lines: list[str], start: int, end: int, key: str,
+              value_src: str) -> None:
+    i = _toml_key_at(lines, start, end, key)
+    if i is None:
+        lines.insert(start + 1, f"{key} = {value_src}")
+    else:
+        lines[i] = f"{key} = {value_src}"
+
+
+def _wave_worktree_required(cfg: Manifest, manifests_dir: Path) -> set[str]:
+    """Step names that MUST keep worktree=true: members of a same-project
+    multi-step wave (validation rejects the manifest otherwise)."""
+    projects = load_projects()
+    resolved = []
+    for s in cfg.steps:
+        try:
+            resolved.append((*resolve_project(s, projects, manifests_dir), s))
+        except ManifestError:
+            resolved.append((Path(s.project), s.project, s))
+    need: set[str] = set()
+    for members in group_waves(resolved):
+        by_dir: dict[str, list[Step]] = {}
+        for pdir, _slug, s in members:
+            by_dir.setdefault(str(pdir), []).append(s)
+        for ss in by_dir.values():
+            if len(ss) > 1:
+                need.update(s.name for s in ss)
+    return need
+
+
+def _apply_fields_to_toml(text: str, fields: dict,
+                          manifests_dir: Path = MANIFESTS_DIR) -> str:
+    """Patch a proposal's option fields in place - the 'Apply to TOML' path.
+    Only keys present in `fields` are touched: {on_failure, merge_resolver}
+    write [run]; {model, effort, max_attempts} write [defaults] and are
+    stripped from [[step]] sections so the form value wins; {worktrees}
+    sets/clears per-step worktree (kept on same-project wave members and
+    never added to cloud steps - both would fail validation);
+    {followup} adds/removes the closing follow-up-plan step. Request text
+    and project are NOT applyable - those need regeneration."""
+    try:
+        cfg = load_manifest(manifests_dir / "applied.toml", text)
+    except (ManifestError, tomllib.TOMLDecodeError) as exc:
+        raise RequestError(f"Existing proposal does not parse - fix it or "
+                           f"regenerate first ({exc})", 409)
+    lines = text.splitlines()
+
+    def sect(kind: str) -> tuple[int | None, int | None]:
+        for k, s, e in _toml_tables(lines):
+            if k == kind:
+                return s, e
+        return None, None
+
+    def ensure(kind: str) -> tuple[int, int]:
+        s, e = sect(kind)
+        if s is None:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(f"[{kind}]")
+            s, e = sect(kind)
+        return s, e
+
+    def step_sect(name: str) -> tuple[int | None, int | None]:
+        for k, s, e in _toml_tables(lines):
+            if k != "step":
+                continue
+            i = _toml_key_at(lines, s, e, "name")
+            if i is None:
+                continue
+            try:
+                if tomllib.loads(lines[i]).get("name") == name:
+                    return s, e
+            except (tomllib.TOMLDecodeError, ValueError):
+                continue
+        return None, None
+
+    if fields.get("on_failure") in ("stop", "continue"):
+        _toml_set(lines, *ensure("run"), "on_failure",
+                  json.dumps(fields["on_failure"]))
+    if "merge_resolver" in fields:
+        _toml_set(lines, *ensure("run"), "merge_resolver",
+                  "true" if fields["merge_resolver"] else "false")
+    # Per-step overrides of fields the form owns would silently fight the
+    # applied value - strip them so defaults/run keys are the sole source.
+    drop_keys = ({"merge_resolver"} if "merge_resolver" in fields else
+                 set()) | (
+        {"model", "effort"}
+        if any(fields.get(k) is not None for k in ("model", "effort"))
+        else set()) | (
+        {"max_attempts"} if fields.get("max_attempts") is not None else set())
+    if drop_keys:
+        drop = sorted((i for k, s, e in _toml_tables(lines) if k == "step"
+                       for i, key in _toml_keys(lines, s, e)
+                       if key in drop_keys), reverse=True)
+        for i in drop:
+            del lines[i]
+    if any(fields.get(k) is not None for k in ("model", "effort")) or \
+            fields.get("max_attempts") is not None:
+        s, e = ensure("defaults")
+        for key in ("model", "effort"):
+            if fields.get(key) is not None:
+                _toml_set(lines, s, e, key, json.dumps(fields[key]))
+        if fields.get("max_attempts") is not None:
+            _toml_set(lines, s, e, "max_attempts",
+                      str(int(fields["max_attempts"])))
+    if "worktrees" in fields:
+        want = bool(fields["worktrees"])
+        required = _wave_worktree_required(cfg, manifests_dir)
+        cloud_steps = {s.name for s in cfg.steps if s.cloud}
+        for s in cfg.steps:
+            ss, se = step_sect(s.name)
+            if ss is None:
+                continue
+            if want and s.name not in cloud_steps:
+                _toml_set(lines, ss, se, "worktree", "true")
+            elif not want and s.name not in required:
+                i = _toml_key_at(lines, ss, se, "worktree")
+                if i is not None:
+                    del lines[i]
+    if "followup" in fields:
+        ss, se = step_sect("follow-up-plan")
+        if fields["followup"] and ss is None and cfg.steps:
+            slug = fields.get("project") or cfg.steps[-1].project
+            lines.extend(FOLLOWUP_STEP.format(
+                slug=slug, run=cfg.name, runs=RUNS_DIR.as_posix(),
+                manifests=MANIFESTS_DIR.as_posix()).splitlines())
+        elif not fields["followup"] and ss is not None:
+            del lines[ss:se]
+            if ss and ss - 1 < len(lines) and not lines[ss - 1].strip():
+                del lines[ss - 1]
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def _guarantee_isolation(text: str, rec: dict,
+                         manifests_dir: Path = MANIFESTS_DIR) -> str:
+    """The worktrees/merge_resolver checkboxes are guarantees, not hints:
+    add the flags when the planner omitted them. One-directional - an
+    unchecked box never strips a deliberate worktree/merge_resolver."""
+    fields = {}
+    if rec.get("worktrees"):
+        fields["worktrees"] = True
+    if rec.get("merge_resolver"):
+        fields["merge_resolver"] = True
+    if not fields:
+        return text
+    try:
+        return _apply_fields_to_toml(text, fields, manifests_dir)
+    except RequestError:
+        return text   # unparseable planner output fails validation anyway
+
+
 def _publish_proposal(rec: dict, text: str, requests_dir: Path,
                       manifests_dir: Path, runs_dir: Path) -> dict:
     cfg = validate_proposal(text, manifests_dir)
@@ -1985,6 +2200,10 @@ def _publish_proposal(rec: dict, text: str, requests_dir: Path,
         text = text.rstrip() + FOLLOWUP_STEP.format(
             slug=slug, run=cfg.name, runs=RUNS_DIR.as_posix(),
             manifests=MANIFESTS_DIR.as_posix())
+        cfg = validate_proposal(text, manifests_dir)
+    if rec.get("worktrees") or rec.get("merge_resolver"):
+        # The checkboxes are guarantees: add the flags the planner omitted.
+        text = _guarantee_isolation(text, rec, manifests_dir)
         cfg = validate_proposal(text, manifests_dir)
     if not manifests_dir.is_dir():
         raise RequestError(f"Missing manifests directory: {manifests_dir}", 409)
@@ -2017,10 +2236,13 @@ def save_request(request_id: str, payload: dict,
             raise RequestError("This request is being processed or already run", 409)
         rec["status"] = stage
         fields = _request_fields(payload, rec)
+        # Planner model/effort never enter the TOML, so they cannot stale a
+        # proposal; the rest diverge from the on-disk runbook until the
+        # user applies them to the TOML or regenerates.
         changed = any(fields[k] != rec.get(k) for k in
                       ("raw", "project", "model", "effort", "followup",
-                       "on_failure", "max_attempts",
-                       "plan_model", "plan_effort"))
+                       "worktrees", "merge_resolver",
+                       "on_failure", "max_attempts"))
         rec.update(fields)
         if "manifest" in payload:
             return _publish_proposal(rec, payload["manifest"],
@@ -2029,6 +2251,43 @@ def save_request(request_id: str, payload: dict,
             rec["stale"] = True
         _save_request(rec, requests_dir)
         return dict(rec)
+
+
+def apply_request(request_id: str, payload: dict,
+                  requests_dir: Path = REQUESTS_DIR,
+                  manifests_dir: Path = MANIFESTS_DIR,
+                  runs_dir: Path = RUNS_DIR) -> dict:
+    """Save the form fields AND rewrite the proposal TOML to match - the
+    deterministic alternative to regeneration. Refused when the request
+    text or target project changed: those shape the step prompts, which a
+    deterministic patch cannot rewrite."""
+    with REQUEST_LOCK:
+        _assert_unwatched(runs_dir, requests_dir, manifests_dir)
+        rec = _read_request(request_id, requests_dir)
+        stage = _request_status(rec, runs_dir)
+        if stage not in ("draft", "ready", "error", "launch_failed"):
+            raise RequestError("This request is being processed or already run",
+                               409)
+        if not rec.get("manifest"):
+            raise RequestError("No proposal yet - generate one first", 409)
+        rec["status"] = stage
+        fields = _request_fields(payload, rec)
+        if fields["raw"] != rec.get("raw") or \
+                fields["project"] != rec.get("project"):
+            raise RequestError("Request text or project changed - the step "
+                               "prompts depend on them; regenerate the "
+                               "proposal instead", 409)
+        text = payload.get("manifest")
+        if not isinstance(text, str):
+            p = _manifest_path(rec, manifests_dir)
+            try:
+                text = p.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise RequestError("Cannot read the proposal TOML", 500) from exc
+        rec.update(fields)
+        patched = _apply_fields_to_toml(text, fields, manifests_dir)
+        return _publish_proposal(rec, patched, requests_dir, manifests_dir,
+                                 runs_dir)
 
 
 def request_details(request_id: str, requests_dir: Path = REQUESTS_DIR,
@@ -2076,6 +2335,18 @@ def _planner_response(rec: dict, projects: dict,
             f"'{MANIFESTS_DIR.as_posix()}/<your run name>-followup.toml' "
             "using forward slashes. The step must NOT launch or implement "
             "the follow-up - a human reviews it.\n\n")
+    isolate = ""
+    if rec.get("worktrees"):
+        isolate += ("The human asked for worktree isolation: set "
+                    "worktree = true on EVERY [[step]] (except a cloud = "
+                    "true step, where worktrees are meaningless). Each "
+                    "step then runs on a conductor/<run>/<step> branch in "
+                    "its own checkout and merges back after its wave.\n\n")
+    if rec.get("merge_resolver"):
+        isolate += ("The human asked for automatic conflict resolution: "
+                    "set merge_resolver = true in [run], so a conflicted "
+                    "worktree merge is finished by a resolve-<step> "
+                    "session instead of only being parked.\n\n")
     prompt = f"""You are writing a proposed agent-conductor TOML runbook, not doing the work.
 Do not edit files, invoke tools, run commands, inspect projects, or start a run.
 Reply with exactly one TOML document between BEGIN_MANIFEST and END_MANIFEST,
@@ -2103,7 +2374,7 @@ Windows paths belong in TOML literal strings (single quotes) or use forward
 slashes - a backslash inside a double-quoted string is a TOML escape and
 breaks parsing.
 {followup}
-{fix}HUMAN REQUEST:
+{isolate}{fix}HUMAN REQUEST:
 {rec['raw']}
 
 BEGIN_MANIFEST
@@ -2369,6 +2640,115 @@ def resume_run(name: str, runs_dir: Path = RUNS_DIR,
     return {"resumed": name, "pid": _RESUME_PIDS[name]}
 
 
+_MERGE_BUSY: set[str] = set()
+_MERGE_LOCK = threading.Lock()
+
+
+def merge_run(name: str, runs_dir: Path = RUNS_DIR,
+              devin_argv: list[str] | None = None) -> dict:
+    """Merge a finished run's pending worktree branches back into their main
+    checkouts - the dashboard's manual counterpart to the post-wave merge.
+    Same rules: a clean merge lands and removes the worktree; a conflict
+    parks it (or, when the step has merge_resolver, spawns a resolve-*
+    session). Refused while the run has a live step, an in-flight resume,
+    or another merge already running - a resolve-* session can take
+    minutes and two callers must never race the same merge."""
+    with _MERGE_LOCK:
+        if name in _MERGE_BUSY:
+            raise RequestError("A merge is already running for this run",
+                               409)
+        _MERGE_BUSY.add(name)
+    try:
+        return _merge_run(name, runs_dir, devin_argv)
+    finally:
+        with _MERGE_LOCK:
+            _MERGE_BUSY.discard(name)
+
+
+def _merge_run(name: str, runs_dir: Path,
+               devin_argv: list[str] | None) -> dict:
+    if not RUN_DIR_RE.fullmatch(name):
+        raise RequestError("Invalid run dir", 404)
+    d = (runs_dir / name).resolve()
+    if d.parent != runs_dir.resolve() or not (d / "state.json").is_file():
+        raise RequestError("Run not found", 404)
+    try:
+        st = json.loads((d / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RequestError("Cannot read run state", 500) from exc
+    steps = st.get("steps") or {}
+    if any(step_live(r) for r in steps.values()):
+        raise RequestError("This run still has a live agent - wait for it "
+                           "or let it die first", 409)
+    pid = _RESUME_PIDS.get(name)
+    if pid and pid_alive(pid):
+        raise RequestError("A resume is already running for this run", 409)
+    pending = {n for n, r in steps.items()
+               if r.get("branch") and r.get("merged") is not True}
+    if not pending:
+        return {"dir": name, "merged": [], "conflicted": [], "skipped": []}
+    manifest = st.get("manifest")
+    if not manifest or not Path(manifest).is_file():
+        raise RequestError("Run's manifest is gone; merge the branches "
+                           "by hand from each kept worktree", 409)
+    cfg = load_manifest(Path(manifest))
+    projects = load_projects()
+    results = {"dir": name, "merged": [], "conflicted": [], "skipped": []}
+    for step in cfg.steps:                    # manifest order, like cmd_run
+        rec = steps.get(step.name) or {}
+        branch = rec.get("branch")
+        if not branch or rec.get("merged") is True:
+            continue
+        try:
+            repo_dir, slug = resolve_project(step, projects,
+                                             Path(manifest).parent)
+        except ManifestError as exc:
+            rec["note"] = f"merge skipped: {exc}"
+            results["skipped"].append(step.name)
+            continue
+        wt = (Path(rec["work_dir"]) if rec.get("work_dir")
+              else runs_dir.parent / "worktrees" / d.name / step.name)
+        if _git(repo_dir, "rev-parse", "-q", "--verify",
+                branch).returncode != 0:
+            rec["note"] = "merge skipped: branch is gone"
+            results["skipped"].append(step.name)
+            continue
+        # Clear a stale conductor merge left by a dead run before trying
+        # ours; a human's merge in progress makes worktree_merge refuse.
+        if abort_own_merge(repo_dir):
+            log_event(d, event="merge_abort_stale", step=step.name,
+                      project=str(repo_dir))
+        ok = worktree_merge(repo_dir, wt, branch)
+        if not ok and step.merge_resolver:
+            ok = resolve_merge_conflict(step, slug, repo_dir, wt, branch,
+                                        cfg, d, devin_argv or ["devin"], st)
+        if ok:
+            rec.update(status="done" if rec.get("status") == "failed"
+                       else rec.get("status"),
+                       merged=True,
+                       note="merged via dashboard "
+                            f"(was {rec.get('status')})")
+            results["merged"].append(step.name)
+        else:
+            rec.update(merged=False,
+                       note="merge still conflicts; the worktree is kept "
+                            f"at {wt} for manual resolution")
+            results["conflicted"].append(step.name)
+    pending -= set(results["merged"])
+    for n in pending - set(results["conflicted"]) - set(results["skipped"]):
+        # recorded branch belongs to a step the manifest no longer names
+        steps[n]["note"] = "merge skipped: step not in the manifest anymore"
+        results["skipped"].append(n)
+    save_state(d, st)
+    log_event(d, event="merge_manual", merged=results["merged"],
+              conflicted=results["conflicted"], skipped=results["skipped"])
+    try:
+        (runs_dir.parent / "worktrees" / d.name).rmdir()
+    except OSError:
+        pass
+    return results
+
+
 def discard_request(request_id: str,
                     requests_dir: Path = REQUESTS_DIR,
                     manifests_dir: Path = MANIFESTS_DIR,
@@ -2478,6 +2858,124 @@ def model_options(devin_argv: list[str]) -> dict[str, list[str]]:
     return fams
 
 
+# Per-token rates: docs.devin.ai publishes the chat-models table as an
+# embedded JS array (modelCostData) in the page's MDX source - valid JSON
+# once extracted. Fetched in the background, mirrored to
+# <data>/pricing.json so restarts/offline still price old rows. We use the
+# Self-serve tab's tier (TEAMS_TIER_PRO).
+_PRICES_URL = "https://docs.devin.ai/desktop/chat/models.md"
+_PRICES_TIER = "TEAMS_TIER_PRO"
+_PRICES_TTL_S = 6 * 3600          # refetch a good table ~4x/day
+_PRICES_RETRY_S = 600             # a failed fetch retries in ~10min
+_PRICE_CACHE = {"fetched": 0.0, "table": {}, "source": ""}
+_PRICE_BUSY = False
+_PRICE_TRIED = 0.0
+
+
+def _parse_price_table(text: str) -> dict:
+    """modelCostData -> {model_uid: {label, in, out, cr}} for the self-serve
+    tier; rates are USD per million tokens ('cr' = cache-read input)."""
+    m = re.search(r"modelCostData\s*=\s*(\[.*?\])\s*;", text, re.S)
+    if not m:
+        return {}
+    try:
+        data = json.loads(m.group(1))
+    except ValueError:
+        return {}
+    table = {}
+    for ent in data:
+        if not isinstance(ent, dict) or ent.get("tier") != _PRICES_TIER:
+            continue
+        uid = ent.get("model_uid")
+        if not isinstance(uid, str) or not uid:
+            continue
+        table[uid] = {
+            "label": ent.get("label") or uid,
+            "in": ent.get("input_cost_per_million_usd"),
+            "out": ent.get("output_cost_per_million_usd"),
+            "cr": ent.get("cache_read_cost_per_million_usd")}
+    return table
+
+
+def price_table(runs_dir: Path | None = None) -> dict:
+    """Best-known self-serve rate table. Memory first, then the pricing.json
+    disk mirror; the refresh is a background thread so this never blocks a
+    dashboard render."""
+    if _PRICE_CACHE["table"]:
+        return _PRICE_CACHE["table"]
+    pf = (runs_dir.parent if runs_dir else DATA_DIR) / "pricing.json"
+    try:
+        d = json.loads(pf.read_text(encoding="utf-8"))
+        if isinstance(d.get("table"), dict):
+            _PRICE_CACHE["fetched"] = float(d.get("fetched_at") or 0)
+            _PRICE_CACHE["table"] = d["table"]
+            _PRICE_CACHE["source"] = d.get("url") or pf.name
+    except (OSError, ValueError, TypeError):
+        pass
+    return _PRICE_CACHE["table"]
+
+
+def refresh_prices(runs_dir: Path) -> None:
+    """Background re-fetch of the docs rate table. A populated table refetches
+    every 6h; an empty one (offline boot, docs down) retries every 10min.
+    Failures keep whatever table we had."""
+    global _PRICE_BUSY, _PRICE_TRIED
+    interval = _PRICES_TTL_S if _PRICE_CACHE["table"] else _PRICES_RETRY_S
+    if _PRICE_BUSY or time.time() - _PRICE_TRIED < interval:
+        return
+    _PRICE_BUSY = True
+    _PRICE_TRIED = time.time()
+
+    def work() -> None:
+        global _PRICE_BUSY
+        try:
+            req = urllib.request.Request(
+                _PRICES_URL, headers={"User-Agent": "agent-conductor",
+                                      "Accept": "text/markdown,*/*"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                table = _parse_price_table(
+                    r.read().decode("utf-8", "replace"))
+            if table:
+                _PRICE_CACHE.update(fetched=time.time(), table=table,
+                                    source=_PRICES_URL)
+                try:
+                    (runs_dir.parent / "pricing.json").write_text(
+                        json.dumps({"fetched_at": _PRICE_CACHE["fetched"],
+                                    "tier": _PRICES_TIER, "url": _PRICES_URL,
+                                    "table": table}), encoding="utf-8")
+                except OSError:
+                    pass
+        except Exception:
+            LOG.exception("pricing refresh failed")
+        _PRICE_BUSY = False
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def estimate_cost(tokens: dict | None, model: str | None,
+                  effort: str | None, table: dict) -> dict | None:
+    """USD estimate for one session's token totals at self-serve rates.
+
+    `cached` prices at the cache-read rate and `prompt - cached` is the
+    uncached input share (ATIF doesn't split cache write vs read; docs'
+    cache-write column is 0 or near-0 for most models anyway). The uid is
+    the fused model id the CLI actually ran (model + '-' + effort), falling
+    back to the bare model. Returns {'usd': None} for unpriced models."""
+    if not tokens:
+        return None
+    uid = f"{model}-{effort}" if model and effort else model
+    ent = table.get(uid) or table.get(model or "")
+    used = uid if uid in table else model
+    if not ent or ent.get("in") is None or ent.get("out") is None:
+        return {"usd": None, "uid": uid}
+    p = tokens.get("prompt") or 0
+    c = tokens.get("cached") or 0
+    o = tokens.get("completion") or 0
+    usd = (max(p - c, 0) * ent["in"] + c * (ent.get("cr") or 0)
+           + o * ent["out"]) / 1_000_000
+    return {"usd": round(usd, 4), "uid": used, "label": ent.get("label")}
+
+
 def live_sessions_by_dir(runs_dir: Path,
                          devin_argv: list[str]) -> dict[str, dict | None]:
     """work_dir -> {session id: last_activity epoch} from `devin list`
@@ -2554,6 +3052,7 @@ def proposal_agent(step: dict, rec: dict, projects: dict, key: str,
             "effort": step.get("effort"), "mode": step.get("mode"),
             "task": step.get("task"), "wt": step.get("wt"),
             "merged": None, "cloud": step.get("cloud"), "tokens": None,
+            "cost": None,
             "alive": False,
             "note": "Run ended before this step started" if status == "skipped"
             else None}
@@ -2567,6 +3066,8 @@ def collect_dashboard(runs_dir: Path,
     requests_dir = requests_dir or runs_dir.parent / "requests"
     sess_by_dir = live_sessions_by_dir(runs_dir, devin_argv or ["devin"])
     projects = load_projects()
+    refresh_prices(runs_dir)
+    prices = price_table(runs_dir)
     requests: dict[str, dict] = {}
     for rf in requests_dir.glob("*.json"):
         try:
@@ -2590,6 +3091,9 @@ def collect_dashboard(runs_dir: Path,
                else str(sj.parent))
         counts: dict[str, int] = {}
         tok_run: dict[str, int] = {}
+        run_cost = 0.0
+        run_priced = 0
+        run_unpriced = 0
         request = requests.get(st.get("request_id"))
         proposed = {s["step"]: s for s in request.get("proposed_steps", [])} \
             if request else {}
@@ -2608,6 +3112,23 @@ def collect_dashboard(runs_dir: Path,
             wd = (rec.get("work_dir") or rec.get("project") or
                   str(projects.get(slug, {}).get("path") or ""))
             live = sess_by_dir.get(wd)
+            model = rec.get("model") or plan.get("model")
+            effort = rec.get("effort") or plan.get("effort")
+            cost = estimate_cost(t, model, effort, prices)
+            if isinstance(t, dict):
+                if cost and cost.get("usd") is not None:
+                    run_cost += cost["usd"]
+                    run_priced += 1
+                else:
+                    run_unpriced += 1
+            # A recorded id missing from `devin list` minutes after spawn is
+            # propagation/cache lag, not deletion - 'gone' only once the
+            # step ended or the grace window passed.
+            start_ts = _iso_ts(rec.get("started_at"))
+            session_gone = bool(
+                sid and live is not None and str(sid) not in live and (
+                    rec.get("ended_at") or
+                    (start_ts or 0) < time.time() - SESSION_GONE_GRACE_S))
             agents.append({
                 "run": st.get("run"), "run_dir": st.get("run_dir") or str(sj.parent),
                 "run_key": key, "request_id": st.get("request_id"),
@@ -2618,18 +3139,17 @@ def collect_dashboard(runs_dir: Path,
                 "elapsed_s": rec.get("elapsed_s"),
                 "alive": step_live(rec),
                 "pid": rec.get("pid"), "session_id": rec.get("session_id"),
-                "model": rec.get("model") or plan.get("model"),
+                "model": model,
                 "mode": rec.get("mode") or plan.get("mode"),
-                "effort": rec.get("effort") or plan.get("effort"),
+                "effort": effort,
                 "task": task_label(rec) or plan.get("task"),
                 "cloud": rec.get("cloud", plan.get("cloud")),
                 "verify_ok": rec.get("verify_ok"),
                 "note": rec.get("note"), "next": rec.get("next"),
-                "session_gone": bool(sid and live is not None
-                                     and str(sid) not in live),
+                "session_gone": session_gone,
                 "exit_code": rec.get("exit_code"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
-                "tokens": rec.get("tokens"),
+                "tokens": rec.get("tokens"), "cost": cost,
                 "wt": bool(rec.get("branch") or plan.get("wt")),
                 "stdout_log": rec.get("stdout_log"),
                 "tail": stdout_tail(rec.get("stdout_log")),
@@ -2650,7 +3170,15 @@ def collect_dashboard(runs_dir: Path,
                      "started_at": st.get("started_at"),
                      "ended_at": st.get("ended_at"), "counts": counts,
                      "tokens": tok_run or None,
+                     "cost": ({"usd": round(run_cost, 4) if run_priced
+                               else None, "unpriced": run_unpriced}
+                              if run_priced or run_unpriced else None),
                      "plan_tokens": (request or {}).get("plan_tokens"),
+                     "plan_cost": estimate_cost(
+                         (request or {}).get("plan_tokens"),
+                         (request or {}).get("plan_model")
+                         or (request or {}).get("model"),
+                         (request or {}).get("plan_effort"), prices),
                      "max_parallel": st.get("max_parallel"),
                      "projects": sorted({r.get("slug") for r in
                                          st.get("steps", {}).values()
@@ -2684,6 +3212,10 @@ def collect_dashboard(runs_dir: Path,
                      "counts": {"planned": len(steps)} if steps else {},
                      "tokens": None,
                      "plan_tokens": rec.get("plan_tokens"),
+                     "plan_cost": estimate_cost(
+                         rec.get("plan_tokens"),
+                         rec.get("plan_model") or rec.get("model"),
+                         rec.get("plan_effort"), prices),
                      "max_parallel": None,
                      "stage": stage, "error": rec.get("error"),
                      "stale": rec.get("stale"), "gen_last": gen_last,
@@ -2714,6 +3246,7 @@ def collect_dashboard(runs_dir: Path,
                     (rec.get("raw") or "").split())[:120],
                 "note": None, "next": None, "exit_code": None,
                 "branch": None, "merged": None, "tokens": None, "wt": False,
+                "cost": None,
                 "stdout_log": str(log_p) if log_p.is_file() else None,
                 "tail": gen_tail, "export": None, "prompt": None})
         for s in steps:
@@ -2744,6 +3277,12 @@ def collect_dashboard(runs_dir: Path,
             "free_ram_gb": free_ram_gb(), "runs": runs, "agents": agents,
             "project_options": [{"slug": slug, "cloud_ok": p["cloud_ok"]}
                                 for slug, p in sorted(projects.items())],
+            "pricing": {"tier": "self-serve", "models": len(prices),
+                        "fetched": (dt.datetime.fromtimestamp(
+                            _PRICE_CACHE["fetched"]).isoformat(
+                                timespec="seconds")
+                            if _PRICE_CACHE["fetched"] else None),
+                        "source": _PRICE_CACHE["source"]},
             "defaults": dict(zip(("model", "effort"), default_model_effort())),
             "model_options": model_options(devin_argv or ["devin"]),
             "auth": auth_status(devin_argv or ["devin"])}
@@ -2822,6 +3361,7 @@ a { color:#58a6ff; text-decoration:none; }
 .btn { border:1px solid #388bfd; border-radius:6px; background:#1f6feb; color:#fff; padding:7px 12px; cursor:pointer; font:inherit; }
 .btn.secondary { color:#e6edf3; background:#21262d; border-color:#30363d; }
 .btn.danger { color:#ffb2aa; background:transparent; border-color:#9f3535; }
+.btn.attn { border-color:#d29922; color:#e3b341; }
 .btn:disabled { cursor:not-allowed; opacity:.45; }
 #detail label { display:block; color:#8b949e; margin:12px 0 5px; }
 #detail input, #detail textarea, #detail select { box-sizing:border-box; width:100%; padding:8px 10px; border:1px solid #30363d; border-radius:6px; background:#0d1117; color:#e6edf3; font:inherit; }
@@ -2872,12 +3412,22 @@ const fmtS = s => { if(s==null) return '-';
   return (h? h+'h':'') + (m? m+'m':'') + (s%60)+'s'; };
 const kfmt = n => n==null?'-':(n>=1000
   ? (n/1000).toFixed(n>=100000?0:1).replace(/\.0$/,'')+'k' : String(n));
+// tokens render as 'input/output+cached' - a bare trailing 0 read as a
+// bug, so the cached share only shows when nonzero (title has the rest).
 const fmtT = t => (!t||t.prompt==null) ? '-' :
-  `${kfmt(t.prompt)}/${kfmt(t.completion)}/${kfmt(t.cached)}`;
+  `${kfmt(t.prompt)}/${kfmt(t.completion)}` +
+  (t.cached ? `+${kfmt(t.cached)}c` : '') +
+  (t.llm_steps ? ` ·${t.llm_steps}st` : '');
 const tokTitle = t => !t ? '' :
   `prompt ${t.prompt} · completion ${t.completion} · ` +
   `cached ${t.cached} · ${t.llm_steps??'?'} LLM steps`;
-const TOK_HELP = 'prompt / completion / cached; select an agent for details';
+const fmtC = c => !c ? '-' : c.usd==null ? 'n/a' :
+  '$'+(c.usd===0 ? '0' : c.usd<0.01 ? c.usd.toFixed(4) : c.usd.toFixed(2));
+const costTitle = c => !c ? 'no token data yet' :
+  (c.label ? `${c.label} (${c.uid||''})` : (c.uid||'')) +
+  (c.usd==null ? ' - no self-serve rate for this model'
+              : ' - est. self-serve cost');
+const TOK_HELP = 'input / output (+cached ·LLM steps); select an agent for details';
 const tokenHelp = `<details class="tok-help"><summary aria-label="Explain tokens and cost">?</summary>` +
   `<div class="explain"><b>What the numbers mean</b><br>` +
   `<b>Prompt</b>: all input tokens (instructions, tools, context, history).<br>` +
@@ -2891,7 +3441,9 @@ const tokenHelp = `<details class="tok-help"><summary aria-label="Explain tokens
   `6,000 cached, 1,000 completion; at $2/M input, $0.50/M cached, ` +
   `$8/M output: 4,000 × $2/M + 6,000 × $0.50/M + 1,000 × $8/M ` +
   `= $0.008 + $0.003 + $0.008 = <b>$0.019</b>. ` +
-  `Actual rates vary; priced totals await model-compare.</div></details>`;
+  `Rates come from the self-serve table at docs.devin.ai/desktop/chat/` +
+  `models, refetched every few hours; a model with no listed rate ` +
+  `shows n/a.</div></details>`;
 function elapsed(a, now){
   if (a.elapsed_s != null) return fmtS(a.elapsed_s);
   if (a.started_at && (a.status==='running'||a.status==='queued'))
@@ -2908,7 +3460,7 @@ function streamGenTail(){
   if (gel.textContent !== t){ gel.textContent = t; gel.scrollTop = gel.scrollHeight; }
 }
 const expanded = {};      // slug -> true: show all rows, not just latest 10
-const hidden = new Set(); // statuses filtered out via chips
+const only = new Set();   // status chips: empty = all, else show ONLY these
 const facets = new Set();
 let selectedRun = null;
 const prevTail = {};      // run|step -> last tail_last shown; a change
@@ -2927,12 +3479,13 @@ let AGENTS = [];          // last payload, for the detail modal
 // column layout shared by every per-project table (fixed layout -> the
 // same widths line up across tables)
 const AGENT_COLS = '<colgroup>' +
-  '<col style="width:7%"><col style="width:12%"><col style="width:18%">' +
-  '<col style="width:7%"><col class="hide-s" style="width:7%">' +
+  '<col style="width:7%"><col style="width:12%"><col style="width:15%">' +
+  '<col style="width:6%"><col class="hide-s" style="width:7%">' +
   '<col class="hide-s" style="width:5%"><col class="hide-s" style="width:6%">' +
   '<col style="width:6%"><col style="width:5%">' +
-  '<col class="hide-s" style="width:7%"><col style="width:6%">' +
-  '<col class="hide-s" style="width:6%"><col style="width:8%">' +
+  '<col class="hide-s" style="width:7%"><col class="hide-s" style="width:5%">' +
+  '<col style="width:6%"><col class="hide-s" style="width:6%">' +
+  '<col style="width:7%">' +
   '</colgroup>';
 
 let detailIdx = null;
@@ -2953,6 +3506,7 @@ function showDetail(i){
     ['started',a.started_at],['ended',a.ended_at],
     ['elapsed',a.elapsed_s!=null?fmtS(a.elapsed_s):'-'],
     ['tokens',tokTitle(a.tokens)||'-'],
+    ['est cost',(fmtC(a.cost)!=='-'?fmtC(a.cost)+' - ':'')+costTitle(a.cost)],
     ['session',(a.session_id||'-')+(a.session_gone?' (deleted from sidebar)':'')],
     ['verify',a.verify_ok==null?'-':(a.verify_ok?'pass':'FAIL')],
     ['exit',a.exit_code],['work dir',a.work_dir],
@@ -2972,13 +3526,27 @@ function showDetail(i){
 function showRunDetails(key){
   const r = lastData?.runs.find(x=>runKey(x)===key);
   if (!r || !closeDetail()) return;
+  const total = Object.values(r.counts||{}).reduce((s,n)=>s+n,0);
+  const runUsd = (r.cost&&r.cost.usd!=null)||(r.plan_cost&&r.plan_cost.usd!=null)
+    ? (r.cost&&r.cost.usd||0)+(r.plan_cost&&r.plan_cost.usd||0) : null;
   const kv = [['description',r.description||'-'],['projects',(r.projects||[]).join(', ')],
     ['started',r.started_at],['ended',r.ended_at],
-    ['steps',Object.entries(r.counts||{}).map(([s,n])=>`${n} ${s}`).join(', ')],
-    ['tokens',tokTitle(r.tokens)||'-'],['manifest / dir',r.dir]];
+    ['steps',(total?`${total} total · `:'')+
+      Object.entries(r.counts||{}).map(([s,n])=>`${n} ${s}`).join(', ')],
+    ['tokens',tokTitle(r.tokens)||'-'],
+    ['est cost',runUsd!=null?fmtC({usd:runUsd})+
+      (r.cost&&r.cost.unpriced?` (+${r.cost.unpriced} step(s) unpriced)`:'')+
+      ` (self-serve rates, plan + steps)`:'-'],
+    ['manifest / dir',r.dir]];
   const canResume = Object.keys(r.counts||{}).length &&
     !Object.keys(r.counts).some(s=>['running','queued'].includes(s)) &&
     Object.keys(r.counts).some(s=>s!=='done');
+  // Steps whose worktree branch never landed (conflict parked the worktree,
+  // or the conductor died between the wave and the merge) - mergeable from
+  // here once nothing in the run is live.
+  const pendingMerge = AGENTS.some(a=>a.branch && a.merged!==true &&
+    (a.run_key||a.run_dir)===key &&
+    !['running','queued'].includes(a.status));
   document.getElementById('dbody').innerHTML =
     `<h3 id="modal-title">${esc(r.run)}</h3>` +
     (r.stage ? `<span class="stage ${esc(r.stage)}">${esc(STAGES[r.stage]||r.stage)}</span>` : '') +
@@ -2989,6 +3557,9 @@ function showRunDetails(key){
     `data-filter-run="${esc(key)}">Show only this run</button>` +
     (r.request_id ? `<button type="button" class="btn secondary" ` +
       `data-open-request="${esc(r.request_id)}">View original request / TOML</button>` : '') +
+    (pendingMerge ? `<button type="button" class="btn" ` +
+      `data-merge-run="${esc(String(r.dir).split(/[\\/]/).pop())}" ` +
+      `data-rk="${esc(key)}">Merge pending branches</button>` : '') +
     (canResume ? `<button type="button" class="btn" ` +
       `data-resume-run="${esc(String(r.dir).split(/[\\/]/).pop())}">` +
       `Resume unfinished steps</button>` : '') +
@@ -3039,9 +3610,11 @@ function showRequestForm(rec){
       `Starting the run requires a separate, explicit click. Generated TOML ` +
       `is a tracked file: review it before sharing.</div>` +
     (rec.error ? `<div class="notice error">${esc(rec.error)}</div>`:'') +
-    (rec.stale ? `<div class="notice warn">Request or model changed since ` +
-      `the proposal. Regenerate tasks, or edit and save the TOML before ` +
-      `starting a run.</div>`:'') +
+    (rec.stale ? `<div class="notice warn">Request fields changed since ` +
+      `the proposal. Regenerate tasks, or use <b>Apply options to TOML</b> ` +
+      `to write the model/effort/attempts/failure/worktree options into ` +
+      `the manifest without regenerating (request text and project ` +
+      `changes need regeneration).</div>`:'') +
     (stage==='generating'?`<div class="notice warn">Planning in progress. ` +
       `The previous proposal, if any, remains available if generation fails.</div>`:'') +
     (rec.gen_tail && (stage==='generating'||stage==='error')
@@ -3086,6 +3659,16 @@ function showRequestForm(rec){
       `${rec.followup?' checked':''}${disabled}> End the run with a ` +
       `planning step that drafts a follow-up manifest into manifests/ ` +
       `for anything unfinished</label>` +
+    `<label class="check"><input type="checkbox" id="rq-worktrees"` +
+      `${rec.worktrees?' checked':''}${disabled}> Run every step in its own ` +
+      `git worktree (<code>worktree = true</code>): changes land on a ` +
+      `conductor/&lt;run&gt;/&lt;step&gt; branch and merge back after each ` +
+      `wave - required anyway for same-project parallel steps</label>` +
+    `<label class="check"><input type="checkbox" id="rq-merge_resolver"` +
+      `${rec.merge_resolver?' checked':''}${disabled}> On a worktree merge ` +
+      `conflict, spawn a resolve-* session to finish the merge ` +
+      `(<code>merge_resolver = true</code>) instead of only parking the ` +
+      `worktree for a human</label>` +
     (steps.length?`<h3 style="margin:16px 0 0">Proposed steps (${steps.length})</h3>` +
       `<ol class="proposal-list">${steps.map(s=>`<li><b>${esc(s.step)}</b> ` +
         `<small>${esc(s.slug)} · ${esc(s.model||'-')} / ${esc(s.effort||'-')}` +
@@ -3102,8 +3685,15 @@ function showRequestForm(rec){
     `<div class="actions">` +
     (editable?`<button type="button" class="btn secondary" data-action="save">` +
       `${stage==='new'||stage==='draft'?'Save draft':'Save edits'}</button>` +
-      `<button type="button" class="btn" data-action="generate">` +
-      `${rec.manifest?'Regenerate tasks':'Generate proposal'}</button>`:'') +
+      `<button type="button" class="btn${rec.stale?' attn':''}" ` +
+      `data-action="generate">` +
+      `${rec.manifest?'Regenerate tasks':'Generate proposal'}</button>` +
+      (rec.manifest?`<button type="button" ` +
+        `class="btn secondary${rec.stale?' attn':''}" data-action="apply" ` +
+        `title="Rewrite the TOML to match the fields above (model, effort, ` +
+        `attempts, failure policy, worktrees, resolver) without a planner ` +
+        `call - request text and project changes still need Regenerate">` +
+        `Apply options to TOML</button>`:''):'') +
     (stage==='error'&&rec.manifest_text ? `<button type="button" ` +
       `class="btn secondary" data-action="restore">Keep previous plan</button>`:'') +
     (stage==='ready'||stage==='launch_failed' ? `<button type="button" ` +
@@ -3139,8 +3729,10 @@ function requestFields(){
     ['raw','label','project','model','effort','on_failure',
      'plan_model','plan_effort'].map(k=>
     [k,document.getElementById(`rq-${k}`).value]));
-  const fup=document.getElementById('rq-followup');
-  if (fup) f.followup=fup.checked;
+  for (const k of ['followup','worktrees','merge_resolver']){
+    const el=document.getElementById(`rq-${k}`);
+    if (el) f[k]=el.checked;
+  }
   const att=document.getElementById('rq-attempts');
   if (att) f.max_attempts=att.value;
   return f;
@@ -3167,11 +3759,19 @@ async function requestAction(action){
   buttons.forEach(b=>b.disabled=true);
   try {
     let rid=id;
-    if (action==='save'||action==='generate'||action==='restore'){
+    if (action==='apply' && !rid){ formError('Nothing to apply yet - ' +
+      'generate a proposal first.'); return; }
+    if (action==='save'||action==='generate'||action==='restore'||
+        action==='apply'){
       const fields=requestFields();
       if (!rid){
         const saved=await api('POST','/api/requests',fields);
         rid=saved.id; modalRequest.id=rid;
+      } else if (action==='apply'){
+        // Apply patches the proposal on top of the textarea's TOML when it
+        // has unsaved edits, so a hand edit is never silently replaced.
+        if (editedManifest) fields.manifest=manifestEl.value;
+        await api('POST',`/api/requests/${rid}/apply`,fields);
       } else {
         if (action==='restore'||action==='save'&&editedManifest)
           fields.manifest=manifestEl.value;
@@ -3215,6 +3815,10 @@ function render(d){
     `${d.agents.length-planned} agents | ${planned} planned | ${live.length} running | ` +
     `cpu ${d.cpu_count||'?'} cores | free ram ${d.free_ram_gb||'?'} GB | ` +
     `refreshed ${loc(d.generated_at)}` +
+    (d.pricing && d.pricing.models
+      ? ` | ${d.pricing.models} model rates` +
+        (d.pricing.fetched ? ` @ ${loc(d.pricing.fetched)}` : '')
+      : ' | rates unavailable') +
     (d.auth && d.auth!=='ok'
       ? ` <b style="color:#f85149">AUTH: ${esc(d.auth)}</b>` +
         ` <a href="#" data-auth="login">[log in]</a>` +
@@ -3224,7 +3828,7 @@ function render(d){
   // innerHTML every 2s resets animations/hover and looks like a reload.
   // `tail` is excluded: live log growth streams into the open modal instead.
   const sig = JSON.stringify([d.runs, d.agents.map(({tail,...r})=>r),
-    selectedRun, [...hidden].sort(), [...facets].sort(), expanded,
+    selectedRun, [...only].sort(), [...facets].sort(), expanded,
     runsShown===Infinity?'all':runsShown]);
   const tailEl = document.getElementById('dtail');
   if (sig === lastSig){
@@ -3251,16 +3855,18 @@ function render(d){
       `aria-label="Clear run filter">${esc(selected.run)} ×</button></span>`:'') +
     `<span class="filter-group"><span class="filter-label">status:</span>` +
     ORDER.filter(s=>byStatus[s]).map(s=>
-      `<button type="button" class="chip${hidden.has(s)?' off':''}" data-st="${s}" ` +
-      `aria-pressed="${!hidden.has(s)}" style="color:${COLORS[s]||'#8b949e'}">` +
-      `${byStatus[s]} ${s}</button>`).join('') + '</span>' +
+      `<button type="button" class="chip${only.has(s)?' active':''}` +
+      `${only.size&&!only.has(s)?' off':''}" data-st="${s}" ` +
+      `aria-pressed="${only.has(s)}" style="color:${COLORS[s]||'#8b949e'}" ` +
+      `title="show only ${s}">${byStatus[s]} ${s}</button>`).join('') +
+    '</span>' +
     `<span class="filter-group"><span class="filter-label">tags:</span>` +
     FACETS.filter(f=>facetCounts[f]||facets.has(f)).map(f=>
       `<button type="button" class="chip${facets.has(f)?' active':''}" ` +
       `data-facet="${f}" aria-pressed="${facets.has(f)}">` +
       `${facetCounts[f]} ${f}${facets.has(f)?' ×':''}</button>`).join('') +
     '</span>' +
-    (hidden.size||facets.size?` <button type="button" class="chip" ` +
+    (only.size||facets.size?` <button type="button" class="chip" ` +
       `data-reset>clear filters</button>`:'');
 
   // runs table first - a run can span projects (chips show which)
@@ -3273,20 +3879,35 @@ function render(d){
     '<th title="parallel-agent cap for this run (run.max_parallel)">cap</th>' +
     '<th class="hide-s">dir</th></tr>';
   // rows are newest-first; active runs and unlaunched requests always show,
-  // finished history is capped at SHOW_N until "show more"/"show all"
-  const allRuns = d.runs.filter(r=>!selectedRun||runKey(r)===selectedRun);
+  // finished history is capped at SHOW_N until "show more"/"show all".
+  // The status/tag chips also scope the runs table: a run stays visible
+  // while at least one of its agents matches the active filters.
+  const matchAgent = a => (!only.size||only.has(a.status)) &&
+    [...facets].every(f=>matchesFacet(a,f));
+  const allRuns = d.runs.filter(r=>!selectedRun||runKey(r)===selectedRun)
+    .filter(r=>{
+      if (!only.size && !facets.size) return true;
+      const kids = d.agents.filter(a=>(a.run_key||a.run_dir)===runKey(r));
+      return kids.length ? kids.some(matchAgent) : false;
+    });
   const actRuns = allRuns.filter(r=>!r.ended_at);
   const finRuns = allRuns.filter(r=>r.ended_at);
   const finShow = Math.max(runsShown - actRuns.length, 0);
   const shownRuns = actRuns.concat(finRuns.slice(0, finShow));
   const hiddenRuns = finRuns.length - Math.min(finShow, finRuns.length);
   for (const r of shownRuns){
+    const total = Object.values(r.counts||{}).reduce((s,n)=>s+n,0);
     const counts = Object.entries(r.counts||{})
       .map(([k,v])=>`<span style="color:${COLORS[k]||'#8b949e'}">${v} ${k}</span>`)
       .join('');
+    const runUsd = (r.cost&&r.cost.usd!=null)||(r.plan_cost&&r.plan_cost.usd!=null)
+      ? (r.cost&&r.cost.usd||0)+(r.plan_cost&&r.plan_cost.usd||0) : null;
     h += `<tr class="runrow${runKey(r)===selectedRun?' selected':''}" ` +
       `data-run-key="${esc(runKey(r))}" tabindex="0" ` +
       `aria-label="Filter to run ${esc(r.run)}"><td class="wrap">` +
+      (r.counts&&r.counts.running
+        ? `<span class="dot run" style="background:#58a6ff" ` +
+          `title="a step in this run is running"></span>` : '') +
       `<b>${esc(r.run)}</b><br>` +
       (r.stage ? `<span class="stage ${esc(r.stage)}">` +
         `${esc(STAGES[r.stage]||r.stage)}` +
@@ -3308,14 +3929,20 @@ function render(d){
       `<td>${(r.projects||[]).map(p=>`<span class="chip">${esc(p)}</span>`).join('')}</td>` +
       `<td>${loc(r.started_at)}</td>` +
       `<td>${r.ended_at?loc(r.ended_at):(r.started_at?'<b>running</b>':'-')}</td>` +
-      `<td class="counts">${counts||'<span class="sub">not planned</span>'}` +
-      (r.plan_tokens ? `<br><span class="sub" title="${TOK_HELP}">plan ` +
-        `${kfmt(r.plan_tokens.prompt)}/${kfmt(r.plan_tokens.completion)}/` +
-        `${kfmt(r.plan_tokens.cached)}</span>` : '') +
-      (r.tokens ? `<br><span class="sub" title="${TOK_HELP}">` +
-        `${r.plan_tokens ? 'steps ' : 'tok '}` +
-        `${kfmt(r.tokens.prompt)}/${kfmt(r.tokens.completion)}/` +
-        `${kfmt(r.tokens.cached)}</span>` : '') +
+      `<td class="counts">` +
+      (total?`<b>${total}</b> step${total===1?'':'s'}<br>`:'') +
+      `${counts||'<span class="sub">not planned</span>'}` +
+      (r.plan_tokens ? `<br><span class="sub" ` +
+        `title="${esc(tokTitle(r.plan_tokens))}">plan ` +
+        `${fmtT(r.plan_tokens)}` +
+        (r.plan_cost?` · ${fmtC(r.plan_cost)}`:'') + `</span>` : '') +
+      (r.tokens ? `<br><span class="sub" ` +
+        `title="${esc(tokTitle(r.tokens))}">steps ${fmtT(r.tokens)}` +
+        (r.cost?` · ${fmtC(r.cost)}`:'') + `</span>` : '') +
+      (runUsd!=null ? `<br><span class="sub" title="estimated self-serve ` +
+        `cost, plan + steps${r.cost&&r.cost.unpriced
+          ?`; ${r.cost.unpriced} step(s) have no rate`:''}">` +
+        `est ${fmtC({usd:runUsd})}</span>` : '') +
       `</td><td>${r.max_parallel||'-'}</td>` +
       `<td class="hide-s wrap">${esc(r.dir)}</td></tr>`;
   }
@@ -3336,8 +3963,7 @@ function render(d){
     (groups[x][0].started_at||groups[x][0].created_at||'') ? -1 : 1);
   h = '';
   for (const slug of slugs){
-    const rows = groups[slug].filter(a=>!hidden.has(a.status) &&
-      [...facets].every(f=>matchesFacet(a,f)));
+    const rows = groups[slug].filter(matchAgent);
     if (!rows.length) continue;
     const all = groups[slug];
     const nRun = all.filter(r=>r.status==='running').length;
@@ -3352,6 +3978,9 @@ function render(d){
       '<th class="hide-s">model</th><th class="hide-s">effort</th>' +
       '<th class="hide-s">mode</th><th>started</th><th>elapsed</th>' +
       '<th class="hide-s" title="' + TOK_HELP + '">tokens</th>' +
+      '<th class="hide-s" title="estimated cost at self-serve rates ' +
+      '(docs.devin.ai/desktop/chat/models), recomputed as the rate ' +
+      'table updates">est $</th>' +
       '<th>ended</th><th class="hide-s">session</th><th>result</th></tr>';
     for (const a of show){
       const c = COLORS[a.status]||'#8b949e';
@@ -3394,6 +4023,8 @@ function render(d){
         `<td data-el="${a._i}">${elapsed(a,now)}</td>` +
         `<td class="hide-s" title="${esc(tokTitle(a.tokens))}">` +
         `${fmtT(a.tokens)}</td>` +
+        `<td class="hide-s" title="${esc(costTitle(a.cost))}">` +
+        `${fmtC(a.cost)}</td>` +
         `<td>${loc(a.ended_at)}</td>` + sessTd +
         (a.status==='running'
           ? `<td class="res${fresh?' fresh':''}" ` +
@@ -3403,7 +4034,7 @@ function render(d){
           : `<td class="wrap">${esc(a.next||a.note||'')}</td>`) + `</tr>`;
     }
     if (rows.length > SHOW_N)
-      h += `<tr><td colspan="13"><a href="#" data-slug="${esc(slug)}">` +
+      h += `<tr><td colspan="14"><a href="#" data-slug="${esc(slug)}">` +
         (expanded[slug] ? `show latest ${SHOW_N} only` :
           `show ${rows.length - SHOW_N} older agent(s)`)+`</a></td></tr>`;
     h += '</table></div>';
@@ -3442,16 +4073,38 @@ document.addEventListener('click', async e=>{
     } catch(err){ alert('Resume failed: '+err.message); t.disabled=false;
       t.textContent='Resume unfinished steps'; }
     return; }
+  if (t.dataset && t.dataset.mergeRun){
+    if(!confirm('Merge the pending worktree branches of this run into ' +
+                'their ' +
+                'main checkouts? Clean merges land and drop the worktree; ' +
+                'conflicts stay parked for manual resolution (or a ' +
+                'resolve-* session when merge_resolver is set).')) return;
+    const rk = t.dataset.rk;
+    t.disabled=true; t.textContent='Merging…';
+    try {
+      const out=await api('POST',
+        `/api/runs/${encodeURIComponent(t.dataset.mergeRun)}/merge`,{});
+      const bits=[];
+      if (out.merged?.length) bits.push(`merged: ${out.merged.join(', ')}`);
+      if (out.conflicted?.length)
+        bits.push(`still conflicted (worktree kept): ${out.conflicted.join(', ')}`);
+      if (out.skipped?.length) bits.push(`skipped: ${out.skipped.join(', ')}`);
+      await refresh();
+      if (rk) showRunDetails(rk);
+      alert(bits.length ? bits.join(' | ') : 'Nothing pending to merge.');
+    } catch(err){ alert('Merge failed: '+err.message); t.disabled=false;
+      t.textContent='Merge pending branches'; }
+    return; }
   if (t.dataset && t.dataset.filterRun){
     selectedRun=t.dataset.filterRun;
     closeDetail(true); if (lastData) render(lastData); return; }
   if (t.dataset && t.dataset.clearRun!==undefined){
     selectedRun=null; if (lastData) render(lastData); return; }
   if (t.dataset && t.dataset.reset!==undefined){
-    hidden.clear(); facets.clear(); if (lastData) render(lastData); return; }
-  if (t.dataset && t.dataset.st){            // status filter chip
-    hidden.has(t.dataset.st) ? hidden.delete(t.dataset.st)
-                             : hidden.add(t.dataset.st);
+    only.clear(); facets.clear(); if (lastData) render(lastData); return; }
+  if (t.dataset && t.dataset.st){            // status filter chip: show only
+    only.has(t.dataset.st) ? only.delete(t.dataset.st)
+                           : only.add(t.dataset.st);
     if (lastData) render(lastData); return;
   }
   if (t.dataset && t.dataset.facet){
@@ -3503,6 +4156,12 @@ document.addEventListener('input', e=>{
     modalRequest.dirty=true;
     const msg=document.getElementById('form-msg');
     if (msg) msg.hidden=true;
+    // Edited fields diverge from the proposal TOML until applied or
+    // regenerated - flag the buttons that reconcile them.
+    if (modalRequest.record?.manifest)
+      document.querySelectorAll(
+        '#detail [data-action=generate],#detail [data-action=apply]')
+        .forEach(b=>b.classList.add('attn'));
     if (e.target.id==='rq-model' || e.target.id==='rq-plan_model'){
       const dl=document.getElementById(
         e.target.id==='rq-model'?'rq-efforts':'rq-plan_efforts');
@@ -3620,7 +4279,8 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 if path == "/api/requests":
                     self._json(create_request(body, requests_dir, runs_dir), 201)
                 elif (m := re.fullmatch(r"/api/requests/([^/]+)/"
-                                         r"(save|generate|run|discard)", path)):
+                                         r"(save|generate|run|discard|apply)",
+                                         path)):
                     request_id, action = m.groups()
                     if action == "save":
                         self._json(save_request(request_id, body, requests_dir,
@@ -3633,6 +4293,9 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                         self._json(launch_request(request_id, requests_dir,
                                                   manifests_dir, runs_dir,
                                                   devin_argv), 202)
+                    elif action == "apply":
+                        self._json(apply_request(request_id, body, requests_dir,
+                                                 manifests_dir, runs_dir))
                     else:
                         if body.get("confirm") is not True:
                             raise RequestError("Confirm discard explicitly")
@@ -3641,6 +4304,8 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/resume", path)):
                     self._json(resume_run(m.group(1), runs_dir,
                                           devin_argv), 202)
+                elif (m := re.fullmatch(r"/api/runs/([^/]+)/merge", path)):
+                    self._json(merge_run(m.group(1), runs_dir, devin_argv))
                 elif path == "/api/auth/login":
                     # Login is an interactive console flow (trap 3) - the most a
                     # dashboard button can do is pop a REAL terminal for it.

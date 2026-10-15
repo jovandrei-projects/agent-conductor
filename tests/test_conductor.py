@@ -1091,9 +1091,12 @@ const row={dataset:{runKey:'/first'}};
   await click({dataset:{facet:'merged'}});
   assert.match(elem('filters').innerHTML,/merged ×/);
   await click({dataset:{clearRun:''}});
-  assert.match(elem('runs').innerHTML,/A separate run/);
+  // the 'merged' tag chip still filters both tables: 'second' has no
+  // merged step, so its run row hides too.
+  assert.doesNotMatch(elem('runs').innerHTML,/A separate run/);
   assert.doesNotMatch(elem('agents').innerHTML,/implement two/);
-  await click({dataset:{facet:'merged'}});
+  await click({dataset:{facet:'merged'}});   // toggles the tag back off
+  assert.match(elem('runs').innerHTML,/A separate run/);
   assert.match(elem('agents').innerHTML,/implement two/);
   vm.runInContext('showDetail(0)',ctx);
   assert.match(elem('dbody').innerHTML,/Explain tokens and cost/);
@@ -1866,6 +1869,407 @@ prompt = "first"
             self.assertIn("ok", lines[0])
             self.assertEqual(
                 json.loads((proj / ".mock_sessions.json").read_text()), [])
+
+
+class PricingTests(unittest.TestCase):
+    TABLE_SNIPPET = (
+        "<script>const modelCostData = [\n"
+        ' {"model_uid":"swe-2-max","label":"SWE-2 Max","tier":"TEAMS_TIER_PRO",'
+        '"input_cost_per_million_usd":0,"output_cost_per_million_usd":0,'
+        '"cache_read_cost_per_million_usd":0},\n'
+        ' {"model_uid":"swe-2-max","label":"SWE-2 Max","tier":"CORE_TIER",'
+        '"input_cost_per_million_usd":9,"output_cost_per_million_usd":9,'
+        '"cache_read_cost_per_million_usd":9},\n'
+        ' {"model_uid":"gpt-6-luna-max","label":"Luna Max",'
+        '"tier":"TEAMS_TIER_PRO","input_cost_per_million_usd":2.5,'
+        '"output_cost_per_million_usd":10.0,'
+        '"cache_read_cost_per_million_usd":0.25}\n'
+        "];</script>")
+
+    def test_parse_price_table_picks_self_serve_tier(self):
+        t = conductor._parse_price_table(self.TABLE_SNIPPET)
+        self.assertEqual(set(t), {"swe-2-max", "gpt-6-luna-max"})
+        self.assertEqual(t["swe-2-max"]["in"], 0)      # PRO, not CORE's 9
+        self.assertEqual(t["gpt-6-luna-max"]["out"], 10.0)
+        self.assertEqual(t["gpt-6-luna-max"]["cr"], 0.25)
+
+    def test_parse_price_table_tolerates_garbage(self):
+        self.assertEqual(conductor._parse_price_table("no table here"), {})
+        self.assertEqual(conductor._parse_price_table(
+            "modelCostData = [not json];"), {})
+
+    def test_estimate_cost_splits_cached_from_prompt(self):
+        table = {"m-x": {"label": "M X", "in": 2.0, "out": 10.0, "cr": 0.2}}
+        c = conductor.estimate_cost(
+            {"prompt": 1_000_000, "cached": 200_000,
+             "completion": 100_000, "llm_steps": 3}, "m", "x", table)
+        # (1M-200k)*$2/M + 200k*$0.2/M + 100k*$10/M = 1.6 + 0.04 + 1.0
+        self.assertAlmostEqual(c["usd"], 2.64, places=3)
+        self.assertEqual(c["uid"], "m-x")
+        self.assertEqual(c["label"], "M X")
+        # bare model uid is the fallback when the effort variant is unlisted
+        self.assertEqual(conductor.estimate_cost(
+            {"prompt": 5}, "m", None, table)["uid"], "m")
+        # unpriced model -> usd None; no tokens -> cost None
+        self.assertIsNone(conductor.estimate_cost(
+            {"prompt": 5}, "zzz", "x", table)["usd"])
+        self.assertIsNone(conductor.estimate_cost(None, "m", "x", table))
+
+    def test_price_table_disk_cache_and_refresh(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            runs.mkdir()
+            (Path(td) / "pricing.json").write_text(json.dumps({
+                "fetched_at": 123.0, "url": "u",
+                "table": {"m-x": {"label": "M", "in": 1, "out": 2, "cr": 0}}}))
+            with mock.patch.object(conductor, "_PRICE_CACHE",
+                                   {"fetched": 0.0, "table": {},
+                                    "source": ""}):
+                t = conductor.price_table(runs)
+                self.assertEqual(t["m-x"]["in"], 1)
+
+            snippet = self.TABLE_SNIPPET.encode()
+
+            class _Resp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def read(self):
+                    return snippet
+
+            cache = {"fetched": 0.0, "table": {}, "source": ""}
+            with mock.patch.object(conductor, "_PRICE_CACHE", cache), \
+                    mock.patch.object(conductor, "_PRICE_TRIED", 0.0), \
+                    mock.patch.object(conductor, "_PRICE_BUSY", False), \
+                    mock.patch.object(conductor.urllib.request, "urlopen",
+                                      return_value=_Resp()):
+                conductor.refresh_prices(runs)
+                # the refresh thread updates memory before the disk mirror
+                # - poll the file, not just the cache
+                deadline = __import__("time").time() + 5
+                disk = {}
+                while __import__("time").time() < deadline:
+                    try:
+                        disk = json.loads(
+                            (Path(td) / "pricing.json").read_text(
+                                encoding="utf-8"))
+                    except (OSError, ValueError):
+                        disk = {}
+                    if "gpt-6-luna-max" in (disk.get("table") or {}):
+                        break
+                    __import__("time").sleep(0.05)
+                self.assertIn("swe-2-max", cache["table"])
+                self.assertEqual(cache["source"], conductor._PRICES_URL)
+                self.assertIn("gpt-6-luna-max", disk["table"])
+
+    def test_collect_dashboard_costs_agents_and_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "runs"
+            rd = runs / "20261014-000000-t"
+            rd.mkdir(parents=True)
+            (rd / "state.json").write_text(json.dumps({
+                "run": "t", "manifest": "m.toml",
+                "steps": {"s": {"name": "s", "status": "done",
+                                "model": "swe-2", "effort": "max",
+                                "tokens": {"prompt": 5000,
+                                           "completion": 1000,
+                                           "cached": 0, "llm_steps": 2}}}}))
+            table = {"swe-2-max": {"label": "SWE-2 Max", "in": 2.0,
+                                   "out": 10.0, "cr": 0.1}}
+            with mock.patch.object(conductor, "_PRICE_CACHE",
+                                   {"fetched": 1.0, "table": table,
+                                    "source": "t"}), \
+                    mock.patch.object(conductor, "refresh_prices"):
+                d = conductor.collect_dashboard(runs, ["no-such-devin"])
+            a = d["agents"][0]
+            # 5000 * 2 + 1000 * 10 = $0.02
+            self.assertAlmostEqual(a["cost"]["usd"], 0.02, places=3)
+            self.assertEqual(a["cost"]["uid"], "swe-2-max")
+            self.assertAlmostEqual(d["runs"][0]["cost"]["usd"], 0.02)
+            self.assertEqual(d["runs"][0]["cost"]["unpriced"], 0)
+            self.assertEqual(d["pricing"]["models"], 1)
+
+
+class SessionGoneGraceTests(unittest.TestCase):
+    """A recorded session_id missing from `devin list` minutes after spawn
+    is registration/cache lag - 'gone' waits out SESSION_GONE_GRACE_S."""
+
+    def _collect(self, runs: Path, rd: Path, rec: dict) -> bool:
+        (rd / "state.json").write_text(json.dumps(
+            {"run": "t", "started_at": conductor.now_iso(),
+             "steps": {"s": rec}}))
+        with mock.patch.object(conductor, "live_sessions_by_dir",
+                               return_value={rec["work_dir"]: {}}), \
+                mock.patch.object(conductor, "refresh_prices"):
+            d = conductor.collect_dashboard(runs, ["no-such-devin"])
+        return d["agents"][0]["session_gone"]
+
+    def test_grace_and_expiry(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "runs"
+            rd = runs / "20261014-000000-t"
+            rd.mkdir(parents=True)
+            wd = str(base / "proj")
+            now = conductor.now_iso()
+            # fresh running step: id recorded, list hasn't caught up yet
+            self.assertFalse(self._collect(runs, rd, {
+                "name": "s", "status": "running", "session_id": "abc",
+                "started_at": now, "timeout_min": 60, "work_dir": wd}))
+            # ended -> honest immediately, grace does not apply
+            self.assertTrue(self._collect(runs, rd, {
+                "name": "s", "status": "done", "session_id": "abc",
+                "started_at": now, "ended_at": now, "work_dir": wd}))
+            # still running but spawned before the grace window
+            old = (conductor.dt.datetime.now() - conductor.dt.timedelta(
+                seconds=conductor.SESSION_GONE_GRACE_S + 60)).isoformat(
+                    timespec="seconds")
+            self.assertTrue(self._collect(runs, rd, {
+                "name": "s", "status": "running", "session_id": "abc",
+                "started_at": old, "timeout_min": 60, "work_dir": wd}))
+
+
+class DashboardJsFilterTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_status_chips_filter_agents_and_runs(self):
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,textContent:''}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  addEventListener:(event,handler)=>{handlers[event]=handler;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-14T00:00:00',agents:[
+  {step:'alpha',run:'first',run_dir:'/first',slug:'p',status:'running',wt:true,branch:'b1',task:'work one'},
+  {step:'beta',run:'first',run_dir:'/first',slug:'p',status:'done',task:'work two',
+   tokens:{prompt:1000,cached:0,completion:200,llm_steps:2},
+   cost:{usd:0.1234,uid:'m-x',label:'M X'}},
+  {step:'gamma',run:'second',run_dir:'/second',slug:'q',status:'done',task:'work three'}],runs:[
+  {run:'first',dir:'/first',description:'run one',projects:['p'],
+   counts:{running:1,done:1},
+   tokens:{prompt:1000,cached:0,completion:200,llm_steps:2},
+   cost:{usd:1.5,unpriced:0}},
+  {run:'second',dir:'/second',description:'run two',projects:['q'],counts:{done:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+// run row: step total, live pulse, est cost
+assert.match(elem('runs').innerHTML,/<b>2<\/b> steps/);
+assert.match(elem('runs').innerHTML,/class="dot run"/);
+assert.match(elem('runs').innerHTML,/est \$1\.50/);
+// agent row: cost cell; tokens show in/out without a trailing /0
+assert.match(elem('agents').innerHTML,/\$0\.12/);
+assert.match(elem('agents').innerHTML,/1k\/200 ·2st/);
+assert.doesNotMatch(elem('agents').innerHTML,/1k\/200\/0/);
+const click=async(t)=>handlers.click({target:t,preventDefault:()=>{}});
+(async()=>{
+  // clicking 'running' shows ONLY running agents and ONLY their run
+  await click({dataset:{st:'running'}});
+  assert.match(elem('agents').innerHTML,/work one/);
+  assert.doesNotMatch(elem('agents').innerHTML,/work two/);
+  assert.doesNotMatch(elem('agents').innerHTML,/work three/);
+  assert.match(elem('runs').innerHTML,/run one/);
+  assert.doesNotMatch(elem('runs').innerHTML,/run two/);
+  assert.match(elem('filters').innerHTML,/chip active/);
+  // clicking again returns to showing everything
+  await click({dataset:{st:'running'}});
+  assert.match(elem('agents').innerHTML,/work three/);
+  assert.match(elem('runs').innerHTML,/run two/);
+  // multi-select: done + running keeps both runs
+  await click({dataset:{st:'done'}});
+  await click({dataset:{st:'running'}});
+  assert.match(elem('agents').innerHTML,/work one/);
+  assert.match(elem('agents').innerHTML,/work three/);
+  await click({dataset:{reset:''}});
+  assert.match(elem('runs').innerHTML,/run two/);
+  assert.match(elem('agents').innerHTML,/work three/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
+class ApplyRequestTests(unittest.TestCase):
+    """The deterministic 'Apply options to TOML' path: option fields patch
+    the proposal in place; request text and project still need a planner."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.proj = make_project(self.base)
+        self.runs = self.base / "runs"
+        self.requests = self.base / "requests"
+        self.manifests = self.base / "manifests"
+        self.manifests.mkdir()
+        patch = mock.patch.object(conductor, "load_projects", return_value={
+            "proj": {"path": self.proj, "cloud_ok": False}})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def proposal(self, extra_steps=""):
+        return f'''[run]
+name = "catalog-cleanup"
+description = "Tidy the catalog"
+on_failure = "continue"
+checkpoint = true
+
+[defaults]
+project = "proj"
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+max_attempts = 3
+
+[[step]]
+name = "organize"
+prompt = "Organize the catalog and verify results."
+{extra_steps}'''
+
+    def ready(self):
+        rec = conductor.create_request(
+            {"raw": "Please tidy the catalog carefully", "project": "proj",
+             "model": "swe-2", "effort": "max"}, self.requests, self.runs)
+        return conductor.save_request(
+            rec["id"], {"manifest": self.proposal()},
+            self.requests, self.manifests, self.runs)
+
+    def test_apply_patches_options_and_clears_stale(self):
+        rec = self.ready()
+        out = conductor.apply_request(
+            rec["id"], {"effort": "high", "worktrees": True,
+                        "merge_resolver": True, "followup": True,
+                        "max_attempts": 5},
+            self.requests, self.manifests, self.runs)
+        text = Path(out["manifest"]).read_text(encoding="utf-8")
+        cfg = conductor.load_manifest(Path(out["manifest"]))
+        self.assertIn('merge_resolver = true', text)
+        self.assertIn('effort = "high"', text)
+        self.assertIn('max_attempts = 5', text)
+        self.assertTrue(all(s.worktree for s in cfg.steps))
+        self.assertTrue(cfg.merge_resolver)
+        self.assertTrue(any(s.name == "follow-up-plan" for s in cfg.steps))
+        self.assertFalse(out["stale"])
+        self.assertEqual(out["status"], "ready")
+
+    def test_apply_refuses_request_text_or_project_changes(self):
+        rec = self.ready()
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.apply_request(rec["id"], {"raw": "different scope"},
+                                    self.requests, self.manifests,
+                                    self.runs)
+        self.assertEqual(e.exception.status, 409)
+        self.assertIn("regenerate", str(e.exception))
+        with self.assertRaises(conductor.RequestError):
+            conductor.apply_request(rec["id"], {"project": "other"},
+                                    self.requests, self.manifests,
+                                    self.runs)
+
+    def test_option_changes_stale_but_planner_model_does_not(self):
+        rec = self.ready()
+        out = conductor.save_request(
+            rec["id"], {"plan_model": "gpt-6-luna"}, self.requests,
+            self.manifests, self.runs)
+        self.assertFalse(out["stale"])   # planner-only, nothing in the TOML
+        out = conductor.save_request(rec["id"], {"worktrees": True},
+                                     self.requests, self.manifests,
+                                     self.runs)
+        self.assertTrue(out["stale"])
+        out = conductor.apply_request(rec["id"], {"worktrees": True},
+                                      self.requests, self.manifests,
+                                      self.runs)
+        self.assertFalse(out["stale"])
+        self.assertIn("worktree = true",
+                      Path(out["manifest"]).read_text(encoding="utf-8"))
+
+    def test_apply_strips_step_overrides_the_form_owns(self):
+        text = self.proposal('''
+worktree = true
+model = "gpt-6-luna"
+effort = "min"
+max_attempts = 9
+merge_resolver = true
+''')
+        rec = conductor.create_request(
+            {"raw": "x", "project": "proj", "model": "swe-2",
+             "effort": "max"}, self.requests, self.runs)
+        rec = conductor.save_request(rec["id"], {"manifest": text},
+                                     self.requests, self.manifests,
+                                     self.runs)
+        out = conductor.apply_request(
+            rec["id"], {"model": "gpt-6-astra", "effort": "low",
+                        "merge_resolver": False},
+            self.requests, self.manifests, self.runs)
+        cfg = conductor.load_manifest(Path(out["manifest"]))
+        s = cfg.steps[0]
+        self.assertEqual(s.model, "gpt-6-astra")   # form wins over per-step
+        self.assertEqual(s.effort, "low")
+        self.assertFalse(s.merge_resolver)
+        # the unchecked worktrees box owns the option: a planner-added
+        # per-step flag is stripped (except same-project wave members)
+        self.assertFalse(s.worktree)
+        body = Path(out["manifest"]).read_text(encoding="utf-8")
+        step_body = body.split("[[step]]")[1]
+        self.assertNotIn("max_attempts = 9", step_body)
+
+    def test_apply_worktrees_never_marks_cloud_steps(self):
+        cproj = make_project(self.base, "cproj")
+        with mock.patch.object(conductor, "load_projects", return_value={
+                "proj": {"path": self.proj, "cloud_ok": False},
+                "cproj": {"path": cproj, "cloud_ok": True}}):
+            rec = conductor.create_request(
+                {"raw": "x", "project": "proj", "model": "swe-2",
+                 "effort": "max"}, self.requests, self.runs)
+            rec = conductor.save_request(rec["id"], {"manifest": self.proposal('''
+[[step]]
+name = "sky"
+project = "cproj"
+cloud = true
+prompt = "check the thing"
+''')}, self.requests, self.manifests, self.runs)
+            out = conductor.apply_request(rec["id"], {"worktrees": True},
+                                          self.requests, self.manifests,
+                                          self.runs)
+            by_name = {s.name: s for s in
+                       conductor.load_manifest(Path(out["manifest"])).steps}
+            self.assertTrue(by_name["organize"].worktree)
+            self.assertFalse(by_name["sky"].worktree)  # cloud+wt is invalid
+
+    def test_apply_toggles_followup_step_both_ways(self):
+        rec = self.ready()
+        out = conductor.apply_request(rec["id"], {"followup": True},
+                                      self.requests, self.manifests,
+                                      self.runs)
+        self.assertIn("follow-up-plan",
+                      Path(out["manifest"]).read_text(encoding="utf-8"))
+        out = conductor.apply_request(rec["id"], {"followup": False},
+                                      self.requests, self.manifests,
+                                      self.runs)
+        self.assertNotIn("follow-up-plan",
+                         Path(out["manifest"]).read_text(encoding="utf-8"))
+
+    def test_checkboxes_guarantee_flags_at_publish(self):
+        """worktrees/merge_resolver are guarantees: a planner (or a hand
+        edit) that omits them still gets the flags appended at publish."""
+        rec = conductor.create_request(
+            {"raw": "x", "project": "proj", "model": "swe-2",
+             "effort": "max", "worktrees": True, "merge_resolver": True},
+            self.requests, self.runs)
+        out = conductor.save_request(rec["id"], {"manifest": self.proposal()},
+                                     self.requests, self.manifests,
+                                     self.runs)
+        cfg = conductor.load_manifest(Path(out["manifest"]))
+        self.assertTrue(cfg.merge_resolver)
+        self.assertTrue(all(s.worktree for s in cfg.steps))
+        self.assertTrue(all(s["wt"] for s in out["proposed_steps"]))
 
 
 if __name__ == "__main__":

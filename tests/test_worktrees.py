@@ -18,6 +18,7 @@ The space, roughly:
 """
 import json
 import os
+import shlex
 import sys
 import tempfile
 import unittest
@@ -631,6 +632,124 @@ class CapAndOrderingTests(unittest.TestCase):
             st, _ = state_of(runs)
             for n in ("w1", "w2", "w3"):
                 self.assertTrue(st["steps"][n]["merged"])
+
+
+class MergeRunTests(unittest.TestCase):
+    """The dashboard's 'Merge pending branches' button -> merge_run(): the
+    manual counterpart to the post-wave merge loop, for branches parked by
+    a conflict or left unmerged by a dead conductor."""
+
+    def test_merge_run_lands_parked_branch(self):
+        """A timed-out step's worktree holds committed work; a manual merge
+        lands it and drops worktree+branch."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "stuck"
+project = "{proj.as_posix()}"
+prompt = "sleep_after=30 write A.txt"
+worktree = true
+timeout_min = 0.02
+''')
+            self.assertEqual(run_manifest(m, runs), 1)
+            st, rd = state_of(runs)
+            self.assertEqual(st["steps"]["stuck"]["status"], "timed_out")
+            self.assertTrue(Path(st["steps"]["stuck"]["work_dir"]).is_dir())
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], ["stuck"])
+            self.assertEqual(out["conflicted"], [])
+            st, _ = state_of(runs)
+            rec = st["steps"]["stuck"]
+            self.assertTrue(rec["merged"])
+            self.assertIn("merged via dashboard", rec["note"])
+            self.assertTrue((proj / "A.txt").is_file())
+            self.assertFalse(Path(rec["work_dir"]).is_dir())
+            self.assertEqual(git(proj, "branch", "--list",
+                                 "conductor/*").stdout.strip(), "")
+
+    def test_merge_run_parks_still_conflicting_branch(self):
+        """A real conflict stays conflicted: merge_run reports it, the
+        worktree+branch are kept, and no merge is left in progress."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, wt_steps(proj, [
+                ("p1", "append to WORK.txt"),
+                ("p2", "append to WORK.txt")]),
+                extra='on_failure = "continue"')
+            self.assertEqual(run_manifest(m, runs), 1)
+            st, rd = state_of(runs)
+            self.assertEqual(st["steps"]["p2"]["status"], "failed")
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], [])
+            self.assertEqual(out["conflicted"], ["p2"])
+            st, _ = state_of(runs)
+            self.assertFalse(st["steps"]["p2"]["merged"])
+            self.assertTrue(Path(st["steps"]["p2"]["work_dir"]).is_dir())
+            self.assertFalse(conductor.merge_in_progress(proj))
+
+    def test_merge_run_resolver_finishes_conflict(self):
+        """Flipping merge_resolver on in the manifest lets merge_run spawn
+        the resolve-* session that completes a parked conflict."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, wt_steps(proj, [
+                ("p1", "append to WORK.txt"),
+                ("p2", "append to WORK.txt")]),
+                extra='on_failure = "continue"')
+            self.assertEqual(run_manifest(m, runs), 1)
+            _, rd = state_of(runs)
+            write_manifest(base, wt_steps(proj, [   # same path, flag flipped
+                ("p1", "append to WORK.txt"),
+                ("p2", "append to WORK.txt")]),
+                extra='merge_resolver = true')
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], ["p2"])
+            st, _ = state_of(runs)
+            self.assertTrue(st["steps"]["p2"]["merged"])
+            self.assertEqual(st["steps"]["resolve-p2"]["status"], "done")
+            self.assertEqual(len((proj / "WORK.txt")
+                                 .read_text().splitlines()), 2)
+            self.assertFalse(conductor.merge_in_progress(proj))
+
+    def test_merge_run_refuses_a_live_step(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "runs"
+            rd = runs / "20261014-000000-t"
+            rd.mkdir(parents=True)
+            (rd / "state.json").write_text(json.dumps({
+                "steps": {"s": {"status": "running",
+                                "started_at": conductor.now_iso(),
+                                "timeout_min": 60, "work_dir": str(base),
+                                "branch": "conductor/x/s"}}}))
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.merge_run(rd.name, runs, ["devin"])
+            self.assertEqual(e.exception.status, 409)
+
+    def test_merge_run_no_pending_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            _, rd = state_of(runs)
+            out = conductor.merge_run(rd.name, runs, ["devin"])
+            self.assertEqual(out["merged"], [])
+            self.assertEqual(out["conflicted"], [])
+            self.assertEqual(out["skipped"], [])
 
 
 if __name__ == "__main__":
