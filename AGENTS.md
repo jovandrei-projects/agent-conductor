@@ -166,13 +166,23 @@ Real runs still use `state.json` as their registry. A run's detail modal
 has a Resume button (`POST /api/runs/<dir>/resume` -> `run <manifest>
 --resume <dir>`) once nothing in it is live - same semantics as the CLI
 flag, fresh attempts for every non-done step. While a run IS live the
-modal instead offers `Stop run now` (POST `/stop` - flags + tree-kills
+modal instead offers `Pause run` (POST `/pause` - same hard stop of live
+steps, but the run records `aborted="paused"`: the deliberate-hold case
+for machine restarts), `Stop run now` (POST `/stop` - flags + tree-kills
 every live step) and `Drain & stop` (`/stop` `{drain:true}` - live steps
 finish, nothing new launches); an agent modal on a live step gets `Stop
-this agent` (POST `/api/runs/<dir>/steps/<step>/stop`). Stop/drain travel
+this agent` (POST `/api/runs/<dir>/steps/<step>/stop`). Stop/drain/pause
+travel
 as empty sentinel files in `%TEMP%/agent-conductor-flags` (never inside
 run_dir - trap 5), polled by `wait_worker` and the wave loop; `resume`
-clears them via `clear_run_flags` first. A live agent's modal also has a
+clears them via `clear_run_flags` first. Sentinels are path-keyed
+(`<name>-<hash>`); runs launched by pre-namespacing code lack
+`state["flags"]="v2"` so endpoints dual-write the legacy bare names too -
+a new dashboard can still stop a run its older self spawned.
+Unplanned-death recovery needs no button: `sweep` (and `effective_statuses`
+live) mark dead-pid `running`/orphaned `queued` records `lost`, the run
+modal shows an "Interrupted" notice when a run has no `ended_at` and
+nothing alive, and plain Resume re-runs them with INTERRUPTED_NOTE. A live agent's modal also has a
 timeout editor (`POST .../steps/<step>/timeout` {minutes}) - the same
 sentinel mechanism: `wait_worker` re-reads it each poll and moves the
 deadline to spawn+minutes (under elapsed = early kill; retries inherit).
@@ -265,6 +275,10 @@ Append as they are hit.
    2026-10-15, apartment-3d wall placement: committed dc5edab then the
    log truncated mid-sentence). `--resume` prepends the interrupted-
    state note to `failed` steps too - partial work may be committed.
+   `tail_status`/`tail_next` scan the WHOLE stdout log (once, at step
+   end) - an 8KB tail window misses a `STATUS:` that precedes a long
+   closing report. A `STATUS:` inside Markdown prose or a bullet still
+   doesn't count - the regex is anchored `^STATUS:` at column zero.
 7. **`os.kill(pid, 0)` is TerminateProcess on Windows.** It KILLS the
    process it probes - verified by spawning a sleeper and watching it die.
    The dashboard's liveness check used it on every `running` record per

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -2505,6 +2506,189 @@ class LifecycleDisplayTests(unittest.TestCase):
             self.assertEqual(d["agents"][0]["model"], "adaptive")
             self.assertEqual(d["agents"][0]["model_actual"],
                              "GPT-6 Astra")
+
+
+class PauseRunTests(unittest.TestCase):
+    """Run-level Pause: hold the pipeline for a deliberate restart.
+
+    Pause = hard stop of the live step + a 'paused' label on the run, and
+    no later step launches regardless of on_failure. Resume picks it back
+    up - the interrupted step re-runs in a fresh session with the
+    'previous session ended abruptly' note."""
+
+    def _wait_status(self, run_dir: Path, step: str, want: str,
+                     timeout: float = 10.0) -> dict:
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            st = json.loads((run_dir / "state.json").read_text())
+            rec = (st.get("steps") or {}).get(step) or {}
+            if rec.get("status") == want:
+                return st
+            time.sleep(0.05)
+        self.fail(f"{step} never reached {want}: "
+                  f"{(st.get('steps') or {}).keys()}")
+
+    def test_pause_mid_step_halts_regardless_of_on_failure(self):
+        """on_failure='continue' must NOT advance past a pause: s1 is
+        tree-killed -> 'stopped', s2/s3 never launch -> 'skipped', and
+        the run records aborted='paused'."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "sleep=30 then work"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "second"
+
+[[step]]
+name = "s3"
+project = "{proj.as_posix()}"
+prompt = "third"
+''', 'on_failure = "continue"\n')
+            rc_box: list[int] = []
+            t = threading.Thread(
+                target=lambda: rc_box.append(run_manifest(m, runs)),
+                daemon=True)
+            t.start()
+            run_dir = None
+            t0 = time.time()
+            while time.time() - t0 < 10:
+                dirs = [d for d in runs.glob("*/state.json")] \
+                    if runs.exists() else []
+                if dirs:
+                    run_dir = dirs[0].parent
+                    st = json.loads(dirs[0].read_text())
+                    if (st.get("steps") or {}).get("s1", {}).get(
+                            "status") == "running":
+                        break
+                time.sleep(0.05)
+            self.assertIsNotNone(run_dir, "run never started")
+            out = conductor.stop_run(run_dir.name, {"pause": True}, runs)
+            self.assertTrue(out["paused"])
+            self.assertIn("s1", out["stopping"])
+            t.join(timeout=30)
+            st = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(st.get("aborted"), "paused")
+            self.assertEqual(st["steps"]["s1"]["status"], "stopped")
+            self.assertEqual(st["steps"]["s2"]["status"], "skipped")
+            self.assertEqual(st["steps"]["s3"]["status"], "skipped")
+            self.assertTrue(st.get("ended_at"))
+
+    def test_pause_then_resume_finishes_the_run(self):
+        """A paused run resumes: the interrupted step re-runs (with the
+        abrupt-ending note in its prompt) and queued steps proceed."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "sleep=30 then work"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "second"
+''')
+            rc_box: list[int] = []
+            t = threading.Thread(
+                target=lambda: rc_box.append(run_manifest(m, runs)),
+                daemon=True)
+            t.start()
+            run_dir = None
+            t0 = time.time()
+            while time.time() - t0 < 10:
+                dirs = [d for d in runs.glob("*/state.json")] \
+                    if runs.exists() else []
+                if dirs:
+                    run_dir = dirs[0].parent
+                    st = json.loads(dirs[0].read_text())
+                    if (st.get("steps") or {}).get("s1", {}).get(
+                            "status") == "running":
+                        break
+                time.sleep(0.05)
+            conductor.stop_run(run_dir.name, {"pause": True}, runs)
+            t.join(timeout=30)
+            # --resume: s1 re-runs (its prompt carries the interruption
+            # note), s2 proceeds, run ends clean.
+            rc = run_manifest(m, runs, resume=str(run_dir))
+            self.assertEqual(rc, 0)
+            st = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(st["steps"]["s1"]["status"], "done")
+            self.assertEqual(st["steps"]["s2"]["status"], "done")
+            prompt = (run_dir / "prompts" / "s1.md").read_text(
+                encoding="utf-8")
+            self.assertIn("previous session attempt", prompt)
+
+    def test_pause_before_launch_skips_everything(self):
+        """Pause landing before the first wave: no worker ever spawns."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "work"
+''')
+            # Pin the run dir name so the flags can be raised against
+            # the real path before cmd_run starts (the conductor sees
+            # them at its very first wave-loop check).
+            fixed = runs / "20260101-000000-t"
+
+            def _fixed_run_dir(_cfg, _runs):
+                fixed.mkdir(parents=True)
+                (fixed / "prompts").mkdir(exist_ok=True)
+                return fixed
+
+            with mock.patch.object(conductor, "new_run_dir",
+                                   side_effect=_fixed_run_dir):
+                for f in conductor.pause_flags_for(fixed, {}) + \
+                        conductor.stop_flags_for(fixed, {}):
+                    conductor._flag_raise(f.name)
+                rc = run_manifest(m, runs)
+            self.assertEqual(rc, 1)
+            st = json.loads((fixed / "state.json").read_text())
+            self.assertEqual(st.get("aborted"), "paused")
+            self.assertEqual(st["steps"]["s1"]["status"], "skipped")
+            self.assertFalse(list(fixed.glob("*.stdout.log")))
+
+    def test_stop_run_dual_writes_legacy_flag_names(self):
+        """A run launched by OLD code (no state['flags']='v2' marker)
+        polls bare-name sentinels - a new dashboard must write both."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "runs"
+            d = runs / "20260101-000000-t"
+            d.mkdir(parents=True)
+            (d / "state.json").write_text(json.dumps(
+                {"run": "t", "steps": {}}))
+            conductor.stop_run(d.name, {"pause": True}, runs)
+            legacy = conductor._flag_dir() / f"stop-{d.name}"
+            self.assertTrue(legacy.is_file(),
+                            "legacy bare-name flag not written")
+            self.assertTrue(
+                (conductor._flag_dir() / f"pause-{d.name}").is_file())
+            self.assertTrue(conductor.stop_flag(d).is_file())
+            conductor.clear_run_flags(d)
+            self.assertFalse(legacy.exists())
+            # a v2 run writes ONLY the path-keyed name
+            (d / "state.json").write_text(json.dumps(
+                {"run": "t", "flags": "v2", "steps": {}}))
+            conductor.stop_run(d.name, {}, runs)
+            self.assertFalse(legacy.exists())
+            self.assertTrue(conductor.stop_flag(d).is_file())
+            conductor.clear_run_flags(d)
 
 
 if __name__ == "__main__":

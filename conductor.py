@@ -782,8 +782,13 @@ def log_event(run_dir: Path, **kv) -> None:
 
 
 def tail_status(stdout_log: Path) -> str | None:
+    """The worker's terminal STATUS: line. Reads the WHOLE log, not a
+    tail: an agent that prints 'STATUS: done' then a long closing report
+    (>8KB of prose) must not flip to 'failed - no STATUS line' - that
+    exact false negative was hit on the live apartment run. Logs are
+    small and this runs once per step end, not per poll."""
     try:
-        data = stdout_log.read_bytes()[-8192:].decode("utf-8", "replace")
+        data = stdout_log.read_bytes().decode("utf-8", "replace")
     except OSError:
         return None
     found = STATUS_RE.findall(data)
@@ -792,9 +797,10 @@ def tail_status(stdout_log: Path) -> str | None:
 
 def tail_next(stdout_log: Path) -> str | None:
     """The worker's NEXT: line - its one-line report to the next session
-    (and to a human reading the dashboard)."""
+    (and to a human reading the dashboard). Whole-file like tail_status:
+    a closing report can push NEXT: past any fixed tail window."""
     try:
-        data = stdout_log.read_bytes()[-8192:].decode("utf-8", "replace")
+        data = stdout_log.read_bytes().decode("utf-8", "replace")
     except OSError:
         return None
     found = NEXT_RE.findall(data)
@@ -910,6 +916,48 @@ def timeout_flag(run_dir: Path, step: str) -> Path:
     return _flag_dir() / f"timeout-{_flag_key(run_dir)}-{_safe_name(step)}"
 
 
+def pause_flag(run_dir: Path) -> Path:
+    """Dashboard 'pause' sentinel: halts the pipeline exactly like stop,
+    but the run records aborted='paused' - deliberate hold for e.g. a
+    machine restart, distinct from a hard abort or a crash."""
+    return _flag_dir() / f"pause-{_flag_key(run_dir)}"
+
+
+# Runs launched by an older conductor poll BARE-name sentinels
+# (stop-<run>, drain-<run>, timeout-<run>-<step>) - the path-keyed names
+# above only exist in new code. state["flags"]="v2" marks a run whose
+# driver knows the new scheme; without it, flag writes dual-write both
+# names so a new dashboard can still stop/drain/pause an old-code run
+# (e.g. a run that outlives the dashboard that spawned it).
+def _flag_paths(run_dir: Path, st: dict | None, new_p: Path,
+                legacy: str) -> list[Path]:
+    paths = [new_p]
+    if (st or {}).get("flags") != "v2":
+        paths.append(_flag_dir() /
+                     f"{legacy}-{_safe_name(run_dir.name)}")
+    return paths
+
+
+def stop_flags_for(run_dir: Path, st: dict | None,
+                   step: str | None = None) -> list[Path]:
+    """Every sentinel that means 'halt' for the code version driving this
+    run: path-keyed always, plus the bare-name variant for legacy runs."""
+    paths = [stop_flag(run_dir, step)]
+    if (st or {}).get("flags") != "v2":
+        n = f"stop-{_safe_name(run_dir.name)}"
+        paths.append(_flag_dir() /
+                     (n + f"-{_safe_name(step)}" if step else n))
+    return paths
+
+
+def drain_flags_for(run_dir: Path, st: dict | None) -> list[Path]:
+    return _flag_paths(run_dir, st, drain_flag(run_dir), "drain")
+
+
+def pause_flags_for(run_dir: Path, st: dict | None) -> list[Path]:
+    return _flag_paths(run_dir, st, pause_flag(run_dir), "pause")
+
+
 def _flag_set(*flags: Path) -> Path | None:
     return next((f for f in flags if f.is_file()), None)
 
@@ -930,13 +978,20 @@ def _flag_raise(name: str) -> None:
 
 def clear_run_flags(run_dir: Path) -> None:
     """Remove all sentinels for a run - called on resume/merge so a
-    previously stopped run can actually start work again."""
+    previously stopped run can actually start work again. Clears both
+    path-keyed names and legacy bare-name ones: a run paused under old
+    code must be resumable by new code."""
+    name = _safe_name(run_dir.name)
+    pats = [f"*{_flag_key(run_dir)}*",
+            f"stop-{name}*", f"drain-{name}", f"pause-{name}",
+            f"timeout-{name}-*"]
     try:
-        for f in _flag_dir().glob(f"*{_flag_key(run_dir)}*"):
-            try:
-                f.unlink()
-            except OSError:
-                pass
+        for pat in pats:
+            for f in _flag_dir().glob(pat):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
     except OSError:
         pass
 
@@ -1098,7 +1153,9 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             state["steps"].setdefault(step.name, {}).update(
                 name=step.name, slug=slug, status="skipped",
                 ended_at=now_iso(),
-                note="stopped by user before the session spawned")
+                note=("run paused" if pause_flag(run_dir).is_file()
+                      else "stopped by user") +
+                     " before the session spawned")
             save_state(run_dir, state)
         log_event(run_dir, event="step_stopped", step=step.name,
                   phase="before_spawn")
@@ -1492,6 +1549,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.resume is not None:
         run_dir = find_resume_dir(cfg, runs_dir, args.resume or "latest")
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        # The driver is now THIS code version: it polls the path-keyed
+        # sentinels only, so the dashboard can stop writing legacy names.
+        state["flags"] = "v2"
+        save_state(run_dir, state)
         print(f"[resume] {run_dir.name}")
         # Resume must be able to start work again: drop any stop/drain
         # sentinels left by a dashboard Stop click.
@@ -1504,6 +1565,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                  "started_at": now_iso(), "devin": " ".join(devin_argv),
                  "devin_argv": devin_argv,
                  "run_dir": str(run_dir), "max_parallel": cap,
+                 "flags": "v2",
                  "free_ram_gb": free_ram_gb(), "steps": {}}
         save_state(run_dir, state)
     hub = getattr(args, "hub", True)
@@ -1529,6 +1591,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         launched is recorded 'skipped' (not just absent) so the dashboard
         shows the full plan and --resume knows what is left."""
         halted = stop_flag(run_dir).is_file()
+        paused = pause_flag(run_dir).is_file()
         with STATE_LOCK:
             for grp in groups[from_gi:]:
                 for _d, _s, s_ in grp:
@@ -1536,9 +1599,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                     if r.get("status") != "done":
                         state["steps"].setdefault(s_.name, {}).update(
                             name=s_.name, status="skipped",
-                            note="run stopped by user before this "
-                                 "step ran")
-            state["aborted"] = "stopped" if halted else "drained"
+                            note=("run paused" if paused else
+                                  "run stopped by user") +
+                                  " before this step ran")
+            state["aborted"] = ("paused" if paused else
+                                "stopped" if halted else "drained")
             state["ended_at"] = now_iso()
             save_state(run_dir, state)
 
@@ -1549,10 +1614,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             # wait_worker's flag poll; 'drain' lets them finish. Either
             # way nothing NEW launches - remaining work stays resumable.
             halted = stop_flag(run_dir).is_file()
-            print(f"run {'stopped' if halted else 'drained'} by user - "
-                  f"no further steps launch "
+            paused = pause_flag(run_dir).is_file()
+            kind = "paused" if paused else "stopped" if halted else "drained"
+            print(f"run {kind} by user - no further steps launch "
                   f"(resume with --resume {run_dir.name})")
-            log_event(run_dir, event="run_stop", drain=not halted)
+            log_event(run_dir, event="run_stop", drain=not halted,
+                      paused=paused)
             halt_remaining(gi)
             break
         if cfg.max_hours and time.time() - run_t0 > cfg.max_hours * 3600:
@@ -3105,7 +3172,8 @@ def stop_step(run_name: str, step_name: str,
     if rec.get("status") == "running" and not step_live(rec):
         raise RequestError("This step is already dead (its record is "
                            "stale - sweep will mark it lost)", 409)
-    _flag_raise(stop_flag(d, step_name).name)
+    for f in stop_flags_for(d, st, step_name):
+        _flag_raise(f.name)
     if rec.get("pid"):
         _kill_pid(rec["pid"], rec.get("started_at"))
     # NB no log_event here: while a step is live, run_dir can sit inside
@@ -3117,23 +3185,32 @@ def stop_step(run_name: str, step_name: str,
 
 def stop_run(run_name: str, body: dict,
              runs_dir: Path = RUNS_DIR) -> dict:
-    """Dashboard run-level stop. {"drain": true} lets live steps finish but
-    launches nothing new; otherwise every live step is flagged + killed.
-    The conductor's wave loop honors the sentinel between waves."""
+    """Dashboard run-level halt. {"drain": true} lets live steps finish
+    but launches nothing new; {"pause": true} is a hard stop that the
+    run records as aborted='paused' (deliberate hold - the machine-restart
+    case); otherwise every live step is flagged + killed. The conductor's
+    wave loop honors the sentinels between waves, so no later step
+    launches regardless of on_failure."""
     d, st = _run_dir_checked(run_name, runs_dir)
     if st.get("ended_at"):
         raise RequestError("This run already ended", 409)
     if body.get("drain"):
-        _flag_raise(drain_flag(d).name)
+        for f in drain_flags_for(d, st):
+            _flag_raise(f.name)
         return {"draining": run_name}
-    _flag_raise(stop_flag(d).name)
+    if body.get("pause"):
+        for f in pause_flags_for(d, st):
+            _flag_raise(f.name)
+    for f in stop_flags_for(d, st):
+        _flag_raise(f.name)
     live = [n for n, r in (st.get("steps") or {}).items()
             if r.get("status") == "running" and step_live(r)]
     for n in live:                       # immediate kill, not just the poll
         _kill_pid((st["steps"][n]).get("pid"),
                   st["steps"][n].get("started_at"))
-        _flag_raise(stop_flag(d, n).name)
-    return {"stopping": live}
+        for f in stop_flags_for(d, st, n):
+            _flag_raise(f.name)
+    return {"stopping": live, "paused": bool(body.get("pause"))}
 
 
 def set_step_timeout(run_name: str, step_name: str, body: dict,
@@ -3632,6 +3709,7 @@ def collect_dashboard(runs_dir: Path,
                      (request or {}).get("description"),
                      "started_at": st.get("started_at"),
                      "ended_at": st.get("ended_at"), "counts": counts,
+                     "aborted": st.get("aborted"),
                      "tokens": tok_run or None,
                      "cost": ({"usd": round(run_cost, 4) if run_priced
                                else None, "unpriced": run_unpriced}
@@ -4043,9 +4121,22 @@ function showRunDetails(key){
     !['running','queued'].includes(a.status));
   const liveSteps = AGENTS.filter(a=>(a.run_key||a.run_dir)===key &&
     ['running','queued'].includes(a.status));
+  // Paused vs interrupted: 'paused' means someone clicked Pause (a clean,
+  // deliberate hold); a run with no ended_at and nothing live means the
+  // conductor itself died (crash/reboot) - resumable either way.
+  const interrupted = !r.ended_at && !r.aborted && !liveSteps.length &&
+    Object.keys(r.counts||{}).length;
+  const notice = r.aborted==='paused'
+    ? `<div class="notice warn">Paused by user - no live steps, nothing ` +
+      `new launches. Resume continues it (safe across a restart).</div>`
+    : interrupted
+    ? `<div class="notice warn">Interrupted - the conductor process is ` +
+      `gone (crash or machine restart). Resume picks up unfinished ` +
+      `steps from committed state.</div>` : '';
   document.getElementById('dbody').innerHTML =
     `<h3 id="modal-title">${esc(r.run)}</h3>` +
     (r.stage ? `<span class="stage ${esc(r.stage)}">${esc(STAGES[r.stage]||r.stage)}</span>` : '') +
+    notice +
     `<div class="kv" style="margin-top:12px">` +
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">${esc(v??'-')}` +
       (k==='tokens'?tokenHelp:'') + `</div>`).join('') + '</div>' +
@@ -4056,7 +4147,12 @@ function showRunDetails(key){
     (pendingMerge ? `<button type="button" class="btn" ` +
       `data-merge-run="${esc(String(r.dir).split(/[\\/]/).pop())}" ` +
       `data-rk="${esc(key)}">Merge pending branches</button>` : '') +
-    (liveSteps.length ? `<button type="button" class="btn danger" ` +
+    (liveSteps.length ? `<button type="button" class="btn" ` +
+      `data-pause-run="${esc(String(r.dir).split(/[\\/]/).pop())}" ` +
+      `title="stop the live step now and hold the pipeline - nothing ` +
+      `new launches until you Resume (built for machine restarts)">` +
+      `Pause run</button>` +
+      `<button type="button" class="btn danger" ` +
       `data-stop-run="${esc(String(r.dir).split(/[\\/]/).pop())}" ` +
       `title="tree-kill every live step now - committed work stays; ` +
       `the run ends and can be resumed">Stop run now</button>` +
@@ -4650,6 +4746,21 @@ document.addEventListener('click', async e=>{
     } catch(err){ alert('Timeout update failed: '+err.message);
       t.disabled=false; }
     return; }
+  if (t.dataset && t.dataset.pauseRun){
+    if(!confirm('Pause this run? The live step is tree-killed now ' +
+                '(committed work stays) and NO further step launches - ' +
+                'regardless of on_failure. The run stays resumable ' +
+                'across a dashboard or machine restart.')) return;
+    t.disabled=true;
+    try {
+      const out=await api('POST',
+        `/api/runs/${encodeURIComponent(t.dataset.pauseRun)}/pause`,{});
+      closeDetail(true); await refresh();
+      alert(out.stopping?.length
+        ? `Pausing: ${out.stopping.join(', ')}` :
+          'Pause requested - nothing was live.');
+    } catch(err){ alert('Pause failed: '+err.message); t.disabled=false; }
+    return; }
   if (t.dataset && (t.dataset.stopRun || t.dataset.drainRun)){
     const drain=!!t.dataset.drainRun, dir=t.dataset.stopRun||t.dataset.drainRun;
     if(!confirm(drain
@@ -4880,6 +4991,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     self._json(merge_run(m.group(1), runs_dir, devin_argv))
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/stop", path)):
                     self._json(stop_run(m.group(1), body, runs_dir), 202)
+                elif (m := re.fullmatch(r"/api/runs/([^/]+)/pause", path)):
+                    self._json(stop_run(m.group(1),
+                                        {**body, "pause": True},
+                                        runs_dir), 202)
                 elif (m := re.fullmatch(
                         r"/api/runs/([^/]+)/steps/([^/]+)/stop", path)):
                     self._json(stop_step(m.group(1), m.group(2), runs_dir),

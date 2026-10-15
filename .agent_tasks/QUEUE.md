@@ -46,7 +46,15 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   4x ceiling, `timeout_extended_s` recorded); lifecycle sentinels are
   keyed by run-path hash (cross-checkout collisions gone); resume/merge
   prefer the run's recorded worker binary; `adaptive` clears/disables
-  the effort field (form + server-side normalization).
+  the effort field (form + server-side normalization). Later still:
+  run-level `Pause run` (`/pause` -> pause+stop sentinels; live step
+  killed, nothing new launches regardless of on_failure, run records
+  aborted='paused' and resumes clean); endpoints dual-write legacy
+  bare-name sentinels for runs launched before flag-namespacing
+  (state['flags']='v2' marks new-code drivers); run modal warns on
+  'Interrupted' (no ended_at, nothing alive = conductor died);
+  tail_status/tail_next now scan the whole log (8KB tail could miss a
+  STATUS: before a long closing report).
 - First real overnight manifest on a real project (Phase 2 in ROADMAP.md; live smoke already green)
 - Push agent-conductor to GitHub if cloud steps on it are wanted - it has NO remote, and cloud workers clone from origin (human decision: repo name + private/public)
 - Phone access to the :8773 dashboard via lan-bridge proxy (needs mobile-apps change; tasks-ui rows already give coarse progress)
