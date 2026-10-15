@@ -100,7 +100,10 @@ Tracking: `state.json` is the agent registry (status, pid, started/ended,
 elapsed, session id, work dir, paths to prompt/stdout/export, and per-step
 `tokens` - prompt/completion/cached sums plus LLM step count, read out of
 the ATIF export's `final_metrics` at step end; they roll up per run on the
-dashboard). `serve`
+dashboard). The planner session also exports and its metrics accumulate on
+the request as `plan_tokens` (across regenerations and the malformed-TOML
+retry) - the runs table shows them as `plan`/`steps` labels when present.
+`serve`
 renders it as a live page at `http://127.0.0.1:8773` (loopback only,
 auto-refreshes, shows elapsed time ticking for running agents). The same
 run row is live-posted to `hub.db`, so `http://127.0.0.1:8762/tasks-ui`

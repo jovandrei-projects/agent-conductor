@@ -784,6 +784,13 @@ def tail_metrics(export_path: Path) -> dict | None:
     return out or None
 
 
+def _merge_tokens(acc: dict[str, int], tok: dict | None) -> dict:
+    for k, v in (tok or {}).items():
+        if isinstance(v, (int, float)):
+            acc[k] = acc.get(k, 0) + int(v)
+    return acc
+
+
 def kill_tree(proc) -> None:
     """Kill the worker AND its children. Bare proc.kill() orphans
     grandchildren - a spawned vite kept :8805 bound for hours after its
@@ -1005,8 +1012,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         new_sessions = (session_ids(devin_argv, work_dir) or set()) - before
         all_sessions |= new_sessions
         status_line = tail_status(stdout_log)
-        for k, v in (tail_metrics(export_path) or {}).items():
-            tok_acc[k] = tok_acc.get(k, 0) + int(v)
+        _merge_tokens(tok_acc, tail_metrics(export_path))
         # Commit each attempt's product BEFORE deciding to retry - the next
         # session resumes from committed state, not the working tree.
         if post_commit and cfg.checkpoint and is_git_repo(work_dir) \
@@ -2110,6 +2116,7 @@ STATUS: done
         prompt_path = Path(wd) / "request.md"
         prompt_path.write_text(prompt, encoding="utf-8")
         log = log_path or Path(ld) / "planner.stdout.log"
+        export_path = log.with_suffix(".export.json")
         pm = rec.get("plan_model") or rec["model"]
         pe = rec.get("plan_effort")          # '' = bare variant, no suffix
         if pe is None:
@@ -2117,7 +2124,8 @@ STATUS: done
         cmd = devin_argv + [
             "--print", "--prompt-file", str(prompt_path),
             "--model", f"{pm}-{pe}" if pe else pm,
-            "--permission-mode", "normal", "--respect-workspace-trust", "false"]
+            "--permission-mode", "normal", "--export", str(export_path),
+            "--respect-workspace-trust", "false"]
         with open(log, "ab" if fix_note else "wb") as out:
             proc = subprocess.Popen(cmd, cwd=wd, stdout=out,
                                     stderr=subprocess.STDOUT,
@@ -2140,11 +2148,14 @@ STATUS: done
 def _finish_generation(request_id: str, requests_dir: Path,
                        manifests_dir: Path, runs_dir: Path,
                        devin_argv: list[str]) -> None:
+    tok_plan: dict[str, int] = {}
     try:
         rec = _read_request(request_id, requests_dir)
         log_path = requests_dir / f"{request_id}.gen.log"
+        export_path = log_path.with_suffix(".export.json")
         projects = load_projects()
         text = _planner_response(rec, projects, devin_argv, log_path)
+        _merge_tokens(tok_plan, tail_metrics(export_path))
         try:
             defaults = tomllib.loads(text).get("defaults", {})
         except tomllib.TOMLDecodeError as exc:
@@ -2153,6 +2164,7 @@ def _finish_generation(request_id: str, requests_dir: Path,
             # parse error fed back.
             text = _planner_response(rec, projects, devin_argv, log_path,
                                      fix_note=str(exc))
+            _merge_tokens(tok_plan, tail_metrics(export_path))
             defaults = tomllib.loads(text).get("defaults", {})
         if defaults.get("model") != rec["model"] or \
                 defaults.get("effort") != rec["effort"]:
@@ -2175,6 +2187,10 @@ def _finish_generation(request_id: str, requests_dir: Path,
                 with REQUEST_LOCK:
                     rec = _read_request(request_id, requests_dir)
                     if rec["status"] == "generating":
+                        plan_tok = _merge_tokens(
+                            dict(rec.get("plan_tokens") or {}), tok_plan)
+                        if plan_tok:
+                            rec["plan_tokens"] = plan_tok
                         _publish_proposal(rec, text, requests_dir,
                                           manifests_dir, runs_dir)
                 break
@@ -2192,6 +2208,10 @@ def _finish_generation(request_id: str, requests_dir: Path,
         with REQUEST_LOCK:
             rec = _read_request(request_id, requests_dir)
             if rec["status"] == "generating":
+                plan_tok = _merge_tokens(
+                    dict(rec.get("plan_tokens") or {}), tok_plan)
+                if plan_tok:
+                    rec["plan_tokens"] = plan_tok
                 rec.update(status="error", error=msg[:300])
                 _save_request(rec, requests_dir)
     finally:
@@ -2630,6 +2650,7 @@ def collect_dashboard(runs_dir: Path,
                      "started_at": st.get("started_at"),
                      "ended_at": st.get("ended_at"), "counts": counts,
                      "tokens": tok_run or None,
+                     "plan_tokens": (request or {}).get("plan_tokens"),
                      "max_parallel": st.get("max_parallel"),
                      "projects": sorted({r.get("slug") for r in
                                          st.get("steps", {}).values()
@@ -2659,7 +2680,9 @@ def collect_dashboard(runs_dir: Path,
                      "updated_at": rec.get("updated_at"),
                      "started_at": None, "ended_at": None,
                      "counts": {"planned": len(steps)} if steps else {},
-                     "tokens": None, "max_parallel": None,
+                     "tokens": None,
+                     "plan_tokens": rec.get("plan_tokens"),
+                     "max_parallel": None,
                      "stage": stage, "error": rec.get("error"),
                      "stale": rec.get("stale"), "gen_last": gen_last,
                      "projects": sorted({s["slug"] for s in steps})
@@ -2680,7 +2703,10 @@ def collect_dashboard(runs_dir: Path,
                 "started_at": rec.get("generation_started_at"),
                 "ended_at": None, "elapsed_s": None, "alive": False,
                 "pid": None, "session_id": None, "session_gone": False,
-                "model": rec.get("model"), "effort": rec.get("effort"),
+                "model": rec.get("plan_model") or rec.get("model"),
+                "effort": (rec.get("plan_effort")
+                           if rec.get("plan_effort") is not None
+                           else rec.get("effort")),
                 "mode": "planner", "cloud": False, "verify_ok": None,
                 "task": "Propose a TOML runbook for: " + " ".join(
                     (rec.get("raw") or "").split())[:120],
@@ -3277,7 +3303,11 @@ function render(d){
       `<td>${loc(r.started_at)}</td>` +
       `<td>${r.ended_at?loc(r.ended_at):(r.started_at?'<b>running</b>':'-')}</td>` +
       `<td class="counts">${counts||'<span class="sub">not planned</span>'}` +
-      (r.tokens ? `<br><span class="sub" title="${TOK_HELP}">tok ` +
+      (r.plan_tokens ? `<br><span class="sub" title="${TOK_HELP}">plan ` +
+        `${kfmt(r.plan_tokens.prompt)}/${kfmt(r.plan_tokens.completion)}/` +
+        `${kfmt(r.plan_tokens.cached)}</span>` : '') +
+      (r.tokens ? `<br><span class="sub" title="${TOK_HELP}">` +
+        `${r.plan_tokens ? 'steps ' : 'tok '}` +
         `${kfmt(r.tokens.prompt)}/${kfmt(r.tokens.completion)}/` +
         `${kfmt(r.tokens.cached)}</span>` : '') +
       `</td><td>${r.max_parallel||'-'}</td>` +

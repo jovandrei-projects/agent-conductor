@@ -1378,6 +1378,47 @@ prompt = "Review the catalog tests."
         if os.name == "nt":
             self.assertEqual(seen["flags"], subprocess.CREATE_NO_WINDOW)
 
+    def test_planner_tokens_recorded_on_request(self):
+        rec = self.new()
+        proposal = self.proposal()
+
+        class FakeProc:
+            def __init__(self, cmd, **kwargs):
+                exp = Path(cmd[cmd.index("--export") + 1])
+                exp.write_text(json.dumps({"final_metrics": {
+                    "total_prompt_tokens": 1000,
+                    "total_completion_tokens": 50,
+                    "total_cached_tokens": 100,
+                    "total_steps": 4}}))
+                kwargs["stdout"].write(("BEGIN_MANIFEST\n" + proposal +
+                                        "END_MANIFEST\nSTATUS: done\n"
+                                        ).encode())
+                kwargs["stdout"].flush()
+
+        real_popen = subprocess.Popen
+
+        def popen_router(cmd, **kwargs):
+            # Only the planner spawn is faked; git/probe subprocesses run
+            # for real (validate_proposal checks git roots).
+            if isinstance(cmd, list) and "--prompt-file" in cmd \
+                    and "--export" in cmd:
+                return FakeProc(cmd, **kwargs)
+            return real_popen(cmd, **kwargs)
+
+        with mock.patch.object(conductor.subprocess, "Popen",
+                               popen_router), \
+                mock.patch.object(conductor, "wait_worker",
+                                  return_value=(0, False, False)):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "ready")
+        self.assertEqual(rec["plan_tokens"],
+                         {"prompt": 1000, "completion": 50,
+                          "cached": 100, "llm_steps": 4})
+
     def test_planner_must_honor_selected_model_and_effort(self):
         rec = self.new()
         wrong = self.proposal().replace('model = "swe-2"',
