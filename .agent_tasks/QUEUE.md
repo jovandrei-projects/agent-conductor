@@ -83,3 +83,11 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   apartment-3d's own trap note. floorplan-fixes was the different case:
   killed mid-explore-test with no STATUS - 90min was genuinely too short
   for that phase's calibration workload.
+- DONE 2026-10-15: Sticky dashboard chrome. `.topbar` (title/meta/New
+  request/density seg/filters) pins at top; every table `th` pins just
+  under it via `--topbar-h` measured at render (filters wrap). `.wrapw`
+  dropped `overflow-x` - an overflow ancestor becomes the scroll
+  container and breaks `th` stickiness. Compact|Full toggle flips
+  `body.compact`: wrap cells ellipsize to one line, `.sub` and `<br>`
+  hide; persists in `localStorage['ac-density']`. Modal z-index bumped
+  above the bar (50/51).
