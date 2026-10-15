@@ -254,8 +254,13 @@ Append as they are hit.
      worker's cwd too. The poisoned case was only non-worktree self-runs.
 6. **`rc 0` proves nothing.** A `devin -p` worker can exit 0 before the ACP
    turn starts (see trap 5) or print `STATUS` only at the end of a real
-   turn. `run_step` now marks `rc==0` + missing `STATUS` as `failed`
-   (note: "no-op run"), never `done`.
+   turn. `run_step` now marks `rc==0` + missing `STATUS` as `failed`,
+   never `done`. The note says "no-op run" only when the export shows
+   zero tokens - a worker that ran 2h of LLM steps and committed real
+   work can still end its turn mid-report without a STATUS line (hit
+   2026-10-15, apartment-3d wall placement: committed dc5edab then the
+   log truncated mid-sentence). `--resume` prepends the interrupted-
+   state note to `failed` steps too - partial work may be committed.
 7. **`os.kill(pid, 0)` is TerminateProcess on Windows.** It KILLS the
    process it probes - verified by spawning a sleeper and watching it die.
    The dashboard's liveness check used it on every `running` record per

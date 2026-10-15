@@ -127,7 +127,8 @@ recent git log and .agent_tasks state, then CONTINUE from where it stopped.
 INTERRUPTED_NOTE = """\
 NOTE FROM THE CONDUCTOR: a previous session attempt at this step ended \
 abruptly (recorded {how}) - it was stopped by the user, the connection \
-dropped, or the conductor process died mid-turn. Partial work may already \
+dropped, the conductor process died mid-turn, or the worker exited \
+before reporting STATUS. Partial work may already \
 be committed in this repo - inspect the recent git log and .agent_tasks \
 state, then CONTINUE from where it stopped rather than redoing finished \
 work.
@@ -1232,8 +1233,14 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             notes.append(f"retried after timeout: {attempt} attempts total, "
                          "each attempt's work committed before the next")
         if status_line is None and rc == 0:
-            notes.append("worker exited 0 without a STATUS line "
-                         "(no-op run - nothing was done)")
+            if tok_acc:
+                notes.append("worker exited 0 without a STATUS: line - "
+                             "turn ended before the report but tokens "
+                             "show real work ran; check commits before "
+                             "re-running")
+            else:
+                notes.append("worker exited 0 without a STATUS line "
+                             "(no-op run - nothing was done)")
         if hung:
             notes.append("STATUS printed but the CLI stayed alive on a "
                          "spawned child (trap 12); tree-killed after "
@@ -1565,7 +1572,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             # tell the fresh session it isn't starting clean.
             rnote = (INTERRUPTED_NOTE.format(how=prior["status"])
                      if args.resume is not None and prior.get("status") in
-                     ("running", "lost", "timed_out", "stopped")
+                     ("running", "lost", "timed_out", "stopped", "failed")
                      else None)
             if step.worktree:
                 if cfg.checkpoint and not wave_ckpt_done \
@@ -3887,7 +3894,8 @@ function showDetail(i){
   const a = AGENTS[i]; if(!a || !closeDetail()) return;
   detailIdx = i;
   const kv = [['step',a.step],['run',a.run],['project',a.slug],
-    ['status',a.status],['task',a.task_full||a.task],['result',a.next||a.note],
+    ['status',a.status],['task',a.task_full||a.task],['result',a.next],
+    ['note',a.note],['log tail',a.tail_last],
     ['model',(a.model||'-')+(a.effort?' (effort '+a.effort+')':'')+
       (a.model_actual?' → '+a.model_actual:'')],
     ['mode',(a.mode||'-')+(a.cloud?' cloud':'')],

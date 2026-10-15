@@ -898,6 +898,25 @@ prompt = "p"
             self.assertEqual(st, "failed")
             self.assertIn("STATUS", state["steps"]["a"]["note"])
 
+    def test_no_status_with_tokens_is_not_called_noop(self):
+        """rc 0 + no STATUS but a nonzero-token export: real work ran, so
+        the note must not claim 'nothing was done'."""
+        with tempfile.TemporaryDirectory() as td:
+            proj, run_dir, cfg, state = self._fixture(Path(td))
+            fake = [sys.executable, "-c",
+                    "import sys,json;"
+                    "p=sys.argv[sys.argv.index('--export')+1];"
+                    "json.dump({'final_metrics':{'total_prompt_tokens':9,"
+                    "'total_completion_tokens':4}},open(p,'w'))"]
+            with mock.patch.object(conductor, "session_ids",
+                                   lambda *a, **k: set()):
+                st = conductor.run_step(cfg.steps[0], "s", proj, cfg,
+                                        run_dir, fake, state)
+            self.assertEqual(st, "failed")
+            note = state["steps"]["a"]["note"]
+            self.assertIn("real work ran", note)
+            self.assertNotIn("no-op", note)
+
     def test_timeout_retries_in_fresh_session(self):
         """max_attempts>1: a timed-out step is committed then respawned in a
         fresh session whose prompt carries the continue-from-state note -

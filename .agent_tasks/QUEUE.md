@@ -37,7 +37,11 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   override for worktree checkouts, session 'gone' suppressed while the
   worker pid is alive (dead pid shows deletion immediately, no grace),
   save_state retries the rename (WinError 5 flake), runs-table steps
-  column shows per-status counts only.
+  column shows per-status counts only. Later: rc-0-no-STATUS note now
+  distinguishes a token-bearing export (real work ran - check commits)
+  from a true no-op; agent modal gains separate 'note' + 'log tail'
+  rows (a set `next` no longer masks the failure note); --resume
+  prepends the interrupted-state note to `failed` steps too.
 - First real overnight manifest on a real project (Phase 2 in ROADMAP.md; live smoke already green)
 - Push agent-conductor to GitHub if cloud steps on it are wanted - it has NO remote, and cloud workers clone from origin (human decision: repo name + private/public)
 - Phone access to the :8773 dashboard via lan-bridge proxy (needs mobile-apps change; tasks-ui rows already give coarse progress)
