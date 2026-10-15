@@ -2214,6 +2214,9 @@ const runs=elem('runs').innerHTML;
 assert.match(runs,/paused - resume ready/);
 assert.match(runs,/interrupted - resume ready/);
 assert.match(runs,/class="stage live"[^>]*>running</);
+// run name is the details affordance - no separate Details link
+assert.match(runs,/class="linkbtn run-name"[^>]*data-run-details=/);
+assert.doesNotMatch(runs,/>Details</);
 const cleanRow=runs.split('runrow').find(r=>r.includes('>clean<'));
 assert.ok(cleanRow && !/stage (live|paused|interrupted|halted)/.test(cleanRow));
 const agents=elem('agents').innerHTML;
@@ -2772,6 +2775,11 @@ prompt = "second"
             st = json.loads((run_dir / "state.json").read_text())
             self.assertEqual(st["steps"]["s1"]["status"], "done")
             self.assertEqual(st["steps"]["s2"]["status"], "done")
+            # resume drops the stale 'aborted'/'ended_at' from the pause -
+            # the dashboard would otherwise keep showing 'Paused by user'
+            # on a finished run.
+            self.assertNotIn("aborted", st)
+            self.assertIn("ended_at", st)
             prompt = (run_dir / "prompts" / "s1.md").read_text(
                 encoding="utf-8")
             self.assertIn("previous session attempt", prompt)

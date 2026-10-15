@@ -1555,6 +1555,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         # The driver is now THIS code version: it polls the path-keyed
         # sentinels only, so the dashboard can stop writing legacy names.
         state["flags"] = "v2"
+        # A resumed run is in flight again: the stale 'aborted'/'ended_at'
+        # from the pause/crash would keep showing the old end-state notice
+        # (e.g. 'Paused by user') until the loop re-stamps them.
+        state.pop("aborted", None)
+        state.pop("ended_at", None)
         save_state(run_dir, state)
         print(f"[resume] {run_dir.name}")
         # Resume must be able to start work again: drop any stop/drain
@@ -3968,6 +3973,8 @@ a { color:#58a6ff; text-decoration:none; }
 .stage.interrupted { color:#f0883e; border-color:#7a3d12; background:#2d1f14; }
 .stage.halted { color:#8b949e; }
 .linkbtn { background:none; border:0; color:#58a6ff; cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
+.run-name { color:#e6edf3; text-decoration:none; text-align:left; }
+.run-name:hover, .run-name:focus-visible { color:#58a6ff; text-decoration:underline; }
 .btn { border:1px solid #388bfd; border-radius:6px; background:#1f6feb; color:#fff; padding:7px 12px; cursor:pointer; font:inherit; }
 .btn.secondary { color:#e6edf3; background:#21262d; border-color:#30363d; }
 .btn.danger { color:#ffb2aa; background:transparent; border-color:#9f3535; }
@@ -4650,7 +4657,17 @@ function render(d){
       (r.counts&&r.counts.running
         ? `<span class="dot run" style="background:#58a6ff" ` +
           `title="a step in this run is running"></span>` : '') +
-      `<b>${esc(r.run)}</b><br>` +
+      // the run name itself is the details affordance (requests open the
+      // proposal modal instead) - the separate Details link is gone; a
+      // click on the rest of the row still filters.
+      (r.stage
+        ? `<button type="button" class="linkbtn run-name" ` +
+          `data-open-request="${esc(r.request_id)}" ` +
+          `title="${r.stage==='draft'?'Edit draft':'Review proposal'}">` +
+          `<b>${esc(r.run)}</b></button>`
+        : `<button type="button" class="linkbtn run-name" ` +
+          `data-run-details="${esc(runKey(r))}" title="run details">` +
+          `<b>${esc(r.run)}</b></button>`) + `<br>` +
       (r.stage ? `<span class="stage ${esc(r.stage)}">` +
         `${esc(STAGES[r.stage]||r.stage)}` +
         (r.stage==='generating'
@@ -4664,9 +4681,7 @@ function render(d){
         runStateChip(r) + `<br>` +
         `<span class="sub">${esc(base(r.dir))}</span>`) +
       (r.stale?` <span class="stage error">Needs review</span>`:'') +
-      `<br><button type="button" class="linkbtn" ` +
-      (r.stage ? `data-open-request="${esc(r.request_id)}">${r.stage==='draft'?'Edit':'Review'}` :
-        `data-run-details="${esc(runKey(r))}">Details`) + `</button></td>` +
+      `</td>` +
       `<td class="wrap">${r.description?esc(r.description):
         r.stage?'<span class="sub">Awaiting proposal</span>':'-'}</td>` +
       `<td>${(r.projects||[]).map(p=>`<span class="chip">${esc(p)}</span>`).join('')}</td>` +
