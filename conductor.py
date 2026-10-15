@@ -291,15 +291,25 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
 
 
 def load_projects() -> dict[str, dict]:
-    if not PROJECTS_FILE.is_file():
-        return {}
-    doc = tomllib.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
-    out = {}
-    for slug, ent in doc.get("project", {}).items():
-        p = Path(ent["path"])
-        if not p.is_absolute():
-            p = (ROOT / p).resolve()
-        out[slug] = {"path": p, "cloud_ok": bool(ent.get("cloud_ok", False))}
+    """The project registry. `projects.toml` is tracked and its relative
+    `path`s resolve against the repo root - which breaks in a git worktree
+    checkout (../other-project lands outside the worktree). An untracked
+    `projects.local.toml` next to it merges over the base so a worktree or
+    machine can re-point slugs (typically with absolute paths) without
+    touching the shared file."""
+    out: dict[str, dict] = {}
+    for f in (PROJECTS_FILE, PROJECTS_FILE.with_name("projects.local.toml")):
+        if not f.is_file():
+            continue
+        doc = tomllib.loads(f.read_text(encoding="utf-8"))
+        for slug, ent in doc.get("project", {}).items():
+            p = Path(ent["path"])
+            if not p.is_absolute():
+                p = (f.parent / p).resolve()
+            merged = dict(out.get(slug, {}))
+            merged.update({"path": p,
+                           "cloud_ok": bool(ent.get("cloud_ok", False))})
+            out[slug] = merged
     return out
 
 
@@ -743,7 +753,17 @@ def save_state(run_dir: Path, state: dict) -> None:
     with STATE_LOCK:
         tmp = run_dir / "state.json.tmp"
         tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        tmp.replace(run_dir / "state.json")
+        # Windows: a reader or the AV scanner can hold either path open for
+        # a few ms and the rename fails with WinError 5. Retry briefly -
+        # losing a state write is far worse than a 100ms stall.
+        for attempt in range(20):
+            try:
+                tmp.replace(run_dir / "state.json")
+                return
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.1)
 
 
 def log_event(run_dir: Path, **kv) -> None:
@@ -868,6 +888,12 @@ def drain_flag(run_name: str) -> Path:
     return _flag_dir() / f"drain-{_safe_name(run_name)}"
 
 
+def timeout_flag(run_name: str, step: str) -> Path:
+    """Minutes override written by the dashboard's timeout editor;
+    wait_worker re-reads it each poll and moves the deadline."""
+    return _flag_dir() / f"timeout-{_safe_name(run_name)}-{_safe_name(step)}"
+
+
 def _flag_set(*flags: Path) -> Path | None:
     return next((f for f in flags if f.is_file()), None)
 
@@ -896,7 +922,8 @@ def clear_run_flags(run_name: str) -> None:
 
 
 def wait_worker(proc, stdout_log: Path, timeout_s: float,
-                stop_flags: tuple[Path, ...] = ()
+                stop_flags: tuple[Path, ...] = (),
+                timeout_flag: Path | None = None
                 ) -> tuple[int | None, bool, bool, bool]:
     """Wait for the worker; returns (rc, timed_out, hung_after_status,
     user_stopped).
@@ -906,14 +933,23 @@ def wait_worker(proc, stdout_log: Path, timeout_s: float,
     STATUS_GRACE_S before the tree is killed. hung_after_status tells the
     caller the work completed - run verify and honor the status line
     rather than reporting a timeout. A stop sentinel appearing mid-wait
-    tree-kills the worker and reports user_stopped."""
-    deadline = time.time() + timeout_s
+    tree-kills the worker and reports user_stopped. timeout_flag, if it
+    appears, carries minutes set from the dashboard - the deadline moves
+    to start+that value (a value under elapsed kills next poll)."""
+    t_start = time.time()
+    deadline = t_start + timeout_s
     grace_at = None
     while True:
         try:
             return proc.wait(timeout=WAIT_POLL_S), False, False, False
         except subprocess.TimeoutExpired:
             pass
+        if timeout_flag is not None:
+            try:
+                deadline = t_start + float(
+                    timeout_flag.read_text().strip()) * 60
+            except (OSError, ValueError):
+                pass
         if _flag_set(*stop_flags) is not None:
             kill_tree(proc)
             return proc.wait(), False, False, True
@@ -1037,6 +1073,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                    status="running", started_at=now_iso(), ended_at=None,
                    model=step.model, mode=step.mode, cloud=step.cloud,
                    effort=step.effort, timeout_min=step.timeout_min,
+                   max_attempts=step.max_attempts,
                    task=" ".join((body_src or "").split())[:160],
                    prompt=str(prompt_path), stdout_log=str(stdout_log),
                    export=str(export_path))
@@ -1123,7 +1160,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                     rc, timed_out, hung, stopped = wait_worker(
                         proc, stdout_log, step.timeout_min * 60,
                         stop_flags=(stop_flag(run_dir.name),
-                                    stop_flag(run_dir.name, step.name)))
+                                    stop_flag(run_dir.name, step.name)),
+                        timeout_flag=timeout_flag(run_dir.name, step.name))
                 except subprocess.TimeoutExpired:      # unreachable; safety
                     kill_tree(proc)
                     proc.wait()
@@ -3015,6 +3053,38 @@ def stop_run(run_name: str, body: dict,
     return {"stopping": live}
 
 
+def set_step_timeout(run_name: str, step_name: str, body: dict,
+                     runs_dir: Path = RUNS_DIR) -> dict:
+    """Dashboard timeout editor: a minutes value in a tempdir sentinel the
+    conductor's wait_worker polls, so the deadline moves live - grow it
+    past the default, or shrink it under elapsed to end the step early.
+    Applies to the current attempt and every retry of this step."""
+    if not RUN_DIR_RE.fullmatch(step_name):
+        raise RequestError("Invalid step name", 404)
+    d, st = _run_dir_checked(run_name, runs_dir)
+    rec = (st.get("steps") or {}).get(step_name)
+    if rec is None:
+        raise RequestError("Step not in this run", 404)
+    if rec.get("status") not in ("running", "queued"):
+        raise RequestError(
+            f"Step is {rec.get('status')} - only live steps take a "
+            "timeout override (edit the manifest for future runs)", 409)
+    try:
+        minutes = float(body.get("minutes"))
+    except (TypeError, ValueError):
+        raise RequestError("minutes must be a number") from None
+    if not 1 <= minutes <= 1440:
+        raise RequestError("minutes must be 1-1440", 422)
+    try:
+        _flag_dir().mkdir(exist_ok=True)
+        timeout_flag(run_name, step_name).write_text(
+            str(minutes), encoding="utf-8")
+    except OSError as exc:
+        raise RequestError(f"Could not write the timeout flag: {exc}",
+                           500) from exc
+    return {"timeout_min": minutes}
+
+
 def discard_request(request_id: str,
                     requests_dir: Path = REQUESTS_DIR,
                     manifests_dir: Path = MANIFESTS_DIR,
@@ -3335,6 +3405,8 @@ def proposal_agent(step: dict, rec: dict, projects: dict, key: str,
             "effort": step.get("effort"), "mode": step.get("mode"),
             "task": step.get("task"), "task_full": None,
             "model_actual": None, "wt": step.get("wt"),
+            "timeout_min": step.get("timeout_min"),
+            "attempts": None, "max_attempts": None,
             "merged": None, "cloud": step.get("cloud"), "tokens": None,
             "cost": None,
             "alive": False,
@@ -3407,13 +3479,29 @@ def collect_dashboard(runs_dir: Path,
                 else:
                     run_unpriced += 1
             # A recorded id missing from `devin list` minutes after spawn is
-            # propagation/cache lag, not deletion - 'gone' only once the
-            # step ended or the grace window passed.
+            # propagation/cache lag, not deletion. While the worker pid is
+            # provably alive the session must exist (list is just stale), so
+            # 'gone' is suppressed entirely; once the pid is dead (user
+            # deleted the session -> CLI child reaped) show it immediately.
+            # No-pid records (self-hosted runs keep the pid memory-only,
+            # trap 5) still wait out the grace window.
             start_ts = _iso_ts(rec.get("started_at"))
+            rec_pid = rec.get("pid")
+            worker_alive = bool(rec_pid) and pid_alive(
+                rec_pid, rec.get("started_at"))
             session_gone = bool(
-                sid and live is not None and str(sid) not in live and (
-                    rec.get("ended_at") or
+                sid and live is not None and str(sid) not in live
+                and not worker_alive and (
+                    rec.get("ended_at") or rec_pid or
                     (start_ts or 0) < time.time() - SESSION_GONE_GRACE_S))
+            # A dashboard-edited timeout overrides the manifest value for
+            # display - wait_worker applies the same flag on its next poll.
+            try:
+                tf = timeout_flag(sj.parent.name, rec.get("name") or name)
+                timeout_min = (float(tf.read_text().strip())
+                               if tf.is_file() else rec.get("timeout_min"))
+            except (OSError, ValueError):
+                timeout_min = rec.get("timeout_min")
             agents.append({
                 "run": st.get("run"), "run_dir": st.get("run_dir") or str(sj.parent),
                 "run_key": key, "request_id": st.get("request_id"),
@@ -3437,6 +3525,9 @@ def collect_dashboard(runs_dir: Path,
                 "session_gone": session_gone,
                 "exit_code": rec.get("exit_code"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
+                "timeout_min": timeout_min,
+                "attempts": rec.get("attempts"),
+                "max_attempts": rec.get("max_attempts"),
                 "tokens": rec.get("tokens"), "cost": cost,
                 "wt": bool(rec.get("branch") or plan.get("wt")),
                 "stdout_log": rec.get("stdout_log"),
@@ -3802,6 +3893,8 @@ function showDetail(i){
     ['mode',(a.mode||'-')+(a.cloud?' cloud':'')],
     ['started',a.started_at],['ended',a.ended_at],
     ['elapsed',a.elapsed_s!=null?fmtS(a.elapsed_s):'-'],
+    ['timeout',a.timeout_min!=null?a.timeout_min+' min':'-'],
+    ['attempt',a.attempts!=null?`${a.attempts} of ${a.max_attempts||'?'}`:'-'],
     ['tokens',tokTitle(a.tokens)||'-'],
     ['est cost',(fmtC(a.cost)!=='-'?fmtC(a.cost)+' - ':'')+costTitle(a.cost)],
     ['session',(a.session_id||'-')+(a.session_gone?' (deleted from sidebar)':'')],
@@ -3820,7 +3913,17 @@ function showDetail(i){
         `data-step="${esc(a.step)}">Stop this agent</button>` +
         `<span class="sub" style="margin-left:10px">tree-kills the devin ` +
         `process; committed work stays. Resume re-runs the step.</span>` +
-        `</div>` : '') +
+        `</div>` +
+        `<div class="actions"><label for="d-timeout" ` +
+        `style="margin:0">timeout (min)</label>` +
+        `<input id="d-timeout" type="number" min="1" max="1440" ` +
+        `value="${a.timeout_min??''}" style="width:90px">` +
+        `<button type="button" class="btn secondary" ` +
+        `data-set-timeout="${esc(String(a.run_dir).split(/[\\/]/).pop())}" ` +
+        `data-step="${esc(a.step)}">Save</button>` +
+        `<span class="sub">moves the live deadline on the next poll ` +
+        `(&lt;15s); a value under elapsed ends the step early, retries ` +
+        `use it too.</span></div>` : '') +
     (a.request_id ? `<div class="actions"><button type="button" class="btn secondary" ` +
       `data-open-request="${esc(a.request_id)}">View request / runbook</button></div>` : '') +
     (a.tail ? `<h3 style="margin-top:14px">stdout tail</h3><pre id="dtail">${esc(a.tail)}</pre>` : '');
@@ -3971,19 +4074,20 @@ function showRequestForm(rec){
     `<label for="rq-raw">Your request</label><textarea id="rq-raw"${disabled} ` +
     `placeholder="Describe the work in your own words…">${esc(rec.raw||'')}</textarea>` +
     `<label class="check"><input type="checkbox" id="rq-followup"` +
-      `${rec.followup?' checked':''}${disabled}> End the run with a ` +
+      `${rec.followup?' checked':''}${disabled}><span>End the run with a ` +
       `planning step that drafts a follow-up manifest into manifests/ ` +
-      `for anything unfinished</label>` +
+      `for anything unfinished</span></label>` +
     `<label class="check"><input type="checkbox" id="rq-worktrees"` +
-      `${rec.worktrees?' checked':''}${disabled}> Run every step in its own ` +
-      `git worktree (<code>worktree = true</code>): changes land on a ` +
-      `conductor/&lt;run&gt;/&lt;step&gt; branch and merge back after each ` +
-      `wave - required anyway for same-project parallel steps</label>` +
+      `${rec.worktrees?' checked':''}${disabled}><span>Run every step in ` +
+      `its own git worktree (<code>worktree = true</code>): changes land ` +
+      `on a conductor/&lt;run&gt;/&lt;step&gt; branch and merge back ` +
+      `after each wave - required anyway for same-project parallel ` +
+      `steps</span></label>` +
     `<label class="check"><input type="checkbox" id="rq-merge_resolver"` +
-      `${rec.merge_resolver?' checked':''}${disabled}> On a worktree merge ` +
-      `conflict, spawn a resolve-* session to finish the merge ` +
-      `(<code>merge_resolver = true</code>) instead of only parking the ` +
-      `worktree for a human</label>` +
+      `${rec.merge_resolver?' checked':''}${disabled}><span>On a ` +
+      `worktree merge conflict, spawn a resolve-* session to finish the ` +
+      `merge (<code>merge_resolver = true</code>) instead of only ` +
+      `parking the worktree for a human</span></label>` +
     (steps.length?`<h3 style="margin:16px 0 0">Proposed steps (${steps.length})</h3>` +
       `<ol class="proposal-list">${steps.map(s=>`<li><b>${esc(s.step)}</b> ` +
         `<small>${esc(s.slug)} · ${esc(s.model||'-')} / ${esc(s.effort||'-')}` +
@@ -4245,7 +4349,6 @@ function render(d){
       `<td>${loc(r.started_at)}</td>` +
       `<td>${r.ended_at?loc(r.ended_at):(r.started_at?'<b>running</b>':'-')}</td>` +
       `<td class="counts">` +
-      (total?`<b>${total}</b> step${total===1?'':'s'}<br>`:'') +
       `${counts||'<span class="sub">not planned</span>'}` +
       (r.plan_tokens ? `<br><span class="sub" ` +
         `title="${esc(tokTitle(r.plan_tokens))}">plan ` +
@@ -4424,6 +4527,19 @@ document.addEventListener('click', async e=>{
         `${encodeURIComponent(t.dataset.step)}/stop`,{});
       closeDetail(true); await refresh();
     } catch(err){ alert('Stop failed: '+err.message); t.disabled=false; }
+    return; }
+  if (t.dataset && t.dataset.setTimeout){
+    const inp=document.getElementById('d-timeout');
+    const mins=parseFloat(inp?.value);
+    if(!(mins>=1)){ alert('Enter a timeout in minutes (1-1440).'); return; }
+    t.disabled=true;
+    try {
+      await api('POST',
+        `/api/runs/${encodeURIComponent(t.dataset.setTimeout)}/steps/` +
+        `${encodeURIComponent(t.dataset.step)}/timeout`,{minutes:mins});
+      await refresh();
+    } catch(err){ alert('Timeout update failed: '+err.message);
+      t.disabled=false; }
     return; }
   if (t.dataset && (t.dataset.stopRun || t.dataset.drainRun)){
     const drain=!!t.dataset.drainRun, dir=t.dataset.stopRun||t.dataset.drainRun;
@@ -4660,6 +4776,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                         r"/api/runs/([^/]+)/steps/([^/]+)/stop", path)):
                     self._json(stop_step(m.group(1), m.group(2), runs_dir),
                                202)
+                elif (m := re.fullmatch(
+                        r"/api/runs/([^/]+)/steps/([^/]+)/timeout", path)):
+                    self._json(set_step_timeout(
+                        m.group(1), m.group(2), body, runs_dir), 202)
                 elif path == "/api/auth/login":
                     # Login is an interactive console flow (trap 3) - the most a
                     # dashboard button can do is pop a REAL terminal for it.

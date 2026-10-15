@@ -53,6 +53,33 @@ def run_manifest(manifest: Path, runs_dir: Path, resume=None) -> int:
         runs_dir=str(runs_dir), hub=False, keep_awake=False))
 
 
+class ProjectsRegistryTests(unittest.TestCase):
+    def test_projects_local_toml_merges_over_base(self):
+        """A worktree checkout breaks '../other-project' relatives - an
+        untracked projects.local.toml re-points slugs without editing the
+        tracked registry."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            real = base / "real-proj"
+            real.mkdir()
+            pf = base / "projects.toml"
+            pf.write_text(
+                '[project.demo]\npath = "../somewhere-else"\n'
+                'cloud_ok = false\n', encoding="utf-8")
+            local = base / "projects.local.toml"
+            with mock.patch.object(conductor, "PROJECTS_FILE", pf):
+                # base file alone resolves relative to its own dir
+                got = conductor.load_projects()
+                self.assertEqual(got["demo"]["path"],
+                                 (base / "../somewhere-else").resolve())
+                local.write_text(
+                    f'[project.demo]\npath = "{real.as_posix()}"\n'
+                    'cloud_ok = true\n', encoding="utf-8")
+                got = conductor.load_projects()
+                self.assertEqual(got["demo"]["path"], real.resolve())
+                self.assertTrue(got["demo"]["cloud_ok"])
+
+
 class ManifestTests(unittest.TestCase):
     def test_defaults_merge_and_prompt_xor(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2032,6 +2059,45 @@ class SessionGoneGraceTests(unittest.TestCase):
                 "name": "s", "status": "running", "session_id": "abc",
                 "started_at": old, "timeout_min": 60, "work_dir": wd}))
 
+    def test_live_pid_suppresses_gone_dead_pid_shows_now(self):
+        """While the recorded worker pid is alive the session must exist -
+        `devin list` lag alone never marks it gone, however old. A dead pid
+        means the session really is gone - show it without waiting out the
+        grace window."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "runs"
+            rd = runs / "20261014-000000-t"
+            rd.mkdir(parents=True)
+            wd = str(base / "proj")
+            now = conductor.now_iso()
+            old = (conductor.dt.datetime.now() - conductor.dt.timedelta(
+                seconds=conductor.SESSION_GONE_GRACE_S + 60)).isoformat(
+                    timespec="seconds")
+            sleeper = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"])
+            try:
+                alive_pid = sleeper.pid
+            finally:
+                pass
+            dead_shell = subprocess.Popen(
+                [sys.executable, "-c", "pass"])
+            dead_shell.wait()
+            dead_pid = dead_shell.pid
+            try:
+                # brand-new step, recorded pid dead -> real deletion: no wait
+                self.assertTrue(self._collect(runs, rd, {
+                    "name": "s", "status": "running", "session_id": "abc",
+                    "started_at": now, "timeout_min": 60, "pid": dead_pid,
+                    "work_dir": wd}))
+                # ancient step, pid still alive -> lag, not deletion
+                self.assertFalse(self._collect(runs, rd, {
+                    "name": "s", "status": "running", "session_id": "abc",
+                    "started_at": old, "timeout_min": 60, "pid": alive_pid,
+                    "work_dir": wd}))
+            finally:
+                sleeper.kill(); sleeper.wait()
+
 
 class DashboardJsFilterTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
@@ -2059,8 +2125,9 @@ const data={serve_boot:'b',generated_at:'2026-10-14T00:00:00',agents:[
    cost:{usd:1.5,unpriced:0}},
   {run:'second',dir:'/second',description:'run two',projects:['q'],counts:{done:1}}]};
 vm.runInContext('render('+JSON.stringify(data)+')',ctx);
-// run row: step total, live pulse, est cost
-assert.match(elem('runs').innerHTML,/<b>2<\/b> steps/);
+// run row: per-status step counts, live pulse, est cost
+assert.match(elem('runs').innerHTML,/>1 running</);
+assert.match(elem('runs').innerHTML,/>1 done</);
 assert.match(elem('runs').innerHTML,/class="dot run"/);
 assert.match(elem('runs').innerHTML,/est \$1\.50/);
 // agent row: cost cell; tokens show in/out without a trailing /0

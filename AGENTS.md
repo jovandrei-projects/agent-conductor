@@ -127,7 +127,9 @@ never touched.
 `manifests/` holds real manifests (hand-written `<project>-<what>.toml` and
 UI-generated `<YYYYMMDD-HHMMSS>-<random>-<run>.toml`, flat; see its README);
 `examples/` is reference-only. `projects.toml` registers slug -> path +
-`cloud_ok`. `--devin "..."` or `CONDUCTOR_DEVIN` overrides the spawned binary
+`cloud_ok`; relative `path`s resolve against the repo root, so a git
+worktree checkout needs the untracked `projects.local.toml` next to it
+(absolute paths) - it merges over the tracked entries. `--devin "..."` or `CONDUCTOR_DEVIN` overrides the spawned binary
 (shlex-split; use forward slashes or quotes - posix shlex eats unquoted
 backslashes). The :8773 dashboard's New request saves raw drafts in ignored
 `data/requests/`, generates/validates a reviewable TOML with a planning-only
@@ -166,7 +168,11 @@ finish, nothing new launches); an agent modal on a live step gets `Stop
 this agent` (POST `/api/runs/<dir>/steps/<step>/stop`). Stop/drain travel
 as empty sentinel files in `%TEMP%/agent-conductor-flags` (never inside
 run_dir - trap 5), polled by `wait_worker` and the wave loop; `resume`
-clears them via `clear_run_flags` first. A step killed by a stop is
+clears them via `clear_run_flags` first. A live agent's modal also has a
+timeout editor (`POST .../steps/<step>/timeout` {minutes}) - the same
+sentinel mechanism: `wait_worker` re-reads it each poll and moves the
+deadline to spawn+minutes (under elapsed = early kill; retries inherit).
+A step killed by a stop is
 `stopped` (vs `skipped` = never spawned); both plus `lost`/`timed_out`
 get INTERRUPTED_NOTE prepended on resume so the fresh session recovers
 from committed state instead of trusting a clean start. `model =

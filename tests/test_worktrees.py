@@ -19,6 +19,7 @@ The space, roughly:
 import json
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import threading
@@ -982,6 +983,84 @@ class StopEndpointTests(unittest.TestCase):
             with self.assertRaises(conductor.RequestError) as e:
                 conductor.stop_run(rd.name, {}, runs)
             self.assertEqual(e.exception.status, 409)
+
+
+class TimeoutOverrideTests(unittest.TestCase):
+    """The dashboard timeout editor writes a minutes sentinel that
+    wait_worker polls - the live deadline moves without a restart."""
+
+    def _state(self, base, run="r1", steps=None):
+        runs = base / "runs"
+        rd = runs / run
+        rd.mkdir(parents=True)
+        (rd / "state.json").write_text(json.dumps(
+            {"run": "t", "steps": steps or {}}))
+        return runs, rd
+
+    def test_wait_worker_honors_a_shortened_timeout(self):
+        """Flag written mid-wait -> next poll recomputes the deadline; a
+        value under elapsed tree-kills instead of waiting timeout_min."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "l.log"
+            log.write_text("", encoding="utf-8")
+            flag = Path(td) / "timeout.flag"
+            flag.write_text("0.01", encoding="utf-8")   # 0.6s, already past
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"])
+            try:
+                with mock.patch.object(conductor, "WAIT_POLL_S", 0.1):
+                    rc, timed_out, _hung, stopped = conductor.wait_worker(
+                        proc, log, 600, timeout_flag=flag)
+                self.assertTrue(timed_out)
+                self.assertFalse(stopped)
+                self.assertNotEqual(rc, 0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+
+    def test_set_step_timeout_writes_flag_and_validates(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs, rd = self._state(base, steps={
+                "s": {"name": "s", "status": "running",
+                      "started_at": conductor.now_iso(),
+                      "timeout_min": 60},
+                "d": {"name": "d", "status": "done"}})
+            out = conductor.set_step_timeout(
+                rd.name, "s", {"minutes": 45}, runs)
+            self.assertEqual(out["timeout_min"], 45.0)
+            self.assertEqual(conductor.timeout_flag(
+                rd.name, "s").read_text().strip(), "45.0")
+            with self.assertRaises(conductor.RequestError):
+                conductor.set_step_timeout(rd.name, "s",
+                                           {"minutes": 0}, runs)
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.set_step_timeout(rd.name, "d",
+                                           {"minutes": 45}, runs)
+            self.assertEqual(e.exception.status, 409)
+            with self.assertRaises(conductor.RequestError):
+                conductor.set_step_timeout("../x", "s",
+                                           {"minutes": 45}, runs)
+
+    def test_override_flag_visible_in_dashboard_timeout(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs, rd = self._state(base, steps={
+                "s": {"name": "s", "status": "running",
+                      "started_at": conductor.now_iso(),
+                      "timeout_min": 60, "work_dir": str(base / "p")}})
+            with mock.patch.object(conductor, "refresh_prices"):
+                d = conductor.collect_dashboard(runs, ["no-such-devin"])
+            self.assertEqual(d["agents"][0]["timeout_min"], 60)
+            conductor._flag_dir().mkdir(exist_ok=True)
+            conductor.timeout_flag(rd.name, "s").write_text("90")
+            try:
+                with mock.patch.object(conductor, "refresh_prices"):
+                    d = conductor.collect_dashboard(runs, ["no-such-devin"])
+                self.assertEqual(d["agents"][0]["timeout_min"], 90.0)
+            finally:
+                conductor.timeout_flag(rd.name, "s").unlink(
+                    missing_ok=True)
 
 
 if __name__ == "__main__":

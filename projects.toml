@@ -2,7 +2,9 @@
 #
 # A [[step]] project = "slug" resolves here; otherwise it is treated as a
 # literal path relative to the manifest. `path` may be absolute or relative
-# to this file's directory.
+# to this file's directory. A git worktree checkout breaks the relative
+# paths - put an untracked `projects.local.toml` next to this file with
+# absolute paths; it merges over these entries (same [project.*] table).
 #
 # cloud_ok = true allows `cloud = true` steps (devin --cloud -p). The session
 # clones the repo from origin onto a Devin VM - code already on GitHub is fine,

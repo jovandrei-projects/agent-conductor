@@ -32,6 +32,12 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   suffix; export's agent.model_name -> model_actual shown + priced).
   Modal shows the full task (task_full from the prompt file); running
   agent 'result' cell is the log TAIL (\r-aware), not the head.
+  Follow-up same day: live timeout editor per step (minutes sentinel
+  polled by wait_worker), attempt N/max in the modal, `projects.local.toml`
+  override for worktree checkouts, session 'gone' suppressed while the
+  worker pid is alive (dead pid shows deletion immediately, no grace),
+  save_state retries the rename (WinError 5 flake), runs-table steps
+  column shows per-status counts only.
 - First real overnight manifest on a real project (Phase 2 in ROADMAP.md; live smoke already green)
 - Push agent-conductor to GitHub if cloud steps on it are wanted - it has NO remote, and cloud workers clone from origin (human decision: repo name + private/public)
 - Phone access to the :8773 dashboard via lan-bridge proxy (needs mobile-apps change; tasks-ui rows already give coarse progress)

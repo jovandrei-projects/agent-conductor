@@ -3,3 +3,4 @@ logs/
 .agent_tasks/*/scratch/
 __pycache__/
 *.pyc
+projects.local.toml
