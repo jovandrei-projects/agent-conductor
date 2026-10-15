@@ -4230,8 +4230,8 @@ function showRunDetails(key){
   // deliberate hold); a run with no ended_at and nothing live means the
   // conductor itself died (crash/reboot) - resumable either way.
   const interrupted = !r.ended_at && !r.aborted && !liveSteps.length &&
-    Object.keys(r.counts||{}).length;
-  const notice = r.aborted==='paused'
+    Object.keys(r.counts||{}).some(s=>s!=='done');
+  const notice = (r.aborted==='paused' && canResume)
     ? `<div class="notice warn">Paused by user - no live steps, nothing ` +
       `new launches. Resume continues it (safe across a restart).</div>`
     : interrupted
@@ -4626,13 +4626,17 @@ function render(d){
   const hiddenRuns = finRuns.length - Math.min(finShow, finRuns.length);
   // Every real run gets a state label under its name: live, held
   // (paused/stopped/drained - all resumable), or interrupted (conductor
-  // died - crash or machine restart). Ended-clean runs need nothing.
+  // died - crash or machine restart). These chips all say "resume me" -
+  // when every step is done there is nothing to resume, so a stale
+  // 'aborted' left by a pre-fix resume must not keep labeling the row.
   const runStateChip = r => {
     const c = r.counts||{};
     const live = (c.running||0)+(c.queued||0);
     if (live) return `<span class="stage live" ` +
-      `title="a step in this run is live - Details for controls">` +
+      `title="a step in this run is live - click the name for controls">` +
       `running</span>`;
+    const left = Object.keys(c).some(s=>s!=='done');
+    if (!left) return '';
     if (r.aborted==='paused')
       return `<span class="stage paused" title="deliberate hold - ` +
         `Resume continues it">paused - resume ready</span>`;
@@ -4828,10 +4832,14 @@ document.addEventListener('click', async e=>{
     setDensity(t.dataset.density); return; }
   if (t.dataset && t.dataset.action){
     await requestAction(t.dataset.action); return; }
-  if (t.dataset && t.dataset.openRequest){
-    await openRequest(t.dataset.openRequest); return; }
-  if (t.dataset && t.dataset.runDetails){
-    showRunDetails(t.dataset.runDetails); return; }
+  // closest(), not t.dataset - the name button wraps a <b>, so the
+  // actual click target can be an inner element with an empty dataset.
+  const openReqEl = t.closest && t.closest('[data-open-request]');
+  if (openReqEl){
+    await openRequest(openReqEl.dataset.openRequest); return; }
+  const runDetEl = t.closest && t.closest('[data-run-details]');
+  if (runDetEl){
+    showRunDetails(runDetEl.dataset.runDetails); return; }
   if (t.dataset && t.dataset.resumeRun){
     if(!confirm('Resume this run? Non-done steps re-run in fresh sessions ' +
                 'with fresh timeouts.')) return;

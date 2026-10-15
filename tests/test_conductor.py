@@ -2208,7 +2208,11 @@ const data={serve_boot:'b',generated_at:'2026-10-14T00:00:00',agents:[
    counts:{done:1,stopped:1,skipped:2}},
   {run:'crashed',dir:'/crashed',counts:{lost:1}},
   {run:'live',dir:'/live',counts:{running:1}},
-  {run:'clean',dir:'/clean',ended_at:'2026-10-14T01:00:00',counts:{done:2}}]};
+  {run:'clean',dir:'/clean',ended_at:'2026-10-14T01:00:00',counts:{done:2}},
+  // resumed-and-finished before the aborted-clear fix: nothing left to
+  // resume, so the stale label must not render
+  {run:'healed',dir:'/healed',aborted:'paused',
+   ended_at:'2026-10-14T02:00:00',counts:{done:4}}]};
 vm.runInContext('render('+JSON.stringify(data)+')',ctx);
 const runs=elem('runs').innerHTML;
 assert.match(runs,/paused - resume ready/);
@@ -2219,9 +2223,26 @@ assert.match(runs,/class="linkbtn run-name"[^>]*data-run-details=/);
 assert.doesNotMatch(runs,/>Details</);
 const cleanRow=runs.split('runrow').find(r=>r.includes('>clean<'));
 assert.ok(cleanRow && !/stage (live|paused|interrupted|halted)/.test(cleanRow));
+const healedRow=runs.split('runrow').find(r=>r.includes('>healed<'));
+assert.ok(healedRow && !/stage (live|paused|interrupted|halted)/.test(healedRow));
 const agents=elem('agents').innerHTML;
 assert.match(agents,/×2/);
 assert.match(agents,/> \+ext</);
+// a click landing on the <b> INSIDE the name button still opens the
+// modal - e.target.dataset is empty, so the handler must closest() up
+const btn={dataset:{runDetails:'/paused'}}, btn2={dataset:{runDetails:'/healed'}};
+(async()=>{
+  await handlers.click({target:{dataset:{},
+    closest:sel=>sel==='[data-run-details]'?btn:null,
+    preventDefault:()=>{}}});
+  assert.match(elem('dbody').innerHTML,/>paused</);
+  assert.equal(elem('backdrop').hidden,false);
+  // ...but a resumed-and-done run drops the stale 'Paused by user' notice
+  await handlers.click({target:{dataset:{},
+    closest:sel=>sel==='[data-run-details]'?btn2:null,
+    preventDefault:()=>{}}});
+  assert.doesNotMatch(elem('dbody').innerHTML,/Paused by user/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
                            capture_output=True, text=True, encoding="utf-8",
