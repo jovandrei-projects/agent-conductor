@@ -131,7 +131,10 @@ never touched.
 `manifests/` holds real manifests (hand-written `<project>-<what>.toml` and
 UI-generated `<YYYYMMDD-HHMMSS>-<random>-<run>.toml`, flat; see its README);
 `examples/` is reference-only. `projects.toml` registers slug -> path +
-`cloud_ok`; relative `path`s resolve against the repo root, so a git
+`cloud_ok` + optional `verify` (the project's known gate command, e.g.
+`python run_tests.py` - steps on the slug inherit it unless they set
+their own; `verify = ""` opts out; cloud steps never inherit). Relative
+`path`s resolve against the repo root, so a git
 worktree checkout needs the untracked `projects.local.toml` next to it
 (absolute paths) - it merges over the tracked entries. `--devin "..."` or `CONDUCTOR_DEVIN` overrides the spawned binary
 (shlex-split; use forward slashes or quotes - posix shlex eats unquoted

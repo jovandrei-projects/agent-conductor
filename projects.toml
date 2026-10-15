@@ -12,15 +12,21 @@
 # must not leave this machine. Note: cloud workers see origin's last push,
 # not local uncommitted/unpushed state.
 
+# verify = "..." is the project's known gate command (usually its
+# run_tests.py). Steps on the slug inherit it unless the step sets its own
+# verify (verify = "" opts out); cloud steps never inherit it.
+
 [project.agent-conductor]
 path = "."
 cloud_ok = true   # decided 2026-10-13. NOTE: repo has no git remote yet -
                   # cloud steps clone from origin, so they need a GitHub
                   # repo + push first.
+verify = "python run_tests.py"
 
 [project.apartment-3d]
 path = "../apartment-3d"
 cloud_ok = true
+verify = "python run_tests.py"
 
 # Demo fixtures under data/ (gitignored, disposable). Recreate with
 # `python examples/make_demo_projects.py`; used by examples/demo*.toml.

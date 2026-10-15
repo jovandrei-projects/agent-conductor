@@ -243,7 +243,8 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
 
     steps: list[Step] = []
     seen: set[str] = set()
-    for i, raw in enumerate(doc.get("step", [])):
+    registry: dict | None = None     # lazy - only loaded when a step
+    for i, raw in enumerate(doc.get("step", [])):  #   omits verify
         merged = {**defaults, **raw}
         merged.setdefault("name", f"step-{i + 1}")
         if merged["name"] in seen:
@@ -264,6 +265,18 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
         mr = merged.get("merge_resolver")
         if mr is None:
             mr = run.get("merge_resolver", False)
+        # A step without verify inherits the project's registered gate
+        # (projects.toml `verify = "..."`). Explicit verify = "" opts out.
+        # Cloud steps never inherit - a local verify of an untouched
+        # checkout proves nothing about what ran on the VM.
+        verify = merged.get("verify")
+        if verify is None and not merged.get("cloud"):
+            if registry is None:
+                try:
+                    registry = load_projects()
+                except Exception:
+                    registry = {}
+            verify = (registry.get(merged["project"]) or {}).get("verify")
         try:
             ma = int(merged.get("max_attempts", 1))
         except (TypeError, ValueError):
@@ -277,7 +290,7 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
             prompt_file=merged.get("prompt_file"),
             model=merged.get("model"), mode=mode,
             timeout_min=float(merged.get("timeout_min", 60)),
-            verify=merged.get("verify"),
+            verify=verify,
             verify_must_pass=bool(merged.get("verify_must_pass", True)),
             cloud=bool(merged.get("cloud", False)),
             wave=merged.get("wave"),
@@ -318,7 +331,8 @@ def load_projects() -> dict[str, dict]:
                 p = (f.parent / p).resolve()
             merged = dict(out.get(slug, {}))
             merged.update({"path": p,
-                           "cloud_ok": bool(ent.get("cloud_ok", False))})
+                           "cloud_ok": bool(ent.get("cloud_ok", False)),
+                           "verify": ent.get("verify")})
             out[slug] = merged
     return out
 
@@ -2712,6 +2726,16 @@ def _planner_response(rec: dict, projects: dict,
                     "set merge_resolver = true in [run], so a conflicted "
                     "worktree merge is finished by a resolve-<step> "
                     "session instead of only being parked.\n\n")
+    known_verify = {s: p["verify"] for s, p in projects.items()
+                    if p.get("verify")}
+    verify_hint = (f"Registered verify commands: {known_verify} - set "
+                   "verify under [defaults] (or per [[step]]) to the "
+                   "command for each step's project. A failed verify "
+                   "keeps the step's worktree parked instead of merging "
+                   "broken work, so it is worth having.\n"
+                   if known_verify else
+                   "Do not guess verification commands; include verify "
+                   "only when known.\n")
     prompt = f"""You are writing a proposed agent-conductor TOML runbook, not doing the work.
 Do not edit files, invoke tools, run commands, inspect projects, or start a run.
 Reply with exactly one TOML document between BEGIN_MANIFEST and END_MANIFEST,
@@ -2731,8 +2755,7 @@ Each [[step]] needs a unique name, a registered project slug, and a concrete
 prompt describing only that step. Prefer sequential steps. If using waves on
 one project, every member needs worktree = true. Cloud steps require explicit
 user intent and a project permitted for cloud. No prompt_file or preamble.
-Do not guess verification commands; include verify only when known.
-Do not reproduce credentials or private data in the tracked manifest; refer
+{verify_hint}Do not reproduce credentials or private data in the tracked manifest; refer
 agents to the project files containing those details instead.
 The proposal must NOT start work; the human will edit it and launch later.
 Windows paths belong in TOML literal strings (single quotes) or use forward

@@ -162,6 +162,53 @@ prompt = "2"
             with self.assertRaises(conductor.ManifestError):
                 conductor.load_manifest(m)
 
+    def test_verify_inherited_from_projects_toml(self):
+        """A step on a registered slug inherits its project's verify gate
+        (the planner cannot know it - it never inspects the project).
+        Step-level verify wins; verify = "" opts out; cloud steps never
+        inherit (a local verify proves nothing about the VM's run)."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            reg = base / "projects.toml"
+            reg.write_text('[project.demo]\npath = "."\n'
+                           'verify = "python run_tests.py"\n',
+                           encoding="utf-8")
+            m = write_manifest(base, '''
+[[step]]
+name = "a"
+project = "demo"
+prompt = "x"
+
+[[step]]
+name = "b"
+project = "demo"
+prompt = "y"
+verify = "echo ok"
+
+[[step]]
+name = "c"
+project = "demo"
+prompt = "z"
+verify = ""
+
+[[step]]
+name = "d"
+project = "demo"
+prompt = "w"
+cloud = true
+''')
+            old = conductor.PROJECTS_FILE
+            conductor.PROJECTS_FILE = reg
+            try:
+                cfg = conductor.load_manifest(m)
+            finally:
+                conductor.PROJECTS_FILE = old
+            steps = {s.name: s for s in cfg.steps}
+            self.assertEqual(steps["a"].verify, "python run_tests.py")
+            self.assertEqual(steps["b"].verify, "echo ok")
+            self.assertEqual(steps["c"].verify, "")      # explicit opt-out
+            self.assertIsNone(steps["d"].verify)         # cloud never inherits
+
 
 class ResolutionTests(unittest.TestCase):
     def test_slug_and_literal_path(self):
