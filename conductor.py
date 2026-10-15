@@ -3548,6 +3548,30 @@ def stdout_tail(path: str | None, lines: int = 15) -> str | None:
                               data.decode("utf-8", "replace"))[-lines:])
 
 
+def _state_md(work_dir: str | None, step: str | None,
+              project_dir: str | None = None) -> str | None:
+    """The project's own task-state file for this step, when present.
+
+    .agent_tasks/<task>/STATE.md is the project's memory - written BY the
+    worker for the NEXT session, not by the conductor. Step names
+    conventionally match task folder names, so probe both the step's
+    work_dir (a worktree's copy while it still exists) and the
+    registered project path (the main checkout, post-merge).
+    """
+    if not step:
+        return None
+    for base in (work_dir, project_dir):
+        if not base:
+            continue
+        try:
+            p = Path(base) / ".agent_tasks" / step / "STATE.md"
+            if p.is_file():
+                return str(p)
+        except OSError:
+            continue
+    return None
+
+
 # serve process boot id - embedded in every payload so an open tab notices
 # a restart and reloads itself to get fresh JS/HTML.
 SERVE_BOOT = now_iso()
@@ -3696,7 +3720,10 @@ def collect_dashboard(runs_dir: Path,
                 "wt": bool(rec.get("branch") or plan.get("wt")),
                 "stdout_log": rec.get("stdout_log"),
                 "tail": stdout_tail(rec.get("stdout_log")),
-                "export": rec.get("export"), "prompt": rec.get("prompt")})
+                "export": rec.get("export"), "prompt": rec.get("prompt"),
+                "state_md": _state_md(
+                    wd, rec.get("name") or name,
+                    str(projects.get(slug, {}).get("path") or "") or None)})
         if request:
             pending = "skipped" if st.get("ended_at") else "waiting"
             for step in request.get("proposed_steps") or []:
@@ -3908,6 +3935,10 @@ a { color:#58a6ff; text-decoration:none; }
   animation:pulse 1.2s ease-in-out infinite; }
 .stage.launching { color:#58a6ff; background:#172638; }
 .stage.error, .stage.launch_failed { color:#f85149; background:#321c20; }
+.stage.live { color:#58a6ff; background:#172638; border-color:#1f6feb; }
+.stage.paused { color:#e3b341; border-color:#6b5a1f; background:#2a2317; }
+.stage.interrupted { color:#f0883e; border-color:#7a3d12; background:#2d1f14; }
+.stage.halted { color:#8b949e; }
 .linkbtn { background:none; border:0; color:#58a6ff; cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
 .btn { border:1px solid #388bfd; border-radius:6px; background:#1f6feb; color:#fff; padding:7px 12px; cursor:pointer; font:inherit; }
 .btn.secondary { color:#e6edf3; background:#21262d; border-color:#30363d; }
@@ -4069,7 +4100,8 @@ function showDetail(i){
     ['verify',a.verify_ok==null?'-':(a.verify_ok?'pass':'FAIL')],
     ['exit',a.exit_code],['work dir',a.work_dir],
     ['branch',a.branch],['merged',a.merged],
-    ['prompt',a.prompt],['stdout',a.stdout_log],['export',a.export]];
+    ['prompt',a.prompt],['stdout',a.stdout_log],['export',a.export],
+    ['state file',a.state_md]];
   document.getElementById('dbody').innerHTML =
     `<h3 id="modal-title">${esc(a.slug)} / ${esc(a.step)}</h3><div class="kv">` +
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">${esc(v??'-')}` +
@@ -4522,6 +4554,24 @@ function render(d){
   const finShow = Math.max(runsShown - actRuns.length, 0);
   const shownRuns = actRuns.concat(finRuns.slice(0, finShow));
   const hiddenRuns = finRuns.length - Math.min(finShow, finRuns.length);
+  // Every real run gets a state label under its name: live, held
+  // (paused/stopped/drained - all resumable), or interrupted (conductor
+  // died - crash or machine restart). Ended-clean runs need nothing.
+  const runStateChip = r => {
+    const c = r.counts||{};
+    const live = (c.running||0)+(c.queued||0);
+    if (live) return `<span class="stage live">running</span>`;
+    if (r.aborted==='paused')
+      return `<span class="stage paused" title="deliberate hold - ` +
+        `Resume continues it">paused - resume ready</span>`;
+    if (!r.ended_at && Object.keys(c).length)
+      return `<span class="stage interrupted" title="conductor process ` +
+        `died (crash/reboot) - Resume continues it">interrupted - ` +
+        `resume ready</span>`;
+    if (r.aborted) return `<span class="stage halted">${esc(r.aborted)}` +
+      ` - resumable</span>`;
+    return '';
+  };
   for (const r of shownRuns){
     const total = Object.values(r.counts||{}).reduce((s,n)=>s+n,0);
     const counts = Object.entries(r.counts||{})
@@ -4546,6 +4596,7 @@ function render(d){
             ? `<br><span class="sub">planner warming up - ` +
               `devin stays silent for the first minutes; watch the ` +
               `plan-proposal row below</span>` : '') :
+        runStateChip(r) +
         `<span class="sub">${esc((r.dir||'').split(/[\\/]/).pop())}</span>`) +
       (r.stale?` <span class="stage error">Needs review</span>`:'') +
       `<br><button type="button" class="linkbtn" ` +
@@ -4628,7 +4679,13 @@ function render(d){
       h += `<tr class="agen" data-i="${a._i}" data-run-key="${esc(a.run_key||a.run_dir||'')}">` +
         `<td><span class="dot${pulse}" style="background:${c}" ` +
         `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>` +
-        `${a.status}</td>` +
+        `${a.status}` +
+        (a.attempts>1 ? `<span class="sub" title="ran ` +
+          `${a.attempts} session attempts (timeout retries)"> ` +
+          `×${a.attempts}</span>` : '') +
+        (a.timeout_ext_s ? `<span class="sub" title="stayed active ` +
+          `${fmtS(a.timeout_ext_s)} past the timeout floor"> +ext</span>`
+          : '') + `</td>` +
         `<td class="step"><span ` +
         `style="white-space:nowrap">${esc(a.step)}</span>${a.wt
           ? ` <button type="button" class="chip" data-facet="wt" ` +

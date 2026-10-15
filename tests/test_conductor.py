@@ -2183,6 +2183,73 @@ const click=async(t)=>handlers.click({target:t,preventDefault:()=>{}});
                            timeout=10)
         self.assertEqual(p.returncode, 0, p.stderr)
 
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_run_state_chips_and_retry_marks(self):
+        """Run rows always carry a state label: running / paused /
+        interrupted / halted; agent rows mark retried (xN) and
+        timeout-extended (+ext) steps."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,textContent:''}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  addEventListener:(event,handler)=>{handlers[event]=handler;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-14T00:00:00',agents:[
+  {step:'s1',run:'paused',run_dir:'/paused',slug:'p',status:'stopped',task:'t1'},
+  {step:'s2',run:'paused',run_dir:'/paused',slug:'p',status:'done',task:'t2',
+   attempts:2,timeout_ext_s:300},
+  {step:'s3',run:'live',run_dir:'/live',slug:'p',status:'running',task:'t3'}],runs:[
+  {run:'paused',dir:'/paused',aborted:'paused',ended_at:'2026-10-14T01:00:00',
+   counts:{done:1,stopped:1,skipped:2}},
+  {run:'crashed',dir:'/crashed',counts:{lost:1}},
+  {run:'live',dir:'/live',counts:{running:1}},
+  {run:'clean',dir:'/clean',ended_at:'2026-10-14T01:00:00',counts:{done:2}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const runs=elem('runs').innerHTML;
+assert.match(runs,/paused - resume ready/);
+assert.match(runs,/interrupted - resume ready/);
+assert.match(runs,/class="stage live">running</);
+const cleanRow=runs.split('runrow').find(r=>r.includes('>clean<'));
+assert.ok(cleanRow && !/stage (live|paused|interrupted|halted)/.test(cleanRow));
+const agents=elem('agents').innerHTML;
+assert.match(agents,/×2/);
+assert.match(agents,/> \+ext</);
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_state_md_finds_project_task_file(self):
+        """The agent modal links the project's own .agent_tasks STATE.md
+        (step name == task folder name by convention), falling back from
+        a gone worktree dir to the registered project path."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            wt = base / "wt" / "mystep"
+            proj = base / "proj"
+            (proj / ".agent_tasks" / "mystep").mkdir(parents=True)
+            (proj / ".agent_tasks" / "mystep" / "STATE.md").write_text(
+                "state\n", encoding="utf-8")
+            # worktree dir gone -> registered project path wins
+            self.assertEqual(
+                conductor._state_md(str(wt), "mystep", str(proj)),
+                str(proj / ".agent_tasks" / "mystep" / "STATE.md"))
+            # inside an existing worktree it resolves there first
+            (wt / ".agent_tasks" / "mystep").mkdir(parents=True)
+            (wt / ".agent_tasks" / "mystep" / "STATE.md").write_text(
+                "x", encoding="utf-8")
+            self.assertEqual(
+                conductor._state_md(str(wt), "mystep", str(proj)),
+                str(wt / ".agent_tasks" / "mystep" / "STATE.md"))
+            self.assertIsNone(
+                conductor._state_md(str(proj), "nope", str(proj)))
+
 
 class ApplyRequestTests(unittest.TestCase):
     """The deterministic 'Apply options to TOML' path: option fields patch
