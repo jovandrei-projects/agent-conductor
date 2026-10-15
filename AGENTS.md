@@ -139,6 +139,9 @@ closing `follow-up-plan` step that drafts `<run>-followup.toml` into
 appends the step itself. `On step failure` and `Attempts/step` map to
 `run.on_failure` and `[defaults].max_attempts`; generation fails closed
 when the planner ignores them (edit the TOML directly to override).
+`Step model/effort` feed `[defaults]` (the workers); `Planner
+model/effort` feed only the `--model` of the planning session itself, so
+an expensive planner can write a runbook cheap workers execute.
 Discard removes only an unrun, app-owned proposal and its planned rows.
 Real runs still use `state.json` as their registry. A run's detail modal
 has a Resume button (`POST /api/runs/<dir>/resume` -> `run <manifest>

@@ -1822,12 +1822,14 @@ def _save_request(rec: dict, requests_dir: Path) -> None:
 def _request_fields(payload: dict, rec: dict | None = None) -> dict:
     if not isinstance(payload, dict) or set(payload) - {
             "raw", "label", "project", "model", "effort", "manifest",
-            "followup", "on_failure", "max_attempts"}:
+            "followup", "on_failure", "max_attempts",
+            "plan_model", "plan_effort"}:
         raise RequestError("Invalid request fields")
     model, effort = default_model_effort()
     fields = {k: (rec or {}).get(k, v) for k, v in (
         ("raw", ""), ("label", ""), ("project", ""), ("on_failure", "continue"),
-        ("model", model), ("effort", effort))}
+        ("model", model), ("effort", effort),
+        ("plan_model", model), ("plan_effort", effort))}
     for key in fields:
         if key in payload:
             if not isinstance(payload[key], str):
@@ -1853,12 +1855,13 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
         raise RequestError("Label must be at most 80 characters")
     if fields["project"] and fields["project"] not in load_projects():
         raise RequestError("Choose a registered project from projects.toml")
-    for key in ("model", "effort"):
+    for key in ("model", "effort", "plan_model", "plan_effort"):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", fields[key]):
             raise RequestError(f"Invalid {key}")
-    if fields["model"] == "swe-2" and fields["effort"] not in {
-            "medium", "high", "max"}:
-        raise RequestError("SWE-2 supports medium, high or max effort")
+    for mk, ek in (("model", "effort"), ("plan_model", "plan_effort")):
+        if fields[mk] == "swe-2" and fields[ek] not in {
+                "medium", "high", "max"}:
+            raise RequestError("SWE-2 supports medium, high or max effort")
     fields["label"] = fields["label"] or " ".join(fields["raw"].split())[:80]
     return fields
 
@@ -2006,7 +2009,8 @@ def save_request(request_id: str, payload: dict,
         fields = _request_fields(payload, rec)
         changed = any(fields[k] != rec.get(k) for k in
                       ("raw", "project", "model", "effort", "followup",
-                       "on_failure", "max_attempts"))
+                       "on_failure", "max_attempts",
+                       "plan_model", "plan_effort"))
         rec.update(fields)
         if "manifest" in payload:
             return _publish_proposal(rec, payload["manifest"],
@@ -2104,7 +2108,8 @@ STATUS: done
         log = log_path or Path(ld) / "planner.stdout.log"
         cmd = devin_argv + [
             "--print", "--prompt-file", str(prompt_path),
-            "--model", f"{rec['model']}-{rec['effort']}",
+            "--model", f"{rec.get('plan_model') or rec['model']}-"
+                       f"{rec.get('plan_effort') or rec['effort']}",
             "--permission-mode", "normal", "--respect-workspace-trust", "false"]
         with open(log, "ab" if fix_note else "wb") as out:
             proc = subprocess.Popen(cmd, cwd=wd, stdout=out,
@@ -2924,6 +2929,9 @@ function showRequestForm(rec){
       `${esc(p.slug)}${p.cloud_ok?'':' (local only)'}</option>`).join('');
   const effortOptions=['min','low','medium','high','max'].map(x=>
     `<option value="${x}"${x===rec.effort?' selected':''}>${x}</option>`).join('');
+  const planEffortOptions=['min','low','medium','high','max'].map(x=>
+    `<option value="${x}"${x===(rec.plan_effort||rec.effort)?' selected':''}>` +
+    `${x}</option>`).join('');
   const steps=rec.proposed_steps||[];
   const canEdit=editable && stage!=='new';
   document.getElementById('dbody').innerHTML =
@@ -2951,11 +2959,17 @@ function showRequestForm(rec){
     `<input id="rq-label" maxlength="80" value="${esc(rec.label||'')}"${disabled}>` +
     `<div class="field-row"><div><label for="rq-project">Project</label>` +
     `<select id="rq-project"${disabled}>${projectOptions}</select></div>` +
-    `<div><label for="rq-model">Model</label><input id="rq-model" ` +
+    `<div><label for="rq-model">Step model</label><input id="rq-model" ` +
     `list="rq-models" value="${esc(rec.model||'')}"${disabled}>` +
     `<datalist id="rq-models"><option value="swe-2"><option value="gpt-6-luna">` +
-    `</datalist></div><div><label for="rq-effort">Effort</label>` +
+    `</datalist></div><div><label for="rq-effort">Step effort</label>` +
     `<select id="rq-effort"${disabled}>${effortOptions}</select></div></div>` +
+    `<div class="field-row"><div><label for="rq-plan_model">Planner model ` +
+    `</label><input id="rq-plan_model" list="rq-models" ` +
+    `value="${esc(rec.plan_model||rec.model||'')}"${disabled}></div>` +
+    `<div><label for="rq-plan_effort">Planner effort</label>` +
+    `<select id="rq-plan_effort"${disabled}>${planEffortOptions}</select></div>` +
+    `<div></div></div>` +
     `<div class="field-row"><div><label for="rq-on_failure">On step failure</label>` +
     `<select id="rq-on_failure"${disabled}>` +
       `<option value="continue"${rec.on_failure!=='stop'?' selected':''}>` +
@@ -3021,7 +3035,8 @@ async function openRequest(id){
 }
 function requestFields(){
   const f=Object.fromEntries(
-    ['raw','label','project','model','effort','on_failure'].map(k=>
+    ['raw','label','project','model','effort','on_failure',
+     'plan_model','plan_effort'].map(k=>
     [k,document.getElementById(`rq-${k}`).value]));
   const fup=document.getElementById('rq-followup');
   if (fup) f.followup=fup.checked;
