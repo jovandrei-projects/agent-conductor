@@ -24,6 +24,32 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (proposal-action-state, wave step of run
+  20261016-013719-workflow-ux-safety): proposal staleness is a computed
+  field-vs-baseline diff, not a latched `stale` flag
+  (`_pending_actions`). Generation inputs (request text, project,
+  attachments) diff against the `gen_inputs` snapshot stamped by
+  `_publish_proposal`; option fields (model/effort/attempts/failure
+  policy/worktrees/resolver/followup) diff against what the manifest
+  TOML itself encodes (`_manifest_options`), so a hand-edited TOML moves
+  its own baseline. The modal's `#pend-note` re-diffs the live form on
+  every input - reverting a field to its baseline clears the mark
+  without a save - and names which action reconciles which bucket
+  (Regenerate for generation inputs, Apply options for the rest, both =>
+  Regenerate first since it writes the options too). Apply is disabled
+  with an explanatory title when there is nothing to apply, and refuses
+  (409) when generation inputs diverged from baseline - including a
+  divergence saved earlier, which the old record-compare let through.
+  Launch refuses while either bucket is pending; failed generation or
+  apply keeps the pending state; Regenerate is a neutral `btn
+  secondary` (Start run keeps the primary look), always confirms, and
+  now names unsaved TOML edits it would drop. Legacy pre-baseline
+  records keep the old flag as an opaque 'fields' gen marker; a
+  never-stale legacy record materializes `gen_inputs` from its stored
+  fields on next save. En route fix: a follow-up-plan step appended by
+  Apply missed the worktree pass (mixed state the checkbox can't say) -
+  it now inherits a checked `worktrees`. 294/294 tests + demo green;
+  16 new PendingStateTests + 2 new DashboardJsFilterTests.
 - DONE 2026-10-16 (row-context-menus, wave step of run
   20261016-013719-workflow-ux-safety): right-click (or Shift+F10 / the
   Menu key on a focused row) opens a `#ctxmenu` action list on run and

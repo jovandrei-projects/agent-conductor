@@ -4031,6 +4031,12 @@ def _apply_fields_to_toml(text: str, fields: dict,
             lines.extend(FOLLOWUP_STEP.format(
                 slug=slug, run=cfg.name, runs=RUNS_DIR.as_posix(),
                 manifests=MANIFESTS_DIR.as_posix()).splitlines())
+            # the step list was parsed before this append, so the worktree
+            # pass above never saw the new section - a checked box must
+            # reach it or the result is a mixed state the form can't say
+            if fields.get("worktrees"):
+                _toml_set(lines, *step_sect("follow-up-plan"),
+                          "worktree", "true")
         elif not fields["followup"] and ss is not None:
             del lines[ss:se]
             if ss and ss - 1 < len(lines) and not lines[ss - 1].strip():
@@ -4054,6 +4060,148 @@ def _guarantee_isolation(text: str, rec: dict,
         return _apply_fields_to_toml(text, fields, manifests_dir)
     except RequestError:
         return text   # unparseable planner output fails validation anyway
+
+
+# ---------------------------------------------------------------- staleness
+# A proposal is stale only while a form field semantically diverges from
+# it - computed, never a sticky flag. The fields split by what reconciles
+# them: GEN_INPUT_FIELDS feed the planner prompt (request text, project,
+# image attachments - only Regenerate rebuilds the plan around them, so
+# their baseline is a snapshot of what the planner saw); OPTION_FIELDS map
+# to known TOML keys ('Apply options to TOML' patches them in place, and a
+# regeneration writes them too - their baseline is the TOML itself, so a
+# hand edit of the manifest moves the baseline on its own). Everything
+# else - label, plan_model/plan_effort, ask - is cosmetic or feeds only
+# the next planning pass and can never stale the current proposal.
+GEN_INPUT_FIELDS = ("raw", "project", "attachments")
+OPTION_FIELDS = ("model", "effort", "on_failure", "max_attempts",
+                 "worktrees", "merge_resolver", "followup")
+
+
+def _att_key(lst) -> list:
+    return [(a.get("name") or "", a.get("path") or "")
+            if isinstance(a, dict) else (str(a), "")
+            for a in lst or []]
+
+
+def _gen_inputs_of(rec: dict) -> dict:
+    """The task-generation inputs as the planner saw them - stamped on the
+    record when a proposal publishes, diffed against the live fields for
+    the 'gen' pending set. Attachments compare by (name, path) pairs."""
+    return {"raw": rec.get("raw") or "", "project": rec.get("project")
+            or "", "attachments": [dict(a) for a in rec.get("attachments")
+                                   or []]}
+
+
+def _manifest_options(text: str, manifests_dir: Path) -> dict:
+    """The option fields as the manifest TOML itself encodes them - the
+    Apply baseline. Read at the level the form owns: [defaults] model /
+    effort / max_attempts and [run] on_failure / merge_resolver (per-step
+    overrides are beyond the form's vocabulary and not drift). worktrees
+    reads True only when every non-cloud step is isolated and False when
+    none beyond same-project-wave-required steps are; a mixed state is
+    None - the checkbox cannot express it, so it drifts either way until
+    reconciled. followup is the presence of a 'follow-up-plan' step."""
+    doc = tomllib.loads(text)
+    run, defaults = doc.get("run", {}), doc.get("defaults", {})
+    cfg = load_manifest(manifests_dir / "pending.toml", text)
+    cloud = {s.name for s in cfg.steps if s.cloud}
+    required = _wave_worktree_required(cfg, manifests_dir)
+    if all(s.worktree or s.name in cloud for s in cfg.steps):
+        wt = True
+    elif not any(s.worktree for s in cfg.steps if s.name not in required):
+        # only wave-required steps are isolated (or none) - cloud steps
+        # can never carry worktree (load_manifest rejects the pairing)
+        wt = False
+    else:
+        wt = None          # mixed - Apply or a hand edit must reconcile it
+    try:
+        attempts = int(defaults.get("max_attempts"))
+    except (TypeError, ValueError):
+        attempts = 1       # load_manifest's own fallback for a missing key
+    return {"model": defaults.get("model"),
+            "effort": defaults.get("effort") or "",
+            "on_failure": run.get("on_failure", "stop"),
+            "max_attempts": attempts, "worktrees": wt,
+            "merge_resolver": bool(run.get("merge_resolver", False)),
+            "followup": any(s.name == "follow-up-plan" for s in cfg.steps)}
+
+
+def _pending_actions(rec: dict) -> dict:
+    """Semantic staleness for a manifested request, in two buckets:
+    'gen' - task-generation inputs that diverged from what the published
+            proposal was built around; only Regenerate resolves them.
+    'opts' - option fields whose form value differs from what the TOML
+            encodes; 'Apply options to TOML' (or a Regenerate) resolves.
+    Both empty means the proposal matches the form. A pre-baseline record
+    (no gen_inputs) keeps the old sticky flag as an opaque 'fields' gen
+    marker until a publish re-baselines it; a manifest that does not read
+    or parse reports the pseudo-key 'manifest' (Apply can't patch it)."""
+    out = {"gen": [], "opts": []}
+    if not rec.get("manifest"):
+        return out
+    base = rec.get("gen_inputs")
+    if base is None:
+        if rec.get("stale"):
+            out["gen"].append("fields")
+    else:
+        if (rec.get("raw") or "") != (base.get("raw") or ""):
+            out["gen"].append("raw")
+        if (rec.get("project") or "") != (base.get("project") or ""):
+            out["gen"].append("project")
+        if _att_key(rec.get("attachments")) != _att_key(
+                base.get("attachments")):
+            out["gen"].append("attachments")
+    try:
+        manifest = Path(rec["manifest"])
+        opts = _manifest_options(
+            manifest.read_text(encoding="utf-8"), manifest.parent)
+    except (OSError, ManifestError, tomllib.TOMLDecodeError, ValueError,
+            KeyError):
+        opts = None
+    if opts is None:
+        out["opts"].append("manifest")
+    else:
+        form = {"model": rec.get("model") or "",
+                "effort": rec.get("effort") or "",
+                "on_failure": rec.get("on_failure") or "continue",
+                "max_attempts": int(rec.get("max_attempts") or 3),
+                "worktrees": bool(rec.get("worktrees")),
+                "merge_resolver": bool(rec.get("merge_resolver")),
+                "followup": bool(rec.get("followup"))}
+        for key, value in form.items():
+            if opts.get(key) is None or value != opts[key]:
+                out["opts"].append(key)
+    return out
+
+
+def _request_baseline(rec: dict) -> dict:
+    """Per-field baseline values for the client's live diff - the gen
+    inputs the proposal was built from and the option values the TOML
+    encodes. A key is None when unknowable (pre-baseline record whose
+    divergence was never attributed) or unexpressible (mixed worktrees);
+    the client then keeps the server-computed pending verdict for it."""
+    out = {k: None for k in GEN_INPUT_FIELDS + OPTION_FIELDS}
+    if not rec.get("manifest"):
+        return out
+    base = rec.get("gen_inputs")
+    if base is None and not rec.get("stale"):
+        # A never-stale pre-baseline record's stored fields ARE the
+        # publish-time fields - synthesize so the client diff works.
+        base = _gen_inputs_of(rec)
+    if base is not None:
+        out.update({"raw": base.get("raw") or "",
+                    "project": base.get("project") or "",
+                    "attachments": [dict(a) for a in
+                                    base.get("attachments") or []]})
+    try:
+        manifest = Path(rec["manifest"])
+        out.update(_manifest_options(
+            manifest.read_text(encoding="utf-8"), manifest.parent))
+    except (OSError, ManifestError, tomllib.TOMLDecodeError, ValueError,
+            KeyError):
+        pass               # Nones left - the 'manifest' pending key says why
+    return out
 
 
 def _publish_proposal(rec: dict, text: str, requests_dir: Path,
@@ -4082,13 +4230,20 @@ def _publish_proposal(rec: dict, text: str, requests_dir: Path,
     tmp.replace(p)
     rec.update(status="ready", manifest=str(p), run=cfg.name,
                description=cfg.description.strip(), error=None, stale=False,
+               gen_inputs=_gen_inputs_of(rec),
                pending_questions=[],
                proposed_steps=[{
                    "step": s.name, "slug": s.project, "model": s.model,
                    "effort": s.effort, "mode": s.mode,
                    "task": task_summary(s.prompt), "wt": s.worktree,
                    "cloud": s.cloud} for s in cfg.steps])
+    # The gen baseline moved to what this publish was built from, but the
+    # option fields can still diverge from a hand-edited TOML - compute
+    # rather than assume clean.
+    pend = _pending_actions(rec)
+    rec["stale"] = bool(pend["gen"] or pend["opts"])
     _save_request(rec, requests_dir)
+    rec["pending"] = pend      # derived, not persisted - callers diff live
     return dict(rec)
 
 
@@ -4105,14 +4260,14 @@ def save_request(request_id: str, payload: dict,
             raise RequestError("This request is being processed or already run", 409)
         rec["status"] = stage
         fields = _request_fields(payload, rec)
-        # Planner model/effort never enter the TOML, so they cannot stale a
-        # proposal; the rest diverge from the on-disk runbook until the
-        # user applies them to the TOML or regenerates.
-        changed = any(fields[k] != rec.get(k) for k in
-                      ("raw", "project", "model", "effort", "followup",
-                       "worktrees", "merge_resolver",
-                       "on_failure", "max_attempts")) \
-            or fields["attachments"] != (rec.get("attachments") or [])
+        if rec.get("manifest") and "gen_inputs" not in rec \
+                and not rec.get("stale"):
+            # Pre-baseline record: never-stale means the stored fields
+            # still describe the published proposal - pin them as the
+            # diff baseline BEFORE this save can move them. A record
+            # already marked stale can't be attributed this way; it
+            # keeps the opaque 'fields' marker until a publish lands.
+            rec["gen_inputs"] = _gen_inputs_of(rec)
         raw_moved = (fields["raw"] != rec.get("raw")
                      or fields["project"] != rec.get("project"))
         rec.update(fields)
@@ -4124,9 +4279,14 @@ def save_request(request_id: str, payload: dict,
             # text - drop it; Regenerate re-plans from the new one.
             rec.update(status="draft", pending_questions=[], qa=[],
                        qa_rounds=0)
-        if rec.get("manifest") and changed:
-            rec["stale"] = True
+        # Staleness is a live diff, not a latched flag: _pending_actions
+        # diffs generation inputs against the publish-time gen_inputs and
+        # option fields against the TOML itself, so reverting a field to
+        # its baseline clears the mark without any publish.
+        pend = _pending_actions(rec)
+        rec["stale"] = bool(pend["gen"] or pend["opts"])
         _save_request(rec, requests_dir)
+        rec["pending"] = pend
         return dict(rec)
 
 
@@ -4135,9 +4295,13 @@ def apply_request(request_id: str, payload: dict,
                   manifests_dir: Path = MANIFESTS_DIR,
                   runs_dir: Path = RUNS_DIR) -> dict:
     """Save the form fields AND rewrite the proposal TOML to match - the
-    deterministic alternative to regeneration. Refused when the request
-    text or target project changed: those shape the step prompts, which a
-    deterministic patch cannot rewrite."""
+    deterministic alternative to regeneration. Refused when a generation
+    input (request text, target project, attachments) diverges from what
+    the proposal was built around: those shape the step prompts, which a
+    deterministic patch cannot rewrite. The diff runs against the
+    publish-time gen_inputs baseline, so a divergence that was saved in
+    an earlier edit (or reverted since) is judged correctly - not against
+    the record's last save."""
     with REQUEST_LOCK:
         _assert_unwatched(runs_dir, requests_dir, manifests_dir)
         rec = _read_request(request_id, requests_dir)
@@ -4150,11 +4314,26 @@ def apply_request(request_id: str, payload: dict,
             raise RequestError("No proposal yet - generate one first", 409)
         rec["status"] = stage
         fields = _request_fields(payload, rec)
-        if fields["raw"] != rec.get("raw") or \
-                fields["project"] != rec.get("project"):
-            raise RequestError("Request text or project changed - the step "
-                               "prompts depend on them; regenerate the "
-                               "proposal instead", 409)
+        base = rec.get("gen_inputs")
+        if base is None:
+            # Pre-baseline record: fall back to comparing against the
+            # stored fields (the only reference the old flag left).
+            moved = (["request text"] if fields["raw"] != rec.get("raw")
+                     else []) + (["project"] if fields["project"]
+                                 != rec.get("project") else [])
+        else:
+            moved = [label for key, label in
+                     (("raw", "request text"), ("project", "project"),
+                      ("attachments", "attachments"))
+                     if (_att_key(fields[key]) if key == "attachments"
+                         else fields[key] or "")
+                     != (_att_key(base.get(key)) if key == "attachments"
+                         else base.get(key) or "")]
+        if moved:
+            raise RequestError(
+                "The " + " and ".join(moved) + " changed since this "
+                "proposal was generated - step prompts depend on them; "
+                "regenerate the proposal instead", 409)
         text = payload.get("manifest")
         if not isinstance(text, str):
             p = _manifest_path(rec, manifests_dir)
@@ -4179,6 +4358,10 @@ def request_details(request_id: str, requests_dir: Path = REQUESTS_DIR,
                                     if p.is_file() else "")
         else:
             rec["manifest_text"] = ""
+        pend = _pending_actions(rec)
+        rec["pending"] = pend
+        rec["stale"] = bool(pend["gen"] or pend["opts"])
+        rec["baseline"] = _request_baseline(rec)
         log = _gen_log_path(request_id, requests_dir)
         rec["gen_tail"] = (stdout_tail(str(log), 40)
                            if log.is_file() else None)
@@ -5207,11 +5390,26 @@ def launch_request(request_id: str,
     with REQUEST_LOCK:
         _assert_unwatched(runs_dir, requests_dir)
         rec = _read_request(request_id, requests_dir)
+        pend = _pending_actions(rec)
         if _request_status(rec, runs_dir) not in ("ready", "launch_failed") \
-                or rec.get("stale"):
-            raise RequestError("Review and save a current proposal before "
-                               "launching; already launched requests cannot "
-                               "be started again", 409)
+                or pend["gen"] or pend["opts"]:
+            which = []
+            if pend["gen"]:
+                which.append("request inputs changed ("
+                             + ", ".join(pend["gen"]) + ") - Regenerate "
+                             "tasks")
+            if pend["opts"]:
+                which.append("options differ from the proposal TOML ("
+                             + ", ".join(pend["opts"]) + ") - Apply "
+                             "options to TOML or regenerate")
+            raise RequestError(
+                ("The proposal does not match the request form: "
+                 + "; ".join(which)
+                 + ". Review and reconcile before launching; already "
+                   "launched requests cannot be started again")
+                if which else
+                "Review and save a current proposal before launching; "
+                "already launched requests cannot be started again", 409)
         p = _manifest_path(rec, manifests_dir)
         try:
             cfg = validate_proposal(p.read_text(encoding="utf-8"),
@@ -6939,7 +7137,9 @@ def collect_dashboard(runs_dir: Path,
                          rec.get("plan_effort"), prices),
                      "max_parallel": None,
                      "stage": stage, "error": rec.get("error"),
-                     "stale": rec.get("stale"), "gen_last": gen_last,
+                     "stale": bool((pend := _pending_actions(rec))["gen"]
+                                   or pend["opts"]),
+                     "pending": pend, "gen_last": gen_last,
                      # pending questionnaire (stage 'questions'): enough for
                      # the row chip + auto-popup signature; the modal loads
                      # the full objects via GET /api/requests/<id>
@@ -8397,14 +8597,11 @@ function showRequestForm(rec){
       `Starting the run requires a separate, explicit click. Generated TOML ` +
       `is a tracked file: review it before sharing.</div>` +
     (rec.error ? `<div class="notice error">${esc(rec.error)}</div>`:'') +
-    // no 'fields changed' nag while planning is in flight - the change is
-    // being regenerated/answered already
-    (rec.stale && stage!=='generating' && stage!=='questions'
-      ? `<div class="notice warn">Request fields changed since ` +
-      `the proposal. Regenerate tasks, or use <b>Apply options to TOML</b> ` +
-      `to write the model/effort/attempts/failure/worktree options into ` +
-      `the manifest without regenerating (request text and project ` +
-      `changes need regeneration).</div>`:'') +
+    // pending guidance is rebuilt live by refreshPending from a real
+    // field-vs-baseline diff - reverting a field to its baseline clears
+    // its mark without a save, and nothing is flagged while planning is
+    // in flight (the change is being regenerated/answered already)
+    `<div id="pend-note" class="notice warn" hidden></div>` +
     (stage==='generating'?`<div class="notice warn">Planning in progress. ` +
       `The previous proposal, if any, remains available if generation ` +
       `fails. <b>Stop proposal</b> cancels this pass and returns the form ` +
@@ -8511,21 +8708,24 @@ function showRequestForm(rec){
         `${(rec.pending_questions||[]).length})</button>`:'') +
     (editable?`<button type="button" class="btn secondary" data-action="save">` +
       `${stage==='new'||stage==='draft'?'Save draft':'Save edits'}</button>` +
-      `<button type="button" class="btn${rec.stale?' attn':''}" ` +
-      `data-action="generate">` +
+      // Regenerate is a neutral secondary - the primary slot on a
+      // reviewed proposal belongs to Start run, and an amber 'attn' flag
+      // would be a colour-only staleness signal (the note above names
+      // the pending fields instead)
+      `<button type="button" id="rq-generate" ` +
+      `class="btn${rec.manifest?' secondary':''}" data-action="generate" ` +
+      `title="plan a fresh TOML runbook from the request fields - ` +
+      `replaces the current proposal only when generation succeeds">` +
       `${rec.manifest?'Regenerate tasks':'Generate proposal'}</button>` +
-      (rec.manifest?`<button type="button" ` +
-        `class="btn secondary${rec.stale?' attn':''}" data-action="apply" ` +
-        `title="Rewrite the TOML to match the fields above (model, effort, ` +
-        `attempts, failure policy, worktrees, resolver) without a planner ` +
-        `call - request text and project changes still need Regenerate">` +
+      (rec.manifest?`<button type="button" id="rq-apply" ` +
+        `class="btn secondary" data-action="apply">` +
         `Apply options to TOML</button>`:''):'') +
     ((stage==='error'||stage==='questions')&&rec.manifest_text
       ? `<button type="button" class="btn secondary" data-action="restore"` +
         ` title="republish the previous proposal and drop the pending ` +
         `questions">Keep previous plan</button>`:'') +
     (stage==='ready'||stage==='launch_failed' ? `<button type="button" ` +
-      `class="btn" data-action="run"${rec.stale?' disabled':''}>` +
+      `id="rq-run" class="btn" data-action="run"${rec.stale?' disabled':''}>` +
       `${stage==='launch_failed'?'Retry start':'Start run'}</button>`:'') +
     (canEdit?`<button type="button" class="btn danger" data-action="discard">` +
       `Discard</button>`:'') +
@@ -8538,6 +8738,126 @@ function showRequestForm(rec){
   syncEffort(document.getElementById('rq-model'),'rq-effort','rq-efforts');
   syncEffort(document.getElementById('rq-plan_model'),
              'rq-plan_effort','rq-plan_efforts');
+  refreshPending();
+}
+
+// --- proposal pending state ---------------------------------------------
+// 'Stale' is a computed field-vs-baseline diff, not a latched flag. Two
+// baselines: rec.baseline carries the generation inputs the proposal was
+// built from (raw/project/attachments - only Regenerate reconciles those)
+// and the option values the TOML itself encodes (Apply patches those
+// deterministically). pendingNow() re-diffs the live form so reverting a
+// field to its baseline clears the mark without a save round-trip; a null
+// baseline key keeps the server's pending verdict (unknowable for
+// pre-baseline records, unexpressible for a mixed worktree state).
+const GEN_KEYS=['raw','project','attachments'];
+const OPT_KEYS=['model','effort','on_failure','max_attempts','worktrees',
+  'merge_resolver','followup'];
+const PEND_LABEL={raw:'request text',project:'target project',
+  attachments:'image attachments',fields:'request fields',
+  model:'step model',effort:'step effort',on_failure:'failure policy',
+  max_attempts:'attempts/step',worktrees:'worktrees',
+  merge_resolver:'merge resolver',followup:'follow-up step',
+  manifest:'the proposal TOML'};
+const pendName=k=>PEND_LABEL[k]||k;
+function sameBase(k,v,b){
+  if (k==='attachments')
+    return (v||[]).map(a=>a&&a.name).join('|')===
+           (b||[]).map(a=>a&&a.name).join('|');
+  if (k==='max_attempts') return parseInt(v||'0',10)===b;
+  if (typeof b==='boolean') return !!v===b;
+  return String(v==null?'':v)===String(b==null?'':b);
+}
+function pendingNow(){
+  const rec=(modalRequest&&modalRequest.record)||{};
+  const srv=rec.pending||{};
+  const pend={gen:new Set(srv.gen||[]),opts:new Set(srv.opts||[])};
+  // a pre-pending record carries only the lumped flag - an unattributed
+  // 'fields' marker, same fallback _pending_actions makes server-side
+  if (rec.stale && rec.pending===undefined) pend.gen.add('fields');
+  const base=rec.baseline;
+  // no proposal yet, no baselines shipped, or no editable form on screen:
+  // the server's saved-state verdict stands alone
+  if (!rec.manifest || !base || !document.getElementById('rq-raw'))
+    return {gen:[...pend.gen],opts:[...pend.opts]};
+  const f=requestFields();
+  for (const k of GEN_KEYS){
+    if (base[k]==null) continue;      // unknowable - keep server verdict
+    pend.gen.delete(k);
+    if (!sameBase(k,f[k],base[k])) pend.gen.add(k);
+  }
+  for (const k of OPT_KEYS){
+    pend.opts.delete(k);
+    // null = the TOML cannot express the form value (absent key or a
+    // mixed worktree set) - diverged whichever way the field sits
+    if (base[k]==null || !sameBase(k,f[k],base[k])) pend.opts.add(k);
+  }
+  return {gen:[...pend.gen],opts:[...pend.opts]};
+}
+function pendNote(p){
+  if (p.opts.includes('manifest'))
+    return 'The saved proposal TOML does not parse - fix it in the ' +
+      'editor below, or <b>Regenerate tasks</b> to rebuild it from the ' +
+      'request.';
+  if (p.gen.includes('fields'))
+    return 'Request fields changed since this proposal was generated ' +
+      '(which ones is not recorded for this older draft) - ' +
+      '<b>Regenerate tasks</b> is the safe refresh; it also writes the ' +
+      'current options into the new TOML.';
+  const hasGen=p.gen.length>0, hasOpts=p.opts.length>0;
+  if (!hasGen && !hasOpts) return '';
+  const genTxt=p.gen.map(pendName).join(', ');
+  const optTxt=p.opts.map(pendName).join(', ');
+  if (hasGen && hasOpts)
+    return `Two kinds of changes are pending: ${genTxt} - only ` +
+      `<b>Regenerate tasks</b> rebuilds the plan around those - and ` +
+      `options (${optTxt}) that Apply options to TOML could patch. ` +
+      `Regenerate first: the new plan is built from the current request ` +
+      `and writes the current options too, so a single Regenerate ` +
+      `clears both.`;
+  if (hasGen)
+    return `${genTxt} changed since this proposal was generated - the ` +
+      `step prompts were built from the old input. <b>Regenerate ` +
+      `tasks</b> rebuilds the plan around the current fields; Apply ` +
+      `options to TOML only patches option keys.`;
+  return `Options changed (${optTxt}) since this TOML was written - ` +
+    `<b>Apply options to TOML</b> patches them in place, no planner ` +
+    `call needed. Regenerate tasks also works but re-plans the whole ` +
+    `proposal.`;
+}
+function refreshPending(){
+  const stage=(modalRequest&&modalRequest.status)||'';
+  const p=pendingNow();
+  const note=document.getElementById('pend-note');
+  if (note){
+    // mid-planning the regeneration/answers already own the change
+    const html=(stage==='generating'||stage==='questions')?'':pendNote(p);
+    note.innerHTML=html;
+    note.hidden=!html;
+  }
+  const ap=document.getElementById('rq-apply');
+  if (ap){
+    const usable=!p.gen.length && p.opts.length>0 &&
+                 !p.opts.includes('manifest');
+    ap.disabled=!usable;
+    ap.title= p.gen.length
+      ? 'disabled while generation inputs differ - Regenerate tasks ' +
+        'first (it writes the pending options into the new TOML too)'
+      : p.opts.includes('manifest')
+      ? 'disabled - the proposal TOML does not parse; fix it in the ' +
+        'editor or regenerate'
+      : usable
+      ? 'patch ' + p.opts.map(pendName).join(', ') +
+        ' into the proposal TOML without a planner call'
+      : 'options already match the proposal TOML - nothing to apply';
+  }
+  const run=document.getElementById('rq-run');
+  if (run){
+    run.disabled=!!(p.gen.length||p.opts.length);
+    run.title= run.disabled
+      ? 'disabled while fields differ from the proposal - Regenerate ' +
+        'tasks or Apply options to TOML first' : '';
+  }
 }
 // --- request image attachments -----------------------------------------
 // Thumbnail strip under 'Your request' fed by file drops and clipboard
@@ -8594,6 +8914,7 @@ async function attachFiles(files){
       renderAttach(true);
       insertAtCaret(ta,out.path);
       if(modalRequest) modalRequest.dirty=true;
+      refreshPending();
       try{ta.dispatchEvent(new Event('input',{bubbles:true}));}catch(e){}
     } catch(err){ formError('Attach failed: '+err.message); }
   }
@@ -8650,8 +8971,13 @@ async function requestAction(action){
   const editedManifest=!!manifestEl &&
     manifestEl.value!==modalRequest.originalManifest;
   if (action==='discard' && !confirm('Discard this request, its proposal TOML, and all planned steps?')) return;
+  // Regenerate replaces the generated tasks when it succeeds, so it
+  // always confirms - and names any unsaved TOML edits it would drop
   if (action==='generate' && rec.manifest && !confirm(
-      'Regenerate the proposal? Your current TOML will be replaced only if generation succeeds.')) return;
+      'Regenerate the proposal?' +
+      (editedManifest ? ' Your unsaved TOML edits are dropped and ' : ' ') +
+      'the current generated TOML is replaced only if generation ' +
+      'succeeds.')) return;
   if (action==='stop' && !confirm(
       'Stop preparing this proposal? The planner session is cancelled - ' +
       'your request and any previous proposal are kept.')) return;
@@ -8700,7 +9026,9 @@ async function requestAction(action){
     await refresh();
     await openRequest(rid, true);
   } catch(err){ formError(err.message); }
-  finally { buttons.forEach(b=>b.disabled=false); }
+  // a failed action keeps the modal - the blanket re-enable must not
+  // resurrect a pending-disabled Apply, so the diff re-arms it
+  finally { buttons.forEach(b=>b.disabled=false); refreshPending(); }
 }
 
 // --- planner questionnaire ('ask me questions' checkbox) ---------------
@@ -8931,12 +9259,26 @@ function render(d){
       r.stage==='questions' && (r.questions||[]).length
         ? `planner waits on ${r.questions.length} answer(s)`
         : glast || (r.stage==='generating' ? 'planner warming up' : '');
-    // stale survives until _publish_proposal clears it, so mid-planning
-    // stages would double-label the row ('Preparing proposal' + 'Needs
-    // review'); the flag only means something once planning has stopped
+    // staleness is a computed diff (gen inputs vs publish baseline,
+    // option fields vs the TOML itself); mid-planning stages would
+    // double-label the row ('Preparing proposal' + 'Needs review'), so
+    // the chip only means something once planning has stopped. The
+    // title carries WHICH side is pending - the colour alone says less.
+    const staleTip = r.pending
+      ? [
+          (r.pending.gen||[]).length
+            ? 'request inputs changed (' +
+              (r.pending.gen).join(', ') + ') - Regenerate tasks' : '',
+          (r.pending.opts||[]).length
+            ? 'options differ from the TOML (' +
+              (r.pending.opts).join(', ') + ') - Apply options or ' +
+              'regenerate' : '',
+        ].filter(Boolean).join('; ')
+      : 'fields changed since the proposal was generated';
     const staleChip = r.stale &&
       r.stage!=='generating' && r.stage!=='questions'
-        ? ` <span class="stage error">Needs review</span>`:'';
+        ? ` <span class="stage error" title="${esc(staleTip)}">` +
+          `Needs review</span>`:'';
     h += `<tr class="runrow${runKey(r)===selectedRun?' selected':''}" ` +
       `data-run-key="${esc(runKey(r))}" tabindex="0" ` +
       `aria-haspopup="menu" ` +
@@ -9217,6 +9559,7 @@ document.addEventListener('click', async e=>{
       a=>a.name!==rmAtt.dataset.attachRm);
     renderAttach(true);
     if (modalRequest) modalRequest.dirty=true;
+    refreshPending();
     return; }
   if (modalQA && t.dataset && t.dataset.qopt!==undefined){
     // toggle a suggested option - single-select replaces, multi toggles;
@@ -9614,16 +9957,16 @@ document.addEventListener('input', e=>{
     modalRequest.dirty=true;
     const msg=document.getElementById('form-msg');
     if (msg) msg.hidden=true;
-    // Edited fields diverge from the proposal TOML until applied or
-    // regenerated - flag the buttons that reconcile them.
-    if (modalRequest.record?.manifest)
-      document.querySelectorAll(
-        '#detail [data-action=generate],#detail [data-action=apply]')
-        .forEach(b=>b.classList.add('attn'));
+    // syncEffort may rewrite the effort input when its model changed -
+    // run it first so the pending diff sees the settled value
     if (e.target.id==='rq-model' || e.target.id==='rq-plan_model')
       syncEffort(e.target,
                  e.target.id==='rq-model'?'rq-effort':'rq-plan_effort',
                  e.target.id==='rq-model'?'rq-efforts':'rq-plan_efforts');
+    // stale state is a live diff against the publish baselines - edit
+    // and revert both re-evaluate, so returning a field to its baseline
+    // clears its mark without a save
+    refreshPending();
   }
 });
 // attachment drop/paste: bound once at document level (the modal's
