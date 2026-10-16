@@ -3927,6 +3927,18 @@ def _finish_generation(request_id: str, requests_dir: Path,
     def still_mine(rec: dict) -> bool:
         return rec.get("status") == "generating" \
             and rec.get("gen_id") == gen_id
+
+    def save_draft(text: str) -> bool:
+        """Draft is durable in the spool before any publish wait - but
+        only while this attempt still owns the record. A stop or a
+        Regenerate drops the overlay; resurrecting it here would let the
+        stale attempt publish as if it had never been stopped."""
+        with REQUEST_LOCK:
+            if not still_mine(_read_request(request_id, requests_dir)):
+                return False
+            _save_draft(rec, spool, text)
+        return True
+
     try:
         rec = _read_request(request_id, requests_dir)
         spool.mkdir(parents=True, exist_ok=True)
@@ -3947,7 +3959,8 @@ def _finish_generation(request_id: str, requests_dir: Path,
             text = _planner_response(rec, projects, devin_argv, log_path,
                                      qa=qa)
             _merge_tokens(tok_plan, tail_metrics(export_path))
-            _save_draft(rec, spool, text)
+            if not save_draft(text):
+                return              # stopped/superseded - nothing to publish
             try:
                 defaults = tomllib.loads(text).get("defaults", {})
             except tomllib.TOMLDecodeError as exc:
@@ -3957,7 +3970,8 @@ def _finish_generation(request_id: str, requests_dir: Path,
                 text = _planner_response(rec, projects, devin_argv,
                                          log_path, fix_note=str(exc), qa=qa)
                 _merge_tokens(tok_plan, tail_metrics(export_path))
-                _save_draft(rec, spool, text)
+                if not save_draft(text):
+                    return          # stopped/superseded mid-retry
                 defaults = tomllib.loads(text).get("defaults", {})
         except PlannerQuestions as q:
             # The planner asked instead of drafting - park the sanitized
