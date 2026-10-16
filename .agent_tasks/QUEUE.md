@@ -21,6 +21,16 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-15 (follow-up-plan, closing step of run
+  20261015-182057-ux-controls): reviewed the run - 6/8 steps merged
+  clean; `image-attachments` + `task-modal-navigation` are done work but
+  parked unmerged (conflicts only on .agent_tasks/QUEUE.md +
+  efficiency_stats.md; the resolver's untracked-files guard refused
+  silently - fixed since f261937). task-modal-navigation's verify hit
+  the hard-coded 600s gate despite a green suite. Drafted
+  manifests/ux-controls-followup.toml: merge the two parked branches,
+  configurable verify_timeout_s, .agent_tasks merge-safety, flaky
+  stop-flag test, live planner-ask smoke. NOT launched - human review.
 - DONE 2026-10-15 (run-link-affordance): run names in the runs table
   always render as links now (blue + underline, lighter blue on hover) -
   they are the run-modal affordance and previously looked like plain
