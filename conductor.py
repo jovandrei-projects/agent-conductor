@@ -177,8 +177,8 @@ RESOLVE_BODY = """\
 <!-- conductor-purpose: resolve-merge -->
 A git merge is in progress in this repo and needs a human-style
 resolution. Conductor tried to merge branch `{branch}` - a parallel
-agent's work, still checked out at {worktree} - back into the main
-checkout, and it conflicts.
+agent's work, still checked out at {worktree} - back into {where}, and
+it conflicts.
 
 Conflicted files:
 {files}
@@ -222,6 +222,9 @@ class Step:
                                        # session in the main checkout to
                                        # finish the merge instead of only
                                        # parking the worktree for a human
+    merge_target: str | None = None    # local branch the worktree branch is
+                                       # created from and merged back into;
+                                       # None = the checkout's current branch
     max_attempts: int = 1              # a step hitting timeout_min is committed
                                        # and retried in a fresh session until
                                        # this many total attempts ran
@@ -241,6 +244,7 @@ class Manifest:
     max_hours: float | None            # wall-clock cap for the whole run
     max_parallel: int | None           # cap on concurrent agents; None = auto
     merge_resolver: bool               # run-wide default for step.merge_resolver
+    merge_target: str | None           # run-wide default for step.merge_target
     steps: list[Step]
     description: str | None = None
 
@@ -288,6 +292,30 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
         mr = merged.get("merge_resolver")
         if mr is None:
             mr = run.get("merge_resolver", False)
+        # merge_target: an existing local branch the step's worktree is
+        # created from and merged back into. A step value (or an inherited
+        # [defaults] one) wins; "" unsets. On a step without worktree that
+        # explicit choice is a manifest error - a merge target on a step
+        # that never merges must not be silently ignored. [run].merge_target
+        # is different: it is only a DEFAULT for worktree steps, so a
+        # run-wide choice (the request form's field) never breaks a plan
+        # that keeps some steps on the main checkout.
+        mt = merged.get("merge_target")
+        explicit_mt = mt is not None
+        if mt is None:
+            mt = run.get("merge_target")
+        if mt is not None:
+            if not isinstance(mt, str):
+                raise ManifestError(
+                    f"step {merged['name']!r}: merge_target must be a "
+                    f"branch name string")
+            mt = mt.strip() or None
+        if mt and not merged.get("worktree"):
+            if explicit_mt:
+                raise ManifestError(
+                    f"step {merged['name']!r}: merge_target requires "
+                    f"worktree = true (non-worktree steps never merge)")
+            mt = None
         # A step without verify inherits the project's registered gate
         # (projects.toml `verify = "..."`). Explicit verify = "" opts out.
         # Cloud steps never inherit - a local verify of an untouched
@@ -319,7 +347,7 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
             wave=merged.get("wave"),
             worktree=bool(merged.get("worktree", False)),
             effort=merged.get("effort") or None,
-            merge_resolver=bool(mr), max_attempts=ma,
+            merge_resolver=bool(mr), merge_target=mt, max_attempts=ma,
             stall_min=float(merged.get("stall_min", 20))))
     if not steps:
         raise ManifestError("manifest has no [[step]] entries")
@@ -328,11 +356,17 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
         max_parallel = int(max_parallel)
         if max_parallel < 1:
             raise ManifestError("run.max_parallel must be >= 1")
+    run_mt = run.get("merge_target")
+    if run_mt is not None:
+        if not isinstance(run_mt, str):
+            raise ManifestError("run.merge_target must be a branch name string")
+        run_mt = run_mt.strip() or None
     return Manifest(path=path, name=name, on_failure=on_failure,
                     checkpoint=bool(run.get("checkpoint", True)),
                     preamble=preamble, max_hours=run.get("max_hours"),
                     max_parallel=max_parallel,
                     merge_resolver=bool(run.get("merge_resolver", False)),
+                    merge_target=run_mt,
                     steps=steps, description=description)
 
 
@@ -754,10 +788,206 @@ def sanitize_branch(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._/-]", "-", s)
 
 
-def worktree_add(repo_dir: Path, wt_path: Path, branch: str) -> bool:
+def current_branch(repo_dir: Path) -> str | None:
+    """The branch the checkout has checked out, or None on a detached HEAD."""
+    r = _git(repo_dir, "symbolic-ref", "--short", "-q", "HEAD")
+    return r.stdout.strip() or None if r.returncode == 0 else None
+
+
+def branch_name_ok(name: str) -> bool:
+    """True when `name` is a syntactically valid local branch name, checked
+    through git itself (check-ref-format) rather than a hand-rolled regex.
+    A leading dash is refused anyway - it would parse as an option at every
+    downstream call site."""
+    if not name or len(name) > 200 or name.startswith("-") \
+            or name != name.strip():
+        return False
+    r = subprocess.run(["git", "check-ref-format", "--allow-onelevel", name],
+                       capture_output=True, text=True, timeout=15,
+                       **hidden_subprocess_kwargs())
+    return r.returncode == 0
+
+
+def local_branch_exists(repo_dir: Path, name: str) -> bool:
+    """refs/heads/<name> exists - a LOCAL branch only. Tags, remote refs and
+    abbreviations can never satisfy a merge target."""
+    return _git(repo_dir, "rev-parse", "-q", "--verify",
+                f"refs/heads/{name}").returncode == 0
+
+
+def list_local_branches(repo_dir: Path) -> list[str]:
+    """Local branch names for the dashboard selector. conductor/* run
+    branches are per-run work product, never a sane merge target."""
+    r = _git(repo_dir, "for-each-ref", "--format=%(refname:short)",
+             "refs/heads")
+    if r.returncode != 0:
+        return []
+    return [b for b in r.stdout.split() if not b.startswith("conductor/")]
+
+
+def worktree_list(repo_dir: Path) -> list[tuple[Path, str | None]]:
+    """(worktree dir, checked-out branch|None) for every registered worktree
+    of the repo, main checkout first (`git worktree list --porcelain`)."""
+    r = _git(repo_dir, "worktree", "list", "--porcelain")
+    if r.returncode != 0:
+        return [(repo_dir, current_branch(repo_dir))]
+    out: list[tuple[Path, str | None]] = []
+    wt: Path | None = None
+    branch: str | None = None
+    for ln in r.stdout.splitlines() + [""]:
+        if ln.startswith("worktree "):
+            if wt is not None:
+                out.append((wt, branch))
+            wt, branch = Path(ln[9:]), None
+        elif ln.startswith("branch "):
+            ref = ln[7:]
+            branch = (ref[len("refs/heads/"):]
+                      if ref.startswith("refs/heads/") else ref)
+    if wt is not None:                        # covers a detached tail entry
+        out.append((wt, branch))
+    return out
+
+
+def merge_target_error(label: str, project_dir: Path,
+                       target: str) -> str | None:
+    """The actionable rejection for a bad merge_target, or None when the
+    target is usable: name must be a valid branch name AND already exist as
+    a local branch in the project repo. `label` is the offending entity in
+    the message (a step or project name). Never silently substitutes
+    another branch and never creates one."""
+    if not branch_name_ok(target):
+        return (f"{label}: merge_target {target!r} is not a "
+                f"valid branch name")
+    if not is_git_repo(project_dir):
+        return (f"{label}: merge_target {target!r} cannot be "
+                f"checked - {project_dir} is not a git repository root")
+    if not local_branch_exists(project_dir, target):
+        return (f"{label}: merge_target {target!r} does not "
+                f"exist in {project_dir} - create the branch there "
+                f"(git -C <repo> branch {target}) or choose another "
+                f"target; conductor will not fall back to the default "
+                f"branch or create it")
+    return None
+
+
+def validate_merge_targets(resolved: list[tuple[Path, str, Step]]) -> None:
+    """Pre-flight check for cmd_plan/cmd_run: every explicit merge_target
+    must name an existing local branch in its own project's repo. A missing
+    branch fails the whole manifest before any state exists - per-project
+    targets are checked independently, so a multi-project run reports every
+    bad target at once."""
+    errs = [merge_target_error(f"step {s.name!r}", pdir, s.merge_target)
+            for pdir, _slug, s in resolved if s.merge_target]
+    errs = [e for e in errs if e]
+    if errs:
+        raise ManifestError("\n".join(errs))
+
+
+def merge_wt_for(wt_path: Path) -> Path:
+    """The conductor-owned 'merge worktree' for a step - a second linked
+    worktree used to merge into a target the main checkout does not have
+    checked out. Lives next to the step's worktree under data/worktrees."""
+    return wt_path.with_name(wt_path.name + ".merge")
+
+
+def _merge_loc(repo_dir: Path, target: str | None,
+               merge_wt: Path) -> tuple[Path | None, str | None]:
+    """Where a merge into `target` runs. (loc, None) on success: the main
+    checkout when target is unset or IS its current branch, else merge_wt -
+    created on demand on the target branch. (None, actionable error) when
+    the target vanished or sits in a foreign checkout."""
+    if not target or target == current_branch(repo_dir):
+        return repo_dir, None
+    own = (repo_dir.resolve(), merge_wt.resolve())
+    for wdir, wbranch in worktree_list(repo_dir):
+        if wbranch == target and wdir.resolve() not in own:
+            return None, (f"merge target {target!r} is checked out in "
+                          f"{wdir} - detach that worktree or merge there "
+                          f"by hand; conductor never merges into a "
+                          f"checkout it does not own")
+    entry = next(((wdir, b) for wdir, b in worktree_list(repo_dir)
+                  if wdir.resolve() == merge_wt.resolve()), None)
+    if entry is not None and entry[1] != target:
+        # A previous attempt's merge worktree sits on another branch (or
+        # detached) - ours to recycle, but it is not the target's checkout.
+        _git(repo_dir, "worktree", "remove", "--force", str(merge_wt))
+        entry = None
+    if entry is None:
+        if merge_wt.is_dir() and any(merge_wt.iterdir()):
+            return None, (f"stale merge worktree {merge_wt} is not a "
+                          f"registered git worktree - remove it by hand "
+                          f"so the merge can proceed")
+        if not local_branch_exists(repo_dir, target):
+            return None, (f"merge target {target!r} no longer exists in "
+                          f"{repo_dir} - restore the branch or pick "
+                          f"another target")
+        # Plain branch name - NOT refs/heads/<target>: a full ref is a
+        # commit-ish to `worktree add` and checks out a DETACHED head, so
+        # the merge would land on a throwaway head and leave the branch
+        # unmoved. Verified below because a name matching a repo path
+        # could still detach silently.
+        r = _git(repo_dir, "worktree", "add", str(merge_wt), target)
+        if r.returncode != 0:
+            return None, (f"cannot create merge worktree on {target!r}: "
+                          f"{r.stderr.strip()[:200]}")
+        if current_branch(merge_wt) != target:
+            _git(repo_dir, "worktree", "remove", "--force",
+                 str(merge_wt))
+            return None, (f"merge worktree {merge_wt} did not check out "
+                          f"{target!r} - refusing to merge onto a "
+                          f"detached head")
+    return merge_wt, None
+
+
+def merge_step_branch(repo_dir: Path, wt_path: Path, branch: str,
+                      target: str | None, merge_wt: Path
+                      ) -> tuple[bool, Path | None, str | None]:
+    """Merge the step's branch into `target` (None/empty = the main
+    checkout's current branch - the legacy behavior).
+
+    Returns (merged, loc, err):
+    - merged=True: landed. A conductor-created merge worktree is removed;
+      the step's worktree+branch too.
+    - merged=False, loc set: the merge was attempted in `loc` and
+      conflicted (or a foreign merge blocked it); it was aborted, and a
+      merge worktree is kept clean on the target at `loc` when `loc` is
+      not the main checkout - a resolver session re-enters the merge
+      there. The step's worktree+branch stay either way.
+    - merged=False, loc None, err set: no merge could be attempted -
+      the target vanished or sits in a foreign checkout. `err` is the
+      actionable note; a resolver session cannot fix this."""
+    loc, err = _merge_loc(repo_dir, target, merge_wt)
+    if loc is None:
+        LOG.warning("merge of %s skipped: %s", branch, err)
+        return False, None, err
+    if merge_in_progress(loc) and not abort_own_merge(loc):
+        return False, loc, "a merge is already in progress there"
+    r = _git(loc, "merge", "--no-edit", branch)
+    if r.returncode != 0:
+        _git(loc, "merge", "--abort")
+        return False, loc, None
+    if _git(loc, "merge-base", "--is-ancestor", branch,
+            "HEAD").returncode != 0:
+        # rc=0 yet the branch never landed - treat like a conflict:
+        # park the work so nothing is silently dropped.
+        _git(loc, "merge", "--abort")
+        return False, loc, ("merge reported success but the branch did "
+                            "not land - worktree+branch kept")
+    worktree_remove(repo_dir, wt_path, branch)
+    if loc != repo_dir:
+        # Our throwaway checkout of the target - the branch must stay.
+        _git(repo_dir, "worktree", "remove", "--force", str(loc))
+    return True, loc, None
+
+
+def worktree_add(repo_dir: Path, wt_path: Path, branch: str,
+                 start: str | None = None) -> bool:
     if wt_path.is_dir():
         return True   # resume: reuse the worktree left by an earlier attempt
-    r = _git(repo_dir, "worktree", "add", str(wt_path), "-b", branch)
+    cmd = ["worktree", "add", str(wt_path), "-b", branch]
+    if start:
+        cmd.append(start)   # baseline the branch on the merge target
+    r = _git(repo_dir, *cmd)
     if r.returncode != 0 and "already exists" in r.stderr:
         r = _git(repo_dir, "worktree", "add", str(wt_path), branch)
     return r.returncode == 0
@@ -768,26 +998,13 @@ def worktree_remove(repo_dir: Path, wt_path: Path, branch: str) -> None:
     _git(repo_dir, "branch", "-D", branch)
 
 
-def worktree_debris(repo_dir: Path, wt_path: Path, branch: str) -> bool:
-    """A branch is debris when it carries no commits beyond the repo's HEAD
-    (the step died before committing anything). Safe to delete."""
-    r = _git(repo_dir, "rev-list", "--count", f"HEAD..{branch}")
+def worktree_debris(repo_dir: Path, wt_path: Path, branch: str,
+                    target: str | None = None) -> bool:
+    """A branch is debris when it carries no commits beyond the merge
+    target (or the repo's HEAD when none was chosen) - the step died before
+    committing anything. Safe to delete."""
+    r = _git(repo_dir, "rev-list", "--count", f"{target or 'HEAD'}..{branch}")
     return r.returncode == 0 and r.stdout.strip() == "0"
-
-
-def worktree_merge(repo_dir: Path, wt_path: Path, branch: str) -> bool:
-    """Merge the step's branch into the main checkout. On conflict, abort the
-    merge and LEAVE the worktree+branch for a human - the work is not lost.
-    A merge already in progress (someone else's - abort_own_merge cleared
-    ours) makes this refuse instead of `merge --abort`-ing a foreign merge."""
-    if merge_in_progress(repo_dir):
-        return False
-    r = _git(repo_dir, "merge", "--no-edit", branch)
-    if r.returncode != 0:
-        _git(repo_dir, "merge", "--abort")
-        return False
-    worktree_remove(repo_dir, wt_path, branch)
-    return True
 
 
 def unmerged_paths(repo_dir: Path) -> list[str]:
@@ -1101,12 +1318,15 @@ def _fmtK(n: int) -> str:
     return s.rstrip("0").rstrip(".") + u
 
 
-def _branch_commits(repo: str | None, branch: str | None) -> list[str]:
-    """`git log --oneline <default>..<branch>` for a step's branch -
-    best effort: gone branch or deleted worktree just yields no section."""
+def _branch_commits(repo: str | None, branch: str | None,
+                    target: str | None = None) -> list[str]:
+    """`git log --oneline <base>..<branch>` for a step's branch - the base
+    is the recorded merge target when one exists, else the usual default-
+    branch guesses. Best effort: gone branch or deleted worktree just
+    yields no section."""
     if not repo or not branch:
         return []
-    for base in ("master", "main"):
+    for base in ([target] if target else []) + ["master", "main"]:
         try:
             r = subprocess.run(
                 ["git", "-C", repo, "log", "--oneline",
@@ -1145,9 +1365,12 @@ def step_summary_md(rec: dict, st: dict, run_name: str) -> str:
     merged = rec.get("merged")
     branch_s = ""
     if branch:
+        tgt = rec.get("merge_target")
         branch_s = f"`{branch}` - " + (
-            "merged" if merged else "unmerged, kept at "
-            f"`{rec.get('work_dir') or rec.get('project')}`")
+            f"merged{f' into `{tgt}`' if tgt else ''}" if merged
+            else "unmerged, kept at "
+            f"`{rec.get('work_dir') or rec.get('project')}`"
+            + (f" (target `{tgt}`)" if tgt else ""))
     L = [f"# {run_name} / {name}", ""]
     L += [
         f"- **status:** {status} · **verify:** {verify_s} · "
@@ -1195,7 +1418,7 @@ def step_summary_md(rec: dict, st: dict, run_name: str) -> str:
                      (f" — {head[:110]}" if head else ""))
         L.append("")
     commits = _branch_commits(rec.get("project") or rec.get("work_dir"),
-                              branch)
+                              branch, rec.get("merge_target"))
     if commits:
         L += [f"## Commits ({len(commits)})", ""]
         L += [f"- {c}" for c in commits]
@@ -1935,10 +2158,13 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
 def resolve_merge_conflict(step: Step, slug: str, repo_dir: Path,
                            work_dir: Path, branch: str, cfg: Manifest,
                            run_dir: Path, devin_argv: list[str],
-                           state: dict) -> bool:
-    """A worktree branch conflicted at merge-back: re-enter the merge in the
-    MAIN checkout and hand the resolution to a fresh session (manifest
-    `merge_resolver`). Returns True when the merge was completed.
+                           state: dict, merge_dir: Path | None = None,
+                           target: str | None = None) -> bool:
+    """A worktree branch conflicted at merge-back: re-enter the merge in
+    merge_dir (the main checkout, or the merge worktree when the recorded
+    target lives on another branch) and hand the resolution to a fresh
+    session (manifest `merge_resolver`). Returns True when the merge was
+    completed.
 
     Safety shape: the resolver may stage a fix without committing - the
     conductor finishes `git commit --no-edit` itself once the index is
@@ -1946,26 +2172,31 @@ def resolve_merge_conflict(step: Step, slug: str, repo_dir: Path,
     (a resolver that quietly aborted the merge can never pass). Anything
     else -> merge --abort + the worktree/branch stay for a human.
 
-    Refuses entirely on a dirty main checkout: another agent's uncommitted
+    Refuses entirely on a dirty merge checkout: another agent's uncommitted
     work sitting in the tree would get swept into the merge commit
     (trap 10 shape) - that is human territory.
     """
-    if git_dirty_tracked(repo_dir):
-        LOG.warning("%s: main checkout has modified tracked files; not "
+    merge_dir = merge_dir or repo_dir
+    where = ("the main checkout" if merge_dir == repo_dir else
+             f"the merge worktree {merge_dir} (target {target or '-'})")
+    if git_dirty_tracked(merge_dir):
+        LOG.warning("%s: merge checkout has modified tracked files; not "
                     "spawning a merge resolver", step.name)
         rec = state["steps"].get(step.name, {})
-        _append_note(rec, "merge resolver refused: modified tracked files "
-                          "in main checkout (trap 10/11 - commit or stash "
+        _append_note(rec, f"merge resolver refused: modified tracked files "
+                          f"in {where} (trap 10/11 - commit or stash "
                           "them, then resume)")
         save_state(run_dir, state)
         return False
-    r = _git(repo_dir, "merge", "--no-edit", branch)
+    r = _git(merge_dir, "merge", "--no-edit", branch)
     if r.returncode == 0:                    # raced clean after all
         worktree_remove(repo_dir, work_dir, branch)
+        if merge_dir != repo_dir:
+            _git(repo_dir, "worktree", "remove", "--force", str(merge_dir))
         return True
-    conflicted = unmerged_paths(repo_dir)
+    conflicted = unmerged_paths(merge_dir)
     body = RESOLVE_BODY.format(
-        branch=branch, worktree=work_dir,
+        branch=branch, worktree=work_dir, where=where,
         files="\n".join(f"- {f}" for f in conflicted) or "- (see git status)")
     rstep = Step(name=f"resolve-{step.name}", project=slug, prompt=body,
                  model=step.model, mode=step.mode,
@@ -1975,34 +2206,36 @@ def resolve_merge_conflict(step: Step, slug: str, repo_dir: Path,
     # that, so a conductor dying mid-resolution resumes through late-merge.
     rec = state["steps"].get(step.name, {})
     rec.update(note=f"merge conflict on {branch}; resolver session "
-                    f"{rstep.name} spawned in the main checkout",
+                    f"{rstep.name} spawned in {where}",
                merged=False)   # orange 'unmerged' chip while resolving
     save_state(run_dir, state)
     log_event(run_dir, event="resolve_start", step=step.name, branch=branch,
               files=conflicted)
-    status = run_step(rstep, slug, repo_dir, cfg, run_dir, devin_argv,
+    status = run_step(rstep, slug, merge_dir, cfg, run_dir, devin_argv,
                       state, do_checkpoint=False, post_commit=False)
     log_event(run_dir, event="resolve_end", step=step.name, status=status)
 
     # Adopt any resolved-but-unstaged file that carries no markers, then
     # decide. A file still holding markers is never staged.
     for f in conflicted:
-        if not has_conflict_markers(repo_dir, f):
-            _git(repo_dir, "add", f)
-    if status == "done" and not unmerged_paths(repo_dir) \
-            and not any(has_conflict_markers(repo_dir, f)
+        if not has_conflict_markers(merge_dir, f):
+            _git(merge_dir, "add", f)
+    if status == "done" and not unmerged_paths(merge_dir) \
+            and not any(has_conflict_markers(merge_dir, f)
                         for f in conflicted) \
-            and merge_in_progress(repo_dir):
+            and merge_in_progress(merge_dir):
         # Index clean, merge still open -> conductor commits the resolution.
-        _git(repo_dir, "commit", "--no-edit")
+        _git(merge_dir, "commit", "--no-edit")
     tip = _git(repo_dir, "rev-parse", branch).stdout.strip()
-    landed = bool(tip) and _git(repo_dir, "merge-base", "--is-ancestor",
+    landed = bool(tip) and _git(merge_dir, "merge-base", "--is-ancestor",
                                 tip, "HEAD").returncode == 0
-    if status == "done" and landed and not unmerged_paths(repo_dir):
+    if status == "done" and landed and not unmerged_paths(merge_dir):
         worktree_remove(repo_dir, work_dir, branch)
+        if merge_dir != repo_dir:
+            _git(repo_dir, "worktree", "remove", "--force", str(merge_dir))
         return True
-    if merge_in_progress(repo_dir):
-        _git(repo_dir, "merge", "--abort")
+    if merge_in_progress(merge_dir):
+        _git(merge_dir, "merge", "--abort")
     return False
 
 
@@ -2088,10 +2321,11 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     resolved = [(*resolve_project(s, projects, manifest_path.parent), s)
                 for s in cfg.steps]
-    # Validate before any run state exists: a bad wave must not leave a
-    # state.json the dashboard will show as "running" forever.
+    # Validate before any run state exists: a bad wave or merge target must
+    # not leave a state.json the dashboard will show as "running" forever.
     groups = group_waves(resolved)
     validate_groups(groups)
+    validate_merge_targets(resolved)
     cap = effective_max_parallel(cfg, getattr(args, "max_parallel", None))
 
     if getattr(args, "keep_awake", True):
@@ -2223,6 +2457,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 2
         # Materialize worktrees for members that want isolation.
         prepared: list[tuple[Step, str, Path, Path, str | None]] = []
+        targets: dict[str, str | None] = {}   # step -> recorded merge target
         wave_ckpt_done = False
         for project_dir, slug, step in members:
             prior = state["steps"].get(step.name, {})
@@ -2238,14 +2473,28 @@ def cmd_run(args: argparse.Namespace) -> int:
                 wt = Path(prior["work_dir"]) if prior.get(
                     "work_dir") else runs_dir.parent / "worktrees" / (
                     run_dir.name) / step.name
+                # The RECORDED target wins over the manifest key so a retry
+                # can never drift to a different baseline than the work was
+                # created from; pre-feature runs fall back to the manifest,
+                # then to the checkout's current branch (legacy behavior).
+                tgt = prior.get("merge_target", step.merge_target)
+                mwt = Path(prior.get("merge_dir") or merge_wt_for(wt))
                 if _git(project_dir, "rev-parse", "-q", "--verify",
                         prior["branch"]).returncode == 0:
-                    abort_own_merge(project_dir)
-                    ok = worktree_merge(project_dir, wt, prior["branch"])
-                    if not ok and step.merge_resolver:
+                    ok, loc, merr = merge_step_branch(
+                        project_dir, wt, prior["branch"], tgt, mwt)
+                    if loc is not None and loc != project_dir:
+                        prior["merge_dir"] = str(loc)
+                    # merr=None marks a real conflict a resolver can fix;
+                    # an error string means no merge got far enough to
+                    # have conflicts (bad loc, vanished target, foreign
+                    # merge) - spawning a session would just fail again.
+                    if not ok and step.merge_resolver and loc is not None \
+                            and merr is None:
                         ok = resolve_merge_conflict(
                             step, slug, project_dir, wt, prior["branch"],
-                            cfg, run_dir, devin_argv, state)
+                            cfg, run_dir, devin_argv, state,
+                            merge_dir=loc, target=tgt)
                     if ok:
                         was = prior.get('status')
                         prior.update(status="done", merged=True)
@@ -2254,8 +2503,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                         print(f"[merged] {step.name} (merge on resume)")
                     elif prior.get("status") == "done":
                         prior.update(status="failed", merged=False)
-                        _append_note(prior, "merge conflict on resume; "
-                                            f"worktree kept at {wt}")
+                        _append_note(prior, (merr or "merge conflict")
+                                            + f" on resume; worktree "
+                                              f"kept at {wt}")
                         save_state(run_dir, state)
                         print(f"[ failed] {step.name} (merge conflict "
                               "on resume)")
@@ -2264,11 +2514,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                             break
                     else:
                         prior["merged"] = False
-                        _append_note(prior, "merge still conflicts; "
-                                            "resolve the kept worktree by "
-                                            "hand or enable merge_resolver "
-                                            "- re-running the same branch "
-                                            "cannot fix a conflict")
+                        _append_note(prior, merr or
+                                     "merge still conflicts; resolve the "
+                                     "kept worktree by hand or enable "
+                                     "merge_resolver - re-running the same "
+                                     "branch cannot fix a conflict")
                         save_state(run_dir, state)
                         print(f"[conflict] {step.name} still unmerged")
                     continue
@@ -2303,18 +2553,37 @@ def cmd_run(args: argparse.Namespace) -> int:
                 branch = sanitize_branch(
                     f"conductor/{run_dir.name}/{step.name}")
                 wt = runs_dir.parent / "worktrees" / run_dir.name / step.name
-                if not worktree_add(project_dir, wt, branch):
-                    with STATE_LOCK:
-                        state["steps"].setdefault(step.name, {}).update(
-                            name=step.name, slug=slug,
-                            status="failed", note="worktree add failed")
-                        save_state(run_dir, state)
-                    print(f"[  failed] {step.name} (worktree add)")
-                    if cfg.on_failure == "stop":
-                        stop = True
-                        break
+                # The merge target is decided HERE, once: a previously
+                # recorded target (the reused worktree's baseline is already
+                # baked in), else the manifest's merge_target, else the
+                # checkout's current branch. The branch could vanish after
+                # plan-time validation - that is a step failure with the
+                # same actionable note, never a silent fallback to whatever
+                # is checked out.
+                tgt = (prior.get("merge_target") or step.merge_target
+                       or current_branch(project_dir))
+                mterr = (merge_target_error(f"step {step.name!r}",
+                                            project_dir, step.merge_target)
+                         if step.merge_target else None)
+                if mterr is None and worktree_add(
+                        project_dir, wt, branch,
+                        f"refs/heads/{tgt}" if tgt else None):
+                    targets[step.name] = tgt
+                    prepared.append(
+                        (step, slug, wt, project_dir, branch, rnote))
                     continue
-                prepared.append((step, slug, wt, project_dir, branch, rnote))
+                with STATE_LOCK:
+                    state["steps"].setdefault(step.name, {}).update(
+                        name=step.name, slug=slug, status="failed",
+                        merge_target=tgt,
+                        note=mterr or "worktree add failed")
+                    save_state(run_dir, state)
+                print(f"[  failed] {step.name} "
+                      f"({mterr or 'worktree add'})")
+                if cfg.on_failure == "stop":
+                    stop = True
+                    break
+                continue
             else:
                 prepared.append((step, slug, project_dir, project_dir,
                                  None, rnote))
@@ -2325,10 +2594,15 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         # Mark members queued up front: the pool may hold them while a
         # max_parallel-sized set runs, and the dashboard shows the queue.
+        # merge_target is persisted per step NOW - the recorded value (the
+        # manifest's choice or the checkout's branch at materialization) is
+        # what merge-back, retries, resume and the manual Merge button all
+        # target, so none of them can silently fall back to main.
         with STATE_LOCK:
             for step, _s, _w, _r, _b, _n in prepared:
                 state["steps"].setdefault(step.name, {}).update(
-                    status="queued", name=step.name)
+                    status="queued", name=step.name,
+                    merge_target=targets.get(step.name))
             save_state(run_dir, state)
 
         if len(prepared) == 1:
@@ -2354,29 +2628,47 @@ def cmd_run(args: argparse.Namespace) -> int:
                     statuses[futs[f]] = f.result()
                     hub_update(tid, state)
 
-        # Merge worktree branches back into the main checkout, in order.
+        # Merge worktree branches back into their recorded targets,
+        # in manifest order. The merge runs in the main checkout when the
+        # target is its current branch, else in a conductor-owned merge
+        # worktree on the target (<step>.merge) - the checkout's HEAD
+        # never moves for a non-default target.
         for step, slug, work_dir, repo_dir, branch, _n in prepared:
             status = statuses.get(step.name)
             print(f"[{status or 'skipped':>8}] {step.name}")
             if branch:
                 rec = state["steps"].get(step.name, {})
+                tgt = rec.get("merge_target", step.merge_target)
                 if status in ("done", "partial", "blocked"):
-                    if worktree_merge(repo_dir, work_dir, branch):
+                    ok, loc, merr = merge_step_branch(
+                        repo_dir, work_dir, branch, tgt,
+                        merge_wt_for(work_dir))
+                    if loc is not None and loc != repo_dir:
+                        rec["merge_dir"] = str(loc)
+                    if ok:
                         rec["merged"] = True
-                    elif step.merge_resolver and resolve_merge_conflict(
+                    # merr=None = a real conflict a resolver can fix; an
+                    # error string means the merge never got that far
+                    # (bad/vanished target, foreign checkout) - a session
+                    # would just fail there too.
+                    elif step.merge_resolver and loc is not None \
+                            and merr is None and \
+                            resolve_merge_conflict(
                             step, slug, repo_dir, work_dir, branch, cfg,
-                            run_dir, devin_argv, state):
+                            run_dir, devin_argv, state,
+                            merge_dir=loc, target=tgt):
                         rec["merged"] = True
                         _append_note(rec, "merge conflict resolved by "
                                           f"resolve-{step.name}")
                     else:
                         rec.update(status="failed", merged=False)
-                        _append_note(rec, "merge conflict; worktree kept "
-                                          f"at {work_dir}")
+                        _append_note(rec, merr or
+                                     "merge conflict; worktree kept "
+                                     f"at {work_dir}")
                         status = "failed"
                         statuses[step.name] = "failed"
                     save_state(run_dir, state)
-                elif worktree_debris(repo_dir, work_dir, branch):
+                elif worktree_debris(repo_dir, work_dir, branch, tgt):
                     # step died before doing work and the branch carries
                     # nothing - remove the worktree+branch instead of
                     # leaving orphan debris in the target repo.
@@ -2438,6 +2730,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     resolved = [(*resolve_project(s, projects, manifest_path.parent), s)
                 for s in cfg.steps]
     validate_groups(group_waves(resolved))
+    validate_merge_targets(resolved)
     print(f"run {cfg.name!r}: {len(cfg.steps)} steps, on_failure={cfg.on_failure}, "
           f"checkpoint={cfg.checkpoint}, "
           f"max_parallel={effective_max_parallel(cfg)}")
@@ -2451,7 +2744,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
             print(f"    note: cloud workers see origin, not local state ({dirty})")
         tags = cloud + (" [worktree]" if s.worktree else "") \
             + (f" [wave {s.wave}]" if s.wave is not None else "") \
-            + (" [resolver]" if s.merge_resolver else "")
+            + (" [resolver]" if s.merge_resolver else "") \
+            + (f" [merge -> {s.merge_target}]" if s.merge_target else "")
         tries = f" x{s.max_attempts}" if s.max_attempts > 1 else ""
         print(f"  {s.name:<20} {slug:<22} model={s.model or '-':<10} "
               f"mode={s.mode:<8} timeout={s.timeout_min:g}m{tries}{tags}")
@@ -3021,13 +3315,13 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
     if not isinstance(payload, dict) or set(payload) - {
             "raw", "label", "project", "model", "effort", "manifest",
             "followup", "on_failure", "max_attempts",
-            "plan_model", "plan_effort",
+            "plan_model", "plan_effort", "merge_target",
             "worktrees", "merge_resolver", "ask", "attachments"}:
         raise RequestError("Invalid request fields")
     model, effort = default_model_effort()
     fields = {k: (rec or {}).get(k, v) for k, v in (
         ("raw", ""), ("label", ""), ("project", ""), ("on_failure", "continue"),
-        ("model", model), ("effort", effort),
+        ("model", model), ("effort", effort), ("merge_target", ""),
         ("plan_model", model), ("plan_effort", effort))}
     for key in fields:
         if key in payload:
@@ -3055,6 +3349,21 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
         raise RequestError("Label must be at most 80 characters")
     if fields["project"] and fields["project"] not in load_projects():
         raise RequestError("Choose a registered project from projects.toml")
+    # merge_target is validated through git itself: name syntax via
+    # check-ref-format, and - once the project is known - existence via
+    # refs/heads/<name> in that repo. An inferred project defers the
+    # existence check to proposal validation (each step's resolved repo).
+    if fields["merge_target"]:
+        if not branch_name_ok(fields["merge_target"]):
+            raise RequestError(
+                f"merge_target {fields['merge_target']!r} is not a valid "
+                f"branch name")
+        if fields["project"]:
+            pdir = load_projects()[fields["project"]]["path"]
+            err = merge_target_error(f"project {fields['project']!r}",
+                                     pdir, fields["merge_target"])
+            if err:
+                raise RequestError(err)
     for key in ("model", "plan_model"):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", fields[key]):
             raise RequestError(f"Invalid {key}")
@@ -3192,6 +3501,11 @@ def validate_proposal(text: str, manifests_dir: Path = MANIFESTS_DIR) -> Manifes
             project_dir, _slug = resolve_project(step, projects, manifests_dir)
             if not is_git_repo(project_dir):
                 raise RequestError(f"{step.project}: not a git repository root")
+            if step.merge_target:
+                terr = merge_target_error(f"step {step.name!r}",
+                                          project_dir, step.merge_target)
+                if terr:
+                    raise RequestError(terr)
         validate_groups(group_waves([
             (*resolve_project(s, projects, manifests_dir), s)
             for s in cfg.steps]))
@@ -3335,6 +3649,49 @@ def _apply_fields_to_toml(text: str, fields: dict,
     if "merge_resolver" in fields:
         _toml_set(lines, *ensure("run"), "merge_resolver",
                   "true" if fields["merge_resolver"] else "false")
+    if "merge_target" in fields:
+        # The field binds to the project selector: with a project chosen
+        # it writes/clears per-step keys on THAT project's worktree steps
+        # (a run-level key would leak to every project, so it goes too;
+        # a key on a non-worktree step would fail validation outright -
+        # 'effective' below is the post-apply state, since the same Apply
+        # may be adding worktree flags right now). With 'Infer from
+        # request' it is the run-wide default target - [run].merge_target
+        # applies to worktree steps only - and per-step keys stay as
+        # overrides.
+        mt_val = (fields.get("merge_target") or "").strip()
+        mt_proj = (fields.get("project") or "").strip()
+        wt_effective = {
+            s.name for s in cfg.steps
+            if s.worktree
+            or (fields.get("worktrees") and not s.cloud)
+            or s.name in _wave_worktree_required(cfg, manifests_dir)}
+        rs, re_ = sect("run")
+        if mt_proj:
+            if rs is not None:
+                i = _toml_key_at(lines, rs, re_, "merge_target")
+                if i is not None:
+                    del lines[i]
+            for s in cfg.steps:
+                if s.project != mt_proj:
+                    continue
+                ss, se = step_sect(s.name)
+                if ss is None:
+                    continue
+                if mt_val and s.name in wt_effective:
+                    _toml_set(lines, ss, se, "merge_target",
+                              json.dumps(mt_val))
+                elif not mt_val:
+                    i = _toml_key_at(lines, ss, se, "merge_target")
+                    if i is not None:
+                        del lines[i]
+        elif mt_val:
+            _toml_set(lines, *ensure("run"), "merge_target",
+                      json.dumps(mt_val))
+        elif rs is not None:
+            i = _toml_key_at(lines, rs, re_, "merge_target")
+            if i is not None:
+                del lines[i]
     # Per-step overrides of fields the form owns would silently fight the
     # applied value - strip them so defaults/run keys are the sole source.
     drop_keys = ({"merge_resolver"} if "merge_resolver" in fields else
@@ -3388,14 +3745,18 @@ def _apply_fields_to_toml(text: str, fields: dict,
 
 def _guarantee_isolation(text: str, rec: dict,
                          manifests_dir: Path = MANIFESTS_DIR) -> str:
-    """The worktrees/merge_resolver checkboxes are guarantees, not hints:
-    add the flags when the planner omitted them. One-directional - an
-    unchecked box never strips a deliberate worktree/merge_resolver."""
+    """The worktrees/merge_resolver checkboxes and the merge-target field
+    are guarantees, not hints: add them when the planner omitted them.
+    One-directional - an unchecked box never strips a deliberate flag, and
+    an empty merge target never removes a deliberate merge_target."""
     fields = {}
     if rec.get("worktrees"):
         fields["worktrees"] = True
     if rec.get("merge_resolver"):
         fields["merge_resolver"] = True
+    if rec.get("merge_target"):
+        fields["merge_target"] = rec["merge_target"]
+        fields["project"] = rec.get("project") or ""
     if not fields:
         return text
     try:
@@ -3416,8 +3777,9 @@ def _publish_proposal(rec: dict, text: str, requests_dir: Path,
             slug=slug, run=cfg.name, runs=RUNS_DIR.as_posix(),
             manifests=MANIFESTS_DIR.as_posix())
         cfg = validate_proposal(text, manifests_dir)
-    if rec.get("worktrees") or rec.get("merge_resolver"):
-        # The checkboxes are guarantees: add the flags the planner omitted.
+    if rec.get("worktrees") or rec.get("merge_resolver") \
+            or rec.get("merge_target"):
+        # The checkboxes/fields are guarantees: add what the planner omitted.
         text = _guarantee_isolation(text, rec, manifests_dir)
         cfg = validate_proposal(text, manifests_dir)
     if not manifests_dir.is_dir():
@@ -3435,6 +3797,7 @@ def _publish_proposal(rec: dict, text: str, requests_dir: Path,
                    "step": s.name, "slug": s.project, "model": s.model,
                    "effort": s.effort, "mode": s.mode, "task": " ".join(
                        s.prompt.split())[:160], "wt": s.worktree,
+                   "mt": s.merge_target,
                    "cloud": s.cloud} for s in cfg.steps])
     _save_request(rec, requests_dir)
     return dict(rec)
@@ -3458,7 +3821,7 @@ def save_request(request_id: str, payload: dict,
         # user applies them to the TOML or regenerates.
         changed = any(fields[k] != rec.get(k) for k in
                       ("raw", "project", "model", "effort", "followup",
-                       "worktrees", "merge_resolver",
+                       "worktrees", "merge_resolver", "merge_target",
                        "on_failure", "max_attempts")) \
             or fields["attachments"] != (rec.get("attachments") or [])
         raw_moved = (fields["raw"] != rec.get("raw")
@@ -3625,6 +3988,20 @@ def _planner_response(rec: dict, projects: dict,
                     "set merge_resolver = true in [run], so a conflicted "
                     "worktree merge is finished by a resolve-<step> "
                     "session instead of only being parked.\n\n")
+    if (rec.get("merge_target") or "").strip():
+        mt = rec["merge_target"].strip()
+        scope = (f"the [[step]]s on project {rec['project']!r}"
+                 if rec.get("project")
+                 else "every worktree [[step]] (set it under [run] as the "
+                      "default; a step may override it for a different "
+                      "project's target branch)")
+        isolate += (f"The human pinned the merge target: worktree "
+                    f"branches must be created from and merged back into "
+                    f"the existing local branch {json.dumps(mt)} - set "
+                    f"merge_target = {json.dumps(mt)} on {scope} "
+                    f"(requires worktree = true; the branch must already "
+                    f"exist in that project's repo - never substitute "
+                    f"another name).\n\n")
     ask_block = ""
     if rec.get("ask"):
         ask_block = (
@@ -3701,6 +4078,9 @@ Each [[step]] needs a unique name, a registered project slug, and a concrete
 prompt describing only that step. Prefer sequential steps. If using waves on
 one project, every member needs worktree = true. Cloud steps require explicit
 user intent and a project permitted for cloud. No prompt_file or preamble.
+merge_target = "<branch>" (optional, [run] or per [[step]]) names an existing
+local branch the step's worktree branch is created from and merged back into
+instead of the checkout's current branch; it requires worktree = true.
 {verify_hint}Do not reproduce credentials or private data in the tracked manifest; refer
 agents to the project files containing those details instead.
 The proposal must NOT start work; the human will edit it and launch later.
@@ -4569,23 +4949,29 @@ def _merge_run(name: str, runs_dir: Path,
             continue
         wt = (Path(rec["work_dir"]) if rec.get("work_dir")
               else runs_dir.parent / "worktrees" / d.name / step.name)
+        # The recorded target wins: a run that chose (or resolved) a
+        # non-default merge target merges there, never back to whatever
+        # the checkout happens to be on now.
+        tgt = rec.get("merge_target", step.merge_target)
+        mwt = Path(rec.get("merge_dir") or merge_wt_for(wt))
         if _git(repo_dir, "rev-parse", "-q", "--verify",
                 branch).returncode != 0:
             rec["note"] = "merge skipped: branch is gone"
             results["skipped"].append(step.name)
             continue
-        # Clear a stale conductor merge left by a dead run before trying
-        # ours; a human's merge in progress makes worktree_merge refuse.
-        if abort_own_merge(repo_dir):
-            log_event(d, event="merge_abort_stale", step=step.name,
-                      project=str(repo_dir))
-        ok = worktree_merge(repo_dir, wt, branch)
-        if not ok and step.merge_resolver:
+        # A stale conductor merge inside the merge location is cleared by
+        # merge_step_branch itself; a human's merge makes it refuse.
+        ok, loc, merr = merge_step_branch(repo_dir, wt, branch, tgt, mwt)
+        if loc is not None and loc != repo_dir:
+            rec["merge_dir"] = str(loc)
+        if not ok and step.merge_resolver and loc is not None \
+                and merr is None:
             dv = (st.get("devin_argv")
                   or (shlex.split(st["devin"]) if st.get("devin") else None)
                   or devin_argv or ["devin"])
             ok = resolve_merge_conflict(step, slug, repo_dir, wt, branch,
-                                        cfg, d, dv, st)
+                                        cfg, d, dv, st,
+                                        merge_dir=loc, target=tgt)
         if ok:
             rec.update(status="done" if rec.get("status") == "failed"
                        else rec.get("status"),
@@ -4595,7 +4981,8 @@ def _merge_run(name: str, runs_dir: Path,
             results["merged"].append(step.name)
         else:
             rec.update(merged=False,
-                       note="merge still conflicts; the worktree is kept "
+                       note=(merr + "; " if merr else "") +
+                            "merge still conflicts; the worktree is kept "
                             f"at {wt} for manual resolution")
             results["conflicted"].append(step.name)
     pending -= set(results["merged"])
@@ -5305,6 +5692,7 @@ def proposal_agent(step: dict, rec: dict, projects: dict, key: str,
             "effort": step.get("effort"), "mode": step.get("mode"),
             "task": step.get("task"), "task_full": None,
             "model_actual": None, "wt": step.get("wt"),
+            "merge_target": step.get("mt"),
             "timeout_min": step.get("timeout_min"),
             "attempts": None, "max_attempts": None,
             "merged": None, "cloud": step.get("cloud"), "tokens": None,
@@ -5339,6 +5727,7 @@ def _manifest_pending(st: dict, projects: dict) -> list[dict]:
                     "task": task, "model": step.model,
                     "effort": step.effort, "mode": step.mode,
                     "cloud": step.cloud, "wt": step.worktree,
+                    "mt": step.merge_target,
                     "timeout_min": step.timeout_min})
     return out
 
@@ -5379,6 +5768,7 @@ def _pending_agent(st: dict, sd: dict, key: str, run_dir: str,
             "effort": sd.get("effort"), "mode": sd.get("mode"),
             "task": sd.get("task"), "task_full": None,
             "model_actual": None, "wt": sd.get("wt"),
+            "merge_target": sd.get("mt"),
             "timeout_min": sd.get("timeout_min"),
             "attempts": None, "max_attempts": None,
             "merged": None, "cloud": sd.get("cloud"), "tokens": None,
@@ -5542,6 +5932,7 @@ def collect_dashboard(runs_dir: Path,
                 "session_gone": session_gone,
                 "exit_code": rec.get("exit_code"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
+                "merge_target": rec.get("merge_target"),
                 "timeout_min": timeout_min,
                 "timeout_ext_s": rec.get("timeout_extended_s"),
                 "attempts": rec.get("attempts"),
@@ -6179,6 +6570,7 @@ function showDetail(i){
     ['verify',a.verify_ok==null?'-':(a.verify_ok?'pass':'FAIL')],
     ['exit',a.exit_code],['work dir',a.work_dir],
     ['branch',a.branch],['merged',a.merged],
+    ['merge target',a.merge_target],
     ['prompt file',a.prompt],['stdout',a.stdout_log],['export',a.export],
     ['state file',a.state_md]];
   // prev/next walks this step's own pipeline - sibling buttons name their
@@ -6547,7 +6939,18 @@ function showRequestForm(rec){
       `stop - halt the run</option></select></div>` +
     `<div><label for="rq-attempts">Attempts/step</label>` +
     `<input id="rq-attempts" type="number" min="1" max="10" ` +
-      `value="${esc(rec.max_attempts??3)}"${disabled}></div><div></div></div>` +
+      `value="${esc(rec.max_attempts??3)}"${disabled}></div>` +
+    `<div><label for="rq-merge_target">Merge target</label>` +
+    `<input id="rq-merge_target" list="rq-branches" ` +
+      `value="${esc(rec.merge_target||'')}"${disabled} ` +
+      `placeholder="checkout branch">` +
+    `<datalist id="rq-branches"></datalist></div></div>` +
+    `<div class="sub" id="rq-mt-hint">An existing local branch the ` +
+      `worktree branches are created from and merged back into - empty ` +
+      `means the project checkout's current branch. With a project ` +
+      `chosen it is checked against that repo on save; an inferred ` +
+      `project is checked when the proposal resolves it. Needs ` +
+      `worktree isolation.</div>` +
     `<label for="rq-raw">Your request</label><textarea id="rq-raw"${disabled} ` +
     `placeholder="Describe the work in your own words…">${esc(rec.raw||'')}</textarea>` +
     `<div id="rq-attach" class="attach-strip" hidden></div>` +
@@ -6587,7 +6990,9 @@ function showRequestForm(rec){
     (steps.length?`<h3 style="margin:16px 0 0">Proposed steps (${steps.length})</h3>` +
       `<ol class="proposal-list">${steps.map(s=>`<li><b>${esc(s.step)}</b> ` +
         `<small>${esc(s.slug)} · ${esc(s.model||'-')} / ${esc(s.effort||'-')}` +
-        `${s.wt?' · worktree':''}</small><br>${esc(s.task||'')}</li>`).join('')}</ol>`:'') +
+        `${s.wt?' · worktree':''}` +
+        `${s.mt?' · merge&rarr;'+esc(s.mt):''}</small>` +
+        `<br>${esc(s.task||'')}</li>`).join('')}</ol>`:'') +
     (rec.manifest ? `<details class="proposal"><summary>Edit proposed TOML ` +
       `(steps, verify, model, effort and description)</summary>` +
       `<div class="notice">The TOML is the plan that will run. Changes to ` +
@@ -6615,8 +7020,9 @@ function showRequestForm(rec){
       (rec.manifest?`<button type="button" ` +
         `class="btn secondary${rec.stale?' attn':''}" data-action="apply" ` +
         `title="Rewrite the TOML to match the fields above (model, effort, ` +
-        `attempts, failure policy, worktrees, resolver) without a planner ` +
-        `call - request text and project changes still need Regenerate">` +
+        `attempts, failure policy, worktrees, resolver, merge target) ` +
+        `without a planner call - request text and project changes still ` +
+        `need Regenerate">` +
         `Apply options to TOML</button>`:''):'') +
     ((stage==='error'||stage==='questions')&&rec.manifest_text
       ? `<button type="button" class="btn secondary" data-action="restore"` +
@@ -6635,7 +7041,88 @@ function showRequestForm(rec){
   syncEffort(document.getElementById('rq-model'),'rq-effort','rq-efforts');
   syncEffort(document.getElementById('rq-plan_model'),
              'rq-plan_effort','rq-plan_efforts');
+  const projSel=document.getElementById('rq-project');
+  if (projSel && projSel.addEventListener)
+    projSel.addEventListener('change',()=>loadBranches(projSel.value));
+  // A stored choice is the user's own; an untouched field gets the
+  // implied default of whatever project is selected (or 'main' while the
+  // project is still inferred).
+  mtTouched=!!rec.merge_target;
+  mtImplied='';
+  loadBranches(rec.project||'');
 }
+// The merge-target field's datalist comes from the SELECTED project's
+// real repo. The checkout's current branch is the editable default while
+// the field stays untouched; 'main' is the editable default when the
+// project is still inferred (validated per resolved project at
+// generation). mtImplied tracks which default was offered so a project
+// switch can replace only an untouched default, never a typed value.
+// (Module state, not DOM dataset - the node:vm test stubs are plain
+// objects.) The server still does the authoritative check on
+// save/generate.
+let mtBranches={slug:null,list:[]}, mtTouched=false, mtImplied='';
+async function loadBranches(slug){
+  const inp=document.getElementById('rq-merge_target');
+  const dl=document.getElementById('rq-branches');
+  if(!inp) return;
+  if(!slug){
+    mtBranches={slug:'',list:[]};
+    if(dl) dl.innerHTML='';
+    mtImplied='main';
+    if(!mtTouched && !inp.value) inp.value='main';
+    inp.placeholder='main';
+    updateMtHint();
+    return;
+  }
+  try {
+    const b=await api('GET',
+      `/api/projects/${encodeURIComponent(slug)}/branches`);
+    if(document.getElementById('rq-project')?.value!==slug) return;
+    mtBranches={slug,list:b.branches||[]};
+    if(dl) dl.innerHTML=mtBranches.list
+      .map(x=>`<option value="${esc(x)}">`).join('');
+    const cur=b.current||'';
+    mtImplied=cur;
+    if(!mtTouched) inp.value=cur;
+    inp.placeholder=cur||'checkout branch';
+  } catch(err){
+    mtBranches={slug,list:[]};
+    if(dl) dl.innerHTML='';
+  }
+  updateMtHint();
+}
+function updateMtHint(){
+  const inp=document.getElementById('rq-merge_target');
+  const hint=document.getElementById('rq-mt-hint');
+  const slug=document.getElementById('rq-project')?.value||'';
+  if(!inp||!hint) return;
+  const base=`An existing local branch the worktree branches are created ` +
+    `from and merged back into - empty means the project checkout's ` +
+    `current branch. Needs worktree isolation.`;
+  const v=inp.value.trim();
+  if(!slug){
+    hint.innerHTML=esc(base)+' With an inferred project the editable ' +
+      `<b>main</b> default is validated per resolved project at ` +
+      `generation.`;
+  } else if(v && mtBranches.slug===slug &&
+            !mtBranches.list.includes(v)){
+    hint.innerHTML=`<b>${esc(v)}</b> is not a local branch in ` +
+      `<b>${esc(slug)}</b> - pick one from the list or create it in ` +
+      `the repo first; the run will not substitute another branch ` +
+      `or create it.`;
+  } else if(v){
+    hint.innerHTML=`Worktree steps on <b>${esc(slug)}</b> merge back ` +
+      `into <b>${esc(v)}</b>.`;
+  } else {
+    hint.innerHTML=esc(base);
+  }
+}
+document.addEventListener('input',ev=>{
+  if(ev.target && ev.target.id==='rq-merge_target'){
+    mtTouched=true;
+    updateMtHint();
+  }
+});
 // --- request image attachments -----------------------------------------
 // Thumbnail strip under 'Your request' fed by file drops and clipboard
 // pastes: each image uploads to POST /api/attachments (saved under
@@ -6716,7 +7203,7 @@ async function openRequest(id){
 function requestFields(){
   const f=Object.fromEntries(
     ['raw','label','project','model','effort','on_failure',
-     'plan_model','plan_effort'].map(k=>
+     'plan_model','plan_effort','merge_target'].map(k=>
     [k,document.getElementById(`rq-${k}`).value]));
   for (const k of ['followup','worktrees','merge_resolver','ask']){
     const el=document.getElementById(`rq-${k}`);
@@ -7694,6 +8181,21 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                         runs_dir, devin_argv, requests_dir,
                         include_archived=q.get("archived", [""])[0]
                         in ("1", "true", "yes")))
+                elif (m := re.fullmatch(
+                        r"/api/projects/([^/]+)/branches", path)):
+                    # Merge-target selector data: eligible local branches of
+                    # the SELECTED project's real repo plus the branch its
+                    # checkout is on now (the effective default target).
+                    slug = urllib.parse.unquote(m[1])
+                    entry = load_projects().get(slug)
+                    if entry is None:
+                        raise RequestError(f"Unknown project: {slug}", 404)
+                    pdir = entry["path"]
+                    if not is_git_repo(pdir):
+                        raise RequestError(
+                            f"{slug}: not a git repository root")
+                    self._json({"slug": slug, "current": current_branch(pdir),
+                                "branches": list_local_branches(pdir)})
                 elif (m := re.fullmatch(r"/api/requests/([^/]+)", path)):
                     rec = request_details(m[1], requests_dir,
                                           manifests_dir, runs_dir)

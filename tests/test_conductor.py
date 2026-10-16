@@ -1250,12 +1250,15 @@ assert.match(elem('agents').innerHTML,/phase-4/);
   assert.match(elem('dbody').innerHTML,/Proposed steps \(4\)/);
   assert.match(elem('dbody').innerHTML,/Edit proposed TOML/);
   assert.match(elem('dbody').innerHTML,/data-action="run"/);
-  assert.deepEqual(seen,['/api/requests/'+id]);
+  // one extra read-only call: the merge-target field's branch list for
+  // the request's selected project - still no write/launch traffic
+  assert.deepEqual(seen,['/api/requests/'+id,'/api/projects/p/branches']);
   vm.runInContext('openNew()',ctx);
   assert.match(elem('dbody').innerHTML,/Save draft/);
   assert.match(elem('dbody').innerHTML,/Generate proposal/);
   assert.doesNotMatch(elem('dbody').innerHTML,/data-action="run"/);
-  assert.deepEqual(seen,['/api/requests/'+id]);
+  // 'Infer from request' has no repo to query - still only the two reads
+  assert.deepEqual(seen,['/api/requests/'+id,'/api/projects/p/branches']);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
@@ -4013,6 +4016,186 @@ prompt = "check the thing"
         self.assertTrue(cfg.merge_resolver)
         self.assertTrue(all(s.worktree for s in cfg.steps))
         self.assertTrue(all(s["wt"] for s in out["proposed_steps"]))
+
+
+class MergeTargetRequestTests(unittest.TestCase):
+    """The request form's merge-target field: validation through git, the
+    Apply path writing it into the TOML (project-scoped per-step keys, or
+    [run] as the inferred-project default), the publish guarantee, and the
+    proposal-time existence check against the resolved repo."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.proj = make_project(self.base)
+        # 'develop' exists; 'ghost' does not
+        main = git(self.proj, "symbolic-ref", "--short",
+                   "HEAD").stdout.strip()
+        git(self.proj, "branch", "develop")
+        self.main = main
+        self.runs = self.base / "runs"
+        self.requests = self.base / "requests"
+        self.manifests = self.base / "manifests"
+        self.manifests.mkdir()
+        patch = mock.patch.object(conductor, "load_projects", return_value={
+            "proj": {"path": self.proj, "cloud_ok": False}})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def proposal(self, extra_steps="", step_extra=""):
+        return f'''[run]
+name = "catalog-cleanup"
+description = "Tidy the catalog"
+on_failure = "continue"
+checkpoint = true
+
+[defaults]
+project = "proj"
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+max_attempts = 3
+
+[[step]]
+name = "organize"
+prompt = "Organize the catalog and verify results."
+{step_extra}{extra_steps}'''
+
+    def ready(self, **fields):
+        rec = conductor.create_request(
+            {"raw": "Please tidy the catalog carefully",
+             "model": "swe-2", "effort": "max", **fields},
+            self.requests, self.runs)
+        return conductor.save_request(
+            rec["id"], {"manifest": self.proposal()},
+            self.requests, self.manifests, self.runs)
+
+    def test_invalid_branch_name_rejected_at_save(self):
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.create_request(
+                {"raw": "x", "project": "proj",
+                 "merge_target": "bad..name"}, self.requests, self.runs)
+        self.assertIn("valid branch name", str(e.exception))
+
+    def test_missing_branch_rejected_when_project_known(self):
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.create_request(
+                {"raw": "x", "project": "proj",
+                 "merge_target": "ghost"}, self.requests, self.runs)
+        msg = str(e.exception)
+        self.assertIn("ghost", msg)
+        self.assertIn("does not exist", msg)
+        self.assertIn("will not fall back", msg)
+
+    def test_inferred_project_defers_existence_to_generation(self):
+        """No project chosen: only the name format is checked at save -
+        existence is per-step at proposal validation, once the resolved
+        repos are known."""
+        rec = conductor.create_request(
+            {"raw": "x", "merge_target": "develop"}, self.requests,
+            self.runs)
+        self.assertEqual(rec["merge_target"], "develop")
+        # a bad NAME still fails even with no project to check against
+        with self.assertRaises(conductor.RequestError):
+            conductor.create_request(
+                {"raw": "y", "merge_target": "bad..name"}, self.requests,
+                self.runs)
+
+    def test_apply_writes_per_step_key_for_selected_project(self):
+        rec = self.ready(project="proj")
+        out = conductor.apply_request(
+            rec["id"], {"merge_target": "develop", "worktrees": True},
+            self.requests, self.manifests, self.runs)
+        cfg = conductor.load_manifest(Path(out["manifest"]))
+        self.assertEqual(cfg.steps[0].merge_target, "develop")
+        text = Path(out["manifest"]).read_text(encoding="utf-8")
+        # the key landed inside [[step]], not as a run-wide default that
+        # would leak into other projects
+        self.assertIn('merge_target = "develop"',
+                      text.split("[[step]]")[1])
+        self.assertNotIn("merge_target", text.split("[run]")[1]
+                                                .split("[")[0])
+
+    def test_apply_writes_run_default_for_inferred_project(self):
+        rec = self.ready()           # no project on the request
+        out = conductor.apply_request(
+            rec["id"], {"merge_target": "develop", "worktrees": True},
+            self.requests, self.manifests, self.runs)
+        text = Path(out["manifest"]).read_text(encoding="utf-8")
+        self.assertIn('merge_target = "develop"',
+                      text.split("[run]")[1].split("[")[0])
+
+    def test_apply_clearing_removes_the_key(self):
+        rec = self.ready(project="proj")
+        out = conductor.apply_request(
+            rec["id"], {"merge_target": "develop", "worktrees": True},
+            self.requests, self.manifests, self.runs)
+        out = conductor.apply_request(
+            rec["id"], {"merge_target": "", "worktrees": True},
+            self.requests, self.manifests, self.runs)
+        self.assertNotIn("merge_target",
+                         Path(out["manifest"]).read_text(encoding="utf-8"))
+
+    def test_merge_target_change_marks_proposal_stale(self):
+        rec = self.ready(project="proj")
+        out = conductor.save_request(
+            rec["id"], {"merge_target": "develop"}, self.requests,
+            self.manifests, self.runs)
+        self.assertTrue(out["stale"])
+
+    def test_guarantee_writes_target_at_publish(self):
+        """The field is a guarantee: a planner/hand-edit that omits the
+        key still gets merge_target on the selected project's worktree
+        steps when the proposal is published."""
+        rec = conductor.create_request(
+            {"raw": "x", "project": "proj", "model": "swe-2",
+             "effort": "max", "worktrees": True,
+             "merge_target": "develop"}, self.requests, self.runs)
+        out = conductor.save_request(
+            rec["id"], {"manifest": self.proposal()},
+            self.requests, self.manifests, self.runs)
+        cfg = conductor.load_manifest(Path(out["manifest"]))
+        self.assertTrue(all(s.worktree for s in cfg.steps))
+        self.assertEqual(cfg.steps[0].merge_target, "develop")
+        self.assertEqual(out["proposed_steps"][0]["mt"], "develop")
+
+    def test_validate_proposal_rejects_missing_target(self):
+        bad = self.proposal(
+            step_extra='worktree = true\nmerge_target = "ghost"\n')
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.validate_proposal(bad, self.manifests)
+        msg = str(e.exception)
+        self.assertIn("ghost", msg)
+        self.assertIn("does not exist", msg)
+        self.assertIn("create the branch", msg)
+
+    def test_validate_proposal_accepts_existing_target(self):
+        good = self.proposal(
+            step_extra='worktree = true\nmerge_target = "develop"\n')
+        cfg = conductor.validate_proposal(good, self.manifests)
+        self.assertEqual(cfg.steps[0].merge_target, "develop")
+
+    def test_branches_endpoint_lists_real_repo_branches(self):
+        handler = conductor.make_dashboard_handler(
+            self.runs, ["no-such-devin"], self.requests, self.manifests)
+        server = conductor.http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port,
+                                          timeout=5)
+        conn.request("GET", "/api/projects/proj/branches", None,
+                     {"Origin": f"http://127.0.0.1:{server.server_port}"})
+        res = conn.getresponse()
+        payload = json.loads(res.read().decode("utf-8"))
+        conn.close()
+        self.assertEqual(res.status, 200)
+        self.assertEqual(payload["current"], self.main)
+        self.assertIn("develop", payload["branches"])
+        self.assertIn(self.main, payload["branches"])
 
 
 class LifecycleDisplayTests(unittest.TestCase):

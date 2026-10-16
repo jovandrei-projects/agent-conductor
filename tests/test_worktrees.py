@@ -16,6 +16,7 @@ The space, roughly:
                                                 conflict+resolver
     lifecycle:    fresh | resume-after-conflict | resume-after-done-unmerged
 """
+import argparse
 import json
 import os
 import shlex
@@ -1165,6 +1166,364 @@ class TimeoutOverrideTests(unittest.TestCase):
             finally:
                 conductor.timeout_flag(rd, "s").unlink(
                     missing_ok=True)
+
+
+def add_branch(proj: Path, name: str, commits: dict[str, str] | None = None):
+    """Create <name> at HEAD with an extra commit, back on the default
+    branch. Returns the default branch's name."""
+    main = git(proj, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    git(proj, "checkout", "-b", name)
+    for f, txt in (commits or {}).items():
+        (proj / f).write_text(txt, encoding="utf-8")
+    git(proj, "add", "-A")
+    git(proj, "commit", "-m", f"on {name}")
+    git(proj, "checkout", main)
+    return main
+
+
+class MergeTargetTests(unittest.TestCase):
+    """merge_target: a worktree step's branch is created from and merged
+    back into an explicitly chosen local branch, not blindly into whatever
+    the checkout has out. A non-default target is merged inside a
+    conductor-owned 'merge worktree' (<step>.merge) so the main checkout's
+    HEAD never moves; the chosen target is recorded in state.json and
+    drives retries, resume and the manual Merge button."""
+
+    def test_merge_lands_on_target_not_checkout(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            main = add_branch(proj, "develop")
+            runs = base / "runs"
+            m = write_manifest(base, wt_steps(
+                proj, [("w1", "write A.txt")],
+                extra='merge_target = "develop"'))
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, rd = state_of(runs)
+            rec = st["steps"]["w1"]
+            self.assertTrue(rec["merged"])
+            # the choice was persisted at materialization, not re-derived
+            self.assertEqual(rec["merge_target"], "develop")
+            # work landed on develop, and ONLY there
+            self.assertEqual(git(proj, "cat-file", "-e",
+                                 "develop:A.txt").returncode, 0)
+            self.assertNotEqual(git(proj, "cat-file", "-e",
+                                    f"{main}:A.txt").returncode, 0)
+            # both the step worktree and the merge worktree are gone;
+            # the checkout never left its branch and no merge is open
+            self.assertFalse(Path(rec["work_dir"]).is_dir())
+            self.assertFalse(conductor.merge_wt_for(
+                Path(rec["work_dir"])).is_dir())
+            self.assertFalse(conductor.merge_in_progress(proj))
+            self.assertEqual(conductor.current_branch(proj), main)
+
+    def test_worktree_baselines_off_target(self):
+        """The branch is cut at refs/heads/<target>: commits the checkout
+        has but the target lacks must NOT leak into the merge."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            main = add_branch(proj, "develop")
+            # master gains a commit develop never saw - a branch cut from
+            # HEAD would carry it into the develop merge.
+            (proj / "MASTERONLY.txt").write_text("x", encoding="utf-8")
+            git(proj, "add", "-A")
+            git(proj, "commit", "-m", "master-side work")
+            runs = base / "runs"
+            m = write_manifest(base, wt_steps(
+                proj, [("w1", "write A.txt")],
+                extra='merge_target = "develop"'))
+            self.assertEqual(run_manifest(m, runs), 0)
+            # develop: has the step's file, does NOT have master's extra
+            self.assertEqual(git(proj, "cat-file", "-e",
+                                 "develop:A.txt").returncode, 0)
+            self.assertNotEqual(git(proj, "cat-file", "-e",
+                                    "develop:MASTERONLY.txt").returncode, 0)
+
+    def test_manifest_requires_worktree_for_step_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            m = write_manifest(base, f'''
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "x"
+merge_target = "develop"
+''')
+            with self.assertRaises(conductor.ManifestError) as e:
+                conductor.load_manifest(m)
+            self.assertIn("worktree", str(e.exception))
+
+    def test_run_level_target_only_defaults_worktree_steps(self):
+        """[run].merge_target is a fallback for worktree steps: a
+        non-worktree step in the same run simply ignores it (there is
+        nothing to merge) instead of erroring the manifest."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            add_branch(proj, "develop")
+            m = write_manifest(base, f'''
+[[step]]
+name = "direct"
+project = "{proj.as_posix()}"
+prompt = "write D.txt"
+
+[[step]]
+name = "iso"
+project = "{proj.as_posix()}"
+prompt = "write E.txt"
+worktree = true
+''', extra='merge_target = "develop"')
+            cfg = conductor.load_manifest(m)
+            steps = {s.name: s for s in cfg.steps}
+            self.assertIsNone(steps["direct"].merge_target)
+            self.assertEqual(steps["iso"].merge_target, "develop")
+            self.assertEqual(cfg.merge_target, "develop")
+            runs = base / "runs"
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, _ = state_of(runs)
+            self.assertTrue(st["steps"]["iso"]["merged"])
+            self.assertEqual(st["steps"]["iso"]["merge_target"], "develop")
+            self.assertEqual(git(proj, "cat-file", "-e",
+                                 "develop:E.txt").returncode, 0)
+
+    def test_missing_target_fails_before_state_exists(self):
+        """A nonexistent target is an actionable manifest error - never a
+        fallback to main, never a created branch."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            m = write_manifest(base, wt_steps(
+                proj, [("w1", "write A.txt")],
+                extra='merge_target = "ghost"'))
+            cfg = conductor.load_manifest(m)   # name/shape is valid TOML
+            self.assertEqual(cfg.steps[0].merge_target, "ghost")
+            for cmd in (lambda: conductor.cmd_plan(argparse.Namespace(
+                            manifest=str(m), devin=MOCK)),
+                        lambda: conductor.cmd_run(argparse.Namespace(
+                            manifest=str(m), resume=None, devin=MOCK,
+                            runs_dir=str(base / "runs"), hub=False,
+                            keep_awake=False))):
+                with self.assertRaises(conductor.ManifestError) as e:
+                    cmd()
+                msg = str(e.exception)
+                self.assertIn("ghost", msg)
+                self.assertIn("does not exist", msg)
+                self.assertIn("will not fall back", msg)
+            self.assertEqual(git(proj, "branch", "--list",
+                                 "ghost").stdout.strip(), "")
+            self.assertFalse((base / "runs").exists())
+
+    def test_target_checked_out_elsewhere_is_refused(self):
+        """A target sitting in a worktree the conductor doesn't own can't
+        be merged into: actionable failure, parked work, no touching the
+        foreign checkout."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            add_branch(proj, "develop")
+            foreign = base / "elsewhere"
+            git(proj, "worktree", "add", str(foreign), "develop")
+            runs = base / "runs"
+            m = write_manifest(base, wt_steps(
+                proj, [("w1", "write A.txt")],
+                extra='merge_target = "develop"'))
+            self.assertEqual(run_manifest(m, runs), 1)
+            st, _ = state_of(runs)
+            rec = st["steps"]["w1"]
+            self.assertEqual(rec["status"], "failed")
+            self.assertFalse(rec["merged"])
+            self.assertIn("checked out", rec.get("note", ""))
+            # step worktree+branch survive for a human; the foreign
+            # checkout's develop did not get the work
+            self.assertTrue(Path(rec["work_dir"]).is_dir())
+            self.assertFalse((foreign / "A.txt").is_file())
+
+    def test_multi_project_distinct_targets(self):
+        """A wave can merge each project into its own target - no global
+        branch name is forced onto unrelated repos."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            pa = make_project(base, "pa")
+            pb = make_project(base, "pb")
+            main_a = add_branch(pa, "dev-a")
+            main_b = add_branch(pb, "dev-b")
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "a1"
+project = "{pa.as_posix()}"
+prompt = "write A.txt"
+wave = 1
+worktree = true
+merge_target = "dev-a"
+
+[[step]]
+name = "b1"
+project = "{pb.as_posix()}"
+prompt = "write B.txt"
+wave = 1
+worktree = true
+merge_target = "dev-b"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, _ = state_of(runs)
+            self.assertEqual(st["steps"]["a1"]["merge_target"], "dev-a")
+            self.assertEqual(st["steps"]["b1"]["merge_target"], "dev-b")
+            self.assertEqual(git(pa, "cat-file", "-e",
+                                 "dev-a:A.txt").returncode, 0)
+            self.assertNotEqual(git(pa, "cat-file", "-e",
+                                    f"{main_a}:A.txt").returncode, 0)
+            self.assertEqual(git(pb, "cat-file", "-e",
+                                 "dev-b:B.txt").returncode, 0)
+            self.assertNotEqual(git(pb, "cat-file", "-e",
+                                    f"{main_b}:B.txt").returncode, 0)
+
+    def _conflict_parked_on_target(self, base: Path):
+        """Two appends to WORK.txt targeting 'develop': p1 merges, p2
+        conflicts and parks. Returns (proj, runs, manifest, run_dir)."""
+        proj = make_project(base)
+        add_branch(proj, "develop")
+        runs = base / "runs"
+        m = write_manifest(base, wt_steps(
+            proj, [("p1", "append to WORK.txt"),
+                   ("p2", "append to WORK.txt")],
+            extra='merge_target = "develop"'),
+            extra='on_failure = "continue"')
+        self.assertEqual(run_manifest(m, runs), 1)
+        st, rd = state_of(runs)
+        p2 = st["steps"]["p2"]
+        self.assertEqual(p2["status"], "failed")
+        self.assertFalse(p2["merged"])
+        self.assertEqual(p2["merge_target"], "develop")
+        # the merge worktree was created and survives for the retry
+        self.assertEqual(Path(p2["merge_dir"]),
+                         conductor.merge_wt_for(Path(p2["work_dir"])))
+        return proj, runs, m, rd
+
+    def _resolve_parked_branch(self, proj: Path, p2: dict):
+        """Make the parked branch mergeable: merge develop into it inside
+        its kept worktree and union-resolve WORK.txt."""
+        wt = Path(p2["work_dir"])
+        git(wt, "merge", "develop")
+        lines = (wt / "WORK.txt").read_text(encoding="utf-8").splitlines()
+        resolved = [l for l in lines
+                    if not l.startswith(("<<<<<<<", "=======", ">>>>>>>"))]
+        (wt / "WORK.txt").write_text("\n".join(sorted(resolved)) + "\n",
+                                   encoding="utf-8")
+        git(wt, "add", "-A")
+        git(wt, "commit", "--no-edit")
+
+    def test_manual_merge_honors_recorded_target(self):
+        """merge_run (the dashboard Merge button) merges the parked branch
+        into its recorded target - develop - not the checkout's branch."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj, runs, _m, rd = self._conflict_parked_on_target(base)
+            st, _ = state_of(runs)
+            main = conductor.current_branch(proj)
+            self._resolve_parked_branch(proj, st["steps"]["p2"])
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], ["p2"])
+            st, _ = state_of(runs)
+            rec = st["steps"]["p2"]
+            self.assertTrue(rec["merged"])
+            lines = git(proj, "show", "develop:WORK.txt").stdout.splitlines()
+            self.assertEqual(len(lines), 2)   # p1 + p2, union-resolved
+            # checkout's own branch got nothing
+            self.assertEqual(git(proj, "show",
+                                 f"{main}:WORK.txt").stdout.strip(), "")
+            # merge worktree cleaned up on success
+            self.assertFalse(conductor.merge_wt_for(
+                Path(rec["work_dir"])).is_dir())
+            self.assertFalse(conductor.merge_in_progress(proj))
+
+    def test_resume_honors_recorded_target(self):
+        """--resume finalizes the parked branch against the recorded
+        target the same way the manual merge does."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj, runs, m, rd = self._conflict_parked_on_target(base)
+            st, _ = state_of(runs)
+            main = conductor.current_branch(proj)
+            self._resolve_parked_branch(proj, st["steps"]["p2"])
+            self.assertEqual(run_manifest(m, runs, resume=str(rd)), 0)
+            st, _ = state_of(runs)
+            self.assertTrue(st["steps"]["p2"]["merged"])
+            lines = git(proj, "show", "develop:WORK.txt").stdout.splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(git(proj, "show",
+                                 f"{main}:WORK.txt").stdout.strip(), "")
+
+    def test_resolver_session_runs_in_merge_worktree(self):
+        """With merge_resolver the resolve-* session is spawned mid-merge
+        inside the merge worktree on the target - the main checkout stays
+        untouched the whole time."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            main = add_branch(proj, "develop")
+            runs = base / "runs"
+            m = write_manifest(base, wt_steps(
+                proj, [("p1", "append to WORK.txt"),
+                       ("p2", "append to WORK.txt")],
+                extra='merge_target = "develop"'),
+                extra='on_failure = "continue"\nmerge_resolver = true')
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, _ = state_of(runs)
+            p2 = st["steps"]["p2"]
+            self.assertTrue(p2["merged"])
+            res = st["steps"]["resolve-p2"]
+            self.assertEqual(res["status"], "done")
+            # the resolver's cwd was the merge worktree on develop, not
+            # the main checkout
+            self.assertEqual(Path(res["work_dir"]),
+                             conductor.merge_wt_for(Path(p2["work_dir"])))
+            lines = git(proj, "show", "develop:WORK.txt").stdout.splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(git(proj, "show",
+                                 f"{main}:WORK.txt").stdout.strip(), "")
+            self.assertFalse(conductor.merge_in_progress(proj))
+            # merge worktree removed once the merge landed
+            self.assertFalse(Path(res["work_dir"]).is_dir())
+
+    def test_backcompat_unset_target_records_checkout_branch(self):
+        """No merge_target anywhere: same behavior as always - merge into
+        the checkout's branch - but the effective choice is now recorded."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            main = conductor.current_branch(proj)
+            runs = base / "runs"
+            m = write_manifest(base, wt_steps(proj, [("w1", "write A.txt")]))
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, _ = state_of(runs)
+            rec = st["steps"]["w1"]
+            self.assertTrue(rec["merged"])
+            self.assertEqual(rec["merge_target"], main)
+            self.assertEqual(git(proj, "cat-file", "-e",
+                                 f"{main}:A.txt").returncode, 0)
+
+    def test_branch_helpers(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            main = add_branch(proj, "develop")
+            self.assertTrue(conductor.branch_name_ok("feature/x.y"))
+            self.assertFalse(conductor.branch_name_ok("bad..name"))
+            self.assertFalse(conductor.branch_name_ok("-sneaky"))
+            self.assertFalse(conductor.branch_name_ok("has space"))
+            self.assertTrue(conductor.local_branch_exists(proj, "develop"))
+            self.assertTrue(conductor.local_branch_exists(proj, main))
+            self.assertFalse(conductor.local_branch_exists(proj, "ghost"))
+            names = conductor.list_local_branches(proj)
+            self.assertIn("develop", names)
+            self.assertIn(main, names)
+            git(proj, "branch", "conductor/2026/x")
+            self.assertNotIn("conductor/2026/x",
+                             conductor.list_local_branches(proj))
+            self.assertEqual(conductor.current_branch(proj), main)
 
 
 if __name__ == "__main__":
