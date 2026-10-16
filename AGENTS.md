@@ -138,8 +138,9 @@ have raced merges and stale-aborts on the same checkout before.
 `worktree = true`, incompatible with `cloud`) separates isolation from
 merging: nothing lands after the wave - branch, worktree, commits and
 verify results stay pending in `state.json`'s `pending_merges` until a
-human runs `python conductor.py merge <run_dir>` or clicks Merge pending
-branches (`{"steps": [...]}` lands a subset). Sequential deferred steps
+human runs `python conductor.py merge <run_dir>` or ticks pending entries
+in the run modal's Pending merges panel (`{"steps": [...]}` lands only
+the ticked subset). Sequential deferred steps
 on one project still see verified predecessors: each branches off the
 run's integration baseline `conductor/<run>/baseline-<slug>`, which
 fast-forwards over a step only after status=done AND a green verify, and
@@ -214,13 +215,20 @@ fields autocomplete from `devin models list` (cached 10min, parsed into
 per-family effort suffixes - an empty effort picks the family's bare
 variant); the fixed fallback list is all you get while logged out.
 Discard removes only an unrun, app-owned proposal and its planned rows.
-The `worktrees`/`merge resolver` checkboxes reach the planner prompt and
-are guaranteed into the TOML at publish (`_guarantee_isolation` - never
-applied to `cloud=true` steps; wave-required members always keep
-`worktree = true`); Review's `Apply` button is the deterministic path -
+The `worktrees`/`merge resolver` checkboxes and the `Merge timing`
+select (auto = merge after each step; deferred = hold everything pending
+for a manual merge) reach the planner prompt and are guaranteed into the
+TOML at publish (`_guarantee_isolation` - never applied to `cloud=true`
+steps; wave-required members always keep `worktree = true`; `deferred`
+implies `worktree = true` on non-cloud steps and writes a per-step
+`merge = "auto"` on cloud steps since deferred+cloud is invalid).
+Picking `deferred` force-checks + greys the worktrees box
+(`syncMergeTiming`), restoring the pre-forced state on revert. Review's
+`Apply` button is the deterministic path -
 `_apply_fields_to_toml` syncs run-level keys + per-step overrides the
 form owns, so an unchecked `worktrees` strips planner-added flags except
-where a same-project wave requires them.
+where a same-project wave requires them, and per-step `merge` keys are
+stripped so `[run] merge` is the sole policy.
 The `Ask me questions` checkbox (`ask`) is a generation-time permission,
 never a TOML key: the planner may answer with `BEGIN_QUESTIONS`/JSON/
 `END_QUESTIONS` instead of a manifest, which parks the request at stage
@@ -310,11 +318,23 @@ from committed state instead of trusting a clean start. `model =
 "adaptive"` is a valid step/planner model - it takes no effort suffix,
 and the export's `agent.model_name` lands in `rec.model_actual` so the
 dashboard shows which real model adaptive picked and prices against it. When a run has unmerged
-`conductor/*` branches a `Merge pending branches` button appears
-(`POST /api/runs/<dir>/merge` -> `merge_run`): it replays the post-wave
-merge loop for parked branches, spawns the `resolve-*` session when the
-manifest opts in, and 409s while any step is live - the fix for "the
-conductor died/conflicted before merging" without `--resume`.
+`conductor/*` branches the run modal shows a **Pending merges** panel:
+deferred `pending_merges` groups per project repo (recorded target
+branch, baseline, stuck/kept-stage/moved residue, live `resolve-*`
+state, repo merge-lock busy flag) plus legacy parked branches, each
+entry tickable with its status/verify/`alternative` kind - alternatives
+are mutually exclusive picks (ticking one unticks its siblings; they are
+never combined silently), unverified deferred entries can't be ticked
+(never auto-merged; merge by hand if wanted). **Merge selected pending
+work** POSTs `{"steps": [...]}` to `/api/runs/<dir>/merge` ->
+`merge_run`, disabled while any step is live or `_MERGE_BUSY` holds the
+run; the modal re-renders on every state poll (selections survive in
+`mergeSel`) so an in-flight merge's progress shows live, and the
+per-bucket result (merged/conflicted/skipped/unverified/verify_failed/
+moved/busy/kept) renders inline. For parked auto-policy branches it
+replays the post-wave merge loop, spawns the `resolve-*` session when
+the manifest opts in - the fix for "the conductor died/conflicted
+before merging" without `--resume`.
 
 Run hygiene keeps the runs table short without touching files: a run
 whose `ended_at` is older than `CONDUCTOR_ARCHIVE_HOURS` (default 48, 0

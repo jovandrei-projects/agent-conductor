@@ -5550,7 +5550,7 @@ def _merge_run(name: str, runs_dir: Path,
 
 def cmd_merge(args: argparse.Namespace) -> int:
     """CLI handle for the explicit merge: land a run's pending branches -
-    the same op the dashboard's 'Merge pending branches' button runs.
+    the same op the dashboard's 'Merge selected pending work' runs.
     For deferred runs this is THE merge: staged, verified, serialized."""
     try:
         out = merge_run(args.run_dir,

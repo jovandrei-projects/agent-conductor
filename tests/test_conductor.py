@@ -4918,6 +4918,11 @@ class PendingMergeViewTests(unittest.TestCase):
                     "repo_dir": str(proj.resolve()), "slug": "proj",
                     "target_branch": "master", "target_sha": "abc",
                     "baseline": "conductor/r1/baseline-proj",
+                    "baseline_stuck": True,
+                    "stage_kept": {"dir": "C:/x/stage-9f", "ref": "s/x",
+                                   "verify_ok": False, "kept_at": "t",
+                                   "reason": "verify"},
+                    "moved_reason": "dirty checkout",
                     "entries": ["a", "alt1", "bad"]}})
             with mock.patch.object(conductor, "refresh_prices"):
                 d = conductor.collect_dashboard(runs, ["no-such-devin"])
@@ -4926,6 +4931,9 @@ class PendingMergeViewTests(unittest.TestCase):
             g = r["pending_merges"][0]
             self.assertEqual(g["slug"], "proj")
             self.assertEqual(g["target"], "master")
+            self.assertTrue(g["baseline_stuck"])
+            self.assertEqual(g["moved_reason"], "dirty checkout")
+            self.assertEqual(g["stage_kept"]["ref"], "s/x")
             self.assertEqual(
                 [e["step"] for e in g["entries"]], ["a", "alt1", "bad"])
             by = {e["step"]: e for e in g["entries"]}
