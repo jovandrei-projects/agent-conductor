@@ -48,6 +48,7 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 RUNS_DIR = DATA_DIR / "runs"
 REQUESTS_DIR = DATA_DIR / "requests"
+ATTACHMENTS_DIR = DATA_DIR / "attachments"
 MANIFESTS_DIR = ROOT / "manifests"
 LOGS_DIR = ROOT / "logs"
 PROJECTS_FILE = ROOT / "projects.toml"
@@ -2586,12 +2587,96 @@ def _save_request(rec: dict, requests_dir: Path) -> None:
     tmp.replace(p)
 
 
+ATTACH_MAX_BYTES = 20 * 1024 * 1024   # clipboard screenshots run MBs
+ATTACH_MAX_PER_REQUEST = 20
+ATTACH_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+# Magic-byte signatures for the formats a browser can paste/drop. The
+# declared Content-Type is never trusted - the bytes decide both the stored
+# extension and the type thumbnails are served with.
+ATTACH_MAGIC = [
+    (b"\x89PNG\r\n\x1a\n", ".png", "image/png"),
+    (b"\xff\xd8\xff", ".jpg", "image/jpeg"),
+    (b"GIF87a", ".gif", "image/gif"),
+    (b"GIF89a", ".gif", "image/gif"),
+    (b"BM", ".bmp", "image/bmp"),
+]
+
+
+def _image_sig(data: bytes) -> tuple[str, str] | None:
+    for magic, ext, ctype in ATTACH_MAGIC:
+        if data.startswith(magic):
+            return ext, ctype
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp", "image/webp"
+    return None
+
+
+def save_attachment(data: bytes,
+                    attachments_dir: Path = ATTACHMENTS_DIR) -> dict:
+    """Persist a pasted/dropped image under data/attachments and return the
+    {name, path} record the request JSON stores. `path` is absolute - it is
+    what lands in the request text and later in step prompts, so it must
+    resolve from any work_dir."""
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        raise RequestError("Empty attachment")
+    if len(data) > ATTACH_MAX_BYTES:
+        raise RequestError(
+            f"Images over {ATTACH_MAX_BYTES // 1048576} MB are not "
+            "supported", 413)
+    sig = _image_sig(bytes(data[:16]))
+    if sig is None:
+        raise RequestError(
+            "Only PNG/JPEG/GIF/WebP/BMP images can be attached", 415)
+    attachments_dir.mkdir(parents=True, exist_ok=True)
+    name = (f"{dt.datetime.now():%Y%m%d-%H%M%S}-{secrets.token_hex(4)}"
+            f"{sig[0]}")
+    p = attachments_dir / name
+    p.write_bytes(bytes(data))
+    return {"name": name, "path": str(p.resolve())}
+
+
+def read_attachment(name: str,
+                    attachments_dir: Path = ATTACHMENTS_DIR
+                    ) -> tuple[bytes, str]:
+    """Serve a saved attachment back to the dashboard for thumbnails. The
+    name regex plus resolved-parent check keep the endpoint inside the
+    attachments dir."""
+    p = attachments_dir / name
+    if not ATTACH_NAME_RE.fullmatch(name) or \
+            p.resolve().parent != attachments_dir.resolve() or \
+            not p.is_file():
+        raise RequestError("Attachment not found", 404)
+    data = p.read_bytes()
+    sig = _image_sig(data[:16])
+    return data, (sig[1] if sig else "application/octet-stream")
+
+
+def _attachment_fields(value) -> list[dict]:
+    """Shape-check the [{name, path}] list the dashboard sends. `name` is
+    the data/attachments basename (it drives the thumbnail URL); `path` is
+    the absolute path inserted into the request text."""
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list) or len(value) > ATTACH_MAX_PER_REQUEST:
+        raise RequestError(
+            f"At most {ATTACH_MAX_PER_REQUEST} attachments per request")
+    out = []
+    for a in value:
+        if not isinstance(a, dict):
+            raise RequestError("Invalid attachment")
+        name, path = str(a.get("name") or ""), str(a.get("path") or "")
+        if not ATTACH_NAME_RE.fullmatch(name) or not 1 <= len(path) <= 600:
+            raise RequestError("Invalid attachment")
+        out.append({"name": name, "path": path})
+    return out
+
+
 def _request_fields(payload: dict, rec: dict | None = None) -> dict:
     if not isinstance(payload, dict) or set(payload) - {
             "raw", "label", "project", "model", "effort", "manifest",
             "followup", "on_failure", "max_attempts",
             "plan_model", "plan_effort",
-            "worktrees", "merge_resolver", "ask"}:
+            "worktrees", "merge_resolver", "ask", "attachments"}:
         raise RequestError("Invalid request fields")
     model, effort = default_model_effort()
     fields = {k: (rec or {}).get(k, v) for k, v in (
@@ -2637,6 +2722,9 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
         if fields[mk] == "swe-2" and fields[ek] not in {
                 "medium", "high", "max"}:
             raise RequestError("SWE-2 supports medium, high or max effort")
+    fields["attachments"] = _attachment_fields(
+        payload["attachments"] if "attachments" in payload
+        else (rec or {}).get("attachments"))
     fields["label"] = fields["label"] or " ".join(fields["raw"].split())[:80]
     return fields
 
@@ -2997,7 +3085,8 @@ def save_request(request_id: str, payload: dict,
         changed = any(fields[k] != rec.get(k) for k in
                       ("raw", "project", "model", "effort", "followup",
                        "worktrees", "merge_resolver",
-                       "on_failure", "max_attempts"))
+                       "on_failure", "max_attempts")) \
+            or fields["attachments"] != (rec.get("attachments") or [])
         raw_moved = (fields["raw"] != rec.get("raw")
                      or fields["project"] != rec.get("project"))
         rec.update(fields)
@@ -3181,6 +3270,15 @@ def _planner_response(rec: dict, projects: dict,
             "choices may apply at once. The human can always skip a "
             "question or write their own answer, so never ask what you can "
             "reasonably decide yourself.\n\n")
+    attach_block = ""
+    if rec.get("attachments"):
+        attach_block = (
+            "IMAGE ATTACHMENTS - the human attached these images to the "
+            "request (absolute paths saved under data/attachments). Read an "
+            "image when the request depends on what it shows, and pass the "
+            "path through to the prompt of any step that needs it:\n"
+            + "".join(f"- {a.get('path')}\n" for a in rec["attachments"])
+            + "\n")
     qa_block = ""
     if qa:
         lines = []
@@ -3236,7 +3334,7 @@ Windows paths belong in TOML literal strings (single quotes) or use forward
 slashes - a backslash inside a double-quoted string is a TOML escape and
 breaks parsing.
 {followup}
-{isolate}{ask_block}{fix}HUMAN REQUEST:
+{isolate}{ask_block}{attach_block}{fix}HUMAN REQUEST:
 {rec['raw']}
 {qa_block}
 
@@ -4978,6 +5076,14 @@ a { color:#58a6ff; text-decoration:none; }
 .btn:disabled { cursor:not-allowed; opacity:.45; }
 #detail label { display:block; color:#8b949e; margin:12px 0 5px; }
 #detail input, #detail textarea, #detail select { box-sizing:border-box; width:100%; padding:8px 10px; border:1px solid #30363d; border-radius:6px; background:#0d1117; color:#e6edf3; font:inherit; }
+/* image attachments on the request form: a thumbnail strip under the
+   request textarea, fed by drop/paste (saved to data/attachments) */
+.attach-strip { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+.attach-item { position:relative; width:104px; height:70px; border:1px solid #30363d; border-radius:6px; overflow:hidden; background:#0d1117; }
+.attach-item img { width:100%; height:100%; object-fit:cover; display:block; }
+.attach-x { position:absolute; top:2px; right:2px; width:20px; height:20px; border-radius:50%; border:1px solid #30363d; background:rgba(13,17,23,.9); color:#ffb2aa; cursor:pointer; font-size:14px; line-height:1; padding:0; }
+.attach-x:hover { border-color:#9f3535; }
+#detail textarea.drop { border-color:#58a6ff; }
 #detail label.check { display:flex; align-items:flex-start; gap:8px; margin:12px 0 4px; font-size:13px; cursor:pointer; }
 #detail label.check input[type=checkbox] { width:auto; margin-top:2px; }
 #detail textarea { min-height:145px; resize:vertical; }
@@ -5163,6 +5269,7 @@ let detailKey = null;       // run_dir|step of the open agent modal - the
 let modalRequest = null;
 let modalQA = null;         // {id, rec, sel:Set, free:''} while the planner
                             // questionnaire modal is open
+let rqAttachments = [];     // [{name,path}] on the open request form
 const qDismissed = new Set();   // request|qids sigs the human closed - the
                               // auto-popup never re-nags for the same set
 const promptDrafts = {};    // key -> unsaved 'Edit prompt' text
@@ -5446,6 +5553,7 @@ function openNew(){
 function showRequestForm(rec){
   const stage=rec.status, editable=!['generating','launching','launched'].includes(stage);
   const disabled=editable?'':' disabled';
+  rqAttachments=Array.isArray(rec.attachments)?rec.attachments.slice():[];
   const choices=lastData?.project_options||[];
   const projectOptions=`<option value="">Infer from request</option>` +
     choices.map(p=>`<option value="${esc(p.slug)}"${p.slug===rec.project?' selected':''}>` +
@@ -5518,6 +5626,12 @@ function showRequestForm(rec){
       `value="${esc(rec.max_attempts??3)}"${disabled}></div><div></div></div>` +
     `<label for="rq-raw">Your request</label><textarea id="rq-raw"${disabled} ` +
     `placeholder="Describe the work in your own words…">${esc(rec.raw||'')}</textarea>` +
+    `<div id="rq-attach" class="attach-strip" hidden></div>` +
+    (editable?`<div class="sub">Attach images by dropping image files ` +
+      `anywhere on this dialog or pasting a screenshot - each is saved ` +
+      `under data/attachments and its path is inserted into the request. ` +
+      `Remove one with its &times; any time before generating or ` +
+      `starting.</div>`:'') +
     `<label class="check"><input type="checkbox" id="rq-followup"` +
       `${rec.followup?' checked':''}${disabled}><span>End the run with a ` +
       `planning step that drafts a follow-up manifest into manifests/ ` +
@@ -5588,9 +5702,69 @@ function showRequestForm(rec){
       `data-run-details="request:${esc(rec.id)}">View run details</button>`:'') +
     `</div>`;
   document.getElementById('backdrop').hidden = false;
+  renderAttach(editable);
   syncEffort(document.getElementById('rq-model'),'rq-effort','rq-efforts');
   syncEffort(document.getElementById('rq-plan_model'),
              'rq-plan_effort','rq-plan_efforts');
+}
+// --- request image attachments -----------------------------------------
+// Thumbnail strip under 'Your request' fed by file drops and clipboard
+// pastes: each image uploads to POST /api/attachments (saved under
+// data/attachments) and its absolute path lands in the text at the caret.
+// The [{name,path}] list persists on the request JSON - chips are
+// removable until the request reaches a non-editable stage.
+function renderAttach(editable){
+  const strip=document.getElementById('rq-attach');
+  if(!strip) return;
+  strip.innerHTML=rqAttachments.map(a=>
+    `<span class="attach-item"><a href="/api/attachments/` +
+    `${encodeURIComponent(a.name)}" target="_blank" ` +
+    `title="${esc(a.path)}"><img src="/api/attachments/` +
+    `${encodeURIComponent(a.name)}" alt="${esc(a.name)}"></a>` +
+    (editable?`<button type="button" class="attach-x" ` +
+      `data-attach-rm="${esc(a.name)}" title="Remove this attachment">` +
+      `\u00d7</button>`:'') +
+    `</span>`).join('');
+  strip.hidden=!rqAttachments.length;
+}
+// The editable request textarea gates every drop/paste listener - other
+// modals (agent detail, questionnaire) reuse the same backdrop, so a bare
+// document-level bind must bail when rq-raw is absent or disabled.
+function attachTarget(){
+  const ta=document.getElementById('rq-raw');
+  return (ta && !ta.disabled && !modalQA) ? ta : null;
+}
+function insertAtCaret(ta,text){
+  // NL via charCode: a backslash-n written into this Python string would
+  // arrive in the browser as a real newline mid-literal - trap 16.
+  const NL=String.fromCharCode(10);
+  const s=ta.selectionStart==null?ta.value.length:ta.selectionStart;
+  const e=ta.selectionEnd==null?s:ta.selectionEnd;
+  const before=ta.value.slice(0,s), after=ta.value.slice(e);
+  const pad=(before && !before.endsWith(NL)?NL:'') + text + NL +
+    (after && !after.startsWith(NL)?NL:'');
+  ta.value=before+pad+after;
+  ta.selectionStart=ta.selectionEnd=before.length+pad.length;
+}
+async function attachFiles(files){
+  const ta=attachTarget();
+  if(!ta || !files) return;
+  const imgs=[...files].filter(f=>(f.type||'').startsWith('image/'));
+  if(!imgs.length){ formError('Only image files can be attached.'); return; }
+  for (const f of imgs){
+    try {
+      const res=await fetch('/api/attachments',{method:'POST',
+        headers:{'Content-Type':f.type||'application/octet-stream'},
+        body:f});
+      const out=await res.json().catch(()=>({}));
+      if(!res.ok) throw new Error(out.error||('HTTP '+res.status));
+      if(!rqAttachments.some(x=>x.name===out.name)) rqAttachments.push(out);
+      renderAttach(true);
+      insertAtCaret(ta,out.path);
+      if(modalRequest) modalRequest.dirty=true;
+      try{ta.dispatchEvent(new Event('input',{bubbles:true}));}catch(e){}
+    } catch(err){ formError('Attach failed: '+err.message); }
+  }
 }
 async function openRequest(id){
   if (!closeDetail()) return;
@@ -5621,6 +5795,7 @@ function requestFields(){
   }
   const att=document.getElementById('rq-attempts');
   if (att) f.max_attempts=att.value;
+  f.attachments=rqAttachments.map(a=>({name:a.name,path:a.path}));
   return f;
 }
 function formError(message){
@@ -6102,6 +6277,14 @@ document.addEventListener('click', async e=>{
   const openQEl = t.closest && t.closest('[data-open-questions]');
   if (openQEl){
     await openQuestions(openQEl.dataset.openQuestions); return; }
+  const rmAtt = t.closest && t.closest('[data-attach-rm]');
+  if (rmAtt){
+    e.preventDefault();
+    rqAttachments=rqAttachments.filter(
+      a=>a.name!==rmAtt.dataset.attachRm);
+    renderAttach(true);
+    if (modalRequest) modalRequest.dirty=true;
+    return; }
   if (modalQA && t.dataset && t.dataset.qopt!==undefined){
     // toggle a suggested option - single-select replaces, multi toggles;
     // re-clicking the sole pick deselects it
@@ -6392,6 +6575,33 @@ document.addEventListener('input', e=>{
                  e.target.id==='rq-model'?'rq-efforts':'rq-plan_efforts');
   }
 });
+// attachment drop/paste: bound once at document level (the modal's
+// innerHTML is rebuilt per open, element listeners would stack or die);
+// attachTarget() limits them to an editable request form.
+document.addEventListener('dragover', e=>{
+  const ta=attachTarget(); if(!ta) return;
+  if(e.dataTransfer && [...(e.dataTransfer.types||[])].includes('Files')){
+    e.preventDefault(); ta.classList.add('drop'); }
+});
+document.addEventListener('dragleave', ()=>{
+  const ta=document.getElementById('rq-raw');
+  if(ta) ta.classList.remove('drop');
+});
+document.addEventListener('drop', e=>{
+  const ta=attachTarget();
+  if(ta) ta.classList.remove('drop');
+  if(!ta || !e.dataTransfer) return;
+  const files=e.dataTransfer.files;
+  if(files && files.length){ e.preventDefault(); attachFiles(files); }
+});
+document.addEventListener('paste', e=>{
+  const ta=attachTarget(); if(!ta) return;
+  const items=[...(e.clipboardData?e.clipboardData.items||[]:[])];
+  const files=items
+    .filter(i=>i.kind==='file'&&(i.type||'').startsWith('image/'))
+    .map(i=>i.getAsFile()).filter(Boolean);
+  if(files.length){ e.preventDefault(); attachFiles(files); }
+});
 document.addEventListener('keydown', e=>{
   if (e.key==='Enter' && modalQA && e.target.id==='q-free'){
     e.preventDefault();
@@ -6438,8 +6648,10 @@ tick();
 
 def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                            requests_dir: Path | None = None,
-                           manifests_dir: Path = MANIFESTS_DIR):
+                           manifests_dir: Path = MANIFESTS_DIR,
+                           attachments_dir: Path | None = None):
     requests_dir = requests_dir or runs_dir.parent / "requests"
+    attachments_dir = attachments_dir or runs_dir.parent / "attachments"
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def _send(self, body: bytes, ctype: str, status: int = 200) -> None:
@@ -6501,6 +6713,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     if rec["status"] == "discarded":
                         raise RequestError("Request was discarded", 404)
                     self._json(rec)
+                elif (m := re.fullmatch(r"/api/attachments/([^/]+)", path)):
+                    data, ctype = read_attachment(
+                        urllib.parse.unquote(m[1]), attachments_dir)
+                    self._send(data, ctype)
                 elif path in ("/", "/index.html"):
                     self._send(_DASH_HTML.encode("utf-8"),
                                "text/html; charset=utf-8")
@@ -6516,6 +6732,23 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
             path = urllib.parse.urlsplit(self.path).path
             try:
                 self._check_origin()
+                if path == "/api/attachments":
+                    # Raw image bytes (screenshot paste / file drop), NOT the
+                    # JSON envelope _body() expects. data/attachments can sit
+                    # inside a self-hosted run's watched cwd, so uploads take
+                    # the same trap-5 guard as request writes.
+                    try:
+                        size = int(
+                            self.headers.get("Content-Length") or 0)
+                    except ValueError:
+                        raise RequestError("Missing image body") from None
+                    if not 0 < size <= ATTACH_MAX_BYTES:
+                        raise RequestError(
+                            "Image body is too large or empty", 413)
+                    _assert_unwatched(runs_dir, attachments_dir)
+                    self._json(save_attachment(self.rfile.read(size),
+                                               attachments_dir), 201)
+                    return
                 body = self._body()
                 if path == "/api/requests":
                     self._json(create_request(body, requests_dir, runs_dir), 201)
