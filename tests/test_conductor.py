@@ -1883,6 +1883,46 @@ prompt = "Report the outcome."
         self.assertEqual(check["task"], "Check the catalog.")
         self.assertEqual(len(d["agents"]), 4)
 
+    def test_agents_carry_pipeline_seq_for_task_modal_nav(self):
+        """`seq` is the manifest's step order - the pipeline the task
+        modal's prev/next walks. A recorded step the manifest no longer
+        names falls back to record order after it."""
+        rec = conductor.save_request(
+            self.new()["id"],
+            {"manifest": self.proposal(extra_steps='''
+[[step]]
+name = "check"
+prompt = "Check the catalog."
+
+[[step]]
+name = "polish"
+prompt = "Polish the catalog."
+''')}, self.requests, self.manifests, self.runs)
+        # proposal previews get seq = proposed_steps order too
+        d0 = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                         self.requests)
+        plan = {a["step"]: a["seq"] for a in d0["agents"]}
+        self.assertEqual(plan, {"organize": 0, "check": 1, "polish": 2})
+        rd = self.runs / "20261015-000000-catalog-cleanup"
+        rd.mkdir(parents=True)
+        state = {"run": rec["run"], "request_id": rec["id"],
+                 "manifest": rec["manifest"], "run_dir": str(rd),
+                 "started_at": conductor.now_iso(), "steps": {
+                     "polish": {"name": "polish", "slug": "proj",
+                                "status": "done",
+                                "work_dir": str(self.proj)},
+                     "extra": {"name": "extra", "slug": "proj",
+                               "status": "failed",
+                               "work_dir": str(self.proj)}}}
+        (rd / "state.json").write_text(json.dumps(state))
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        seq = {a["step"]: a["seq"] for a in d["agents"]}
+        # pending rows keep manifest positions; 'extra' ran but is not in
+        # the manifest, so it sorts after the declared pipeline
+        self.assertEqual(seq, {"organize": 0, "check": 1, "polish": 2,
+                               "extra": 3})
+
     def test_launch_explicitly_passes_request_id_and_real_run_replaces_plan(self):
         rec = self.ready()
         with mock.patch.object(conductor, "_launch_process", return_value=42) as start:
@@ -2638,6 +2678,76 @@ const btn={dataset:{runDetails:'/paused'}}, btn2={dataset:{runDetails:'/healed'}
     closest:sel=>sel==='[data-run-details]'?btn2:null,
     preventDefault:()=>{}}});
   assert.doesNotMatch(elem('dbody').innerHTML,/Paused by user/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_task_modal_prev_next_pipeline_nav(self):
+        """The task modal's sticky bar walks the run's pipeline (`seq` =
+        manifest order, not the time-sorted table): prev/next buttons
+        name their target, 'task N of M' gives position, and
+        ArrowLeft/ArrowRight do the same walk. Single-step pipelines and
+        seq-less rows (the planner) get no bar."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,
+  {innerHTML:'',hidden:true,textContent:'',scrollTop:9});
+  return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+// AGENTS arrive time-sorted desc - seq (pipeline order), not row order,
+// defines the walk: s1 -> s2 -> s3 inside run /r.
+const data={serve_boot:'b',generated_at:'2026-10-14T00:00:00',agents:[
+  {step:'s1',run:'r',run_dir:'/r',run_key:'/r',slug:'p',status:'done',task:'t1',seq:0},
+  {step:'s3',run:'r',run_dir:'/r',run_key:'/r',slug:'p',status:'done',task:'t3',seq:2},
+  {step:'s2',run:'r',run_dir:'/r',run_key:'/r',slug:'p',status:'done',task:'t2',seq:1},
+  {step:'other',run:'r2',run_dir:'/r2',run_key:'/r2',slug:'q',status:'done',task:'tx',seq:0},
+  {step:'plan-proposal',run:'req',run_key:'request:x',slug:'p',status:'running',task:'planner'}],
+  runs:[{run:'r',dir:'/r',key:'/r',counts:{done:3}},
+        {run:'r2',dir:'/r2',key:'/r2',counts:{done:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const click=async t=>handlers.click({target:t,preventDefault:()=>{}});
+const key=async k=>handlers.keydown({key:k,target:{},preventDefault:()=>{}});
+const open=step=>vm.runInContext(
+  'showDetail(AGENTS.findIndex(a=>a.step==='+JSON.stringify(step)+'))',ctx);
+(async()=>{
+  await open('s2');                    // middle of the pipeline
+  let body=elem('dbody').innerHTML;
+  assert.match(body,/p \/ s2/);
+  assert.match(body,/task 2 of 3/);
+  assert.match(body,/data-nav="\/r\|s1"/);   // prev names its target
+  assert.match(body,/data-nav="\/r\|s3"/);   // next names its target
+  // clicking prev jumps to s1 - first position disables the prev arrow
+  await click({dataset:{},closest:sel=>sel==='[data-nav]'
+    ?{dataset:{nav:'/r|s1'}}:null});
+  body=elem('dbody').innerHTML;
+  assert.match(body,/p \/ s1/);
+  assert.match(body,/task 1 of 3/);
+  assert.match(body,/class="dnav-btn" disabled>/);
+  assert.equal(elem('detail').scrollTop,0);  // nav lands at the task top
+  // arrow keys walk the same chain: Right, Right, Right (clamps), Left
+  await key('ArrowRight'); assert.match(elem('dbody').innerHTML,/p \/ s2/);
+  await key('ArrowRight'); assert.match(elem('dbody').innerHTML,/task 3 of 3/);
+  await key('ArrowRight'); assert.match(elem('dbody').innerHTML,/task 3 of 3/);
+  await key('ArrowLeft');  assert.match(elem('dbody').innerHTML,/task 2 of 3/);
+  // a single-step pipeline gets no bar, and neither does the seq-less
+  // planner row (it shares a run_key with its planned steps but is not
+  // a pipeline task)
+  await open('other');
+  assert.doesNotMatch(elem('dbody').innerHTML,/class="dnav"/);
+  await open('plan-proposal');
+  assert.doesNotMatch(elem('dbody').innerHTML,/class="dnav"/);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
