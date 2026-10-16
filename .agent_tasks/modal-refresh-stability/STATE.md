@@ -9,6 +9,9 @@ when the same task repaints on background refreshes.
 DONE - fix landed, verified in real Chromium + node harness, 331/331
 tests + demo green, committed on branch
 conductor/20261016-100852-run-review-ux/modal-refresh-stability.
+Merged to master via resolve-merge session (merge 8cb3988; seq-guard
+refresh() rerouted through HEAD's stateUrl() so the trash=1 param
+survives; 351/351 tests green post-merge).
 
 ## Root cause (measured, scratch/probe_scroll.py + probe_mech.py)
 
