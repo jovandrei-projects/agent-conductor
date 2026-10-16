@@ -1088,6 +1088,145 @@ def cached_arc(path) -> dict | None:
     return arc
 
 
+def _fmtK(n: int) -> str:
+    """Python twin of the dashboard's fmtK: 10754521 -> 10.8M."""
+    if n >= 1_000_000:
+        s, u = f"{n / 1_000_000:.1f}", "M"
+    elif n >= 1000:
+        s, u = f"{n / 1000:.1f}", "k"
+    else:
+        return str(n)
+    return s.rstrip("0").rstrip(".") + u
+
+
+def _branch_commits(repo: str | None, branch: str | None) -> list[str]:
+    """`git log --oneline <default>..<branch>` for a step's branch -
+    best effort: gone branch or deleted worktree just yields no section."""
+    if not repo or not branch:
+        return []
+    for base in ("master", "main"):
+        try:
+            r = subprocess.run(
+                ["git", "-C", repo, "log", "--oneline",
+                 f"{base}..{branch}"],
+                capture_output=True, text=True, timeout=15,
+                **hidden_subprocess_kwargs())
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if r.returncode == 0:
+            return [ln for ln in r.stdout.splitlines() if ln.strip()]
+    return []
+
+
+def step_summary_md(rec: dict, st: dict, run_name: str) -> str:
+    """Human-readable end-of-step report - the modal's 'Session summary'
+    link. Built on demand from state.json + the cached ATIF arc, so it
+    works retroactively for runs that predate the artifact."""
+    name = rec.get("name") or "-"
+    t = rec.get("tokens") or {}
+    prompt_t = t.get("prompt") or 0
+    cached_t = t.get("cached") or 0
+    out_t = t.get("completion") or 0
+    billed = max(0, prompt_t - cached_t)
+    span = rec.get("elapsed_s")
+    el = (f"{int(span // 60)}m{int(span % 60):02d}s"
+          if isinstance(span, (int, float)) else "-")
+    est = estimate_cost(t, rec.get("model"), rec.get("effort"),
+                        price_table(), rec.get("model_actual"))
+    cost_s = (f"${est['usd']:.3f}" if est and est.get("usd") is not None
+              else "unpriced")
+    status = rec.get("status") or "?"
+    verify = rec.get("verify_ok")
+    verify_s = ("pass" if verify is True else "fail" if verify is False
+                else "n/a")
+    branch = rec.get("branch")
+    merged = rec.get("merged")
+    branch_s = ""
+    if branch:
+        branch_s = f"`{branch}` - " + (
+            "merged" if merged else "unmerged, kept at "
+            f"`{rec.get('work_dir') or rec.get('project')}`")
+    L = [f"# {run_name} / {name}", ""]
+    L += [
+        f"- **status:** {status} · **verify:** {verify_s} · "
+        f"**exit:** {rec.get('exit_code', '-')}",
+        f"- **started:** {rec.get('started_at') or '-'} · "
+        f"**ended:** {rec.get('ended_at') or '-'} · **elapsed:** {el}",
+        f"- **model:** {rec.get('model_actual') or rec.get('model') or '-'}"
+        f" (effort {rec.get('effort') or '-'}) · "
+        f"**mode:** {rec.get('mode') or '-'} · "
+        f"**attempts:** {rec.get('attempts', 1)}/"
+        f"{rec.get('max_attempts', 1)}",
+        f"- **session:** {rec.get('session_id') or '-'}",
+        f"- **tokens:** billed in {_fmtK(billed)} · out {_fmtK(out_t)} · "
+        f"cached {_fmtK(cached_t)} · {t.get('llm_steps') or 0} turns · "
+        f"est {cost_s} (full prompt sum {_fmtK(prompt_t)})",
+    ]
+    if branch_s:
+        L.append(f"- **branch:** {branch_s}")
+    if rec.get("note"):
+        L.append(f"- **note:** {rec['note']}")
+    if rec.get("next"):
+        L.append(f"- **worker says next:** {rec['next']}")
+    L.append("")
+    if rec.get("task"):
+        L += ["## Task", "", rec["task"], ""]
+    arc = cached_arc(rec.get("export"))
+    if arc and arc.get("groups"):
+        L += [f"## Trajectory ({arc['steps']} turns, times UTC)", ""]
+        for g in arc["groups"]:
+            bits = [f"`{g['span']}` **{g['phase']}**"]
+            t0, t1 = g.get("t0"), g.get("t1")
+            if t0:
+                bits.append(str(t0)[11:19] +
+                            (f"-{str(t1)[11:19]}" if t1 and t1 != t0
+                             else ""))
+            if g["n"] > 1:
+                bits.append(f"{g['n']} turns")
+            if g.get("tin") or g.get("tout"):
+                billed_g = max(0, (g["tin"] or 0) - (g["tcached"] or 0))
+                bits.append(f"in {_fmtK(billed_g)} · out "
+                            f"{_fmtK(g['tout'] or 0)} · cached "
+                            f"{_fmtK(g['tcached'] or 0)}")
+            head = (g.get("head") or "").strip()
+            L.append("- " + " · ".join(bits) +
+                     (f" — {head[:110]}" if head else ""))
+        L.append("")
+    commits = _branch_commits(rec.get("project") or rec.get("work_dir"),
+                              branch)
+    if commits:
+        L += [f"## Commits ({len(commits)})", ""]
+        L += [f"- {c}" for c in commits]
+        L.append("")
+    tail = stdout_tail(rec.get("stdout_log"), 15)
+    if tail:
+        L += ["## stdout tail", "", "```", tail, "```", ""]
+    return "\n".join(L)
+
+
+def step_summary(run_name: str, step_name: str,
+                 runs_dir: Path = RUNS_DIR) -> str:
+    """GET /api/runs/<run>/steps/<step>/summary - render the report and,
+    once the step is no longer live, persist it as <step>.summary.md in
+    the run dir. Writing while a worker runs could trip user-edit
+    awareness on self-hosted runs (trap 5), so live steps serve a fresh
+    render without touching disk."""
+    if not RUN_DIR_RE.fullmatch(step_name):
+        raise RequestError("Invalid step name", 404)
+    d, st = _run_dir_checked(run_name, runs_dir)
+    rec = (st.get("steps") or {}).get(step_name)
+    if rec is None:
+        raise RequestError("Step not in this run", 404)
+    md = step_summary_md({**rec, "name": rec.get("name") or step_name},
+                         st, run_name)
+    if rec.get("status") not in ("running", "queued"):
+        try:
+            (d / f"{step_name}.summary.md").write_text(md, encoding="utf-8")
+        except OSError:
+            pass
+    return md
+
+
 def _merge_tokens(acc: dict[str, int], tok: dict | None) -> dict:
     for k, v in (tok or {}).items():
         if isinstance(v, (int, float)):
@@ -4970,7 +5109,7 @@ button.chip:focus-visible, button:focus-visible, tr.runrow:focus-visible { outli
 /* compact density: one line per row - wrap cells ellipsize, sub-lines
    (dir path, plan tokens) hide */
 body.compact td { padding-top:2px; padding-bottom:2px; }
-body.compact td.wrap, body.compact td.step, body.compact td.res {
+body.compact td.wrap, body.compact td.res {
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 body.compact td .sub { display:none; }
 body.compact td br { display:none; }
@@ -5219,12 +5358,12 @@ let AGENTS = [];          // last payload, for the detail modal
 // column layout shared by every per-project table (fixed layout -> the
 // same widths line up across tables)
 const AGENT_COLS = '<colgroup>' +
-  '<col style="width:8%"><col style="width:14%">' +
-  '<col style="width:8%"><col class="hide-s" style="width:8%">' +
-  '<col class="hide-s" style="width:5%"><col class="hide-s" style="width:6%">' +
+  '<col style="width:8%"><col style="width:20%">' +
+  '<col style="width:8%"><col class="hide-s" style="width:6%">' +
+  '<col class="hide-s" style="width:5%"><col class="hide-s" style="width:5%">' +
   '<col style="width:6%"><col style="width:6%">' +
-  '<col class="hide-s" style="width:11%"><col class="hide-s" style="width:5%">' +
-  '<col style="width:6%"><col class="hide-s" style="width:7%">' +
+  '<col class="hide-s" style="width:10%"><col class="hide-s" style="width:5%">' +
+  '<col style="width:6%"><col class="hide-s" style="width:5%">' +
   '<col style="width:10%">' +
   '</colgroup>';
 
@@ -5292,7 +5431,15 @@ function showDetail(i){
       (k==='tokens'?tokenHelp:'') + '</div>').join('') +
     `</div>` +
     (a.run_dir
-      ? ((a.status==='running'
+      ? (`<div class="actions"><a class="btn secondary" target="_blank" ` +
+        `href="/api/runs/${encodeURIComponent(base(a.run_dir))}/steps/` +
+        `${encodeURIComponent(a.step)}/summary" title="human-readable ` +
+        `end-of-step report, generated from the ATIF export - also saved ` +
+        `as <step>.summary.md in the run dir once the step ends">` +
+        `Session summary ↗</a><span class="sub" style="margin-left:10px">` +
+        `status, elapsed, tokens, trajectory, commits, stdout tail - ` +
+        `readable markdown instead of a raw log.</span></div>` +
+        (a.status==='running'
           ? `<div class="actions"><button type="button" class="btn danger" ` +
             `data-stop-agent="${esc(base(a.run_dir))}" ` +
             `data-step="${esc(a.step)}" ` +
@@ -6107,8 +6254,7 @@ function render(d){
         (a.timeout_ext_s ? `<span class="sub" title="stayed active ` +
           `${fmtS(a.timeout_ext_s)} past the timeout floor"> +ext</span>`
           : '') + `</td>` +
-        `<td class="step"><span ` +
-        `style="white-space:nowrap">${esc(a.step)}</span>${a.wt
+        `<td class="step"><span>${esc(a.step)}</span>${a.wt
           ? ` <button type="button" class="chip" data-facet="wt" ` +
             `style="color:#58a6ff" title="${esc(a.branch||'worktree')}">wt</button>` +
             (a.merged===true
@@ -6594,6 +6740,11 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     if rec["status"] == "discarded":
                         raise RequestError("Request was discarded", 404)
                     self._json(rec)
+                elif (m := re.fullmatch(
+                        r"/api/runs/([^/]+)/steps/([^/]+)/summary", path)):
+                    self._send(step_summary(m.group(1), m.group(2),
+                                            runs_dir).encode("utf-8"),
+                               "text/plain; charset=utf-8")
                 elif path in ("/", "/index.html"):
                     self._send(_DASH_HTML.encode("utf-8"),
                                "text/html; charset=utf-8")
