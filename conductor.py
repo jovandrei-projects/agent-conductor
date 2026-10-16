@@ -219,6 +219,23 @@ commands, and never reboot, `emu kill`, taskkill or otherwise stop ANY \
 emulator or device, not even this one: the conductor owns the lifecycle \
 and tears down what it booted. If the device becomes unusable mid-step, \
 finish with STATUS: blocked and say so - do not requisition another.
+
+If your work intentionally restarts or reloads a WebView app, its \
+unsaved-changes guard may surface a NATIVE 'Confirm Navigation' dialog \
+(Leave this Page / Stay on this Page) that CDP/JS cannot answer - the \
+navigation never completes and every automation call behind it waits \
+forever (this has already burned a real step). Do not leave it hanging \
+and never accept it blindly: use the conductor helper `python {helper}` \
+instead - `{helper_name} relaunch <pkg>` does a process restart the \
+dialog cannot block (it settles first so completed saves flush; in-memory \
+unsaved state is lost, so only when that state is disposable), and \
+`{helper_name} confirm-navigation --pkg <pkg> --leave` answers the known \
+dialog after an in-page reload - `--leave` asserts the dirty state is \
+your own disposable test data or already saved. With no decision flag it \
+refuses rather than guess, and unexpected dialogs fail with a captured \
+uiautomator/screenshot diagnosis - nothing is ever auto-accepted. Every \
+call is scoped to `{serial}` and bounded; a bare `location.reload()` on \
+a possibly-dirty page without this helper is the trap.
 """
 
 # Closing review step appended when a request's follow-up checkbox is set -
@@ -3441,8 +3458,15 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         if not isinstance(got, _DeviceLease):
             return got                # 'skipped'/'blocked' already recorded
         device_lease = got
-    device_note = (DEVICE_NOTE.format(serial=device_lease.serial)
-                   if device_lease else "")
+    # The device note hands the worker the relaunch/dialog helper that
+    # ships next to this script - a worktree checkout points at its own
+    # copy, and the path is absolute so it works from the project cwd.
+    helper_path = Path(__file__).resolve().parent / "mobile_device.py"
+    device_note = (DEVICE_NOTE.format(
+        serial=device_lease.serial,
+        helper=str(helper_path),
+        helper_name=helper_path.name)
+        if device_lease else "")
     if device_lease is not None:
         # The dashboard exposes queued steps as editable - a prompt edit,
         # resume note or interrupt that landed DURING the device wait must
