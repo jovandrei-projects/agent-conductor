@@ -104,6 +104,10 @@ python conductor.py demo                           self-test vs tests/mock_devin
                                                    (fixture under data/demo-project/;
                                                    run appears in data/runs/)
 python run_tests.py                                unittest suite (mock, no auth)
+python mobile_device.py relaunch <pkg>             bounded app restart on the
+python mobile_device.py confirm-navigation ...     leased Android device - see
+python mobile_device.py surface                    AGENTS.md 'Intentional app
+                                                   restarts'
 ```
 
 Run flags: `--devin "<cmd>"` binary override, `--no-hub`, `--no-keep-awake`,

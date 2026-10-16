@@ -25,6 +25,38 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (mobile-relaunch-handling, wave step of run
+  20261016-013719-workflow-ux-safety): the apartment-play-edit
+  mobile-parity-validation stall on 'Confirm Navigation' (Leave/Stay)
+  traced to the WORKER's harness - `location.reload()` on a page dirty
+  with its own test edits makes the app's beforeunload guard
+  (apartment-3d src/saveui.js, a legitimate protection - never
+  disabled) surface a native WebView dialog CDP cannot answer; the
+  navigation never completes and automation behind it waited until
+  force-stop/timeout. New `mobile_device.py` (repo root, stdlib-only)
+  is the conductor-owned path, handed to every device-leased step via
+  an extended DEVICE_NOTE: `relaunch <pkg>` = supported process
+  restart the dialog cannot block (settles so completed saves flush,
+  then force-stop + LAUNCHER start + bounded foreground wait + post
+  scan); `confirm-navigation --pkg <pkg> [--leave|--stay]` = bounded
+  uiautomator poll that taps Leave only under explicit consent (the
+  caller asserts disposable test data/saved state), Stay to abort, no
+  flag = refuse with instructions. Foreign-owned signatures and
+  foreign-package modals (ANR/crash/permission/Chrome surfaces) never
+  get tapped - uiautomator.xml + screen.png land under --diag-dir with
+  an actionable error; a Stay request with no Stay button never falls
+  back to Leave; a screen that never dumps is RC_NO_DEVICE, not a
+  false 'no dialog'. Serial resolution: --serial >
+  CONDUCTOR_DEVICE_SERIAL (lease wins - a different flag is refused) >
+  ANDROID_SERIAL; every adb call carries `-s` + a per-call timeout and
+  every wait a deadline. App-side follow-ups RECORDED in AGENTS.md,
+  not implemented (no edits to apartment-3d): its
+  `location.reload()`-based device harnesses should save/flush before
+  reload or call the helper, and an automation-authorized guard bypass
+  (intent extra or awaited flush hook) would remove the dialog
+  round-trip. 30 new MobileDeviceTests (parse/signature/leave/stay/
+  consent/foreign/unexpected/timeout/ownership/CLI) + DeviceOwnership
+  prompt assertion; 410/410 suite green.
 - DONE 2026-10-16 (followup-run-discovery, wave step of run
   20261016-013719-workflow-ux-safety): a produced `<run>-followup.toml`
   is intake, not execution - `discover_followups` registers it as a
