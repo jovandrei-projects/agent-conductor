@@ -4069,6 +4069,106 @@ assert.match(elem('runs').innerHTML,
         self.assertEqual(p.returncode, 0, p.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_compact_run_row_labels_stay_visible(self):
+        """Regression: two compact-density losses in the runs table.
+
+        (a) Compact hides td <br> and squeezes td.wrap to one ellipsized
+        line, so a run row's chips collapsed INLINE after the run name
+        and clipped off - intermittently, since it depended on name
+        length and column width. The label block is a .rlabels div now:
+        a plain block box keeps the chips (+ 'Needs review') on their
+        own line under the name in both densities.
+
+        (b) The planner:/steps:/est token lines were .sub spans, hidden
+        by the blanket 'td .sub' compact rule even though fmtTc() was
+        written as their compact form (dead branch since the compact
+        counter change). They carry .toksub now - same look, exempt
+        from the hide, block-stacked in compact because their <br> is
+        gone - and 'not planned' follows the same rule."""
+        html = conductor._DASH_HTML
+        self.assertRegex(
+            html, r'body\.compact td \.toksub \{[^}]*display:\s*block')
+        self.assertRegex(html, r'\.toksub \{[^}]*color:#8b949e')
+        self.assertRegex(
+            html, r'body\.compact td \.sub \{[^}]*display:\s*none')
+        js = html.split("<script>\n", 1)[1].split("</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true}); return nodes.get(id); };
+const cls={_s:new Set(),toggle(c,on){on?this._s.add(c):this._s.delete(c)},
+  contains(c){return this._s.has(c)}};
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],addEventListener:(ev,h)=>{handlers[ev]=h;},
+  body:{classList:cls},documentElement:{style:{setProperty:(k,v)=>{}}}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',agents:[],
+runs:[
+ {run:'stale-paused',dir:'/sp',aborted:'paused',
+  ended_at:'2026-10-15T01:00:00',counts:{done:1,stopped:1},stale:true},
+ {run:'tokrun',dir:'/tok',counts:{done:2,running:1},
+  started_at:'2026-10-16T00:00:00',
+  plan_tokens:{prompt:10000,cached:6000,completion:1000,llm_steps:2},
+  plan_cost:{usd:0.02,label:'m',uid:'m'},
+  tokens:{prompt:200000,cached:150000,completion:9000,llm_steps:11},
+  cost:{usd:1.5,uid:'m',label:'m'}},
+ {run:'req',key:'request:r1',request_id:'r1',stage:'generating',
+  gen_last:'reading the repo',dir:'',counts:{},stale:true}]};
+const render=()=>vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const row=name=>elem('runs').innerHTML.split('runrow')
+  .find(r=>r.includes('>'+name+'<'));
+render();
+let runs=elem('runs').innerHTML;
+// (a) the label block is a .rlabels div: the name button sits before
+// it, every chip inside it - chips can no longer go inline after the
+// name and clip on an ellipsized line
+assert.match(runs,/<div class="rlabels">/);
+assert.ok(runs.indexOf('run-name') < runs.indexOf('class="rlabels"'));
+const sp=row('stale-paused');
+assert.match(sp,/class="rlabels">[^]*?class="stage paused"[^>]*>paused - resume ready</);
+assert.match(sp,/class="stage error">Needs review</);
+// 'Needs review' groups with the chips BEFORE the hidden dir .sub -
+// an end-of-row position put it on the compact-clipped part
+assert.ok(sp.indexOf('Needs review') < sp.indexOf('>sp<'),
+          'stale chip must sit inside the labels line');
+// a questions/generating proposal row: the stage chip and genline
+// also live inside the labels block
+const rq=row('req');
+assert.match(rq,/class="rlabels">[^]*?class="stage generating"[^>]*>Preparing proposal/);
+assert.match(rq,/class="genline"[^>]*>reading the repo</);
+// (b) the token labels carry .toksub, exempt from the compact hide
+const tok=row('tokrun');
+assert.match(tok,/class="toksub"[^>]*>planner: in 4k · out 1k · cached 6k · 2 turns · \$0\.02</);
+assert.match(tok,/class="toksub"[^>]*>steps: in 50k · out 9k · cached 150k · 11 turns · \$1\.50</);
+assert.match(tok,/class="toksub"[^>]*>est \$1\.52</);
+assert.doesNotMatch(tok,/class="sub"[^>]*>steps:/);
+// 'not planned' is a label too - same compact exemption
+assert.match(row('req'),/class="toksub">not planned</);
+// compact pass: same labels in fmtTc short form (fmtTc finally reaches
+// the runs table - it was dead code inside the hidden .sub spans)
+vm.runInContext("setDensity('compact')",ctx);
+render();
+runs=elem('runs').innerHTML;
+const tokc=row('tokrun');
+assert.match(tokc,/class="toksub"[^>]*>planner: 4k\/1k\/6k 2L · \$0\.02</);
+assert.match(tokc,/class="toksub"[^>]*>steps: 50k\/9k\/150k 11L · \$1\.50</);
+assert.match(tokc,/class="toksub"[^>]*>est \$1\.52</);
+const spc=row('stale-paused');
+assert.match(spc,/class="rlabels">[^]*?class="stage paused"[^>]*>paused - resume ready</);
+assert.match(spc,/class="stage error">Needs review</);
+// back to full: the long labeled form returns, markup unchanged
+vm.runInContext("setDensity('full')",ctx);
+render();
+assert.match(row('tokrun'),/steps: in 50k · out 9k · cached 150k · 11 turns/);
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_run_dir_basename_on_windows_paths(self):
         """Regression: _DASH_HTML is a Python string, so '\\\\' in the
         source reached JS as '\\' - /[\\\\/]/ split on '/' only and
