@@ -22,6 +22,23 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (isolate-worktree-services, wave step of run
+  20261016-013719-workflow-ux-safety): worktree workers were file-isolated
+  but shared the whole port space. Now every dispatched local step leases
+  a distinct loopback port from %TEMP%/agent-conductor-ports (O_EXCL
+  claims + bind probes + pid-stamped dead-owner reclaim; range 8806-8859,
+  past the C:\Projects registry's 8805 ceiling so no registered project
+  port is ever handed out). The worker gets its real checkout path, the
+  off-limits shared repo, the leased port and the
+  don't-touch-foreign-listeners rule via a {service_note} prompt block
+  plus CONDUCTOR_RUN/STEP/WORK_DIR/REPO_DIR/BRANCH/SERVICE_PORT/
+  SERVICE_URL env vars (inherited context vars are popped first - a
+  nested run can't leak its parent's). `conductor.py serve` inside a
+  worker binds the leased port instead of 8773. state.json keeps
+  service_port/service_url and the dashboard modal shows a 'service'
+  row; a port still bound at release is *noted* (leaked dev server),
+  never port-killed. Retries keep the lease; stopped/skipped/cloud
+  steps behave correctly. New tests/test_services.py - 17 tests.
 - DONE 2026-10-16 (follow-up-plan, closing step of run
   20261016-013703-proposal-ui-fixes): reviewed the run - 1/2 worker steps
   landed. `fix-regenerate-label` done + merged (e1eaa7c): 'Needs review'

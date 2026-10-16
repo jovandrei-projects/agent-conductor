@@ -52,3 +52,4 @@ accounted for.
 | agent-conductor / resolve-compact-live-output (merge resolution: both-append conflicts on QUEUE.md + efficiency_stats.md; merge 7e5f3cf) | n/a | n/a | n/a | n/a |
 | agent-conductor / isolate-proposal-planning (planner output spooled outside watched cwds; publish-only waits on merge/watch; spool drain survives restart; 215/215 + demo green) | n/a | n/a | n/a | n/a |
 | agent-conductor / resolve-isolate-proposal-planning (semantic merge: gen_id attempt scoping x spool overlay + gen_id ownership guards in publish/flush/drain; merge c2a8c6c + fix 400124b; 224/224 green) | n/a | n/a | n/a | n/a |
+| agent-conductor / isolate-worktree-services (per-step leased loopback port + checkout/repo/context env propagation; serve honors CONDUCTOR_SERVICE_PORT; 17/17 new tests) | n/a | n/a | n/a | n/a |
