@@ -1278,6 +1278,15 @@ class RequestWorkflowTests(unittest.TestCase):
             "proj": {"path": self.proj, "cloud_ok": False}})
         patch.start()
         self.addCleanup(patch.stop)
+        # Planner output is spooled under %TEMP% in production - keep the
+        # suite hermetic by pointing the spool root at the sandbox, and
+        # shrink the deferred-publish poll so waits resolve in ms.
+        self.spool = self.base / "planner-spool"
+        for target, value in (("PLANNER_SPOOL", self.spool),
+                              ("WATCH_POLL_S", 0.02)):
+            p = mock.patch.object(conductor, target, value)
+            p.start()
+            self.addCleanup(p.stop)
 
     def proposal(self, description="Tidy the catalog", extra_steps=""):
         return f'''[run]
@@ -1488,7 +1497,11 @@ prompt = "Review the catalog tests."
         self.assertEqual(seen["prompt"].parent, Path(seen["cwd"]))
         self.assertNotEqual(seen["log"].parent, Path(seen["cwd"]))
         if os.name == "nt":
-            self.assertEqual(seen["flags"], subprocess.CREATE_NO_WINDOW)
+            # hidden window AND its own process group - a merge/serve
+            # shutdown must not reach the planner's console
+            self.assertTrue(seen["flags"] & subprocess.CREATE_NO_WINDOW)
+            self.assertTrue(
+                seen["flags"] & subprocess.CREATE_NEW_PROCESS_GROUP)
 
     def test_planner_tokens_recorded_on_request(self):
         rec = self.new()
@@ -1962,6 +1975,236 @@ prompt = "Polish the catalog."
         with self.assertRaises(conductor.RequestError):
             conductor.discard_request(rec["id"], self.requests,
                                       self.manifests, self.runs)
+
+    # ---- planner isolation from merges ---------------------------------
+    # A worktree merge can sit in the main checkout for minutes (a live
+    # resolve-* session watches the repo root, or MERGE_HEAD is open).
+    # Generation must still run: the planner phase is spooled outside
+    # every watched cwd and only the short publish defers.
+
+    def _until(self, pred, timeout=10.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            if pred():
+                return True
+            time.sleep(0.02)
+        return pred()
+
+    def _watching_run(self, name="20261016-000000-merging"):
+        """A state.json shaped like a live resolve-* session watching the
+        whole sandbox: work_dir=self.base covers requests/ + manifests/."""
+        rd = self.runs / name
+        rd.mkdir(parents=True)
+        (rd / "state.json").write_text(json.dumps({"steps": {
+            "resolve-x": {"status": "running",
+                          "started_at": conductor.now_iso(),
+                          "timeout_min": 60, "work_dir": str(self.base)}}}))
+        return rd
+
+    def _release_watcher(self, rd):
+        st = json.loads((rd / "state.json").read_text())
+        st["steps"]["resolve-x"]["status"] = "done"
+        st["ended_at"] = conductor.now_iso()
+        (rd / "state.json").write_text(json.dumps(st))
+
+    def test_generation_finishes_while_merge_resolver_is_live(self):
+        """Regression: a resolve-* session in the checkout that owns
+        data/requests used to make start_generation 409 for its whole
+        life. Now the planner runs isolated, output lands in the spool,
+        and only the short publish waits for the watcher to clear."""
+        rec = self.new()
+        rd = self._watching_run()
+        disk_before = (self.requests / f"{rec['id']}.json").read_text()
+
+        def fake(r, projects, argv, log_path=None, fix_note=None, qa=None):
+            if log_path:
+                Path(log_path).write_text(
+                    "BEGIN_MANIFEST\n...\nEND_MANIFEST\nSTATUS: done\n",
+                    encoding="utf-8")
+            return self.proposal()
+
+        with mock.patch.object(conductor, "_planner_response", fake):
+            t = threading.Thread(
+                target=conductor.start_generation,
+                args=(rec["id"], self.requests, self.manifests, self.runs,
+                      ["devin"]), kwargs={"background": False}, daemon=True)
+            t.start()
+            spool = self.spool / rec["id"]
+            draft = spool / "draft.toml"
+            self.assertTrue(self._until(draft.is_file),
+                            "draft never reached the spool")
+            d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                            self.requests)
+            row = next(r for r in d["runs"]
+                       if r.get("request_id") == rec["id"])
+            self.assertEqual(row["stage"], "generating")
+            # the running planner is surfaced as an agent row
+            self.assertIn("plan-proposal",
+                          {a["step"] for a in d["agents"]})
+            # NOTHING was written into the watched checkout meanwhile:
+            # no manifest, no status write, no gen.log in data/requests.
+            self.assertFalse(list(self.manifests.iterdir()))
+            self.assertFalse((self.requests / f"{rec['id']}.gen.log")
+                             .exists())
+            self.assertEqual((self.requests / f"{rec['id']}.json")
+                             .read_text(), disk_before)
+            self.assertTrue(t.is_alive())          # only publish deferred
+            self._release_watcher(rd)
+            t.join(15)
+        self.assertFalse(t.is_alive(), "publish did not land after merge")
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "ready")
+        self.assertTrue(Path(rec["manifest"]).is_file())
+        self.assertTrue((self.requests / f"{rec['id']}.gen.log").is_file())
+        self.assertFalse(spool.exists())
+
+    def test_publish_defers_only_while_merge_is_open(self):
+        """A parked conductor/* branch must not block anything; an OPEN
+        merge (MERGE_HEAD) defers only the publish, not the planner."""
+        repo = make_project(self.base, "repo")
+        manifests = repo / "manifests"
+        manifests.mkdir()
+        (manifests / "README.md").write_text("manifests\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-m", "manifests dir")
+
+        # merge pending: an unmerged conductor/* branch exists but no
+        # merge is open -> a proposal publishes immediately
+        git(repo, "checkout", "-b", "conductor/x")
+        (repo / "WORK.txt").write_text("branch work\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-m", "branch work")
+        git(repo, "checkout", "-")     # back to the default branch
+        self.assertNotEqual(git(repo, "branch", "--show-current").stdout,
+                            "conductor/x")
+        rec = self.new()
+        with mock.patch.object(conductor, "_planner_response",
+                               return_value=self.proposal()):
+            conductor.start_generation(rec["id"], self.requests, manifests,
+                                       self.runs, ["devin"],
+                                       background=False)
+        rec = conductor.request_details(rec["id"], self.requests, manifests)
+        self.assertEqual(rec["status"], "ready")
+
+        # merge active: conflicting change + open MERGE_HEAD
+        (repo / "WORK.txt").write_text("main side\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-m", "main work")
+        r = git(repo, "merge", "--no-edit", "conductor/x")
+        self.assertNotEqual(r.returncode, 0)     # real conflict, merge open
+        rec2 = self.new()
+
+        def fake(r_, projects, argv, log_path=None, fix_note=None, qa=None):
+            if log_path:
+                Path(log_path).write_text("STATUS: done\n")
+            return self.proposal(
+                description="Catalog tidy two") \
+                .replace('name = "catalog-cleanup"',
+                         'name = "catalog-cleanup-2"')
+
+        with mock.patch.object(conductor, "_planner_response", fake):
+            t = threading.Thread(
+                target=conductor.start_generation,
+                args=(rec2["id"], self.requests, manifests, self.runs,
+                      ["devin"]), kwargs={"background": False}, daemon=True)
+            t.start()
+            draft = self.spool / rec2["id"] / "draft.toml"
+            self.assertTrue(self._until(draft.is_file),
+                            "draft never reached the spool")
+            time.sleep(0.2)          # publish had a few poll windows
+            self.assertFalse(list(manifests.glob(f"{rec2['id']}-*.toml")),
+                             "publish landed mid-merge")
+            self.assertTrue(t.is_alive())
+            git(repo, "merge", "--abort")
+            t.join(15)
+        self.assertFalse(t.is_alive(), "publish did not land post-merge")
+        rec2 = conductor.request_details(rec2["id"], self.requests,
+                                         manifests)
+        self.assertEqual(rec2["status"], "ready")
+        self.assertTrue(Path(rec2["manifest"]).is_file())
+
+    def _spool_fixture(self, rec, draft=None, log=None, status="generating",
+                       draft_current=True, log_age_s=3600):
+        """Build a spool as a crashed/interrupted generation left it."""
+        spool = self.spool / rec["id"]
+        spool.mkdir(parents=True)
+        disk = json.loads((self.requests / f"{rec['id']}.json")
+                          .read_text())
+        started = conductor.now_iso()
+        rec.update(status=status, generation_started_at=started)
+        if draft is not None:
+            rec["draft_started_at"] = (started if draft_current
+                                       else "2000-01-01T00:00:00")
+        (spool / "job.json").write_text(json.dumps({
+            "request_id": rec["id"], "requests_dir": str(self.requests),
+            "manifests_dir": str(self.manifests),
+            "runs_dir": str(self.runs),
+            "base_updated_at": disk.get("updated_at"),
+            "base_status": disk.get("status")}), encoding="utf-8")
+        (spool / "request.json").write_text(json.dumps(rec))
+        if draft is not None:
+            (spool / "draft.toml").write_text(draft, encoding="utf-8")
+        if log is not None:
+            lp = spool / "gen.log"
+            lp.write_text(log, encoding="utf-8")
+            old = time.time() - log_age_s       # a dead planner's log
+            os.utime(lp, (old, old))
+        return spool
+
+    def test_drain_publishes_a_draft_left_by_a_restart(self):
+        rec = self.new()
+        spool = self._spool_fixture(rec, draft=self.proposal())
+        adopted = conductor.drain_planner_spool(self.spool)
+        self.assertEqual(adopted, [rec["id"]])
+        # the flush is done when the spool is gone - status flips earlier
+        self.assertTrue(self._until(lambda: not spool.exists()))
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "ready")
+        self.assertTrue(Path(rec["manifest"]).is_file())
+
+    def test_drain_extracts_manifest_from_an_orphaned_log(self):
+        """The planner finished writing BEGIN_MANIFEST but the server died
+        before extracting: the spooled log alone is enough to publish."""
+        rec = self.new()
+        spool = self._spool_fixture(
+            rec, log=("BEGIN_MANIFEST\n" + self.proposal() +
+                      "END_MANIFEST\nSTATUS: done\n"))
+        conductor.drain_planner_spool(self.spool)
+        self.assertTrue(self._until(lambda: not spool.exists()))
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "ready")
+
+    def test_drain_marks_interrupted_generation_and_keeps_artifacts(self):
+        rec = self.new()
+        spool = self._spool_fixture(rec, log="planner died mid-thought\n")
+        conductor.drain_planner_spool(self.spool)
+        self.assertTrue(self._until(lambda: not spool.exists()))
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "error")
+        self.assertIn("interrupted", rec["error"])
+        # the partial log was preserved, not lost with the spool
+        self.assertEqual((self.requests / f"{rec['id']}.gen.log")
+                         .read_text(), "planner died mid-thought\n")
+
+    def test_drain_never_republishes_a_superseded_draft(self):
+        """A regenerate crashed before its own draft: the previous
+        generation's draft.toml stays on disk but must NOT publish -
+        the human asked for a new proposal."""
+        rec = self.new()
+        spool = self._spool_fixture(rec, draft=self.proposal(),
+                                    draft_current=False)
+        conductor.drain_planner_spool(self.spool)
+        self.assertTrue(self._until(lambda: not spool.exists()))
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "error")
+        self.assertFalse(list(self.manifests.glob("*.toml")))
+        self.assertTrue((self.requests / f"{rec['id']}.draft.toml")
+                        .is_file())
 
     def test_http_draft_review_discard_and_same_origin(self):
         handler = conductor.make_dashboard_handler(
