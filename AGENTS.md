@@ -256,7 +256,31 @@ re-baselines them; `ask`/`plan_model`/`plan_effort`/`label` never stale.
 The form's follow-up checkbox asks the planner for a
 closing `follow-up-plan` step that drafts `<run>-followup.toml` into
 `manifests/` for review; if the planner omits it, `_publish_proposal`
-appends the step itself. `On step failure` and `Attempts/step` map to
+appends the step itself. The produced file is *intake, not execution*:
+`discover_followups` runs at run_end, `serve` startup, `sweep` and a
+60s-throttled pass in `collect_dashboard`, and registers it as a request
+record (`Ready to run`, `source_run`/`source_manifest` linked - only a
+human's Start run launches it). The file's own text is validated by
+`validate_proposal` and copied to an owned `manifests/<id>-<name>.toml`;
+the source stays read-only and is never trashed. Idempotency lives in
+`data/requests/followups.index` (sha'd per source), so repeated scans,
+restarts and rewrites reconcile one record instead of duplicating - a
+changed source re-copies and revalidates unless the record was
+human-edited (the source sha no longer matches the owned copy, so the
+edit wins). A no-`[[step]]` TOML or a "nothing remains" report lands as
+`empty` ("No work remains"), a finished step with no file as `missing`
+("Follow-up missing" + the expected path and the import hint), malformed
+or unvalidatable text as `error` - all request rows, all discardable,
+never launchable; a failed/stopped step with no file is `absent` on the
+run stamp only, no row. Discarding an imported row vetoes the source in
+the index (rescans never resurrect it; Restore clears the veto), while
+`python conductor.py import <file.toml>` / `POST /api/requests/import`
+register a written file explicitly - the deliberate override that also
+imports files predating the feature or orphaned by a foreign checkout.
+Run rows carry the `followup` stamp (registered/empty/missing/invalid/
+deferred/absent) with a chip linking the request; busy destinations
+defer to the next pass instead of failing (`_assert_unwatched`). `On
+step failure` and `Attempts/step` map to
 `run.on_failure` and `[defaults].max_attempts`; generation fails closed
 when the planner ignores them (edit the TOML directly to override).
 `Step model/effort` feed `[defaults]` (the workers); `Planner
