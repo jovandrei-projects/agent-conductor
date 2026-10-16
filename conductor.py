@@ -1572,8 +1572,10 @@ def step_summary(run_name: str, step_name: str,
     return md
 
 
-def summary_html(md: str, title: str) -> str:
-    """Render our own generated summary markdown as a styled page.
+def _summary_body(md: str) -> str:
+    """Inner markup of a generated summary report - the in-app summary
+    modal embeds it via ``?frag=1`` while the standalone page wraps it in
+    a document shell.
 
     We only emit a narrow markdown subset (#, ##, - bullets, ``` fences,
     **bold**, `code`), and every line is HTML-escaped BEFORE inline
@@ -1623,6 +1625,12 @@ def summary_html(md: str, title: str) -> str:
     close_ul()
     if in_pre:
         body.append("</pre>")
+    return "".join(body)
+
+
+def summary_html(md: str, title: str) -> str:
+    """Render our own generated summary markdown as a styled page - the
+    standalone document reachable at the /summary URL directly."""
     return ("<!doctype html><html><head><meta charset=utf-8>"
             f"<title>{html.escape(title)}</title><style>"
             "body{background:#0d1117;color:#c9d1d9;font:14px/1.5 "
@@ -1635,7 +1643,7 @@ def summary_html(md: str, title: str) -> str:
             "font-size:12px}pre{background:#161b22;border-radius:6px;"
             "padding:10px 12px;font-size:12px;overflow:auto;"
             "white-space:pre-wrap}strong{color:#e6edf3}</style></head>"
-            f"<body>{''.join(body)}</body></html>")
+            f"<body>{_summary_body(md)}</body></html>")
 
 
 def _merge_tokens(acc: dict[str, int], tok: dict | None) -> dict:
@@ -6975,6 +6983,18 @@ a { color:#58a6ff; text-decoration:none; }
 #detail .dnav-btn:hover:not(:disabled) { border-color:#58a6ff; }
 #detail .dnav-btn:disabled { opacity:.4; cursor:default; }
 #detail .dnav-pos { margin:0 auto; color:#8b949e; font-size:12px; white-space:nowrap; }
+/* the Back button sits in the same sticky .dnav bar as prev/next (or
+   alone in a bar of its own on modals without pipeline nav) */
+#detail .dnav-back { flex:none; }
+/* the summary modal embeds _summary_body's fragment (?frag=1) - the same
+   escaped markup the standalone page wraps, themed to the dialog */
+#detail .sumdoc h1 { font-size:16px; border-bottom:1px solid #21262d; padding-bottom:6px; margin:2px 80px 10px 0; }
+#detail .sumdoc h2 { font-size:13px; color:#58a6ff; margin:14px 0 5px; }
+#detail .sumdoc ul { padding-left:20px; margin:6px 0; }
+#detail .sumdoc li { margin:3px 0; }
+#detail .sumdoc p { margin:8px 0; }
+#detail .sumdoc code { background:#0d1117; border-radius:4px; padding:1px 5px; font-size:12px; }
+#detail .sumdoc strong { color:#e6edf3; }
 .arc { font-size:12px; border:1px solid #21262d; border-radius:6px; padding:6px 8px; max-height:280px; overflow-y:auto; background:#0d1117; }
 .arcrow { display:flex; gap:8px; padding:1px 0; }
 .arcspan { color:#8b949e; min-width:44px; text-align:right; flex:none; }
@@ -7237,6 +7257,11 @@ let detailKey = null;       // run_key|step of the open agent modal - the
 let modalRequest = null;
 let modalQA = null;         // {id, rec, sel:Set, free:''} while the planner
                             // questionnaire modal is open
+let runModalKey = null;     // runKey while the run-details modal shows
+let summaryView = null;     // {key: agentKey} while the summary modal shows
+let modalScroll = null;     // scrollTop a Back navigation restores on render
+const modalHist = [];       // Back stack: {kind, key|id, scroll} entries of
+                            // the view each modal-to-modal jump left behind
 let rqAttachments = [];     // [{name,path}] on the open request form
 const qDismissed = new Set();   // request|qids sigs the human closed - the
                               // auto-popup never re-nags for the same set
@@ -7247,7 +7272,7 @@ const notesDrafts = {};     // key -> unsaved 'resume notes' text
 // modal (and a nav click) land on another request's same-named step.
 const agentKey = a => (a.run_key||a.run_dir||'') + '|' + a.step;
 const qSig = (id, pend) => id + '|' + (pend||[]).map(q=>q.qid).join(',');
-function closeDetail(force=false){
+function closeDetail(force=false, keepStack=false){
   if (!force && modalRequest?.dirty && !confirm('Discard unsaved edits?')) return false;
   // closing the questionnaire mid-way dismisses the auto-popup for THIS
   // question set - the request's Answer button still re-opens it, and a
@@ -7255,6 +7280,8 @@ function closeDetail(force=false){
   if (modalQA && modalQA.rec)
     qDismissed.add(qSig(modalQA.id, modalQA.rec.pending_questions));
   detailIdx = null; detailKey = null; modalRequest = null; modalQA = null;
+  runModalKey = null; summaryView = null;
+  if (!keepStack){ modalHist.length = 0; modalScroll = null; }
   document.getElementById('backdrop').hidden = true;
   return true;
 }
@@ -7277,14 +7304,163 @@ function navStep(d){
   if (b){
     const j = AGENTS.findIndex(x=>agentKey(x)===agentKey(b));
     if (j>=0){
-      showDetail(j);
+      showDetail(j, true);          // sibling nav keeps the Back stack
       const d = document.getElementById('detail');
       if (d) d.scrollTop = 0;      // land on the task top, not mid-scroll
     }
   }
 }
-function showDetail(i){
-  const a = AGENTS[i]; if(!a || !closeDetail()) return;
+// --- modal history (Back) ----------------------------------------------
+// Modal-to-modal jumps (task -> its request/summary, request -> its run)
+// snapshot the view they leave so a Back button can restore that exact
+// view - same task key, same scroll offset, filters untouched (they live
+// outside the modal). Sibling walks and plain closes do NOT stack, and
+// Escape / Close still tear the whole dialog down.
+function snapshotModal(){
+  const d=document.getElementById('detail');
+  const scroll=(d&&d.scrollTop)||0;
+  if (summaryView) return {kind:'summary',key:summaryView.key,scroll};
+  if (modalQA) return null;          // the questionnaire has no back target
+  if (modalRequest && modalRequest.id)
+    return {kind:'request',id:modalRequest.id,scroll};
+  if (detailKey!=null) return {kind:'agent',key:detailKey,scroll};
+  if (runModalKey) return {kind:'run',key:runModalKey,scroll};
+  return null;
+}
+function pushHist(snap){
+  const last=modalHist[modalHist.length-1];
+  if (last && last.kind===snap.kind &&
+      (snap.key||snap.id)===(last.key||last.id)){
+    last.scroll=snap.scroll; return;   // re-entering the same view refreshes
+  }
+  modalHist.push(snap);
+  if (modalHist.length>20) modalHist.shift();
+}
+function histLabel(snap){
+  if (snap.kind==='agent'||snap.kind==='summary'){
+    const a=AGENTS.find(x=>agentKey(x)===snap.key);
+    return (snap.kind==='summary'?'summary: ':'')+(a?a.step:'task');
+  }
+  if (snap.kind==='run'){
+    const r=(lastData?.runs||[]).find(x=>runKey(x)===snap.key);
+    return 'run '+(r?r.run:snap.key);
+  }
+  return 'request';
+}
+function backBtnHTML(){
+  const top=modalHist[modalHist.length-1];
+  if (!top) return '';
+  const lbl=histLabel(top);
+  return `<button type="button" class="dnav-btn dnav-back" ` +
+    `data-modal-back title="return to ${esc(lbl)}">` +
+    `&larr; <span>Back: ${esc(lbl)}</span></button>`;
+}
+function applyModalScroll(){
+  if (modalScroll==null) return;
+  const d=document.getElementById('detail');
+  if (d) d.scrollTop=modalScroll;
+  modalScroll=null;
+}
+function modalBack(){
+  if (modalRequest?.dirty && !confirm('Discard unsaved edits?')) return;
+  while (modalHist.length){
+    const top=modalHist.pop();
+    // the open*() calls below run their own closeDetail(keepStack) -
+    // clear this view's markers first so its dirty flag can't re-prompt
+    detailIdx=null; detailKey=null; modalRequest=null; modalQA=null;
+    runModalKey=null; summaryView=null;
+    modalScroll=top.scroll;
+    if (top.kind==='agent'){
+      const j=AGENTS.findIndex(x=>agentKey(x)===top.key);
+      if (j<0) continue;               // row vanished - try the older entry
+      showDetail(j,true); return;
+    }
+    if (top.kind==='run'){
+      if (!(lastData?.runs||[]).some(x=>runKey(x)===top.key)) continue;
+      showRunDetails(top.key,true); return;
+    }
+    if (top.kind==='request'){ openRequest(top.id,true); return; }
+    if (top.kind==='summary'){ openSummary(top.key,false); return; }
+  }
+  modalScroll=null;
+  closeDetail(true);                   // history exhausted - nothing to show
+}
+// --- in-app session summary ---------------------------------------------
+// The task modal's 'Session summary' opens the report in THIS modal now,
+// not a separate browser window: the server hands back just the body
+// markup (?frag=1 - same escaping as the standalone page), and prev/next
+// walk the same pipeSibs chain the task nav uses. The link keeps its href
+// + target=_blank so the /summary URL stays usable (copy link, middle or
+// ctrl-click opens the standalone page).
+async function openSummary(key, push=true){
+  const a=AGENTS.find(x=>agentKey(x)===key);
+  if (!a) return;
+  const snap = push ? snapshotModal() : null;
+  if (!closeDetail(false, true)) return;   // the stack is managed here
+  if (snap && !(snap.kind==='summary'&&snap.key===key)) pushHist(snap);
+  summaryView={key};
+  if (modalScroll==null) modalScroll=0;    // fresh open lands at the top;
+                                         // a Back restore carries its own
+  renderSummaryFrame(a, null, null);       // loading frame, nav works already
+  document.getElementById('backdrop').hidden=false;
+  let frag=null, err=null;
+  if (!a.run_dir){
+    err='No session summary for this step yet - it has not run.';
+  } else {
+    try{
+      const res=await fetch('/api/runs/'+encodeURIComponent(base(a.run_dir))+
+        '/steps/'+encodeURIComponent(a.step)+'/summary?frag=1');
+      if (res.ok) frag=await res.text();
+      else { const o=await res.json().catch(()=>({}));
+             err='Summary unavailable: '+(o.error||('HTTP '+res.status)); }
+    }catch(e){ err='Summary unavailable: '+(e.message||e); }
+  }
+  if (!summaryView || summaryView.key!==key) return;  // moved on meanwhile
+  renderSummaryFrame(a, frag, err);
+}
+function renderSummaryFrame(a, frag, err){
+  // same chrome as the task modal's .dnav: arrows name their sibling step,
+  // 'task N of M' marks position, the buttons disable at the chain ends
+  const sibs=pipeSibs(a);
+  const pos=summaryView ? sibs.findIndex(x=>agentKey(x)===summaryView.key) : -1;
+  const sbtn=(b,dir)=> b
+    ? `<button type="button" class="dnav-btn" ` +
+      `data-snav="${esc(agentKey(b))}" title="summary: ${esc(b.step)}">` +
+      (dir<0 ? `&larr; <span>${esc(b.step)}</span>`
+             : `<span>${esc(b.step)}</span> &rarr;`) + `</button>`
+    : `<button type="button" class="dnav-btn" disabled>` +
+      (dir<0?'&larr;':'&rarr;') + `</button>`;
+  const nav = (pos>=0 && sibs.length>1)
+    ? sbtn(sibs[pos-1],-1) +
+      `<span class="dnav-pos">task ${pos+1} of ${sibs.length}</span>` +
+      sbtn(sibs[pos+1],1) : '';
+  const bar = backBtnHTML()+nav;
+  document.getElementById('dbody').innerHTML =
+    (bar?`<div class="dnav">${bar}</div>`:'') +
+    `<h3 id="modal-title">Session summary - ${esc(a.slug)} / ${esc(a.step)}</h3>` +
+    (err!=null ? `<div class="notice error">${esc(err)}</div>`
+      : frag==null ? `<div class="notice">Loading summary&hellip;</div>`
+      : `<div class="sumdoc">${frag}</div>`) +
+    (a.run_dir
+      ? `<div class="actions"><a class="btn secondary" target="_blank" ` +
+        `href="/api/runs/${encodeURIComponent(base(a.run_dir))}/steps/` +
+        `${encodeURIComponent(a.step)}/summary" title="the same report ` +
+        `as a standalone page - the shareable URL">Open as page ↗</a></div>`
+      : '');
+  // the loading frame consumed modalScroll already, so a Back restore
+  // keeps its offset through the async fetch below
+  applyModalScroll();
+}
+function summaryNav(d){
+  const a=AGENTS.find(x=>agentKey(x)===(summaryView&&summaryView.key));
+  if (!a) return;
+  const sibs=pipeSibs(a);
+  const pos=sibs.findIndex(x=>agentKey(x)===summaryView.key);
+  const b=pos>=0 && sibs[pos+d];
+  if (b) openSummary(agentKey(b), false);   // sibling nav keeps the Back stack
+}
+function showDetail(i, keepStack){
+  const a = AGENTS[i]; if(!a || !closeDetail(false, !!keepStack)) return;
   detailIdx = i; detailKey = agentKey(a);
   // The modal is rebuilt on every refresh tick - carry the focused
   // textarea's draft text and caret across the rebuild so typing in
@@ -7331,9 +7507,10 @@ function showDetail(i){
     : `<button type="button" class="dnav-btn" disabled>` +
       (dir<0 ? '&larr;' : '&rarr;') + `</button>`;
   const navBar = (pos>=0 && sibs.length>1)
-    ? `<div class="dnav">${navBtn(sibs[pos-1],-1)}` +
+    ? `<div class="dnav">${backBtnHTML()}${navBtn(sibs[pos-1],-1)}` +
       `<span class="dnav-pos">task ${pos+1} of ${sibs.length}</span>` +
-      `${navBtn(sibs[pos+1],1)}</div>` : '';
+      `${navBtn(sibs[pos+1],1)}</div>`
+    : (modalHist.length ? `<div class="dnav">${backBtnHTML()}</div>` : '');
   document.getElementById('dbody').innerHTML =
     navBar +
     `<h3 id="modal-title">${esc(a.slug)} / ${esc(a.step)}</h3><div class="kv">` +
@@ -7342,12 +7519,15 @@ function showDetail(i){
       (k==='tokens'?tokenHelp:'') + '</div>').join('') +
     `</div>` +
     (a.run_dir
-      ? (`<div class="actions"><a class="btn secondary" target="_blank" ` +
+      ? (`<div class="actions"><a class="btn secondary" ` +
+        `data-summary="${esc(agentKey(a))}" target="_blank" ` +
         `href="/api/runs/${encodeURIComponent(base(a.run_dir))}/steps/` +
         `${encodeURIComponent(a.step)}/summary" title="human-readable ` +
-        `end-of-step report, generated from the ATIF export - also saved ` +
-        `as <step>.summary.md in the run dir once the step ends">` +
-        `Session summary ↗</a><span class="sub" style="margin-left:10px">` +
+        `end-of-step report, generated from the ATIF export - opens in ` +
+        `this dialog with prev/next navigation (Ctrl/middle-click opens ` +
+        `the standalone page); also saved as <step>.summary.md in the ` +
+        `run dir once the step ends">` +
+        `Session summary</a><span class="sub" style="margin-left:10px">` +
         `status, elapsed, tokens, trajectory, commits, stdout tail - ` +
         `readable markdown instead of a raw log.</span></div>` +
         (a.status==='running'
@@ -7470,12 +7650,19 @@ function showDetail(i){
     if (el && el.focus){ el.focus();
       try{ el.setSelectionRange(fsel[0],fsel[1]); } catch(e){} }
   }
+  applyModalScroll();
   document.getElementById('backdrop').hidden = false;
 }
 
-function showRunDetails(key){
+function showRunDetails(key, keepStack){
   const r = lastData?.runs.find(x=>runKey(x)===key);
-  if (!r || !closeDetail()) return;
+  if (!r) return;
+  // a non-null snapshot means a modal view is on screen - this is a
+  // modal->modal jump, so the Back stack survives the closeDetail below
+  const snap = keepStack ? null : snapshotModal();
+  if (!closeDetail(false, !!(keepStack || snap))) return;
+  if (snap && !(snap.kind==='run' && snap.key===key)) pushHist(snap);
+  runModalKey = key;
   const total = Object.values(r.counts||{}).reduce((s,n)=>s+n,0);
   const runUsd = (r.cost&&r.cost.usd!=null)||(r.plan_cost&&r.plan_cost.usd!=null)
     ? (r.cost&&r.cost.usd||0)+(r.plan_cost&&r.plan_cost.usd||0) : null;
@@ -7517,6 +7704,7 @@ function showRunDetails(key){
       `gone (crash or machine restart). Resume picks up unfinished ` +
       `steps from committed state.</div>` : '';
   document.getElementById('dbody').innerHTML =
+    (modalHist.length ? `<div class="dnav">${backBtnHTML()}</div>` : '') +
     `<h3 id="modal-title">${esc(r.run)}</h3>` +
     (r.stage ? `<span class="stage ${esc(r.stage)}">${esc(STAGES[r.stage]||r.stage)}</span>` : '') +
     notice +
@@ -7565,6 +7753,7 @@ function showRunDetails(key){
         : 'permanently delete this run record - state, logs, prompts, ' +
           'exports'}">Delete run</button>`) +
     '</div>';
+  applyModalScroll();
   document.getElementById('backdrop').hidden = false;
 }
 async function api(method,path,body){
@@ -7623,6 +7812,7 @@ function showRequestForm(rec){
   const steps=rec.proposed_steps||[];
   const canEdit=editable && stage!=='new';
   document.getElementById('dbody').innerHTML =
+    (modalHist.length ? `<div class="dnav">${backBtnHTML()}</div>` : '') +
     `<h3 id="modal-title">${stage==='new'?'New request':
       stage==='ready'?'Review proposed run':
       stage==='launched'?'Original request': 'Request details'}</h3>` +
@@ -7768,6 +7958,7 @@ function showRequestForm(rec){
     (stage==='launched'?`<button type="button" class="btn secondary" ` +
       `data-run-details="request:${esc(rec.id)}">View run details</button>`:'') +
     `</div>`;
+  applyModalScroll();
   document.getElementById('backdrop').hidden = false;
   renderAttach(editable);
   syncEffort(document.getElementById('rq-model'),'rq-effort','rq-efforts');
@@ -7833,10 +8024,17 @@ async function attachFiles(files){
     } catch(err){ formError('Attach failed: '+err.message); }
   }
 }
-async function openRequest(id){
-  if (!closeDetail()) return;
+async function openRequest(id, keepStack){
+  // a non-null snapshot means a modal view is on screen - this is a
+  // modal->modal jump, so the Back stack survives the closeDetail below
+  const snap = keepStack ? null : snapshotModal();
+  if (!closeDetail(false, !!(keepStack || snap))) return;
+  // re-opening the SAME request (post-save reload, stage follow) is not a
+  // new history entry - the earlier back chain stays untouched
+  if (snap && !(snap.kind==='request' && snap.id===id)) pushHist(snap);
   modalRequest={id,status:'loading',dirty:false,originalManifest:''};
   document.getElementById('dbody').innerHTML =
+    (modalHist.length ? `<div class="dnav">${backBtnHTML()}</div>` : '') +
     '<h3 id="modal-title">Loading request…</h3>';
   document.getElementById('backdrop').hidden = false;
   try {
@@ -7847,8 +8045,10 @@ async function openRequest(id){
     showRequestForm(rec);
   } catch(err){
     document.getElementById('dbody').innerHTML =
+      (modalHist.length ? `<div class="dnav">${backBtnHTML()}</div>` : '') +
       `<h3 id="modal-title">Request unavailable</h3><div class="notice error">` +
       `${esc(err.message)}</div>`;
+    applyModalScroll();
   }
 }
 function requestFields(){
@@ -7924,7 +8124,7 @@ async function requestAction(action){
     }
     modalRequest.dirty=false;
     await refresh();
-    await openRequest(rid);
+    await openRequest(rid, true);
   } catch(err){ formError(err.message); }
   finally { buttons.forEach(b=>b.disabled=false); }
 }
@@ -8349,16 +8549,17 @@ function render(d){
     // the old index
     const j = detailKey==null ? detailIdx
       : AGENTS.findIndex(x=>agentKey(x)===detailKey);
-    if (j >= 0 && AGENTS[j]) showDetail(j);
+    if (j >= 0 && AGENTS[j]) showDetail(j, true);
     else closeDetail(true);
   }
   const modalRun = modalRequest?.id && d.runs.find(r=>r.request_id===modalRequest.id);
   const modalStage = modalRun && (modalRun.stage||'launched');
   // an open request modal follows its stage - 'questions' swaps it for
-  // the questionnaire (the form stays reachable via the run-name click)
+  // the questionnaire (the form stays reachable via the run-name click);
+  // keepStack: the re-opened same request is not a new Back entry
   if (modalStage && modalRequest.status!=='loading' && !modalRequest.dirty &&
       modalRequest.status!==modalStage)
-    (modalStage==='questions' ? openQuestions : openRequest)(modalRequest.id);
+    (modalStage==='questions' ? openQuestions : openRequest)(modalRequest.id, true);
   // A planner questionnaire is blocked on a human - pop it once per
   // question set when nothing else is modal (closing it marks the set
   // dismissed; the request's Answer button re-opens it).
@@ -8426,11 +8627,24 @@ document.addEventListener('click', async e=>{
   const runDetEl = t.closest && t.closest('[data-run-details]');
   if (runDetEl){
     showRunDetails(runDetEl.dataset.runDetails); return; }
+  // 'Session summary' is a real link: plain click opens the in-app summary
+  // view; ctrl/middle-click still reaches the standalone /summary page.
+  const sumEl = t.closest && t.closest('[data-summary]');
+  if (sumEl){
+    if (!e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey){
+      e.preventDefault();
+      openSummary(sumEl.dataset.summary);
+    }
+    return; }
+  const snavEl = t.closest && t.closest('[data-snav]');
+  if (snavEl){ openSummary(snavEl.dataset.snav, false); return; }
+  const backEl = t.closest && t.closest('[data-modal-back]');
+  if (backEl){ modalBack(); return; }
   const navEl = t.closest && t.closest('[data-nav]');
   if (navEl){
     const j = AGENTS.findIndex(x=>agentKey(x)===navEl.dataset.nav);
     if (j>=0){
-      showDetail(j);
+      showDetail(j, true);
       const d = document.getElementById('detail');
       if (d) d.scrollTop = 0;
     }
@@ -8759,14 +8973,16 @@ document.addEventListener('keydown', e=>{
     selectedRun = selectedRun===e.target.dataset.runKey ? null : e.target.dataset.runKey;
     if (lastData) render(lastData);
   }
-  // Left/Right walks the open task's pipeline (same as the .dnav arrows)
-  // - but never while typing in a form field.
-  if ((e.key==='ArrowLeft'||e.key==='ArrowRight') && detailKey!=null &&
+  // Left/Right walks the open task's (or open summary's) pipeline - same
+  // chain as the .dnav arrows - but never while typing in a form field.
+  if ((e.key==='ArrowLeft'||e.key==='ArrowRight') &&
+      (detailKey!=null || summaryView) &&
       !document.getElementById('backdrop').hidden){
     const ae = document.activeElement;
     if (!(ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName||''))){
       e.preventDefault();
-      navStep(e.key==='ArrowLeft'?-1:1);
+      const dir = e.key==='ArrowLeft'?-1:1;
+      if (summaryView) summaryNav(dir); else navStep(dir);
       return;
     }
   }
@@ -8872,6 +9088,11 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     if q.get("raw", [""])[0] in ("1", "true"):
                         self._send(md.encode("utf-8"),
                                    "text/markdown; charset=utf-8")
+                    elif q.get("frag", [""])[0] in ("1", "true"):
+                        # the in-app summary modal embeds the report body
+                        # markup - same escaping as the standalone page
+                        self._send(_summary_body(md).encode("utf-8"),
+                                   "text/html; charset=utf-8")
                     else:
                         self._send(summary_html(
                             md, f"{m.group(1)} / {m.group(2)}")

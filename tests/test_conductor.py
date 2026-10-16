@@ -6240,5 +6240,200 @@ class StepSummaryTests(unittest.TestCase):
         self.assertIn("a.purpose", conductor._DASH_HTML)
 
 
+class ModalDetailNavTests(unittest.TestCase):
+    """The 'Session summary' report opens in-app as a modal view (fetching
+    the ?frag=1 body) instead of a separate browser window, with the same
+    pipeSibs prev/next ordering as the task modal, and modal-to-modal jumps
+    (task -> request/runbook, request -> run details) leave a Back trail."""
+
+    def test_summary_frag_endpoint(self):
+        """?frag=1 returns just the escaped report body for the modal;
+        ?raw=1 (markdown) and the default full-page render are unchanged,
+        and a missing step still 404s as JSON."""
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            rd = runs / "20261015-000000-sum"
+            rd.mkdir(parents=True)
+            (rd / "state.json").write_text(json.dumps({
+                "run": "sum", "steps": {"s1": {
+                    "status": "done", "task": "inject <b>x</b> safely",
+                    "elapsed_s": 5}}}), encoding="utf-8")
+            handler = conductor.make_dashboard_handler(
+                runs, ["no-such-devin"], Path(td) / "reqs",
+                Path(td) / "manifests")
+            server = conductor.http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0), handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            port = server.server_port
+
+            def get(path):
+                conn = http.client.HTTPConnection("127.0.0.1", port,
+                                                  timeout=5)
+                conn.request("GET", path, headers={
+                    "Origin": f"http://127.0.0.1:{port}"})
+                res = conn.getresponse()
+                data = res.read().decode("utf-8")
+                ctype = res.getheader("Content-Type")
+                conn.close()
+                return res.status, data, ctype
+
+            base = "/api/runs/20261015-000000-sum/steps/s1/summary"
+            status, frag, ctype = get(base + "?frag=1")
+            self.assertEqual(status, 200)
+            self.assertIn("text/html", ctype)
+            self.assertIn("<h1>20261015-000000-sum / s1</h1>", frag)
+            self.assertIn("&lt;b&gt;x&lt;/b&gt;", frag)   # still escaped
+            self.assertNotIn("<!doctype", frag.lower())   # body only
+            self.assertNotIn("<style>", frag)
+            status, page, _ = get(base)
+            self.assertEqual(status, 200)
+            self.assertIn("<!doctype html>", page)        # full page intact
+            self.assertIn(frag.strip().split("\n")[0], page)
+            status, raw, ctype = get(base + "?raw=1")
+            self.assertEqual(status, 200)
+            self.assertIn("text/markdown", ctype)
+            self.assertIn("# 20261015-000000-sum / s1", raw)
+            status, body, _ = get(
+                "/api/runs/20261015-000000-sum/steps/nope/summary?frag=1")
+            self.assertEqual(status, 404)
+            self.assertIn("error", json.loads(body))
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_summary_modal_and_modal_back_js(self):
+        """Summary opens as an in-app view: same .dnav chain as the task
+        modal (sibling names + 'task N of M' + disabled ends), Arrow keys
+        walk it, a 404 renders a notice with Back intact, and Back pops the
+        modal history to the exact originating view (task/run/request) with
+        its scroll offset - Escape still tears the whole dialog down."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,
+  {innerHTML:'',hidden:true,textContent:'',scrollTop:0});
+  return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const fetches=[];
+const fetch=async(url)=>{
+  fetches.push(url);
+  if (url.includes('/summary')) {
+    const step=decodeURIComponent(url.match(/steps\/([^/?]+)/)[1]);
+    if (step==='x1') return {ok:false,status:404,
+      json:async()=>({error:'Step not in this run'}),text:async()=>''};
+    return {ok:true,status:200,
+      text:async()=>'<h1>r / '+step+'</h1><ul><li><strong>status:</strong> done</li></ul>',
+      json:async()=>({})};
+  }
+  if (url.startsWith('/api/requests/')) return {ok:true,status:200,
+    json:async()=>({id:'req1',status:'launched',raw:'do it',project:'p',
+      proposed_steps:[],manifest:'m.toml',manifest_text:'x',
+      max_attempts:3})};
+  throw new Error('no net '+url);
+};
+const ctx=vm.createContext({document,fetch,confirm:()=>true,alert:()=>{},
+  location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+// run 'r' is a launched request (key request:req1) with a 3-step pipeline;
+// run 'r2' is a foreign single-step run whose step the server 404s.
+const data={serve_boot:'b',generated_at:'2026-10-14T00:00:00',agents:[
+  {step:'s1',run:'r',run_dir:'/r',run_key:'request:req1',slug:'p',
+   status:'done',task:'t1',seq:0,request_id:'req1'},
+  {step:'s3',run:'r',run_dir:'/r',run_key:'request:req1',slug:'p',
+   status:'done',task:'t3',seq:2,request_id:'req1'},
+  {step:'s2',run:'r',run_dir:'/r',run_key:'request:req1',slug:'p',
+   status:'done',task:'t2',seq:1,request_id:'req1'},
+  {step:'x1',run:'r2',run_dir:'/r2',run_key:'/r2',slug:'q',
+   status:'done',task:'tx',seq:0}],
+  runs:[{run:'r',dir:'/r',key:'request:req1',request_id:'req1',
+         counts:{done:3}},
+        {run:'r2',dir:'/r2',key:'/r2',counts:{done:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const click=async t=>handlers.click({target:t,preventDefault:()=>{}});
+const key=async k=>handlers.keydown({key:k,target:{},preventDefault:()=>{}});
+const open=step=>vm.runInContext(
+  'showDetail(AGENTS.findIndex(a=>a.step==='+JSON.stringify(step)+'))',ctx);
+const el=(sel,ds)=>({dataset:{},closest:s=>s===sel?{dataset:ds}:null});
+const flush=()=>new Promise(r=>setTimeout(r,0));
+const body=()=>elem('dbody').innerHTML;
+(async()=>{
+  // task modal -> in-app summary (the link keeps its real URL + _blank)
+  await open('s2');
+  assert.match(body(),/data-summary="request:req1\|s2"/);
+  assert.match(body(),/href="\/api\/runs\/r\/steps\/s2\/summary"/);
+  assert.match(body(),/target="_blank"/);
+  elem('detail').scrollTop=42;                 // task modal was scrolled
+  await click(el('[data-summary]',{summary:'request:req1|s2'}));
+  await flush();
+  assert.equal(elem('backdrop').hidden,false); // same modal, no new window
+  assert.match(body(),/Session summary - p \/ s2/);
+  assert.match(body(),/<div class="sumdoc"><h1>r \/ s2<\/h1>/);
+  assert.match(body(),/task 2 of 3/);          // same ordering as task nav
+  assert.match(body(),/data-snav="request:req1\|s1"/);
+  assert.match(body(),/data-snav="request:req1\|s3"/);
+  assert.match(body(),/data-modal-back/);
+  assert.ok(fetches.some(u=>u==='/api/runs/r/steps/s2/summary?frag=1'));
+  assert.equal(elem('detail').scrollTop,0);    // fresh view lands on top
+  // sibling nav to the chain end - the next button disables there
+  await click(el('[data-snav]',{snav:'request:req1|s3'})); await flush();
+  assert.match(body(),/r \/ s3/);
+  assert.match(body(),/task 3 of 3/);
+  // arrow keys share the walk; Right clamps at the end of the list
+  await key('ArrowLeft'); await flush();
+  assert.match(body(),/r \/ s2/); assert.match(body(),/task 2 of 3/);
+  await key('ArrowRight'); await flush(); assert.match(body(),/task 3 of 3/);
+  await key('ArrowRight'); await flush(); assert.match(body(),/task 3 of 3/);
+  // Back pops to the ORIGINATING task - same key, same scroll offset
+  await click(el('[data-modal-back]',{})); await flush();
+  assert.match(body(),/p \/ s2/);
+  assert.match(body(),/<div class="kv">/);
+  assert.equal(elem('detail').scrollTop,42);
+  assert.doesNotMatch(body(),/data-modal-back/);   // history consumed
+
+  // task -> request/runbook -> run details, Back walking each level
+  await open('s1');
+  await click(el('[data-open-request]',{openRequest:'req1'})); await flush();
+  assert.match(body(),/Original request/);
+  assert.match(body(),/Back: s1/);
+  await click(el('[data-run-details]',{runDetails:'request:req1'}));
+  assert.match(body(),/<h3 id="modal-title">r<\/h3>/);
+  assert.match(body(),/Back: request/);
+  await click(el('[data-modal-back]',{})); await flush();
+  assert.match(body(),/Original request/);
+  assert.match(body(),/Back: s1/);               // older entry survived
+  await click(el('[data-modal-back]',{})); await flush();
+  assert.match(body(),/p \/ s1/);
+  assert.doesNotMatch(body(),/data-modal-back/);
+
+  // missing item: the server 404s -> notice, no dead nav, Back survives
+  await open('x1');
+  await click(el('[data-summary]',{summary:'/r2|x1'})); await flush();
+  assert.match(body(),/Summary unavailable: Step not in this run/);
+  assert.match(body(),/class="notice error"/);
+  assert.doesNotMatch(body(),/data-snav/);       // single-step run: no nav
+  assert.match(body(),/data-modal-back/);
+  await click(el('[data-modal-back]',{})); await flush();
+  assert.match(body(),/q \/ x1/);
+
+  // Escape tears the whole stack down; nothing leaks into the next modal
+  await open('s2');
+  await click(el('[data-open-request]',{openRequest:'req1'})); await flush();
+  await key('Escape');
+  assert.equal(elem('backdrop').hidden,true);
+  await open('s1');
+  assert.doesNotMatch(body(),/data-modal-back/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
