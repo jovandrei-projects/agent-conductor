@@ -1466,6 +1466,10 @@ prompt = "Review the catalog tests."
 
         class FakeProc:
             def __init__(self, cmd, **kwargs):
+                # `devin list` session probes spawn around the planner -
+                # only the planner's own --prompt-file spawn is of interest
+                if "--prompt-file" not in cmd:
+                    return
                 seen["cmd"] = cmd
                 seen["cwd"] = kwargs["cwd"]
                 seen["prompt"] = Path(cmd[cmd.index("--prompt-file") + 1])
@@ -2509,6 +2513,349 @@ assert.match(elem('dbody').innerHTML,/Stop proposal/);
 (async()=>{
   await handlers.click({target:{dataset:{action:'stop'}}});
   assert.ok(posts.some(p=>p==='/api/requests/r1/stop'));
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
+class RetainProposalSessionTests(unittest.TestCase):
+    """The create-proposal session is kept as 'step 0' preparation history
+    on the plan's task list. _finish_generation banks each attempt's
+    session id + terminal status (plan_sessions) and marks the producer
+    (plan_gen_id); collect_dashboard re-emits them every poll for a ready
+    plan AND for its launched run. They are never runnable: launch,
+    retry and resume operate on manifest steps/state.json only."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.proj = make_project(self.base)
+        self.runs = self.base / "runs"
+        self.requests = self.base / "requests"
+        self.manifests = self.base / "manifests"
+        self.manifests.mkdir()
+        patch = mock.patch.object(conductor, "load_projects", return_value={
+            "proj": {"path": self.proj, "cloud_ok": False}})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def proposal(self, description="Tidy the catalog"):
+        return f'''[run]
+name = "catalog-cleanup"
+description = "{description}"
+on_failure = "continue"
+checkpoint = true
+
+[defaults]
+project = "proj"
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+max_attempts = 3
+
+[[step]]
+name = "organize"
+prompt = "Organize the catalog and verify results."
+'''
+
+    def new(self):
+        return conductor.create_request(
+            {"raw": "Please tidy the catalog carefully", "project": "proj",
+             "model": "swe-2", "effort": "max"}, self.requests, self.runs)
+
+    def cleanup_flag(self, rid):
+        flag = conductor.gen_stop_flag(rid)
+        self.addCleanup(lambda: flag.unlink(missing_ok=True))
+        return flag
+
+    def wait_attempts(self, n=0, timeout=10):
+        deadline = time.time() + timeout
+        while len(conductor._GENERATING) != n and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(conductor._GENERATING), n)
+
+    def planner_popen(self, calls):
+        """popen_router + FakeProc: the --prompt-file spawn writes the
+        ATIF export (with the session id the real CLI stamps) and the
+        manifest to stdout; git/devin-list probes spawn for real."""
+        proposal = self.proposal()
+        real_popen = subprocess.Popen
+
+        class FakeProc:
+            def __init__(self, cmd, **kwargs):
+                self.pid = 1
+                self._dead = False
+                calls.append(self)
+                exp = Path(cmd[cmd.index("--export") + 1])
+                exp.write_text(json.dumps({
+                    "session_id": f"sess-plan-{len(calls)}",
+                    "final_metrics": {"total_prompt_tokens": 10}}))
+                kwargs["stdout"].write((
+                    "BEGIN_MANIFEST\n" + proposal +
+                    "END_MANIFEST\nSTATUS: done\n").encode())
+                kwargs["stdout"].flush()
+
+            def poll(self):
+                return 0 if self._dead else None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                self._dead = True
+
+        def popen_router(cmd, **kwargs):
+            if isinstance(cmd, list) and "--prompt-file" in cmd:
+                return FakeProc(cmd, **kwargs)
+            return real_popen(cmd, **kwargs)
+        return popen_router
+
+    def test_published_plan_keeps_planner_session_as_step0(self):
+        rec = self.new()
+        calls = []
+        with mock.patch.object(conductor.subprocess, "Popen",
+                               self.planner_popen(calls)), \
+                mock.patch.object(conductor, "session_ids",
+                                  return_value=set()), \
+                mock.patch.object(
+                    conductor, "wait_worker",
+                    return_value=(0, False, False, False, 0.0)):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "ready")
+        # the attempt's terminal record is persisted on the request json -
+        # the association survives a serve restart/UI reload
+        self.assertEqual(len(rec["plan_sessions"]), 1)
+        entry = rec["plan_sessions"][0]
+        self.assertEqual(entry["status"], "done")
+        self.assertEqual(entry["session_id"], "sess-plan-1")
+        self.assertEqual(rec["plan_gen_id"], entry["gen_id"])
+        on_disk = json.loads(conductor._request_path(
+            rec["id"], self.requests).read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["plan_sessions"][0]["session_id"],
+                         "sess-plan-1")
+        self.assertEqual(on_disk["plan_gen_id"], entry["gen_id"])
+        # a fresh collect_dashboard (what a reload does) rebuilds the row
+        # under the plan's own run_key, as step 0 of its task list
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        by_step = {a["step"]: a for a in d["agents"]}
+        prep = by_step["plan-proposal"]
+        self.assertEqual(prep["run_key"], f"request:{rec['id']}")
+        self.assertEqual(prep["status"], "done")
+        self.assertEqual(prep["session_id"], "sess-plan-1")
+        self.assertEqual(prep["seq"], -1)
+        self.assertIsNone(prep["run_dir"])        # history, not work
+        self.assertIn("prepared this plan", prep["note"])
+        self.assertFalse(prep["prompt_editable"])
+        self.assertEqual(set(by_step) - {"plan-proposal"}, {"organize"})
+        self.assertEqual(by_step["organize"]["status"], "planned")
+        self.assertEqual(by_step["organize"]["seq"], 0)
+
+    def test_stop_then_regenerate_attributes_each_attempt_to_itself(self):
+        rec = self.new()
+        self.cleanup_flag(rec["id"])
+        calls = []
+        proposal = self.proposal()
+        real_popen = subprocess.Popen
+
+        class FakeProc:
+            def __init__(self, cmd, **kwargs):
+                self.pid = 1
+                self._dead = False
+                calls.append(self)
+                n = len(calls)
+                exp = Path(cmd[cmd.index("--export") + 1])
+                exp.write_text(json.dumps(
+                    {"session_id": f"sess-{n}"}))
+                if n == 2:          # only the second attempt emits a TOML
+                    kwargs["stdout"].write((
+                        "BEGIN_MANIFEST\n" + proposal +
+                        "END_MANIFEST\nSTATUS: done\n").encode())
+                    kwargs["stdout"].flush()
+
+            def poll(self):
+                return 0 if self._dead else None
+
+            def wait(self, timeout=None):
+                if self._dead:
+                    return 0
+                raise subprocess.TimeoutExpired("planner", timeout or 0)
+
+            def kill(self):
+                self._dead = True
+
+        def popen_router(cmd, **kwargs):
+            if isinstance(cmd, list) and "--prompt-file" in cmd:
+                return FakeProc(cmd, **kwargs)
+            return real_popen(cmd, **kwargs)
+
+        def fake_wait(proc, log, timeout_s, stop_flags=(),
+                      timeout_flag=None, stall_s=None):
+            if len(calls) == 1:      # attempt 1 dies on the stop sentinel
+                for _ in range(500):
+                    if stop_flags and conductor._flag_set(*stop_flags):
+                        proc.kill()
+                        return proc.wait(), False, False, True, 0.0
+                    if proc.poll() is not None:
+                        return 0, False, False, False, 0.0
+                    time.sleep(0.01)
+            return 0, False, False, False, 0.0
+
+        with mock.patch.object(conductor.subprocess, "Popen",
+                               popen_router), \
+                mock.patch.object(conductor, "session_ids",
+                                  return_value=set()), \
+                mock.patch.object(conductor, "wait_worker", fake_wait):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"])
+            deadline = time.time() + 10
+            while not calls and time.time() < deadline:
+                time.sleep(0.02)
+            conductor.stop_generation(rec["id"], self.requests, self.runs)
+            self.wait_attempts()
+            # attempt 1 ended stopped with its own session banked
+            rec = conductor.request_details(rec["id"], self.requests,
+                                            self.manifests)
+            self.assertEqual(rec["status"], "draft")
+            self.assertEqual(len(rec["plan_sessions"]), 1)
+            self.assertEqual(rec["plan_sessions"][0]["status"], "stopped")
+            self.assertEqual(rec["plan_sessions"][0]["session_id"],
+                             "sess-1")
+            # attempt 2 publishes - the producer association moves to it
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "ready")
+        self.assertEqual(len(rec["plan_sessions"]), 2)
+        old, new = rec["plan_sessions"]
+        self.assertEqual((old["status"], old["session_id"]),
+                         ("stopped", "sess-1"))
+        self.assertEqual((new["status"], new["session_id"]),
+                         ("done", "sess-2"))
+        self.assertEqual(rec["plan_gen_id"], new["gen_id"])
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        by_step = {a["step"]: a for a in d["agents"]}
+        # 'plan-proposal' is THIS plan's producer - never attempt 1
+        self.assertEqual(by_step["plan-proposal"]["session_id"], "sess-2")
+        self.assertEqual(by_step["plan-proposal"]["seq"], -1)
+        self.assertEqual(by_step["plan-proposal-1"]["status"], "stopped")
+        self.assertEqual(by_step["plan-proposal-1"]["session_id"],
+                         "sess-1")
+        self.assertIsNone(by_step["plan-proposal-1"]["seq"])
+
+    def test_launch_runs_step1_and_keeps_prep_history_not_runnable(self):
+        rec = self.new()
+        calls = []
+        with mock.patch.object(conductor.subprocess, "Popen",
+                               self.planner_popen(calls)), \
+                mock.patch.object(conductor, "session_ids",
+                                  return_value=set()), \
+                mock.patch.object(
+                    conductor, "wait_worker",
+                    return_value=(0, False, False, False, 0.0)):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "ready")
+        self.assertEqual(len(calls), 1)
+        # launch spawns the real conductor; the run executes the manifest
+        # starting at step 1 - proposal generation is never re-invoked
+        args = argparse.Namespace(manifest=rec["manifest"], resume=None,
+                                  devin=MOCK, runs_dir=str(self.runs),
+                                  request_id=rec["id"], hub=False,
+                                  keep_awake=False)
+        self.assertEqual(conductor.cmd_run(args), 0)
+        self.assertEqual(len(calls), 1)      # no planner respawn
+        run_dir = next(self.runs.glob("*/state.json"))
+        st = json.loads(run_dir.read_text(encoding="utf-8"))
+        self.assertEqual(set(st["steps"]), {"organize"})
+        self.assertEqual(st["steps"]["organize"]["status"], "done")
+        # the project's session registry proves only step 1 spawned
+        spawned = json.loads((self.proj / ".mock_sessions.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(len(spawned), 1)
+        # the plan's task list still shows the planner session - now
+        # attached to the real run under the same request:<id> key
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        by_step = {a["step"]: a for a in d["agents"]
+                   if a["run_key"] == f"request:{rec['id']}"}
+        self.assertEqual(by_step["organize"]["status"], "done")
+        self.assertEqual(by_step["plan-proposal"]["status"], "done")
+        self.assertEqual(by_step["plan-proposal"]["session_id"],
+                         "sess-plan-1")
+        run = next(r for r in d["runs"] if r.get("request_id") == rec["id"])
+        self.assertEqual(run["counts"], {"done": 1})
+        # resume sees only manifest steps - prep history is never
+        # selected as runnable work
+        args2 = argparse.Namespace(manifest=rec["manifest"],
+                                   resume=str(run_dir.parent), devin=MOCK,
+                                   runs_dir=str(self.runs),
+                                   request_id=rec["id"], hub=False,
+                                   keep_awake=False)
+        self.assertEqual(conductor.cmd_run(args2), 0)
+        self.assertEqual(len(calls), 1)
+        st2 = json.loads(run_dir.read_text(encoding="utf-8"))
+        self.assertEqual(set(st2["steps"]), {"organize"})
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_prep_row_is_nav_chain_step0(self):
+        """The producer row (seq=-1) leads the task modal's prev/next
+        pipeline - 'conceptually step 0': step 1's prev names it."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,
+  {innerHTML:'',hidden:true,textContent:'',scrollTop:9});
+  return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',agents:[
+  {step:'s1',run:'r',run_dir:null,run_key:'request:x',slug:'p',
+   status:'done',task:'t1',seq:0},
+  {step:'s2',run:'r',run_dir:null,run_key:'request:x',slug:'p',
+   status:'planned',task:'t2',seq:1},
+  {step:'plan-proposal',run:'r',run_dir:null,run_key:'request:x',slug:'p',
+   status:'done',task:'planner',seq:-1,session_id:'sess-1'},
+  {step:'plan-proposal-1',run:'r',run_dir:null,run_key:'request:x',
+   slug:'p',status:'stopped',task:'older attempt',session_id:'sess-0'}],
+  runs:[{run:'r',dir:'',key:'request:x',counts:{done:2,planned:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const open=step=>vm.runInContext(
+  'showDetail(AGENTS.findIndex(a=>a.step==='+JSON.stringify(step)+'))',ctx);
+(async()=>{
+  await open('s1');
+  let body=elem('dbody').innerHTML;
+  assert.match(body,/task 2 of 3/);                       // step0 + s1 + s2
+  assert.match(body,/data-nav="request:x\|plan-proposal"/);  // prev = step 0
+  await open('plan-proposal');
+  body=elem('dbody').innerHTML;
+  assert.match(body,/task 1 of 3/);
+  assert.match(body,/data-nav="request:x\|s1"/);          // next = step 1
+  assert.match(body,/sess-1/);                            // session link kept
+  // the numbered non-producer attempt stays out of the chain
+  await open('plan-proposal-1');
+  assert.doesNotMatch(elem('dbody').innerHTML,/class="dnav"/);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,

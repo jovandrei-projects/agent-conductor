@@ -145,7 +145,17 @@ backslashes). The :8773 dashboard's New request saves raw drafts in ignored
 `data/requests/`, generates/validates a reviewable TOML with a planning-only
 Devin CLI session, and shows its steps as `planned`. The planner's own stdout
 streams to `data/requests/<id>.gen.log` (outside its tempdir cwd, so trap-5
-safe) and appears live as a `plan-proposal` agent row while generating. Saving or generating NEVER
+safe) and appears live as a `plan-proposal` agent row while generating.
+Every finished attempt (published, questions-parked, stopped or failed)
+is banked on the request as a `plan_sessions` record - gen_id, captured
+session id (`devin list` diff in the planner tempdir, then export
+`session_id`/`session` + `tail_session_ref` fallbacks), status, tokens -
+and `plan_gen_id` marks the attempt that produced the current manifest.
+`collect_dashboard` re-emits them as `plan-proposal` (the producer;
+`plan-proposal-N` for other attempts) 'step 0' history rows on the plan's
+task list - after publish, after launch (same `request:<id>` run_key) and
+after reload, with real status + session/log links but never a `run_dir`
+or a `counts` share, so nothing about them is runnable. Saving or generating NEVER
 launches implementation: only the separate Start run button does. Editing
 request/model after generation marks the plan stale; regenerate or edit+save
 TOML before launching. The form's follow-up checkbox asks the planner for a

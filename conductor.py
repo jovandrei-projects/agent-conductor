@@ -931,6 +931,19 @@ def tail_agent_model(export_path: Path) -> str | None:
     return name if isinstance(name, str) and name else None
 
 
+def tail_session_id(export_path: Path) -> str | None:
+    """The session id recorded in the ATIF export - top-level `session_id`
+    (the mock writes `session` instead). None when the session never wrote
+    an export (killed early) or the file can't be parsed."""
+    try:
+        d = json.loads(export_path.read_text(encoding="utf-8",
+                                             errors="replace"))
+    except (OSError, ValueError):
+        return None
+    sid = d.get("session_id") or d.get("session")
+    return sid if isinstance(sid, str) and sid else None
+
+
 # Trajectory arc: condense an ATIF export's `steps` array into labeled
 # phase spans (setup -> audit -> implement -> test -> ... -> commit) so
 # the task modal can show "what the session did" in ~15 lines instead of
@@ -2809,6 +2822,10 @@ _GENERATING: set[str] = set()
 # Live planner Popen per request id - lets 'Stop proposal' tree-kill the
 # devin process now instead of waiting out the wait_worker poll.
 _GEN_PROCS: dict = {}
+# rec['plan_sessions'] is bounded preparation history - one record per
+# planner attempt (done/stopped/failed/questions-parked), enough that a
+# repeatedly regenerated request can't grow the JSON without limit.
+PLAN_HISTORY_MAX = 12
 
 
 class RequestError(ValueError):
@@ -3639,6 +3656,12 @@ STATUS: done
             "--respect-workspace-trust", "false"]
         rid = rec.get("id")
         sflag = gen_stop_flag(rid) if rid else None
+        # The planner's session id is worth banking even when the pass
+        # dies: the dashboard keeps it as preparation history ('step 0').
+        # `devin list` is cwd-scoped, so diff while the tempdir still
+        # exists; the export/log refs cover a session that never
+        # registered there (killed before list propagation).
+        before = session_ids(devin_argv, Path(wd)) or set()
         with open(log, "ab" if fix_note else "wb") as out:
             proc = subprocess.Popen(cmd, cwd=wd, stdout=out,
                                     stderr=subprocess.STDOUT,
@@ -3657,6 +3680,13 @@ STATUS: done
                     with REQUEST_LOCK:
                         if _GEN_PROCS.get(rid) is proc:
                             _GEN_PROCS.pop(rid, None)
+        sids = sorted(
+            (session_ids(devin_argv, Path(wd)) or set()) - before)
+        ref = tail_session_id(export_path) or tail_session_ref(log)
+        if ref and ref not in sids:
+            sids.append(ref)
+        if sids:
+            rec["_gen_session_ids"] = sids
         if stopped or (sflag is not None and sflag.is_file()):
             raise GenerationStopped(f"request {rid} proposal stopped")
         if timed_out or rc != 0:
@@ -3675,6 +3705,45 @@ STATUS: done
     return matches[-1].strip() + "\n"
 
 
+def _plan_attempt_entry(rec: dict, gen_id: str, sids: list[str],
+                        outcome: str, tok: dict | None = None,
+                        note: str | None = None) -> dict:
+    """One planner attempt's terminal record for rec['plan_sessions'] -
+    the persistent 'step 0' association between a create-proposal
+    session and the plan it produced (or tried to). `outcome` is the
+    session's real terminal status: done (published, or parked its
+    questions), stopped, or failed."""
+    entry = {"gen_id": gen_id, "status": outcome,
+             "session_id": sids[-1] if sids else None,
+             "started_at": rec.get("generation_started_at"),
+             "ended_at": now_iso(),
+             "model": rec.get("plan_model") or rec.get("model"),
+             "effort": (rec.get("plan_effort")
+                        if rec.get("plan_effort") is not None
+                        else rec.get("effort"))}
+    if len(sids) > 1:
+        entry["session_ids"] = list(sids)
+    if tok:
+        entry["tokens"] = dict(tok)
+    if note:
+        entry["note"] = note
+    t0, t1 = _iso_ts(entry["started_at"]), _iso_ts(entry["ended_at"])
+    if t0 and t1:
+        entry["elapsed_s"] = round(t1 - t0, 1)
+    return entry
+
+
+def _record_plan_attempt(rec: dict, entry: dict) -> None:
+    """Append a finished planner attempt to rec['plan_sessions'] - the
+    preparation history the dashboard renders as step-0 rows. Deduped by
+    gen_id (each attempt records exactly one terminal outcome) and bounded
+    by PLAN_HISTORY_MAX."""
+    sess = [a for a in (rec.get("plan_sessions") or [])
+            if a.get("gen_id") != entry.get("gen_id")]
+    sess.append(entry)
+    rec["plan_sessions"] = sess[-PLAN_HISTORY_MAX:]
+
+
 def _finish_generation(request_id: str, requests_dir: Path,
                        manifests_dir: Path, runs_dir: Path,
                        devin_argv: list[str], gen_id: str) -> None:
@@ -3683,6 +3752,11 @@ def _finish_generation(request_id: str, requests_dir: Path,
     while the planner unwinds, and an immediate Regenerate already owns the
     'generating' slot then, so a stale attempt must not touch the record."""
     tok_plan: dict[str, int] = {}
+    # Session ids of the devin sessions this attempt spawned - captured by
+    # _planner_response (a malformed-TOML retry spawns a second one). They
+    # land in the attempt's plan_sessions record, the persistent link
+    # between the proposal and the session that drafted it.
+    gen_sids: list[str] = []
 
     def still_mine(rec: dict) -> bool:
         return rec["status"] == "generating" \
@@ -3697,6 +3771,7 @@ def _finish_generation(request_id: str, requests_dir: Path,
         try:
             text = _planner_response(rec, projects, devin_argv, log_path,
                                      qa=qa)
+            gen_sids += rec.pop("_gen_session_ids", [])
             _merge_tokens(tok_plan, tail_metrics(export_path))
             try:
                 defaults = tomllib.loads(text).get("defaults", {})
@@ -3706,6 +3781,7 @@ def _finish_generation(request_id: str, requests_dir: Path,
                 # with the parse error fed back.
                 text = _planner_response(rec, projects, devin_argv,
                                          log_path, fix_note=str(exc), qa=qa)
+                gen_sids += rec.pop("_gen_session_ids", [])
                 _merge_tokens(tok_plan, tail_metrics(export_path))
                 defaults = tomllib.loads(text).get("defaults", {})
         except PlannerQuestions as q:
@@ -3713,6 +3789,7 @@ def _finish_generation(request_id: str, requests_dir: Path,
             # questionnaire on the request. The dashboard poses it one
             # modal at a time; answer_request restarts this function as the
             # refine pass once every question has an answer or a skip.
+            gen_sids += rec.pop("_gen_session_ids", [])
             _merge_tokens(tok_plan, tail_metrics(export_path))
             with REQUEST_LOCK:
                 if not still_mine(_read_request(request_id, requests_dir)):
@@ -3726,6 +3803,9 @@ def _finish_generation(request_id: str, requests_dir: Path,
                         dict(rec.get("plan_tokens") or {}), tok_plan)
                     if plan_tok:
                         rec["plan_tokens"] = plan_tok
+                    _record_plan_attempt(rec, _plan_attempt_entry(
+                        rec, gen_id, gen_sids, "done", tok_plan,
+                        "asked clarifying questions"))
                     if rounds > MAX_QUESTION_ROUNDS:
                         rec.update(
                             status="error", pending_questions=[],
@@ -3768,6 +3848,13 @@ def _finish_generation(request_id: str, requests_dir: Path,
                             dict(rec.get("plan_tokens") or {}), tok_plan)
                         if plan_tok:
                             rec["plan_tokens"] = plan_tok
+                        # plan_gen_id marks the attempt that produced THIS
+                        # manifest - the row labelled 'plan-proposal' at
+                        # rest. An earlier stopped/superseded session is
+                        # never attributed to a later attempt's plan.
+                        rec["plan_gen_id"] = gen_id
+                        _record_plan_attempt(rec, _plan_attempt_entry(
+                            rec, gen_id, gen_sids, "done", tok_plan))
                         _publish_proposal(rec, text, requests_dir,
                                           manifests_dir, runs_dir)
                 break
@@ -3779,9 +3866,11 @@ def _finish_generation(request_id: str, requests_dir: Path,
                 raise
     except GenerationStopped:
         # stop_generation already restored the record (draft, or ready with
-        # the previous proposal). Bank the killed attempt's token usage -
-        # plan_tokens accumulates across attempts - and touch nothing else;
-        # a newer attempt may already own the 'generating' slot.
+        # the previous proposal). Bank the killed attempt's token usage and
+        # record its session as a stopped preparation attempt - the entry
+        # is keyed by this attempt's own gen_id, so it can never be read
+        # as the producer of a plan some other attempt published.
+        gen_sids += rec.pop("_gen_session_ids", [])
         try:
             _assert_unwatched(runs_dir, requests_dir)
             with REQUEST_LOCK:
@@ -3790,10 +3879,14 @@ def _finish_generation(request_id: str, requests_dir: Path,
                     dict(rec.get("plan_tokens") or {}), tok_plan)
                 if plan_tok:
                     rec["plan_tokens"] = plan_tok
-                    _save_request(rec, requests_dir)
+                _record_plan_attempt(rec, _plan_attempt_entry(
+                    rec, gen_id, gen_sids, "stopped", tok_plan,
+                    "stopped before producing a plan"))
+                _save_request(rec, requests_dir)
         except RequestError:
             pass
     except Exception as exc:
+        gen_sids += rec.pop("_gen_session_ids", [])
         _wait_writable(runs_dir, requests_dir, LOGS_DIR)
         LOG.warning("request %s generation failed: %s", request_id, exc)
         msg = (f"Planner returned malformed TOML ({exc})"
@@ -3805,6 +3898,9 @@ def _finish_generation(request_id: str, requests_dir: Path,
                     dict(rec.get("plan_tokens") or {}), tok_plan)
                 if plan_tok:
                     rec["plan_tokens"] = plan_tok
+                _record_plan_attempt(rec, _plan_attempt_entry(
+                    rec, gen_id, gen_sids, "failed", tok_plan,
+                    msg[:160]))
                 rec.update(status="error", error=msg[:300])
                 _save_request(rec, requests_dir)
     finally:
@@ -4908,6 +5004,84 @@ def proposal_agent(step: dict, rec: dict, projects: dict, key: str,
             else None}
 
 
+def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
+                        log_path: Path, prices: dict) -> list[dict]:
+    """Agent rows for a request's recorded planner sessions - the 'step 0'
+    preparation history of its plan.
+
+    Each completed attempt lands one row carrying its real terminal
+    status and the session id captured while it ran. Labels keep
+    agentKey (run_key|step) unique AND keep attribution honest: at rest,
+    the attempt that produced the current manifest (rec['plan_gen_id'])
+    is 'plan-proposal'; every other recorded attempt is 'plan-proposal-N'
+    by attempt order. While a newer pass is generating, the live row
+    holds the bare name and all completed attempts are numbered - an
+    earlier session is never shown as a later attempt's producer. Only
+    the newest completed attempt gets log/export/tail links: all attempts
+    write the same <id>.gen.* files, so only its content is on disk.
+
+    These rows are history, not work: no run_dir, no counts, never
+    runnable (retry/resume operate on state.json + the manifest)."""
+    entries = rec.get("plan_sessions") or []
+    if not entries:
+        return []
+    producer = rec.get("plan_gen_id")
+    export_path = log_path.with_suffix(".export.json")
+    task = "Propose a TOML runbook for: " + " ".join(
+        (rec.get("raw") or "").split())[:120]
+    out = []
+    for i, e in enumerate(entries):
+        produced = bool(e.get("gen_id")) and e.get("gen_id") == producer
+        files = i == len(entries) - 1 and not generating
+        log = str(log_path) if files and log_path.is_file() else None
+        exp = str(export_path) if files and export_path.is_file() else None
+        status = e.get("status") or "done"
+        if produced:
+            note = ("prepared this plan - preparation history, not a "
+                    "run step")
+        elif status == "stopped":
+            note = e.get("note") or "stopped before producing a plan"
+        elif e.get("note"):
+            note = e["note"]
+        elif status == "failed":
+            note = "preparation attempt failed"
+        else:
+            note = "superseded by a later preparation"
+        out.append({
+            "run": rec.get("run") or rec.get("label"),
+            "run_dir": None, "run_key": key, "request_id": rec["id"],
+            "step": ("plan-proposal" if produced and not generating
+                     else f"plan-proposal-{i + 1}"),
+            "slug": rec.get("project") or "agent-conductor",
+            "work_dir": "planner tempdir (auto-cleaned)",
+            "status": status,
+            "created_at": e.get("started_at") or rec.get("updated_at"),
+            "started_at": e.get("started_at"),
+            "ended_at": e.get("ended_at"),
+            "elapsed_s": e.get("elapsed_s"),
+            "alive": False, "pid": None,
+            "session_id": e.get("session_id"), "session_gone": False,
+            "model": e.get("model"),
+            "model_actual": e.get("model_actual"),
+            "effort": e.get("effort"),
+            "mode": "planner", "cloud": False, "verify_ok": None,
+            "task": task, "task_full": task,
+            "note": note, "next": None, "exit_code": None,
+            "branch": None, "merged": None,
+            "tokens": e.get("tokens"), "wt": False,
+            "cost": estimate_cost(e.get("tokens"), e.get("model"),
+                                  e.get("effort"), prices,
+                                  e.get("model_actual")),
+            "stdout_log": log,
+            "tail": stdout_tail(log) if log else None,
+            "export": exp,
+            "arc": cached_arc(exp) if exp else None,
+            "prompt": None, "prompt_editable": False,
+            "notes_enabled": False, "skipped_by_user": False,
+            "seq": -1 if produced else None})
+    return out
+
+
 def _manifest_pending(st: dict, projects: dict) -> list[dict]:
     """Steps the run's manifest declares but state.json has no record for -
     CLI-launched runs get the same pending placeholder rows request runs
@@ -5004,6 +5178,9 @@ def collect_dashboard(runs_dir: Path,
                 str(rec.get("id") or "")) and rec.get("status") != "discarded":
             requests[rec["id"]] = rec
     launched: set[str] = set()
+    emitted_prep: set[str] = set()   # plan_sessions rows emitted once
+                                     # per request (dup run dirs share
+                                     # the same request:<id> agentKey)
     archived_runs = 0
     runs: list[dict] = []
     agents: list[dict] = []
@@ -5183,6 +5360,17 @@ def collect_dashboard(runs_dir: Path,
             row["seq"] = seq_of.get(row["step"], prop_seq.get(row["step"]))
             counts[row["status"]] = counts.get(row["status"], 0) + 1
             agents.append(row)
+        # Preparation history rides the launched run's task list under
+        # the same request:<id> run_key - the session that wrote this
+        # plan, kept as step 0. Deliberately NOT in counts: it is not a
+        # run step, and a 'stopped' planner row must never read as
+        # resumable work.
+        if request and request["id"] not in emitted_prep:
+            emitted_prep.add(request["id"])
+            agents.extend(plan_attempt_agents(
+                request, key, generating=False,
+                log_path=requests_dir / f"{request['id']}.gen.log",
+                prices=prices))
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
                      "key": key, "request_id": st.get("request_id"),
                      "archived": st.get("archived"),
@@ -5288,6 +5476,14 @@ def collect_dashboard(runs_dir: Path,
             a["notes_enabled"] = False
             a["seq"] = i               # proposal order is its pipeline
             agents.append(a)
+        # Step 0: completed planner sessions stay on the plan's task list
+        # after preparation ends (and after reload - they are rebuilt from
+        # the request record each poll). While a new pass generates, the
+        # live 'plan-proposal' row above holds the bare name and every
+        # completed attempt is numbered instead.
+        agents.extend(plan_attempt_agents(
+            rec, key, generating=stage == "generating",
+            log_path=log_p, prices=prices))
     # session_id is discovered post-spawn (diff of `devin list`); while a
     # step runs the cell is empty. Attribute it live instead: among the
     # unclaimed ids in the step's work_dir, the spawned one is the session
