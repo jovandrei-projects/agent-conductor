@@ -45,3 +45,4 @@ accounted for.
 | agent-conductor / follow-up-plan (run review + drafted ux-controls-followup.toml; 2 parked branches + 600s verify-cap + bookkeeping-conflict findings) | n/a | n/a | n/a | n/a |
 | agent-conductor / image-attachments (request-form drop/paste image upload to data/attachments + thumbnail strip + rec.attachments -> planner IMAGE ATTACHMENTS block; 199/199 + demo green) | n/a | n/a | n/a | n/a |
 | agent-conductor / task-modal-navigation (sticky .dnav prev/next bar walking pipeline seq order + arrow keys; agentKey->run_key; 200/200 + demo green) | n/a | n/a | n/a | n/a |
+| agent-conductor / resolve-task-modal-navigation (merge resolution: both-append conflicts on QUEUE.md + efficiency_stats.md; merge e8c79e9) | n/a | n/a | n/a | n/a |

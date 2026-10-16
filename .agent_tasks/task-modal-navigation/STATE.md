@@ -1,6 +1,6 @@
 # Task: task-modal-navigation
 
-**Status:** in progress
+**Status:** done
 **Started:** 2026-10-15   **Last touched:** 2026-10-15
 
 ## Objective
@@ -49,7 +49,9 @@ step; `navStep` shares the walk with `[data-nav]` clicks and
 ArrowLeft/ArrowRight (skipped while a form field is focused); nav resets
 `#detail` scrollTop, the 2s rebuild does not. `agentKey` now prefers
 `run_key` over `run_dir` (proposal rows have no dir - same-named steps in
-different requests could no longer alias).
+different requests could no longer alias). Merged to master via
+resolve-task-modal-navigation (merge commit e8c79e9; conflicts were
+both-append on QUEUE.md + efficiency_stats.md, kept both sides).
 
 ## Verification
 
