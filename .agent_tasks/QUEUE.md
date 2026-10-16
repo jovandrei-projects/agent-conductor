@@ -21,6 +21,18 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (compact-live-output): compact density hid every
+  `.sub`/`<br>` in the proposal run row, so a generating request showed
+  only the 'Preparing proposal' chip with no live output. The same
+  `gen_last` value now also renders inline as `.genline` right after the
+  stage chip - `display:none` at full density (the `.sub` line is
+  unchanged there), a single ellipsized line under `body.compact`,
+  truncated to the last 160 chars (fresh end) of newline-less blobs.
+  The existing `prevTail` diff keys it as `genline|<runkey>` and gives it
+  the `.fresh` flash on new output; the flash now applies to the
+  full-view `.sub` line too. `questions` rows show 'planner waits on N
+  answer(s)' in the same slot; pre-output shows 'planner warming up'.
+  211/211 mock tests green.
 - DONE 2026-10-16 (fix-regenerate-label): clicking Regenerate on a stale
   proposal showed 'Preparing proposal...' AND 'Needs review' at once -
   `stale` is only cleared by `_publish_proposal` on success, so it
