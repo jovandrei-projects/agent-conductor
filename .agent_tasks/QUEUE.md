@@ -21,6 +21,15 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-15 (run-link-affordance): run names in the runs table
+  always render as links now (blue + underline, lighter blue on hover) -
+  they are the run-modal affordance and previously looked like plain
+  text until hovered. Focus fix: after Esc-close the still-focused
+  button kept an outline clipped at the cell's left edge (td is
+  padding-left:0 + overflow:hidden and the shared focus rule offsets
+  the ring outward 2px) - `td :is(a,button):focus-visible` now draws
+  the ring inside the element (`outline-offset:-2px`), which also
+  covers the show-more links. 199/199 mock tests green.
 - DONE 2026-10-15 (trajectory drill-down + compact counters): each arc
   group is now an expandable `<details>` - per-entry timestamp,
   gap-to-next duration, and REAL per-turn in/out/cached tokens read
