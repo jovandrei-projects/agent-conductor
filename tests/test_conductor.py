@@ -8583,6 +8583,219 @@ const body=()=>elem('dbody').innerHTML;
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class ModalScrollStabilityTests(unittest.TestCase):
+    """An open task modal must survive the 2s background repaint: same
+    scroll position, same focus, no DOM churn on identical paint, no
+    inherited position on deliberate task switches, and stale /api/state
+    responses never repaint an older view."""
+
+    _STUB = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+let landmarks=[], focusables=[], activeEl=null, pending=null;
+let dbodyWrites=0, backdropHides=0, dtailSets=0;
+// Fake geometry, honestly modeled: a landmark carries a content-y
+// coordinate (cy) + height (h); its viewport rect derives from the live
+// scrollTop. `pending` says what the NEXT dbody.innerHTML swap does to
+// layout (a fresh landmark set) and to scrollTop (a browser clamp).
+const detailEl={innerHTML:'',hidden:false,textContent:'',scrollTop:0,
+  getBoundingClientRect:()=>({top:0,bottom:654,left:0,right:900}),
+  contains:()=>true};
+const backdrop={_hidden:true,innerHTML:'',textContent:'',scrollTop:0,
+  set hidden(v){ this._hidden=v; if(v===true) backdropHides++; },
+  get hidden(){ return this._hidden; }};
+const dbody={_h:'',textContent:'',hidden:false,scrollTop:0,
+  set innerHTML(v){ this._h=v; dbodyWrites++;
+    if(pending){ if(pending.landmarks) landmarks=pending.landmarks;
+      if(pending.clamp!=null) detailEl.scrollTop=pending.clamp;
+      pending=null; } },
+  get innerHTML(){ return this._h; },
+  querySelectorAll:()=>landmarks};
+const dtail={hidden:false,innerHTML:'',textContent:'',_s:0,
+  set scrollTop(v){ this._s=v; dtailSets++; },
+  get scrollTop(){ return this._s; }};
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',scrollTop:0}); return nodes.get(id); };
+nodes.set('detail',detailEl); nodes.set('backdrop',backdrop);
+nodes.set('dbody',dbody); nodes.set('dtail',dtail);
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:sel=>sel.startsWith('#detail')?focusables:[],
+  get activeElement(){ return activeEl; },
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const lm=o=>Object.assign({id:'',dataset:{},tagName:'DIV',className:'',
+  textContent:'',cy:0,h:20,
+  classList:{contains:c=>(o.cls||'').split(' ').includes(c)},
+  getBoundingClientRect(){ const t=this.cy-detailEl.scrollTop;
+    return {top:t,bottom:t+this.h,left:0,right:0}; }},o);
+let queue=[],defers=null,fetches=[];
+const fetch=u=>{ fetches.push(u);
+  if(defers) return new Promise(r=>defers.push({u,r}));
+  const r=queue.shift()||{ok:true,json:async()=>({}),text:async()=>''};
+  return Promise.resolve(r); };
+const ctx=vm.createContext({document,fetch,confirm:()=>true,alert:()=>{},
+  location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'g0',agents:[
+  {step:'one',run:'rA',run_dir:'/rA',run_key:'/rA',slug:'p',
+   status:'failed',task:'t1',task_full:'tf1',seq:0,note:'n1',
+   timeout_min:60},
+  {step:'two',run:'rA',run_dir:'/rA',run_key:'/rA',slug:'p',
+   status:'done',task:'t2',seq:1}],
+  runs:[{run:'rA',dir:'/rA',key:'/rA',counts:{failed:1,done:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const click=async t=>handlers.click({target:t,preventDefault:()=>{}});
+const el=(sel,ds)=>({dataset:{},closest:s=>s===sel?{dataset:ds}:null});
+const open=key=>click(el('[data-agent-detail]',{agentDetail:key}));
+const tailView=()=>{
+  landmarks=[lm({cls:'k',textContent:'note',cy:200,h:500}),
+             lm({tagName:'H3',textContent:'stdout tail',cy:1050,h:24}),
+             lm({id:'dtail',cy:1074,h:180})];
+  detailEl.scrollTop=1050; };
+'''
+
+    def _node(self, body):
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        p = subprocess.run(["node", "-e", self._STUB + body], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_same_task_repaint_keeps_scroll_anchor(self):
+        """A scrolled modal keeps its place through same-task repaints:
+        content growth above the viewport shifts scrollTop so the same
+        landmark stays put, a mid-swap browser clamp is un-clamped back
+        to the anchor, the #dtail pre's own scroll offset survives, the
+        dialog never hides mid-repaint, and a byte-identical repaint
+        skips the DOM write entirely."""
+        self._node(r'''
+(async()=>{
+  await open('/rA|one');
+  assert.equal(backdrop.hidden,false);
+  assert.match(dbody.innerHTML,/p \/ one/);
+  tailView();                                   // scrolled: tail at top
+  dtail._s=37; dtailSets=0;
+  // same-task update where content above the viewport grew 500px: the
+  // browser keeps numeric scrollTop, so without anchoring the tail the
+  // user was reading slides off-screen
+  const d2=JSON.parse(JSON.stringify(data));
+  d2.agents[0].note='n'.repeat(40);
+  pending={landmarks:[
+    lm({cls:'k',textContent:'note',cy:200,h:1000}),
+    lm({tagName:'H3',textContent:'stdout tail',cy:1550,h:24}),
+    lm({id:'dtail',cy:1574,h:180})]};
+  const h0=backdropHides;
+  vm.runInContext('render('+JSON.stringify(d2)+')',ctx);
+  assert.equal(backdropHides,h0);            // no hide/show round-trip
+  assert.equal(detailEl.scrollTop,1550);     // anchor followed growth
+  assert.ok(dtailSets>=1);                   // inner <pre> scroll carried
+  assert.equal(dtail._s,37);
+  // shrink back to the original note - a browser clamp mid-swap
+  // (scrollTop 1550 -> 802) must NOT be permanent: the anchor restores
+  const d3=JSON.parse(JSON.stringify(data));
+  pending={landmarks:[
+    lm({cls:'k',textContent:'note',cy:200,h:500}),
+    lm({tagName:'H3',textContent:'stdout tail',cy:1050,h:24}),
+    lm({id:'dtail',cy:1074,h:180})],
+    clamp:802};
+  vm.runInContext('render('+JSON.stringify(d3)+')',ctx);
+  assert.equal(detailEl.scrollTop,1050);     // un-clamped to the anchor
+  // a repaint that produces identical markup leaves the DOM alone
+  const d4=JSON.parse(JSON.stringify(d3));
+  d4.agents[1].note='sibling changed';       // sig bust, modal unchanged
+  const w0=dbodyWrites;
+  vm.runInContext('render('+JSON.stringify(d4)+')',ctx);
+  assert.equal(dbodyWrites,w0);
+  // a focused control is re-found on the new DOM by its stable data-*
+  // signature and re-focused (preventScroll, so the anchor isn't fought)
+  const btn={id:'',tagName:'BUTTON',dataset:{saveNotes:'/rA'},focusN:0,
+    focus(){this.focusN++;},getAttribute:()=>null};
+  focusables=[btn]; activeEl=btn;
+  const d5=JSON.parse(JSON.stringify(d4));
+  d5.agents[0].note='n'.repeat(41);
+  pending={landmarks:[
+    lm({cls:'k',textContent:'note',cy:200,h:510}),
+    lm({tagName:'H3',textContent:'stdout tail',cy:1060,h:24}),
+    lm({id:'dtail',cy:1084,h:180})]};
+  vm.runInContext('render('+JSON.stringify(d5)+')',ctx);
+  assert.equal(btn.focusN,1);
+  assert.equal(detailEl.scrollTop,1060);     // focus didn't win the scroll
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_task_switch_is_a_deliberate_top_reset(self):
+        """Navigating to a different task always lands at the top - the
+        previous task's offset can never bleed in (a display:none
+        round-trip does not reset scrollTop in modern browsers). A
+        same-task repaint or re-click is NOT a switch and keeps its
+        place; Escape + reopen also starts at the top."""
+        self._node(r'''
+(async()=>{
+  await open('/rA|one');
+  detailEl.scrollTop=600;
+  await open('/rA|two');
+  assert.match(dbody.innerHTML,/p \/ two/);
+  assert.equal(detailEl.scrollTop,0);
+  detailEl.scrollTop=450;
+  await open('/rA|two');                       // same task again: repaint
+  assert.equal(detailEl.scrollTop,450);
+  await open('/rA|one');
+  detailEl.scrollTop=450;
+  await click(el('[data-nav]',{nav:'/rA|two'})); // sibling nav -> top
+  assert.match(dbody.innerHTML,/p \/ two/);
+  assert.equal(detailEl.scrollTop,0);
+  handlers.keydown({key:'Escape',
+    target:{closest:()=>null,matches:()=>false},preventDefault:()=>{}});
+  assert.equal(backdrop.hidden,true);
+  detailEl.scrollTop=500;                      // stale leftover offset
+  await open('/rA|one');
+  assert.equal(detailEl.scrollTop,0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_modal_action_and_stale_refresh_guard(self):
+        """A POST+refresh action inside the modal (Save notes - same
+        round trip as review actions take) repaints the same task without
+        moving it. And /api/state responses are sequenced: an older body
+        landing after a newer one is dropped, so a stale payload can
+        never resurrect an older view mid-repaint."""
+        self._node(r'''
+(async()=>{
+  await open('/rA|one');
+  tailView();
+  // a modal action's POST + refresh round trip keeps the same view
+  queue.push({ok:true,json:async()=>({})});
+  const d6=JSON.parse(JSON.stringify(data));
+  d6.agents[0].note='note saved';
+  queue.push({ok:true,json:async()=>d6});
+  await click({dataset:{saveNotes:'/rA',step:'one'},closest:()=>null,
+               disabled:false});
+  assert.ok(fetches.some(u=>u.includes('/steps/one/notes')));
+  assert.equal(backdrop.hidden,false);
+  assert.equal(detailEl.scrollTop,1050);
+  assert.match(dbody.innerHTML,/note saved/);
+  // out-of-order /api/state: the newer response lands first, the older
+  // one last - the older body must not repaint on top
+  const dOld=JSON.parse(JSON.stringify(data)); dOld.generated_at='STALE';
+  const dNew=JSON.parse(JSON.stringify(data)); dNew.generated_at='NEW';
+  defers=[];
+  const p1=vm.runInContext('refresh()',ctx);
+  const p2=vm.runInContext('refresh()',ctx);
+  defers[1].r({ok:true,json:async()=>dNew});   // newer lands first
+  await p2;
+  defers[0].r({ok:true,json:async()=>dOld});   // stale lands last
+  await p1;
+  assert.equal(vm.runInContext('lastData.generated_at',ctx),'NEW');
+  assert.equal(backdrop.hidden,false);         // modal still up, same task
+  assert.equal(detailEl.scrollTop,1050);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+
 class ModelComboboxTests(unittest.TestCase):
     """Planner/Step model fields are free-text comboboxes: typing filters a
     Recommendations group on top of a separated, scrollable All models

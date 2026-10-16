@@ -8714,7 +8714,157 @@ function modalSelActive(){
               d.contains(s.anchorNode));
   }catch(e){ return false; }
 }
+// --- scroll-stable repaint of the open task modal ----------------------
+// The refresh tick rebuilds #dbody wholesale, which leaves the browser
+// nothing to scroll-anchor: numeric scrollTop survives the swap but the
+// CONTENT moves - a shorter repaint clamps #detail permanently (the
+// offset never comes back when it regrows), and growth above the
+// viewport pushes the text the user was reading off-screen. Before the
+// swap we remember which landmark sits at the viewport top and its
+// pixel offset; after it we put the SAME landmark back at that offset.
+// Everything is keyed by the open task: only a repaint of the view
+// already on screen restores anything, so a position can never bleed
+// into another task's modal (deliberate sibling nav still lands at the
+// top; a Back jump restores its own modalScroll snapshot instead).
+const MODAL_LANDMARKS = 'h3,.k,.wrap,.actions,.notice,.arcnote,#dtail,' +
+  '.arcgrp,.arcent,textarea,input,.sumdoc';
+// A landmark's identity across the rebuild: real ids first, then the
+// stable data hooks the markup already carries, then content-derived
+// keys. Occurrence index (n) disambiguates repeated sigs ('earlier'
+// outcome rows, .actions/.notice blocks).
+function landmarkSig(el){
+  if (el.id) return '#'+el.id;
+  const d = el.dataset || {};
+  if (d.asid!==undefined) return 'sid:'+d.asid;
+  if (d.ag!==undefined) return 'ag:'+d.ag;
+  const cl = el.classList;
+  if (cl && cl.contains && cl.contains('k'))
+    return 'k:'+(el.textContent||'');
+  if ((el.tagName||'').toUpperCase()==='H3')
+    return 'h3:'+(el.textContent||'').slice(0,48);
+  return (el.tagName||'?').toLowerCase()+'.'+
+    (typeof el.className==='string' ? el.className.split(' ')[0] : '');
+}
+function modalLandmarks(){
+  const b = document.getElementById('dbody');
+  return (b && b.querySelectorAll)
+    ? b.querySelectorAll(MODAL_LANDMARKS) : [];
+}
+function captureModalScroll(){
+  const sc = document.getElementById('detail');
+  const out = {top:(sc && sc.scrollTop)||0, sig:null, n:0, dy:0,
+               dtail:null};
+  const dt = document.getElementById('dtail');
+  if (dt) out.dtail = dt.scrollTop;      // the tail <pre> scrolls itself
+  if (!sc || !sc.getBoundingClientRect) return out;
+  const sTop = sc.getBoundingClientRect().top;
+  const seen = {};
+  for (const el of modalLandmarks()){
+    const sig = landmarkSig(el), idx = seen[sig]||0;
+    seen[sig] = idx + 1;
+    if (out.sig!=null || !el.getBoundingClientRect) continue;
+    const r = el.getBoundingClientRect();
+    if (r.bottom > sTop + 4){            // first still-visible landmark
+      out.sig = sig; out.n = idx; out.dy = r.top - sTop;
+    }
+  }
+  return out;
+}
+function restoreModalScroll(s){
+  const sc = document.getElementById('detail');
+  if (!sc || !s) return;
+  if (s.dtail!=null){
+    const dt = document.getElementById('dtail');
+    if (dt) dt.scrollTop = s.dtail;
+  }
+  if (s.sig && sc.getBoundingClientRect){
+    const sTop = sc.getBoundingClientRect().top, seen = {};
+    for (const el of modalLandmarks()){
+      const sig = landmarkSig(el), idx = seen[sig]||0;
+      seen[sig] = idx + 1;
+      if (sig===s.sig && idx===s.n && el.getBoundingClientRect){
+        // same landmark at the same viewport offset - growth or
+        // shrinkage above it is absorbed here, not as a viewport jump
+        sc.scrollTop += (el.getBoundingClientRect().top - sTop) - s.dy;
+        return;
+      }
+    }
+  }
+  sc.scrollTop = s.top;                  // landmark gone - numeric hold
+}
+// The same idea for keyboard focus: the rebuild drops whatever was
+// focused, so a stable signature finds the equivalent new element. The
+// draft maps already carry textarea CONTENT; this restores where the
+// caret/focus ring was - with preventScroll so it can't fight the
+// anchor restore above.
+const FOCUS_ATTRS = ['modalBack','nav','snav','summary','runSummary',
+  'agentDetail','editPrompt','arcAll','arcNone','arcCopy','stopAgent',
+  'intrOpen','intrSend','intrCancel','skipStep','unskipStep',
+  'setTimeout','savePrompt','revertPrompt','saveNotes','openRequest',
+  'stopGen','reviewStep','reviewRun','filterRun','runDetails','mergeRun',
+  'resumeRun','pauseRun','stopRun','drainRun','archRun','deleteRun',
+  'summarizeRun','action','qopt','qsend','qskip','qskipall'];
+const MODAL_FOCUSABLE = '#detail button,#detail a,#detail summary,' +
+  '#detail input,#detail textarea,#detail select,#detail [tabindex]';
+function focusSig(el){
+  if (!el) return null;
+  const d = el.dataset || {};
+  for (const k of FOCUS_ATTRS)
+    if (d[k]!==undefined) return 'd:'+k+'='+d[k];
+  const ks = Object.keys(d);
+  if (ks.length){ const k = ks.sort()[0]; return 'd:'+k+'='+d[k]; }
+  if (el.id) return '#'+el.id;
+  if ((el.tagName||'')==='A' && el.getAttribute)
+    return 'a:'+(el.getAttribute('href')||'');
+  return null;
+}
+function captureModalFocus(){
+  const f0 = document.activeElement;
+  const d = document.getElementById('detail');
+  if (!f0 || (d && d.contains && !d.contains(f0))) return null;
+  const fid = f0.id;
+  // textareas: the draft maps carry the text; carry the caret position.
+  // #d-timeout has no draft map - carry its unsaved value too, but let
+  // a changed server value win (compare against the rendered default).
+  if (fid==='d-prompt'||fid==='d-rnotes'||fid==='d-instr')
+    return {id:fid, sel:[f0.selectionStart, f0.selectionEnd]};
+  if (fid==='d-timeout')
+    return {id:fid, val:f0.value,
+            rendered:(f0.getAttribute ? f0.getAttribute('value')
+                                      : null)};
+  const sig = focusSig(f0);
+  if (!sig) return null;
+  let n = 0;
+  for (const x of document.querySelectorAll(MODAL_FOCUSABLE)){
+    if (x===f0) break;
+    if (focusSig(x)===sig) n++;
+  }
+  return {sig, n};
+}
+function restoreModalFocus(f){
+  if (!f) return;
+  let el = null;
+  if (f.id) el = document.getElementById(f.id);
+  else if (f.sig!=null){
+    let n = 0;
+    for (const x of document.querySelectorAll(MODAL_FOCUSABLE)){
+      if (focusSig(x)===f.sig){ if (n===f.n){ el=x; break; } n++; }
+    }
+  }
+  if (!el || !el.focus) return;
+  try { el.focus({preventScroll:true}); }
+  catch(e){ try { el.focus(); } catch(e2){} }
+  if (f.sel && el.setSelectionRange){
+    try { el.setSelectionRange(f.sel[0], f.sel[1]); } catch(e){}
+  }
+  if (f.id==='d-timeout' && f.val!==undefined &&
+      el.value===f.rendered) el.value = f.val;
+}
 const qSig = (id, pend) => id + '|' + (pend||[]).map(q=>q.qid).join(',');
+let detailHTML = '';    // markup last painted into #dbody for the OPEN
+                        // task view - a byte-identical repaint skips the
+                        // DOM write entirely, so scroll, selection,
+                        // focus and hover all survive untouched
 function closeDetail(force=false, keepStack=false){
   if (!force && modalRequest?.dirty && !confirm('Discard unsaved edits?')) return false;
   // closing the questionnaire mid-way dismisses the auto-popup for THIS
@@ -8723,7 +8873,7 @@ function closeDetail(force=false, keepStack=false){
   if (modalQA && modalQA.rec)
     qDismissed.add(qSig(modalQA.id, modalQA.rec.pending_questions));
   detailIdx = null; detailKey = null; modalRequest = null; modalQA = null;
-  runModalKey = null; summaryView = null;
+  runModalKey = null; summaryView = null; detailHTML = '';
   if (!keepStack){ modalHist.length = 0; modalScroll = null; }
   document.getElementById('backdrop').hidden = true;
   applySel();        // every row mark clears with the dialog it belongs to
@@ -9051,15 +9201,17 @@ function intrComposerHTML(a){
     `with these instructions.</span></div>`;
 }
 function showDetail(i, keepStack){
-  const a = AGENTS[i]; if(!a || !closeDetail(false, !!keepStack)) return;
-  detailIdx = i; detailKey = agentKey(a);
-  // The modal is rebuilt on every refresh tick - carry the focused
-  // textarea's draft text and caret across the rebuild so typing in
-  // Edit prompt / resume notes / the interrupt composer isn't eaten.
-  const f0 = document.activeElement;
-  const fid = f0 && f0.id;
-  const fsel = (fid==='d-prompt'||fid==='d-rnotes'||fid==='d-instr')
-    ? [f0.selectionStart, f0.selectionEnd] : null;
+  const a = AGENTS[i]; if(!a) return;
+  const key = agentKey(a);
+  // Repaint in place while THIS task's view is already on screen - the
+  // refresh tick re-enters here constantly during live work, and
+  // routing it through closeDetail would hide+reshow the dialog and
+  // churn every piece of view state for nothing.
+  const sameView = detailKey===key && !modalRequest && !modalQA &&
+    !runModalKey && !summaryView &&
+    !document.getElementById('backdrop').hidden;
+  if (!sameView && !closeDetail(false, !!keepStack)) return;
+  detailIdx = i; detailKey = key;
   const pk = detailKey;
   const pd = promptDrafts[pk];   // unsaved edit (undefined = none open)
   const nd = notesDrafts[pk];
@@ -9117,7 +9269,7 @@ function showDetail(i, keepStack){
       `<span class="dnav-pos">task ${pos+1} of ${sibs.length}</span>` +
       `${navBtn(sibs[pos+1],1)}</div>`
     : (modalHist.length ? `<div class="dnav">${backBtnHTML()}</div>` : '');
-  document.getElementById('dbody').innerHTML =
+  const html =
     navBar +
     `<h3 id="modal-title">${esc(a.slug)} / ${esc(a.step)}</h3><div class="kv">` +
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">` +
@@ -9293,10 +9445,29 @@ function showDetail(i, keepStack){
             `is still in the export)</div>`
           : '') +
         `</div>` : '');
-  if (fsel){
-    const el = document.getElementById(fid);
-    if (el && el.focus){ el.focus();
-      try{ el.setSelectionRange(fsel[0],fsel[1]); } catch(e){} }
+  if (sameView && html===detailHTML){
+    // identical repaint (most refresh ticks while nothing visible
+    // changed) - leave the live DOM alone: scroll offset, selection,
+    // focus and hover all survive untouched
+  } else {
+    // real change: carry focus/caret and the scroll anchor across the
+    // swap so the update doesn't eat in-progress input or jump the
+    // viewport (see captureModalScroll for the anchor contract)
+    const fcap = captureModalFocus();
+    const scap = sameView ? captureModalScroll() : null;
+    document.getElementById('dbody').innerHTML = html;
+    detailHTML = html;
+    restoreModalFocus(fcap);
+    if (scap) restoreModalScroll(scap);
+  }
+  // Deliberate task switch policy: a fresh open lands at the top. The
+  // hidden round-trip does NOT reset scrollTop in modern browsers, so
+  // without this a different task would inherit the previous one's
+  // position. A Back jump skips this - applyModalScroll restores its
+  // own snapshot right below.
+  if (!sameView && modalScroll==null){
+    const dd = document.getElementById('detail');
+    if (dd) dd.scrollTop = 0;
   }
   applyModalScroll();
   document.getElementById('backdrop').hidden = false;
@@ -9620,8 +9791,18 @@ async function api(method,path,body){
   if (!res.ok) throw new Error(out.error||`HTTP ${res.status}`);
   return out;
 }
-async function refresh(){ render(await api('GET','/api/state' +
-  (showArchived?'?archived=1':''))); }
+// /api/state requests can overlap - the 2s tick plus every post-action
+// refresh() land whenever they land. Sequence them: only the
+// latest-ISSUED response may paint, so an older body can't arrive late
+// and resurrect a stale view (or repaint the open modal off it) for the
+// two seconds until the next fetch.
+let stateReqSeq = 0;
+async function refresh(){
+  const my = ++stateReqSeq;
+  const d = await api('GET','/api/state' +
+    (showArchived?'?archived=1':''));
+  if (my===stateReqSeq) render(d);
+}
 function effortOptionsFor(model){
   const e=(lastData?.model_options||{})[model];
   return (e && e.length ? e : ['min','low','medium','high','max'])
@@ -11605,8 +11786,7 @@ document.addEventListener('mouseover', e=>{
   applyHl();
 });
 async function tick(){
-  try { render(await (await fetch('/api/state' +
-    (showArchived?'?archived=1':''))).json()); }
+  try { await refresh(); }
   catch(e){} finally { setTimeout(tick, 2000); } }
 setDensity(density);
 if (typeof window!=='undefined' && window.addEventListener)
