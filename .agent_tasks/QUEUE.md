@@ -25,6 +25,33 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (followup-run-discovery, wave step of run
+  20261016-013719-workflow-ux-safety): a produced `<run>-followup.toml`
+  is intake, not execution - `discover_followups` registers it as a
+  persisted proposal request (`Ready to run`, linked to its run via
+  `source_run`/`source_manifest`, only a human's Start run launches it).
+  The source file is validated by `validate_proposal` and copied to an
+  owned `manifests/<id>-<name>.toml`; the source stays read-only.
+  `data/requests/followups.index` makes it idempotent across run_end /
+  serve-startup / sweep / 60s-throttled dashboard passes, retries and
+  rewrites (sha'd; a changed source re-copies unless a human edited the
+  owned copy - the edit wins; a missing/empty row folds in place when the
+  file lands). Outcomes that aren't launchable work are honest request
+  rows: `empty` ("No work remains"), `missing` ("Follow-up missing" +
+  expected path + import hint), `error` (malformed/unvalidatable - the
+  broken text stays inspectable via the owned copy); a failed step with
+  no file is `absent` on the run stamp only. Discard vetoes the source in
+  the index (Restore clears it); `conductor.py import <file.toml>` /
+  `POST /api/requests/import` is the explicit recovery path - also the
+  override for files predating the feature or orphaned by a foreign
+  checkout. Run rows carry the `followup` stamp chip (registered/empty/
+  missing/invalid/deferred/absent); busy destinations defer to the next
+  pass via `_assert_unwatched`. The manifests dir a tree owns is derived
+  (`_followup_owner_dir`) so a dashboard never reaches into a tree it
+  doesn't serve. New request stages render via STAGES/COLORS; empty/
+  missing joined the editable/discardable set and are launch-gated like
+  draft. Registration never spawns work (tested with _launch_process
+  mocked). 15 new FollowupDiscoveryTests; suite + AGENTS.md updated.
 - DONE 2026-10-16 (recoverable-trash, wave step of run
   20261016-013719-workflow-ux-safety): 'Delete run' and proposal 'Discard'
   are recoverable now - both move their whole bundle to
