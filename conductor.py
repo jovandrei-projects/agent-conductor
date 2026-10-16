@@ -2809,6 +2809,20 @@ _GENERATING: set[str] = set()
 # Live planner Popen per request id - lets 'Stop proposal' tree-kill the
 # devin process now instead of waiting out the wait_worker poll.
 _GEN_PROCS: dict = {}
+_DRAINING: set[str] = set()
+
+# Planner output spools OUTSIDE every project's watched cwd (same rule as
+# the flag dir - trap 5): while a generation owns a request its stdout
+# log, ATIF export, extracted draft and the live request overlay all sit
+# in PLANNER_SPOOL/<id>/, and only the short publish is deferred until
+# data/requests + manifests/ are safe to write. The spool also survives a
+# serve restart - drain_planner_spool replays whatever it finds.
+PLANNER_SPOOL = Path(tempfile.gettempdir()) / "agent-conductor-planner"
+WATCH_POLL_S = 5.0            # _wait_writable poll interval
+PLANNER_ORPHAN_GRACE_S = 60   # gen.log this fresh may still be written by
+                              # an orphaned planner - drain waits it out
+_DRAIN_POLL_S = 10.0          # collect_dashboard drain throttle
+_DRAIN_TRIED = 0.0
 
 
 class RequestError(ValueError):
@@ -2845,7 +2859,47 @@ def _request_path(request_id: str, requests_dir: Path) -> Path:
     return requests_dir / f"{request_id}.json"
 
 
-def _read_request(request_id: str, requests_dir: Path) -> dict:
+def _spool_dir(request_id: str, root: Path | None = None) -> Path:
+    if not REQUEST_ID_RE.fullmatch(str(request_id)):
+        raise RequestError("Invalid request id", 404)
+    return (root or PLANNER_SPOOL) / request_id
+
+
+def _spool_rec(request_id: str) -> dict | None:
+    """The generation thread's live request overlay, if one is parked in
+    the spool. While it exists it is more current than the request file,
+    which is only rewritten once the workspace is unwatched."""
+    try:
+        rec = json.loads((_spool_dir(request_id) / "request.json")
+                         .read_text(encoding="utf-8"))
+    except (OSError, ValueError, RequestError):
+        return None
+    return rec if isinstance(rec, dict) and rec.get("id") == request_id \
+        else None
+
+
+def _save_spool(rec: dict, spool: Path) -> None:
+    """Mirror the request record into the spool - the overlay readers
+    consult while the workspace write is still deferred."""
+    spool.mkdir(parents=True, exist_ok=True)
+    tmp = spool / "request.json.tmp"
+    rec["updated_at"] = now_iso()
+    tmp.write_text(json.dumps(rec, indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    tmp.replace(spool / "request.json")
+
+
+def _gen_log_path(request_id: str, requests_dir: Path) -> Path:
+    """Where the planner's stdout log lives right now: the spool while a
+    generation owns the request, requests_dir once the flush copied it."""
+    sp = _spool_dir(request_id) / "gen.log"
+    return sp if sp.is_file() else requests_dir / f"{request_id}.gen.log"
+
+
+def _read_request_file(request_id: str, requests_dir: Path) -> dict:
+    """The request record exactly as it sits in requests_dir - callers
+    deciding whether the human moved on while a spool was parked need the
+    disk truth, not the overlay."""
     try:
         return json.loads(_request_path(request_id, requests_dir).read_text(
             encoding="utf-8"))
@@ -2853,6 +2907,13 @@ def _read_request(request_id: str, requests_dir: Path) -> dict:
         raise RequestError("Request not found", 404) from exc
     except (OSError, ValueError) as exc:
         raise RequestError("Cannot read request", 500) from exc
+
+
+def _read_request(request_id: str, requests_dir: Path) -> dict:
+    overlay = _spool_rec(request_id)
+    if overlay is not None:
+        return overlay          # a generation in flight owns the record
+    return _read_request_file(request_id, requests_dir)
 
 
 def _save_request(rec: dict, requests_dir: Path) -> None:
@@ -2863,6 +2924,13 @@ def _save_request(rec: dict, requests_dir: Path) -> None:
     tmp.write_text(json.dumps(rec, indent=2, ensure_ascii=False),
                    encoding="utf-8")
     tmp.replace(p)
+    # An authoritative request-file write obsoletes the parked overlay -
+    # delete request.json so the shadow drops, but leave the spool's
+    # artifacts for the generation thread's flush to rescue.
+    try:
+        (_spool_dir(rec["id"]) / "request.json").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 ATTACH_MAX_BYTES = 20 * 1024 * 1024   # clipboard screenshots run MBs
@@ -3007,6 +3075,29 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
     return fields
 
 
+def _merge_open_for(path: Path) -> bool:
+    """True when `path` is tracked land inside a repo with an unresolved
+    merge (MERGE_HEAD). A write there can be swept into the merge commit
+    by the next `git add -A` (trap 11), so publishes defer while a merge
+    is open. gitignored destinations (data/, logs/) can never join a
+    commit - they stay writable mid-merge."""
+    probe = next((a for a in (path, *path.parents) if a.is_dir()), None)
+    if probe is None:
+        return False
+    top = _git(probe, "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        return False
+    repo = Path(top.stdout.strip())
+    try:
+        rel = path.resolve().relative_to(repo.resolve())
+    except (OSError, ValueError):
+        return False
+    if _git(repo, "check-ignore", "-q",
+            rel.as_posix() or ".").returncode == 0:
+        return False                    # ignored - a merge can't adopt it
+    return merge_in_progress(repo)
+
+
 def _assert_unwatched(runs_dir: Path, *destinations: Path) -> None:
     for sj in runs_dir.glob("*/state.json"):
         try:
@@ -3021,6 +3112,11 @@ def _assert_unwatched(runs_dir: Path, *destinations: Path) -> None:
                 raise RequestError("A live agent is watching this workspace; "
                                    "wait until it finishes before changing "
                                    "requests or manifests", 409)
+    for p in destinations:
+        if _merge_open_for(p):
+            raise RequestError("A merge is in progress in this checkout; "
+                               "wait until it finishes before changing "
+                               "manifests", 409)
 
 
 def _wait_writable(runs_dir: Path, *destinations: Path) -> None:
@@ -3029,7 +3125,7 @@ def _wait_writable(runs_dir: Path, *destinations: Path) -> None:
             _assert_unwatched(runs_dir, *destinations)
             return
         except RequestError:
-            time.sleep(5)
+            time.sleep(WATCH_POLL_S)
 
 
 def create_request(payload: dict, requests_dir: Path = REQUESTS_DIR,
@@ -3431,7 +3527,7 @@ def request_details(request_id: str, requests_dir: Path = REQUESTS_DIR,
                                     if p.is_file() else "")
         else:
             rec["manifest_text"] = ""
-        log = requests_dir / f"{request_id}.gen.log"
+        log = _gen_log_path(request_id, requests_dir)
         rec["gen_tail"] = (stdout_tail(str(log), 40)
                            if log.is_file() else None)
         if runs_dir:
@@ -3640,11 +3736,15 @@ STATUS: done
         rid = rec.get("id")
         sflag = gen_stop_flag(rid) if rid else None
         with open(log, "ab" if fix_note else "wb") as out:
+            # The planner gets its own process group like run workers
+            # (trap 15): a merge elsewhere must not reach it, and a serve
+            # restart leaves it free to finish - the spool keeps whatever
+            # it writes for drain_planner_spool to recover.
             proc = subprocess.Popen(cmd, cwd=wd, stdout=out,
                                     stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL,
                                     env=clean_devin_env(),
-                                    **hidden_subprocess_kwargs())
+                                    **_detached_kwargs())
             if rid:
                 with REQUEST_LOCK:
                     _GEN_PROCS[rid] = proc
@@ -3675,22 +3775,171 @@ STATUS: done
     return matches[-1].strip() + "\n"
 
 
+def _rotate_log(log_path: Path) -> None:
+    """gen.log -> gen.prev.log so a regeneration keeps the previous
+    planner run's output instead of truncating it."""
+    try:
+        if log_path.is_file():
+            log_path.replace(log_path.with_name("gen.prev.log"))
+    except OSError:
+        pass
+
+
+def _save_draft(rec: dict, spool: Path, text: str) -> None:
+    """The extracted TOML lands in the spool BEFORE any publish wait, so
+    the generated proposal is durable through cancellation and restart.
+    draft_started_at pins it to this generation - a superseded draft
+    stays on disk but is never auto-published."""
+    tmp = spool / "draft.toml.tmp"
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(spool / "draft.toml")
+    rec["draft_started_at"] = rec.get("generation_started_at")
+    _save_spool(rec, spool)
+
+
+def _job_meta(spool: Path) -> dict:
+    try:
+        job = json.loads((spool / "job.json").read_text(encoding="utf-8"))
+        return job if isinstance(job, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _disk_untouched(request_id: str, requests_dir: Path, job: dict) -> bool:
+    """job.json recorded the request file's stamp when the generation
+    started; any other value means a human write landed while the
+    generation was parked, and the parked state must not overwrite it."""
+    if job.get("base_updated_at") is None:
+        return False
+    try:
+        return _read_request_file(request_id, requests_dir).get(
+            "updated_at") == job["base_updated_at"]
+    except RequestError:
+        return False                   # the request was deleted outright
+
+
+def _copy_spool_artifacts(request_id: str, spool: Path, requests_dir: Path,
+                        include_draft: bool = True) -> None:
+    """The durable half of a generation: planner stdout, ATIF export,
+    the previous round's log, and the extracted draft, copied to
+    data/requests/<id>.* - call only inside an unwatched window."""
+    names = [("gen.log", "gen.log"), ("gen.export.json", "gen.export.json"),
+             ("gen.prev.log", "gen.prev.log")]
+    if include_draft:
+        names.append(("draft.toml", "draft.toml"))
+    for src_name, suffix in names:
+        src = spool / src_name
+        if src.is_file():
+            try:
+                shutil.copy2(src, requests_dir / f"{request_id}.{suffix}")
+            except OSError:
+                pass
+
+
+def _flush_spool(request_id: str, spool: Path, requests_dir: Path,
+                 runs_dir: Path, gen_id: str | None = None) -> None:
+    """Land a parked generation state (questions / error) - deferred until
+    data/requests is unwatched, then the overlay becomes the request file
+    and the artifacts are copied out of the spool. If the human moved the
+    request on while the flush waited, only the artifacts survive; a spool
+    a newer generation attempt claimed (job.json carries its gen_id) is
+    left to that attempt entirely."""
+    while True:
+        _wait_writable(runs_dir, requests_dir)
+        with REQUEST_LOCK:
+            try:
+                _assert_unwatched(runs_dir, requests_dir)
+            except RequestError:
+                continue               # a watcher arrived in the gap
+            if gen_id is not None and _job_meta(spool).get(
+                    "gen_id") not in (None, gen_id):
+                return                 # a newer attempt owns this spool
+            overlay = _spool_rec(request_id)
+            _copy_spool_artifacts(request_id, spool, requests_dir)
+            if overlay is not None and _disk_untouched(
+                    request_id, requests_dir, _job_meta(spool)):
+                _save_request(overlay, requests_dir)
+            shutil.rmtree(spool, ignore_errors=True)
+            return
+
+
+def _publish_from_spool(request_id: str, text: str, spool: Path,
+                        requests_dir: Path, manifests_dir: Path,
+                        runs_dir: Path, tok_plan: dict | None = None,
+                        gen_id: str | None = None) -> None:
+    """The deferred publish - the ONLY part of generation that waits on
+    the repo. The planner's whole output is already durable in the spool;
+    this just validates and lands it once no watcher or open merge owns
+    the checkout. A request the human moved on mid-wait gets artifact
+    rescue instead of an overwrite; a spool a newer attempt claimed
+    (job.json or overlay gen_id no longer matches) is left untouched."""
+    while True:
+        _wait_writable(runs_dir, requests_dir, manifests_dir)
+        try:
+            with REQUEST_LOCK:
+                _assert_unwatched(runs_dir, requests_dir, manifests_dir)
+                overlay = _spool_rec(request_id)
+                job = _job_meta(spool)
+                if gen_id is not None and (
+                        job.get("gen_id") not in (None, gen_id)
+                        or (overlay or {}).get("gen_id") not in
+                            (None, gen_id)):
+                    return             # a newer attempt owns this spool
+                if overlay is not None and overlay.get("status") == \
+                        "generating" and _disk_untouched(
+                            request_id, requests_dir, job):
+                    if tok_plan:
+                        plan_tok = _merge_tokens(
+                            dict(overlay.get("plan_tokens") or {}), tok_plan)
+                        if plan_tok:
+                            overlay["plan_tokens"] = plan_tok
+                    _copy_spool_artifacts(request_id, spool, requests_dir,
+                                          include_draft=False)
+                    _publish_proposal(overlay, text, requests_dir,
+                                      manifests_dir, runs_dir)
+                else:
+                    # moved on mid-wait - keep the draft + log as rescue
+                    _copy_spool_artifacts(request_id, spool, requests_dir)
+                shutil.rmtree(spool, ignore_errors=True)
+                return
+        except RequestError:
+            try:
+                _assert_unwatched(runs_dir, requests_dir, manifests_dir)
+            except RequestError:
+                continue
+            raise
+
+
 def _finish_generation(request_id: str, requests_dir: Path,
                        manifests_dir: Path, runs_dir: Path,
                        devin_argv: list[str], gen_id: str) -> None:
-    """One planning attempt. Every state write re-checks BOTH
-    status=='generating' AND gen_id - stop_generation restores the record
-    while the planner unwinds, and an immediate Regenerate already owns the
-    'generating' slot then, so a stale attempt must not touch the record."""
+    """One planning attempt: plan into the SPOOL (outside every project's
+    watched cwd), then defer only the short publish until the repo is
+    writable. Every state write re-checks BOTH status=='generating' AND
+    gen_id - stop_generation restores the record while the planner
+    unwinds, and an immediate Regenerate already owns the 'generating'
+    slot then, so a stale attempt must not touch the record. Killing this
+    thread (restart, shutdown) loses nothing - drain_planner_spool
+    replays whatever the spool holds."""
     tok_plan: dict[str, int] = {}
+    spool = _spool_dir(request_id)
 
     def still_mine(rec: dict) -> bool:
-        return rec["status"] == "generating" \
+        return rec.get("status") == "generating" \
             and rec.get("gen_id") == gen_id
-
     try:
         rec = _read_request(request_id, requests_dir)
-        log_path = requests_dir / f"{request_id}.gen.log"
+        spool.mkdir(parents=True, exist_ok=True)
+        base = _read_request_file(request_id, requests_dir)
+        (spool / "job.json").write_text(json.dumps({
+            "request_id": request_id, "requests_dir": str(requests_dir),
+            "manifests_dir": str(manifests_dir), "runs_dir": str(runs_dir),
+            "gen_id": gen_id,
+            "base_updated_at": base.get("updated_at"),
+            "base_status": base.get("status"),
+            "created_at": now_iso()}), encoding="utf-8")
+        log_path = spool / "gen.log"
+        _rotate_log(log_path)
         export_path = log_path.with_suffix(".export.json")
         projects = load_projects()
         qa = rec.get("qa") or None    # set -> this pass refines on answers
@@ -3698,6 +3947,7 @@ def _finish_generation(request_id: str, requests_dir: Path,
             text = _planner_response(rec, projects, devin_argv, log_path,
                                      qa=qa)
             _merge_tokens(tok_plan, tail_metrics(export_path))
+            _save_draft(rec, spool, text)
             try:
                 defaults = tomllib.loads(text).get("defaults", {})
             except tomllib.TOMLDecodeError as exc:
@@ -3707,37 +3957,38 @@ def _finish_generation(request_id: str, requests_dir: Path,
                 text = _planner_response(rec, projects, devin_argv,
                                          log_path, fix_note=str(exc), qa=qa)
                 _merge_tokens(tok_plan, tail_metrics(export_path))
+                _save_draft(rec, spool, text)
                 defaults = tomllib.loads(text).get("defaults", {})
         except PlannerQuestions as q:
             # The planner asked instead of drafting - park the sanitized
             # questionnaire on the request. The dashboard poses it one
             # modal at a time; answer_request restarts this function as the
             # refine pass once every question has an answer or a skip.
+            # The parked overlay is crash-recoverable: drain lands it.
             _merge_tokens(tok_plan, tail_metrics(export_path))
             with REQUEST_LOCK:
-                if not still_mine(_read_request(request_id, requests_dir)):
-                    return      # stopped/superseded - nothing to park
-            _wait_writable(runs_dir, requests_dir)
-            with REQUEST_LOCK:
                 rec = _read_request(request_id, requests_dir)
-                if still_mine(rec):
-                    rounds = int(rec.get("qa_rounds") or 0) + 1
-                    plan_tok = _merge_tokens(
-                        dict(rec.get("plan_tokens") or {}), tok_plan)
-                    if plan_tok:
-                        rec["plan_tokens"] = plan_tok
-                    if rounds > MAX_QUESTION_ROUNDS:
-                        rec.update(
-                            status="error", pending_questions=[],
-                            error=f"The planner still has questions after "
-                                  f"{MAX_QUESTION_ROUNDS} rounds - "
-                                  "regenerate, or make the request more "
-                                  "specific")
-                    else:
-                        rec.update(status="questions", qa_rounds=rounds,
-                                   pending_questions=q.questions,
-                                   error=None)
-                    _save_request(rec, requests_dir)
+                if not still_mine(rec):
+                    return      # stopped/superseded - nothing to park
+                rounds = int(rec.get("qa_rounds") or 0) + 1
+                plan_tok = _merge_tokens(
+                    dict(rec.get("plan_tokens") or {}), tok_plan)
+                if plan_tok:
+                    rec["plan_tokens"] = plan_tok
+                if rounds > MAX_QUESTION_ROUNDS:
+                    rec.update(
+                        status="error", pending_questions=[],
+                        error=f"The planner still has questions after "
+                              f"{MAX_QUESTION_ROUNDS} rounds - "
+                              "regenerate, or make the request more "
+                              "specific")
+                else:
+                    rec.update(status="questions", qa_rounds=rounds,
+                               pending_questions=q.questions,
+                               error=None)
+                _save_spool(rec, spool)
+            _flush_spool(request_id, spool, requests_dir, runs_dir,
+                         gen_id=gen_id)
             return
         if defaults.get("model") != rec["model"] or \
                 defaults.get("effort") != rec["effort"]:
@@ -3754,29 +4005,9 @@ def _finish_generation(request_id: str, requests_dir: Path,
         if planner_attempts != int(rec.get("max_attempts") or 3):
             raise RequestError("Planner ignored the selected max_attempts; "
                                "regenerate or edit the TOML directly")
-        while True:
-            with REQUEST_LOCK:
-                if not still_mine(
-                        _read_request(request_id, requests_dir)):
-                    return      # stopped/superseded - nothing to publish
-            _wait_writable(runs_dir, requests_dir, manifests_dir)
-            try:
-                with REQUEST_LOCK:
-                    rec = _read_request(request_id, requests_dir)
-                    if still_mine(rec):
-                        plan_tok = _merge_tokens(
-                            dict(rec.get("plan_tokens") or {}), tok_plan)
-                        if plan_tok:
-                            rec["plan_tokens"] = plan_tok
-                        _publish_proposal(rec, text, requests_dir,
-                                          manifests_dir, runs_dir)
-                break
-            except RequestError:
-                try:
-                    _assert_unwatched(runs_dir, requests_dir, manifests_dir)
-                except RequestError:
-                    continue
-                raise
+        _publish_from_spool(request_id, text, spool, requests_dir,
+                            manifests_dir, runs_dir, tok_plan,
+                            gen_id=gen_id)
     except GenerationStopped:
         # stop_generation already restored the record (draft, or ready with
         # the previous proposal). Bank the killed attempt's token usage -
@@ -3786,6 +4017,9 @@ def _finish_generation(request_id: str, requests_dir: Path,
             _assert_unwatched(runs_dir, requests_dir)
             with REQUEST_LOCK:
                 rec = _read_request(request_id, requests_dir)
+                if rec.get("status") == "generating":
+                    return      # superseded or stop write pending - the
+                                # newer/restoring write owns the record
                 plan_tok = _merge_tokens(
                     dict(rec.get("plan_tokens") or {}), tok_plan)
                 if plan_tok:
@@ -3798,18 +4032,160 @@ def _finish_generation(request_id: str, requests_dir: Path,
         LOG.warning("request %s generation failed: %s", request_id, exc)
         msg = (f"Planner returned malformed TOML ({exc})"
                if isinstance(exc, tomllib.TOMLDecodeError) else str(exc))
-        with REQUEST_LOCK:
-            rec = _read_request(request_id, requests_dir)
-            if still_mine(rec):
-                plan_tok = _merge_tokens(
-                    dict(rec.get("plan_tokens") or {}), tok_plan)
-                if plan_tok:
-                    rec["plan_tokens"] = plan_tok
-                rec.update(status="error", error=msg[:300])
-                _save_request(rec, requests_dir)
+        overlay = _spool_rec(request_id)
+        if overlay is not None and still_mine(overlay):
+            plan_tok = _merge_tokens(
+                dict(overlay.get("plan_tokens") or {}), tok_plan)
+            if plan_tok:
+                overlay["plan_tokens"] = plan_tok
+            overlay.update(status="error", error=msg[:300])
+            _save_spool(overlay, spool)
+        # Flush only while this attempt still owns the spool - a newer
+        # generation rewrote job.json with its own gen_id and its parked
+        # state is not ours to land (or delete).
+        if _job_meta(spool).get("gen_id") in (None, gen_id):
+            _flush_spool(request_id, spool, requests_dir, runs_dir,
+                         gen_id=gen_id)
     finally:
         with REQUEST_LOCK:
             _GENERATING.discard(gen_id)
+
+
+def drain_planner_spool(root: Path | None = None) -> list[str]:
+    """Adopt generations whose owner died (server restart, killed thread).
+    Each spool's job.json names its own request/manifest/run dirs, so the
+    restarted serve replays deferred publishes for whichever checkout
+    spawned them. Returns the request ids it took over."""
+    root = root or PLANNER_SPOOL
+    adopted = []
+    try:
+        dirs = sorted(root.iterdir())
+    except OSError:
+        return []
+    for d in dirs:
+        if not d.is_dir() or not REQUEST_ID_RE.fullmatch(d.name) \
+                or not (d / "job.json").is_file():
+            continue
+        # _GENERATING is keyed by attempt gen_id - a live generation's
+        # spool carries it in job.json (and the overlay once written).
+        live = {_job_meta(d).get("gen_id"),
+                (_spool_rec(d.name) or {}).get("gen_id")}
+        if _GENERATING.intersection(live - {None}) \
+                or d.name in _DRAINING:
+            continue
+        _DRAINING.add(d.name)
+        threading.Thread(target=_drain_spool, args=(d,), daemon=True).start()
+        adopted.append(d.name)
+    return adopted
+
+
+def _drain_spool(spool: Path) -> None:
+    try:
+        job = _job_meta(spool)
+        try:
+            rid = str(job["request_id"])
+            requests_dir = Path(job["requests_dir"])
+            manifests_dir = Path(job["manifests_dir"])
+            runs_dir = Path(job["runs_dir"])
+        except (KeyError, TypeError):
+            return                  # unreadable job - leave for a human
+        overlay = _spool_rec(rid)
+        if (overlay or {}).get("status") == "generating":
+            _drain_generating(rid, overlay, spool, requests_dir,
+                              manifests_dir, runs_dir)
+        else:
+            # parked questions/error/ready interrupted mid-flush, or a
+            # stray spool whose overlay an interleaved save dropped -
+            # either way the flush rescues the artifacts
+            _flush_spool(rid, spool, requests_dir, runs_dir)
+    finally:
+        _DRAINING.discard(spool.name)
+
+
+def _drain_generating(rid: str, overlay: dict, spool: Path,
+                      requests_dir: Path, manifests_dir: Path,
+                      runs_dir: Path) -> None:
+    """A generation that never finished: publish a spooled draft, extract
+    one from a finished-but-uncaptured planner log, wait out an orphan
+    that is still writing, else land the interruption as an error."""
+    draft = spool / "draft.toml"
+    current = overlay.get("draft_started_at") == overlay.get(
+        "generation_started_at") and overlay.get("draft_started_at")
+    draft_ok = draft.is_file() and bool(current)
+    log = spool / "gen.log"
+    if not draft_ok and log.is_file():
+        # A detached planner may have outlived the server: while its log
+        # is still being written, leave the spool for the next drain pass.
+        try:
+            fresh = (time.time() - log.stat().st_mtime
+                     < PLANNER_ORPHAN_GRACE_S)
+        except OSError:
+            fresh = False
+        if fresh:
+            return
+        # The writer is gone - recover the manifest straight from the log.
+        try:
+            text = log.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        matches = re.findall(r"^BEGIN_MANIFEST\s*\n(.*?)^END_MANIFEST\s*$",
+                             text, re.M | re.S)
+        if matches and overlay.get("generation_started_at"):
+            overlay = dict(overlay)
+            overlay["draft_started_at"] = overlay["generation_started_at"]
+            _save_spool(overlay, spool)
+            (spool / "draft.toml").write_text(matches[-1].strip() + "\n",
+                                             encoding="utf-8")
+            draft_ok = True
+    gid = overlay.get("gen_id")
+    if draft_ok:
+        _GENERATING.add(gid or rid)
+        try:
+            _publish_from_spool(rid, draft.read_text(encoding="utf-8"),
+                                spool, requests_dir, manifests_dir,
+                                runs_dir, gen_id=gid)
+        except Exception as exc:
+            LOG.exception("spool drain publish failed for %s", rid)
+            cur = _spool_rec(rid)
+            # Only write the failure while the spool still belongs to the
+            # attempt being drained - a Regenerate may have claimed it.
+            if (cur or overlay).get("gen_id") == gid:
+                cur = dict(cur or overlay)
+                cur.update(
+                    status="error",
+                    error=f"Recovered draft failed to publish: {exc}"[:300])
+                _save_spool(cur, spool)
+                _flush_spool(rid, spool, requests_dir, runs_dir,
+                             gen_id=gid)
+        finally:
+            _GENERATING.discard(gid or rid)
+        return
+    # Interrupted mid-planning (or the draft belongs to a superseded
+    # generation): land an error; the artifacts, including any draft,
+    # are preserved under data/requests by the flush.
+    if overlay.get("status") == "generating" and \
+            (_spool_rec(rid) or {}).get("gen_id") == gid:
+        overlay = dict(overlay)
+        overlay.update(
+            status="error",
+            error="Planning was interrupted by a server restart - the "
+                  "draft and log were preserved; regenerate to retry.")
+        _save_spool(overlay, spool)
+    _flush_spool(rid, spool, requests_dir, runs_dir, gen_id=gid)
+
+
+def _auto_drain() -> None:
+    """Throttled spool recovery for a long-lived serve - parked
+    generations left by a crash/restart get replayed without anyone
+    pressing Regenerate."""
+    global _DRAIN_TRIED
+    if time.time() - _DRAIN_TRIED < _DRAIN_POLL_S:
+        return
+    _DRAIN_TRIED = time.time()
+    try:
+        drain_planner_spool()
+    except Exception:
+        LOG.exception("planner spool drain failed")
 
 
 def start_generation(request_id: str,
@@ -3819,7 +4195,10 @@ def start_generation(request_id: str,
                      devin_argv: list[str] | None = None,
                      background: bool = True) -> dict:
     with REQUEST_LOCK:
-        _assert_unwatched(runs_dir, requests_dir)
+        # NO _assert_unwatched here: the planner runs in its own tempdir
+        # and every byte it produces lands in the spool (outside every
+        # watched cwd), so a live worker or an in-progress merge must not
+        # block generation. Only the deferred publish waits on the repo.
         rec = _read_request(request_id, requests_dir)
         if _request_status(rec, runs_dir) not in (
                 "draft", "ready", "error", "launch_failed", "questions"):
@@ -3833,7 +4212,10 @@ def start_generation(request_id: str,
         rec.update(status="generating", error=None, gen_id=gen_id,
                    generation_started_at=now_iso(), pending_questions=[],
                    qa=[], qa_rounds=0)
-        _save_request(rec, requests_dir)
+        rec.pop("draft_started_at", None)
+        # The overlay - not the request file - marks the generation: the
+        # file is only safe to write once the workspace is unwatched.
+        _save_spool(rec, _spool_dir(request_id))
         _GENERATING.add(gen_id)
     args = (request_id, requests_dir, manifests_dir, runs_dir,
             devin_argv or ["devin"], gen_id)
@@ -3966,13 +4348,19 @@ def _request_run_dir(request_id: str, runs_dir: Path) -> Path | None:
 def _request_status(rec: dict, runs_dir: Path) -> str:
     if _request_run_dir(rec["id"], runs_dir):
         return "launched"
-    if rec["status"] == "generating" \
-            and rec.get("gen_id") not in _GENERATING \
-            and time.time() - (_iso_ts(rec.get("generation_started_at"))
-                               or time.time()) > 660:
-        return "error"
-    if rec["status"] != "launching":
-        return rec["status"]
+    # A spooled overlay outranks the request file until the deferred
+    # publish/flush lands - after a crash it is the only place the
+    # interrupted generation's truth survives.
+    eff = _spool_rec(rec["id"]) or rec
+    if eff.get("status") == "generating":
+        if eff.get("gen_id") in _GENERATING:
+            return "generating"
+        age = time.time() - (_iso_ts(eff.get("generation_started_at"))
+                             or time.time())
+        return "generating" if age <= 660 else "error"
+    status = eff.get("status") or "draft"
+    if status != "launching":
+        return status
     age = time.time() - (_iso_ts(rec.get("launched_at")) or time.time())
     if age > 90 and (rec["id"] not in _LAUNCH_PIDS or not pid_alive(
             _LAUNCH_PIDS[rec["id"]], rec.get("launched_at"))):
@@ -3980,23 +4368,27 @@ def _request_status(rec: dict, runs_dir: Path) -> str:
     return "launching"
 
 
-def _launch_process(cmd: list[str], log_path: Path) -> int:
-    """Spawn a conductor `run`/`resume` subprocess from the dashboard.
+def _detached_kwargs() -> dict:
+    """Process-group isolation for children that must outlive their
+    spawner's console: CREATE_NEW_PROCESS_GROUP (nt) / start_new_session
+    (posix) keeps the child out of the server's Ctrl+C/SIGHUP dispatch -
+    closing or interrupting `serve` leaves runs and planners alone (trap
+    15); only the explicit stop endpoints kill run work."""
+    kw = dict(hidden_subprocess_kwargs())
+    if os.name == "nt":
+        kw["creationflags"] = (kw.get("creationflags", 0)
+                               | subprocess.CREATE_NEW_PROCESS_GROUP)
+    else:
+        kw["start_new_session"] = True
+    return kw
 
-    CREATE_NEW_PROCESS_GROUP (nt) / start_new_session (posix) keeps the
-    child out of the SERVER's console Ctrl+C/SIGHUP dispatch: closing or
-    interrupting `serve` leaves live runs alone - only the explicit stop
-    endpoints kill them."""
+
+def _launch_process(cmd: list[str], log_path: Path) -> int:
+    """Spawn a conductor `run`/`resume` subprocess from the dashboard."""
     with open(log_path, "wb") as out:
-        kw = dict(hidden_subprocess_kwargs())
-        if os.name == "nt":
-            kw["creationflags"] = (kw.get("creationflags", 0)
-                                   | subprocess.CREATE_NEW_PROCESS_GROUP)
-        else:
-            kw["start_new_session"] = True
         proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=out,
                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                env=clean_devin_env(), **kw)
+                                env=clean_devin_env(), **_detached_kwargs())
     return proc.pid
 
 
@@ -4033,7 +4425,7 @@ def launch_request(request_id: str,
                 raise RequestError("A live agent already works in this project; "
                                    "wait or isolate work in a worktree", 409)
         if ROOT.resolve() in targets and any(
-                r.get("status") == "generating" for f in
+                _request_status(r, runs_dir) == "generating" for f in
                 requests_dir.glob("*.json") for r in [json.loads(
                     f.read_text(encoding="utf-8"))]):
             raise RequestError("Wait for proposal generation to finish before "
@@ -4990,6 +5382,7 @@ def collect_dashboard(runs_dir: Path,
     disk either way, and the 'archived_runs' count always reflects them."""
     requests_dir = requests_dir or runs_dir.parent / "requests"
     _auto_archive(runs_dir)
+    _auto_drain()
     sess_by_dir = live_sessions_by_dir(runs_dir, devin_argv or ["devin"])
     projects = load_projects()
     refresh_prices(runs_dir)
@@ -5002,7 +5395,8 @@ def collect_dashboard(runs_dir: Path,
             continue
         if isinstance(rec, dict) and REQUEST_ID_RE.fullmatch(
                 str(rec.get("id") or "")) and rec.get("status") != "discarded":
-            requests[rec["id"]] = rec
+            # a parked planner overlay is more current than the file
+            requests[rec["id"]] = _spool_rec(rec["id"]) or rec
     launched: set[str] = set()
     archived_runs = 0
     runs: list[dict] = []
@@ -5209,14 +5603,12 @@ def collect_dashboard(runs_dir: Path,
     for rid, rec in requests.items():
         if rid in launched:
             continue
-        stage = (_request_status(rec, runs_dir)
-                 if rec.get("status") in ("launching", "generating")
-                 else rec.get("status"))
+        stage = _request_status(rec, runs_dir)
         if stage == "launched":
             continue
         steps = rec.get("proposed_steps") or []
         key = f"request:{rid}"
-        log_p = requests_dir / f"{rid}.gen.log"
+        log_p = _gen_log_path(rid, requests_dir)
         gen_tail = (stdout_tail(str(log_p))
                     if stage in ("generating", "error") and log_p.is_file()
                     else None)
@@ -7450,6 +7842,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
     devin_argv = shlex.split(os.environ.get("CONDUCTOR_DEVIN") or "devin")
     for line in sweep_sessions(runs_dir, devin_argv):
         print(f"sweep: {line}")
+    # A restarted serve adopts generations whose owner died: the spool
+    # replays deferred publishes and lands parked questions/errors.
+    for rid in drain_planner_spool():
+        print(f"sweep: adopted planner spool for request {rid}")
     handler = make_dashboard_handler(runs_dir, devin_argv)
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     print(f"conductor dashboard: http://127.0.0.1:{args.port}  "
