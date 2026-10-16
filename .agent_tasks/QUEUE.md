@@ -85,6 +85,36 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   missing joined the editable/discardable set and are launch-gated like
   draft. Registration never spawns work (tested with _launch_process
   mocked). 15 new FollowupDiscoveryTests; suite + AGENTS.md updated.
+- DONE 2026-10-16 (cumulative-elapsed-time, wave step of run
+  20261016-100852-run-review-ux): elapsed time is cumulative across
+  dispatches instead of the last dispatch's span. Root cause: run_step
+  restamped started_at and overwrote elapsed_s on every resume, so a
+  failed-then-resumed step "lost" its prior runtime, a queued resumed
+  row idle-ticked off a stale started_at, and runs had no elapsed at
+  all. Each dispatch now appends `{start,end}` to the step's
+  `exec_intervals` and each driver session appends one to the run's own
+  `exec_intervals` (create/resume/end/auth-abort/halt/sweep all stamp);
+  `elapsed_s` remains the closed-intervals cache written at terminal,
+  `first_started_at` preserves the original start while `started_at`
+  keeps tracking the live dispatch for pid/liveness windows. Idle gaps
+  between attempts are outside every interval by construction; a
+  crashed dispatch's orphaned interval closes at its last sign of life
+  (stdout mtime / newest state+event stamp), not at sweep discovery -
+  dead time never inflates the total. Run elapsed sums driver
+  intervals, never concurrent step spans (parallel wave members would
+  overcount). One authoritative pair `rec_elapsed_s`/`run_elapsed_s`
+  feeds `cmd_status`, step/run summaries, the dashboard payload (run
+  rows now carry `elapsed_s`+`exec_start` so the live cell ticks
+  base+now without a refresh), the runs table's new elapsed column +
+  `data-rel` ticking, and both modals' elapsed/first-started rows.
+  `conductor._now()` is the single clock seam for every recorded stamp;
+  liveness probes stay on real `time.time()`. Pre-interval state seeds
+  once from stored started/ended/elapsed fields (`{'dur': span}` when
+  endpoints are gone) so nothing is fabricated and nothing recorded
+  is lost; empty history renders `-`. 369/369 tests + demo green; 9 new
+  CumulativeElapsedTests (fail->resume, triple dispatch, stop/restart,
+  concurrent wave run total, legacy migration, sweep-witness close,
+  missing-history honesty, payload contract, node-harness tick math).
 - DONE 2026-10-16 (recoverable-trash, wave step of run
   20261016-013719-workflow-ux-safety): 'Delete run' and proposal 'Discard'
   are recoverable now - both move their whole bundle to

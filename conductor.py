@@ -1315,8 +1315,278 @@ def _deferred_record(rec: dict, grp: dict, kind: str, step_name: str) -> None:
 
 # ---------------------------------------------------------------- run state
 
+def _now() -> float:
+    """The one clock seam: every timestamp the conductor RECORDS
+    (now_iso stamps, step/run elapsed math) routes through here so tests
+    can drive a deterministic clock. Liveness probes (step_live,
+    pid_alive, wait_worker deadlines) stay on real time - they gate on
+    real processes, not recorded history."""
+    return time.time()
+
+
 def now_iso() -> str:
-    return dt.datetime.now().isoformat(timespec="seconds")
+    return dt.datetime.fromtimestamp(_now()).isoformat(
+        timespec="seconds")
+
+
+def _iso_from(ts: float | None) -> str | None:
+    """Epoch -> the same naive local ISO shape now_iso() produces."""
+    return (dt.datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+            if ts is not None else None)
+
+
+def _step_seed_intervals(rec: dict) -> None:
+    """Fold a pre-exec_intervals record's stored timing into one honest
+    first interval. A started/ended pair is real data; a lone elapsed_s
+    survives as {'dur'} - its endpoints are gone, and inventing them
+    would lie about when the work ran."""
+    ivs: list[dict] = []
+    t0s, t1s = rec.get("started_at"), rec.get("ended_at")
+    span = rec.get("elapsed_s")
+    if t0s and t1s:
+        ivs.append({"start": t0s, "end": t1s})
+    elif t0s and isinstance(span, (int, float)):
+        t0 = _iso_ts(t0s)
+        ivs.append({"start": t0s,
+                    "end": _iso_from(t0 + span) if t0 is not None
+                    else None})
+    elif t1s and isinstance(span, (int, float)):
+        t1 = _iso_ts(t1s)
+        ivs.append({"start": _iso_from(t1 - span) if t1 is not None
+                    else None, "end": t1s})
+    elif isinstance(span, (int, float)):
+        ivs.append({"dur": float(span)})
+    rec["exec_intervals"] = ivs
+
+
+def _step_last_write(rec: dict, run_dir: Path | None) -> float | None:
+    """Newest mtime over the step's own log files - the last sign of
+    life a dispatch that died mid-flight left behind."""
+    if run_dir is None or not rec.get("name"):
+        return None
+    newest = None
+    try:
+        for f in run_dir.glob(f"{rec['name']}*.stdout.log"):
+            try:
+                m = f.stat().st_mtime
+            except OSError:
+                continue
+            newest = m if newest is None else max(newest, m)
+    except OSError:
+        pass
+    return newest
+
+
+def _iv_close(rec: dict, end_iso: str, *, current: dict | None = None,
+              run_dir: Path | None = None) -> None:
+    """Close open exec_intervals and refresh the stored cumulative
+    elapsed_s. `current` - this dispatch's interval - ends at end_iso
+    verbatim (timeout extensions legitimately exceed the liveness
+    horizon). A stale survivor (driver died mid-dispatch) ends at the
+    last recorded sign of life - its stdout log's mtime - or the
+    liveness horizon when no evidence exists; never at end_iso, which
+    would fold the dead gap into elapsed."""
+    ivs = rec.get("exec_intervals") or []
+    stale = [iv for iv in ivs
+             if iv.get("end") is None and "dur" not in iv
+             and iv is not current]
+    wit = _step_last_write(rec, run_dir) if stale else None
+    horizon_s = float(rec.get("timeout_min") or 60) * 60 + 900
+    end_t = _iso_ts(end_iso)
+    for iv in ivs:
+        if iv.get("end") is not None or "dur" in iv:
+            continue
+        t0 = _iso_ts(iv.get("start"))
+        if iv is current or t0 is None or end_t is None:
+            iv["end"] = end_iso
+            continue
+        cand = wit if (wit is not None and wit > t0) \
+            else t0 + horizon_s
+        close_t = min(end_t, cand)
+        iv["end"] = _iso_from(max(t0, close_t))
+    els = rec_elapsed_s(rec)
+    if els is not None:
+        rec["elapsed_s"] = els
+
+
+def _iv_open(rec: dict, start_iso: str,
+             *, run_dir: Path | None = None) -> dict:
+    """Append a fresh execution interval for this dispatch. First touch
+    under the schema seeds the record's legacy timing; any still-open
+    interval is a crashed dispatch's orphan and closes at evidence."""
+    if "exec_intervals" not in rec:
+        _step_seed_intervals(rec)
+    _iv_close(rec, start_iso, run_dir=run_dir)
+    iv = {"start": start_iso, "end": None}
+    rec["exec_intervals"].append(iv)
+    return iv
+
+
+def rec_elapsed_s(rec: dict, now: float | None = None,
+                  live: bool | None = None) -> float | None:
+    """The one authoritative step elapsed: every recorded closed
+    interval, plus the open interval ticking to `now` while the step is
+    actually in flight (`live` lets callers that already computed
+    liveness - dashboard, status - say so; unset falls back to the
+    record's own status/ended_at). A stale open interval contributes
+    nothing until _iv_close stamps its evidence-bounded end. Records
+    predating exec_intervals fall back to their stored span or
+    start/end pair - recorded data, never an estimate. None when no
+    timing exists at all (the '-' the views render)."""
+    if live is None:
+        live = rec.get("status") == "running" \
+            and rec.get("ended_at") is None
+    ivs = rec.get("exec_intervals")
+    if not ivs:
+        t0 = _iso_ts(rec.get("started_at"))
+        t1 = _iso_ts(rec.get("ended_at"))
+        if t0 is not None and t1 is not None:
+            return round(max(0.0, t1 - t0), 1)
+        span = rec.get("elapsed_s")
+        if isinstance(span, (int, float)):
+            return round(float(span), 1)
+        if t0 is not None and live:
+            n = _now() if now is None else now
+            return round(max(0.0, n - t0), 1)
+        return None
+    total = 0.0
+    for iv in ivs:
+        if isinstance(iv.get("dur"), (int, float)):
+            total += float(iv["dur"])
+            continue
+        t0 = _iso_ts(iv.get("start"))
+        if t0 is None:
+            continue
+        t1 = _iso_ts(iv.get("end"))
+        if t1 is None:
+            if not live:
+                continue
+            t1 = _now() if now is None else now
+        total += max(0.0, t1 - t0)
+    return round(total, 1)
+
+
+def _run_witness_ts(state: dict, run_dir: Path | None = None) -> float | None:
+    """The last recorded sign of a driver session's life: the newest
+    stamp in state.json plus the tail of events.jsonl. Used to end a
+    crashed driver's open interval at evidence, not discovery time."""
+    stamps = [_iso_ts(state.get(k))
+              for k in ("started_at", "ended_at", "driver_started_at",
+                        "archived")]
+    for rec in (state.get("steps") or {}).values():
+        if isinstance(rec, dict):
+            stamps += [_iso_ts(rec.get(k))
+                       for k in ("started_at", "ended_at", "merged_at")]
+    if run_dir is not None:
+        try:
+            ev = run_dir / "events.jsonl"
+            data = ev.read_bytes()[-8192:].decode("utf-8", "replace")
+            for line in reversed(data.splitlines()):
+                try:
+                    stamps.append(_iso_ts(
+                        json.loads(line).get("ts")))
+                    if stamps[-1] is not None:
+                        break
+                except ValueError:
+                    continue
+        except OSError:
+            pass
+    return max((t for t in stamps if t is not None), default=None)
+
+
+def _run_iv_close(state: dict, end_iso: str, *, run_dir: Path | None = None,
+                  witness_cap: bool = False) -> None:
+    """Close the open driver interval. A stamp written by the live driver
+    itself is verbatim (witness_cap=False - its bookkeeping after the
+    last step is real driver work); a discovery-time close (sweep
+    finding a dead driver, a resume that found no ended_at) caps the
+    interval at the last recorded sign of life so the dead gap stays
+    out of the total."""
+    ivs = state.get("exec_intervals") or []
+    end_t = _iso_ts(end_iso)
+    wit = None
+    for iv in ivs:
+        if iv.get("end") is not None:
+            continue
+        t0 = _iso_ts(iv.get("start"))
+        if end_t is None or t0 is None or not witness_cap:
+            iv["end"] = end_iso
+            continue
+        if wit is None:
+            wit = _run_witness_ts(state, run_dir)
+        iv["end"] = _iso_from(wit) \
+            if wit is not None and t0 <= wit < end_t else end_iso
+
+
+def _run_elapsed_split(state: dict,
+                       run_dir: Path | None = None
+                       ) -> tuple[float | None, str | None]:
+    """(closed_seconds, live_start_iso) for a run's elapsed. The closed
+    part sums every finished driver interval plus a crashed interval
+    capped at its last sign of life - stable across refreshes. The live
+    interval never enters it: its start ships separately so the client
+    ticks base + now-start. Legacy rows (no exec_intervals) fall back to
+    the recorded span: a resumed legacy run only has its last driver's
+    driver_started_at->ended_at window provable, a single-execution one
+    the full pair; a dead unended one ends at last witness; nothing
+    recorded -> (None, None) so the column shows '-' not a guess."""
+    ivs = state.get("exec_intervals")
+    live = not state.get("ended_at") and driver_alive(state)
+    if ivs:
+        total = 0.0
+        exec_start = None
+        wit = None
+        for iv in ivs:
+            t0 = _iso_ts(iv.get("start"))
+            if t0 is None:
+                continue
+            t1 = _iso_ts(iv.get("end"))
+            if t1 is None:
+                t1 = _iso_ts(state.get("ended_at"))
+            if t1 is None:
+                if live:
+                    exec_start = iv["start"]
+                    continue
+                if wit is None:
+                    wit = _run_witness_ts(state, run_dir)
+                t1 = wit if wit is not None and wit > t0 else t0
+            total += max(0.0, t1 - t0)
+        return round(total, 1), exec_start
+    t0 = _iso_ts(state.get("started_at"))
+    t1 = _iso_ts(state.get("ended_at"))
+    d0 = _iso_ts(state.get("driver_started_at"))
+    if live:
+        base = d0 if d0 is not None else t0
+        return (0.0, _iso_from(base)) if base is not None else (None, None)
+    if t1 is not None and (t0 is not None or d0 is not None):
+        # resumed before the schema existed: the earlier executions'
+        # spans are unrecoverable - report the provable last one
+        base = d0 if (d0 is not None and t0 is not None
+                      and d0 > t0 + 1) else (t0 if t0 is not None else d0)
+        return round(max(0.0, t1 - base), 1), None
+    wit = _run_witness_ts(state, run_dir)
+    base = d0 if d0 is not None else t0
+    if wit is not None and base is not None:
+        return round(max(0.0, wit - base), 1), None
+    return None, None
+
+
+def run_elapsed_s(state: dict, now: float | None = None,
+                  *, run_dir: Path | None = None) -> float | None:
+    """The one authoritative run elapsed: the driver's own execution
+    intervals (idle gaps between resumes are outside all of them), plus
+    the live interval to `now` while a driver is in flight. Never a sum
+    of step spans - wave members overlap in wall time."""
+    els, start = _run_elapsed_split(state, run_dir)
+    if els is None and start is None:
+        return None
+    total = els or 0.0
+    if start is not None:
+        t0 = _iso_ts(start)
+        if t0 is not None:
+            n = _now() if now is None else now
+            total += max(0.0, n - t0)
+    return round(total, 1)
 
 
 def save_state(run_dir: Path, state: dict) -> None:
@@ -1816,7 +2086,7 @@ def step_summary_md(rec: dict, st: dict, run_name: str) -> str:
     cached_t = t.get("cached") or 0
     out_t = t.get("completion") or 0
     billed = max(0, prompt_t - cached_t)
-    span = rec.get("elapsed_s")
+    span = rec_elapsed_s(rec)
     el = (f"{int(span // 60)}m{int(span % 60):02d}s"
           if isinstance(span, (int, float)) else "-")
     est = estimate_cost(t, rec.get("model"), rec.get("effort"),
@@ -1838,11 +2108,17 @@ def step_summary_md(rec: dict, st: dict, run_name: str) -> str:
     # embedded in `task`, so parse it back out - either way the raw
     # comment must not render as the step's description.
     purpose = rec.get("purpose") or split_purpose(rec.get("task"))[0]
+    # 'started' is the run's overall first dispatch; a later-resumed
+    # step's latest dispatch start stays visible as a parenthetical.
+    first_start = rec.get("first_started_at") or rec.get("started_at")
+    started_s = first_start or "-"
+    if rec.get("started_at") and rec["started_at"] != first_start:
+        started_s += f" (latest dispatch {rec['started_at']})"
     L = [f"# {run_name} / {name}", ""]
     L += [
         f"- **status:** {status} · **verify:** {verify_s} · "
         f"**exit:** {rec.get('exit_code', '-')}",
-        f"- **started:** {rec.get('started_at') or '-'} · "
+        f"- **started:** {started_s} · "
         f"**ended:** {rec.get('ended_at') or '-'} · **elapsed:** {el}",
         f"- **model:** {rec.get('model_actual') or rec.get('model') or '-'}"
         f" (effort {rec.get('effort') or '-'}) · "
@@ -1986,7 +2262,13 @@ SUMMARIZE_TIMEOUT_S = 900      # one cheap prose pass, not a work session
 
 
 def _elapsed_md(rec: dict) -> str:
-    span = rec.get("elapsed_s")
+    span = rec_elapsed_s(rec)
+    return (f"{int(span // 60)}m{int(span % 60):02d}s"
+            if isinstance(span, (int, float)) else "-")
+
+
+def _run_elapsed_md(st: dict) -> str:
+    span = run_elapsed_s(st)
     return (f"{int(span // 60)}m{int(span % 60):02d}s"
             if isinstance(span, (int, float)) else "-")
 
@@ -2040,7 +2322,8 @@ def run_report_md(st: dict) -> str:
              f"{n} {k}" for k, n in sorted(agg["counts"].items()))
              or "none"),
          f"- **started:** {st.get('started_at') or '-'} · "
-         f"**ended:** {st.get('ended_at') or '-'}"]
+         f"**ended:** {st.get('ended_at') or '-'} · "
+         f"**elapsed:** {_run_elapsed_md(st)}"]
     if agg["prompt"] or agg["completion"]:
         L.append(f"- **tokens:** {_fmtK(agg['prompt'])} prompt + "
                  f"{_fmtK(agg['completion'])} completion"
@@ -3514,7 +3797,11 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         else:
             note = "stopped by user"
         with STATE_LOCK:
-            state["steps"].setdefault(step.name, {}).update(
+            rec = state["steps"].setdefault(step.name, {})
+            # a crashed prior dispatch may have left its interval open -
+            # close it at evidence before stamping this skip
+            _iv_close(rec, now_iso(), run_dir=run_dir)
+            rec.update(
                 name=step.name, slug=slug, status="skipped",
                 wt=step.worktree, cloud=step.cloud, ended_at=now_iso(),
                 note=note + " before the session spawned")
@@ -3602,10 +3889,20 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     purpose, _disp_body = split_purpose(body_src)
     with STATE_LOCK:
         rec = state["steps"].setdefault(step.name, {})
+        # Every dispatch is its own execution interval - prior dispatch
+        # spans stay banked in exec_intervals, so a resume accumulates
+        # instead of overwriting. started_at remains the CURRENT
+        # dispatch's start (pid/liveness windows need it); the original
+        # start lives on first_started_at.
+        start_iso = now_iso()
+        cur_iv = _iv_open(rec, start_iso, run_dir=run_dir)
         rec.update(name=step.name, slug=slug, project=str(work_dir),
                    work_dir=str(work_dir), branch=branch,
                    wt=step.worktree,
-                   status="running", started_at=now_iso(), ended_at=None,
+                   status="running", started_at=start_iso, ended_at=None,
+                   first_started_at=(rec.get("first_started_at")
+                                     or rec.get("started_at")
+                                     or start_iso),
                    model=step.model, mode=step.mode, cloud=step.cloud,
                    effort=step.effort, timeout_min=step.timeout_min,
                    max_attempts=step.max_attempts,
@@ -3631,7 +3928,10 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         if not is_git_repo(work_dir):
             _device_release(device_lease, run_dir)
             with STATE_LOCK:
+                _iv_close(rec, now_iso(), current=cur_iv,
+                          run_dir=run_dir)
                 rec.update(status="failed",
+                           ended_at=now_iso(),
                            note="not a git repo root; checkpoint required")
                 _bump_completion(rec)
                 save_state(run_dir, state)
@@ -3647,7 +3947,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         step_env["ANDROID_SERIAL"] = device_lease.serial
         step_env["CONDUCTOR_DEVICE_SERIAL"] = device_lease.serial
 
-    t0 = time.time()
+    t0 = _now()
     timed_out = False
     hung = False
     stopped = False
@@ -3842,7 +4142,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             continue
         if spawn_failed or not timed_out or attempt >= step.max_attempts:
             break
-    elapsed = round(time.time() - t0, 1)
+    elapsed = round(_now() - t0, 1)
 
     verify_ok = None
     if step.verify and not timed_out and not stopped:
@@ -3902,7 +4202,6 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         if all_sessions:
             rec["session_ids"] = sorted(all_sessions)
         rec["exit_code"] = rc
-        rec["elapsed_s"] = elapsed
         rec["attempts"] = attempt
         notes = []
         if attempt > 1:
@@ -3963,7 +4262,11 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                 status=status if i == len(attempt_outcomes) - 1
                 else "timed_out",
                 attempt=att)
-        rec.update(status=status, ended_at=now_iso(), status_line=status_line,
+        # Close this dispatch's interval at the real end; elapsed_s is
+        # the cumulative sum over every interval, not just this one.
+        end_iso = now_iso()
+        _iv_close(rec, end_iso, current=cur_iv, run_dir=run_dir)
+        rec.update(status=status, ended_at=end_iso, status_line=status_line,
                    verify_ok=verify_ok, next=tail_next(stdout_log),
                    timeout_extended_s=round(ext_s) if ext_s > 1 else None,
                    tokens=tok_acc or None,
@@ -4124,8 +4427,10 @@ def hub_update(tid: int | None, state: dict, final: bool = False,
     counts: dict[str, int] = {}
     for rec in state["steps"].values():
         counts[rec["status"]] = counts.get(rec["status"], 0) + 1
+    el = run_elapsed_s(state)
     body = ("run dir: " + state.get("run_dir", "?") + "\n"
             + "ended: " + (state.get("ended_at") or "still running") + "\n"
+            + (f"elapsed: {el:.0f}s\n" if el is not None else "")
             + "\n".join(f"- {r.get('name', '?')}: {r.get('status', '?')}"
                         for r in state["steps"].values()))
     try:
@@ -4170,7 +4475,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         # from the pause/crash would keep showing the old end-state notice
         # (e.g. 'Paused by user') until the loop re-stamps them.
         state.pop("aborted", None)
-        state.pop("ended_at", None)
+        prev_end = state.pop("ended_at", None)
+        # ...and the previous driver session's execution interval closes
+        # before the new one opens - at its recorded end when the run
+        # terminated cleanly, at the last sign of life after a crash.
+        _run_iv_close(state, prev_end or now_iso(), run_dir=run_dir,
+                      witness_cap=prev_end is None)
         # A re-entered run is in flight again - drop the auto-archive
         # stamp so it resurfaces on the default dashboard view.
         state.pop("archived", None)
@@ -4178,6 +4488,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         # tracks the resumed conductor, not the dead original.
         state["driver_pid"] = os.getpid()
         state["driver_started_at"] = now_iso()
+        ivs = state.setdefault("exec_intervals", [])
+        if not ivs:
+            # A legacy run (no exec_intervals yet) seeds its first
+            # interval from recorded stamps - start->ended_at after a
+            # clean end, start->last-witness after a crash - so even
+            # pre-schema work banks instead of vanishing.
+            t0s = state.get("started_at")
+            t1s = prev_end or _iso_from(
+                _run_witness_ts(state, run_dir))
+            if t0s and t1s and t1s > t0s:
+                ivs.append({"start": t0s, "end": t1s})
+        ivs.append({"start": state["driver_started_at"], "end": None})
         # The current manifest's policy applies to steps prepared from now
         # on; already-recorded recs keep their own `deferred` flags.
         state["merge_policy"] = cfg.merge_policy
@@ -4189,17 +4511,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         clear_run_flags(run_dir)
     else:
         run_dir = new_run_dir(cfg, runs_dir)
+        run_start = now_iso()
         state = {"run": cfg.name, "description": cfg.description,
                  "request_id": getattr(args, "request_id", None),
                  "manifest": str(manifest_path),
                  "merge_policy": cfg.merge_policy,
-                 "started_at": now_iso(), "devin": " ".join(devin_argv),
+                 "started_at": run_start, "devin": " ".join(devin_argv),
                  "devin_argv": devin_argv,
                  "run_dir": str(run_dir), "max_parallel": cap,
                  "flags": "v2", "intrq": True,
                  "summarize_model": cfg.summarize,
                  "driver_pid": os.getpid(),
-                 "driver_started_at": now_iso(),
+                 "driver_started_at": run_start,
+                 # the driver's own execution interval - the unit run
+                 # elapsed sums over (never a sum of overlapping steps)
+                 "exec_intervals": [{"start": run_start, "end": None}],
                  "free_ram_gb": free_ram_gb(), "steps": {}}
         save_state(run_dir, state)
     hub = getattr(args, "hub", True)
@@ -4210,7 +4536,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     if "devin" in os.path.basename(devin_argv[-1]).lower():
         if not check_auth(devin_argv):
             print("devin is not logged in. Run `devin auth login` first.")
-            state["ended_at"] = now_iso()
+            end_iso = now_iso()
+            _run_iv_close(state, end_iso)
+            state["ended_at"] = end_iso
             state["aborted"] = "auth"
             _bump_completion(state)
             save_state(run_dir, state)
@@ -4218,7 +4546,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             hub_update(tid, state, final=True, final_status="dropped")
             return 2
 
-    run_t0 = time.time()
+    run_t0 = _now()
     stop = False
 
     def halt_remaining(from_gi: int) -> None:
@@ -4247,7 +4575,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                         note=why + " before this step ran")
             state["aborted"] = ("paused" if paused else
                                 "stopped" if halted else "drained")
-            state["ended_at"] = now_iso()
+            end_iso = now_iso()
+            _run_iv_close(state, end_iso)
+            state["ended_at"] = end_iso
             _bump_completion(state)
             save_state(run_dir, state)
 
@@ -4267,7 +4597,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                       paused=paused)
             halt_remaining(gi)
             break
-        if cfg.max_hours and time.time() - run_t0 > cfg.max_hours * 3600:
+        if cfg.max_hours and _now() - run_t0 > cfg.max_hours * 3600:
             print(f"stopping run: max_hours={cfg.max_hours} reached")
             log_event(run_dir, event="run_deadline", max_hours=cfg.max_hours)
             break
@@ -4290,7 +4620,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                                 note="auth lost mid-run; --resume after "
                                      "devin auth login")
                 state["aborted"] = "auth_midrun"
-                state["ended_at"] = now_iso()
+                end_iso = now_iso()
+                _run_iv_close(state, end_iso)
+                state["ended_at"] = end_iso
                 _bump_completion(state)
                 save_state(run_dir, state)
             hub_update(tid, state, final=True, final_status="dropped")
@@ -4613,7 +4945,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             pause_flag(run_dir)) is not None:
         halt_remaining(len(groups))
 
-    state["ended_at"] = now_iso()
+    end_iso = now_iso()
+    _run_iv_close(state, end_iso)
+    state["ended_at"] = end_iso
     _bump_completion(state)
     save_state(run_dir, state)
     log_event(run_dir, event="run_end")
@@ -4704,15 +5038,16 @@ def cmd_status(args: argparse.Namespace) -> int:
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
     eff = effective_statuses(state)
     ended = state.get("ended_at") or "still running"
+    run_el = run_elapsed_s(state, run_dir=run_dir)
+    run_el_s = f"{run_el:.0f}s" if run_el is not None else "-"
     print(f"run {state.get('run', '?')}  started "
-          f"{state.get('started_at') or '?'}  ended {ended}  ({run_dir})")
+          f"{state.get('started_at') or '?'}  ended {ended}  "
+          f"elapsed {run_el_s}  ({run_dir})")
     for name, rec in (state.get("steps") or {}).items():
         sess = rec.get("session_id") or "-"
-        span = rec.get("elapsed_s")
-        if span is None and rec.get("started_at"):
-            t0 = _iso_ts(rec["started_at"])
-            span = round(time.time() - t0) if t0 else 0
-        print(f"  {eff.get(name, '?'):>9}  {name:<20} {span or 0:>7.0f}s  "
+        span = rec_elapsed_s(rec, live=eff.get(name) == "running")
+        span_s = f"{span:>7.0f}s" if span is not None else "      -"
+        print(f"  {eff.get(name, '?'):>9}  {name:<20} {span_s}  "
               f"ended={rec.get('ended_at') or '-'}  "
               f"session={sess}  verify={rec.get('verify_ok')}")
         if rec.get("outcome"):
@@ -4771,6 +5106,10 @@ def sweep_runs(runs_dir: Path, write: bool = True) -> list[str]:
                              f"{rec.get('status')} -> lost")
                 if write:
                     rec["status"] = "lost"
+                    # its dispatch interval died with the driver - close
+                    # at the last sign of life (log mtime), not at sweep
+                    # time, so the dead gap never inflates elapsed
+                    _iv_close(rec, now_iso(), run_dir=sj.parent)
                     if not rec.get("ended_at"):
                         rec["ended_at"] = now_iso()
                     rec.setdefault(
@@ -4783,7 +5122,10 @@ def sweep_runs(runs_dir: Path, write: bool = True) -> list[str]:
                 for r in steps.values()):
             lines.append(f"{sj.parent.name}: run closed (no live steps)")
             if write:
-                st["ended_at"] = now_iso()
+                end_iso = now_iso()
+                _run_iv_close(st, end_iso, run_dir=sj.parent,
+                              witness_cap=True)
+                st["ended_at"] = end_iso
                 _bump_completion(st)
                 dirty = True
         if dirty:
@@ -10129,7 +10471,10 @@ def collect_dashboard(runs_dir: Path,
                                   prop_seq.get(rec.get("name") or name)),
                 "work_dir": wd,
                 "status": status, "started_at": rec.get("started_at"),
+                "first_started_at": rec.get("first_started_at"),
                 "ended_at": rec.get("ended_at"),
+                # closed-intervals cumulative; the client adds the live
+                # interval (now - started_at) while status is 'running'
                 "elapsed_s": rec.get("elapsed_s"),
                 "alive": alive,
                 "pid": rec.get("pid"), "session_id": rec.get("session_id"),
@@ -10263,6 +10608,10 @@ def collect_dashboard(runs_dir: Path,
              and run_mark.get("reviewed") is False)
             or (st.get("ended_at")
                 and _needs_review(st.get("completion_seq"), run_mark)))
+        # closed-intervals driver cumulative; exec_start carries the
+        # live interval's start so the runs table ticks base+now-start
+        # without a payload refresh
+        run_els, run_exec_start = _run_elapsed_split(st, sj.parent)
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
                      "key": key, "request_id": st.get("request_id"),
                      "archived": st.get("archived"),
@@ -10273,6 +10622,7 @@ def collect_dashboard(runs_dir: Path,
                      "started_at": st.get("started_at"),
                      "ended_at": st.get("ended_at"), "counts": counts,
                      "aborted": st.get("aborted"),
+                     "elapsed_s": run_els, "exec_start": run_exec_start,
                      "resume_log": (str(sj.parent / "resume.launch.log")
                                     if (sj.parent /
                                         "resume.launch.log").is_file()
@@ -10931,10 +11281,23 @@ const tokenHelp = `<details class="tok-help"><summary aria-label="Explain tokens
   `Rates come from the self-serve table at docs.devin.ai/desktop/chat/` +
   `models, refetched every few hours; a model with no listed rate ` +
   `shows n/a.</div></details>`;
+// Cumulative contract: elapsed_s is the sum of CLOSED execution
+// intervals (each dispatch banks its own); while a row is running the
+// live interval adds now - started_at on top. A queued resumed row
+// shows its banked total - never idle-ticks off the stale started_at.
 function elapsed(a, now){
+  const base = a.elapsed_s||0;
+  if (a.status==='running' && a.started_at)
+    return fmtS(base + Math.max(0,(now - new Date(a.started_at))/1000));
   if (a.elapsed_s != null) return fmtS(a.elapsed_s);
-  if (a.started_at && (a.status==='running'||a.status==='queued'))
-    return fmtS((now - new Date(a.started_at))/1000);
+  return '-'; }
+// Runs: same contract - elapsed_s = closed driver intervals, exec_start
+// = the live one's start while a driver is in flight.
+function runElapsed(r, now){
+  const base = r.elapsed_s||0;
+  if (r.exec_start)
+    return fmtS(base + Math.max(0,(now - new Date(r.exec_start))/1000));
+  if (r.elapsed_s != null) return fmtS(r.elapsed_s);
   return '-'; }
 // While a request generates, its planner row carries the live stdout tail -
 // stream it into the open request modal's <pre id="gtail">.
@@ -11659,8 +12022,15 @@ function showDetail(i, keepStack){
     ['model',(a.model||'-')+(a.effort?' (effort '+a.effort+')':'')+
       (a.model_actual?' → '+a.model_actual:'')],
     ['mode',(a.mode||'-')+(a.cloud?' cloud':'')],
-    ['started',a.started_at],['ended',a.ended_at],
-    ['elapsed',a.elapsed_s!=null?fmtS(a.elapsed_s):'-'],
+    // cumulative over every dispatch's execution interval - the live
+    // one included; 'started' keeps the ORIGINAL dispatch, with the
+    // latest one parenthesized when a resume restamped it
+    ['started',(a.first_started_at && a.started_at &&
+      a.first_started_at!==a.started_at)
+      ? a.first_started_at+' (latest dispatch '+a.started_at+')'
+      : a.started_at],
+    ['ended',a.ended_at],
+    ['elapsed',elapsed(a, Date.now())],
     ['timeout',a.timeout_min!=null?a.timeout_min+' min'+
       (a.timeout_ext_s?` (+${fmtS(a.timeout_ext_s)} active past it)`:
       ''):'-'],
@@ -11954,6 +12324,7 @@ function showRunDetails(key, keepStack){
     // review marks live on run records only - a proposal/planner row is
     // preparation history, never a completion to ack
     ...(r.stage?[]:[['review',reviewLine(r)]]),
+    ['elapsed',runElapsed(r, Date.now())],
     ['steps',(total?`${total} total · `:'')+
       Object.entries(r.counts||{}).map(([s,n])=>`${n} ${s}`).join(', ')],
     ['tokens',tokTitle(r.tokens)||'-'],
@@ -13002,6 +13373,12 @@ function tickElapsed(now){
     const td = document.querySelector(`td[data-el="${a._i}"]`);
     if (td) td.textContent = elapsed(a, now);
   }
+  // live run rows tick the same way - keyed by runKey, found via the
+  // attribute (querySelector can't safely quote an arbitrary key)
+  for (const td of document.querySelectorAll('td[data-rel]')){
+    const r = (lastData?.runs||[]).find(x=>runKey(x)===td.dataset.rel);
+    if (r) td.textContent = runElapsed(r, now);
+  }
 }
 // The Trash view (view: 'N trash' chip). Every row is a recoverable
 // deletion with its purge clock; Restore lands it back where it was
@@ -13156,12 +13533,16 @@ function render(d){
   }
 
   // runs table first - a run can span projects (chips show which)
-  let h = '<colgroup><col style="width:13%"><col style="width:19%">' +
-    '<col style="width:15%"><col style="width:9%"><col style="width:9%">' +
-    '<col style="width:17%"><col style="width:5%">' +
+  let h = '<colgroup><col style="width:13%"><col style="width:18%">' +
+    '<col style="width:13%"><col style="width:8%"><col style="width:8%">' +
+    '<col style="width:7%"><col style="width:15%"><col style="width:5%">' +
     '<col class="hide-s" style="width:13%"></colgroup>' +
     '<tr><th>run</th><th>description</th><th>projects</th><th>started</th>' +
-    '<th>ended</th><th title="per-status step counts, then token sums ' +
+    '<th>ended</th>' +
+    '<th title="active execution time - driver intervals summed, ' +
+    'excluding idle gaps between resumes (never a sum of concurrent ' +
+    'task spans)">elapsed</th>' +
+    '<th title="per-status step counts, then token sums ' +
     'for the planner session and the worker steps, then estimated ' +
     'cost">steps</th>' +
     '<th title="parallel-agent cap for this run (run.max_parallel)">cap</th>' +
@@ -13368,6 +13749,9 @@ function render(d){
       `<td>${(r.projects||[]).map(p=>`<span class="chip">${esc(p)}</span>`).join('')}</td>` +
       `<td>${loc(r.started_at)}</td>` +
       `<td>${r.ended_at?loc(r.ended_at):(r.started_at?'<b>running</b>':'-')}</td>` +
+      `<td data-rel="${esc(runKey(r))}" ` +
+      `title="${r.exec_start?'live - cumulative driver execution time':
+        'cumulative driver execution time'}">${runElapsed(r,now)}</td>` +
       `<td class="counts">` +
       `${counts||'<span class="toksub">not planned</span>'}` +
       // .toksub, not .sub: these labeled lines are meant to render in
@@ -13390,11 +13774,11 @@ function render(d){
       `<td class="hide-s wrap">${esc(r.dir)}</td></tr>`;
   }
   if (hiddenRuns > 0)
-    h += `<tr><td colspan="8"><a href="#" data-rmore>show more ` +
+    h += `<tr><td colspan="9"><a href="#" data-rmore>show more ` +
       `(${hiddenRuns} finished run${hiddenRuns===1?'':'s'})</a> · ` +
       `<a href="#" data-rall>show all ${allRuns.length}</a></td></tr>`;
   else if (runsShown > SHOW_N)
-    h += `<tr><td colspan="8"><a href="#" data-rless>` +
+    h += `<tr><td colspan="9"><a href="#" data-rless>` +
       `show latest ${SHOW_N} only</a></td></tr>`;
   document.getElementById('runs').innerHTML = h;
 
