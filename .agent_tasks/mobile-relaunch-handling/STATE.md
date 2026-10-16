@@ -1,6 +1,6 @@
 # Task: mobile-relaunch-handling
 
-**Status:** in progress
+**Status:** done
 **Started:** 2026-10-16   **Last touched:** 2026-10-16
 
 ## Objective
