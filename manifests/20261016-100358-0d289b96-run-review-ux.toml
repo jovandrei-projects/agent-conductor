@@ -1,0 +1,152 @@
+[run]
+name = "run-review-ux"
+description = "Make runs and tasks easier to review with clear completion indicators, useful outcome summaries, stable interactions, accurate timing, and safer merge controls."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 60
+max_attempts = 3
+verify = "python run_tests.py"
+
+[[step]]
+name = "inspect-and-design"
+project = "agent-conductor"
+worktree = true
+timeout_min = 30
+prompt = '''
+Inspect the existing run/task tables and modals, completion reporting, persistence, timing/resume handling, workspace-watcher warning, and manual pending-branch merge flow. Locate relevant tests and project verification instructions without assuming a framework or storage schema.
+
+Research public examples of unread/review-needed indicators and reversible review acknowledgments online. Choose a cohesive model for runs and tasks: explicit human review state separate from execution outcome, clear text labels, accessible visual accents, and reversible acknowledgment. Evaluate the suggested green run and orange task accents without obscuring success/failure status or relying on color alone. Opening a modal should not silently acknowledge review; use explicit controls.
+
+Decide how historical records and subsequent completions after resume should behave. Record source URLs, decisions, actual implementation touchpoints, and test coverage gaps in the project's existing agent-task notes for subsequent steps. This step is investigation and design only; do not implement features.
+'''
+
+[[step]]
+name = "review-workflow"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Implement the run/task human-review workflow using the preceding design and existing persistence conventions. Newly finalized runs and tasks should visibly need review. Keep this state independent of execution success, failure, and merge status; an unsuccessful outcome must not look successful merely because it is reviewable.
+
+Provide explicit "Mark as reviewed" and "Mark as needing review" actions in the appropriate detail views, including the task modal. Use cohesive badges/highlights in both tables and accessible text alongside color. Reviewing a run must not silently acknowledge its tasks, or vice versa.
+
+Persist acknowledgment across refreshes, reopening, and application restarts. A genuinely new completion after retry or resume must require review again, while repeated delivery of the same completion or unrelated metadata updates must not reset acknowledgment. Protect against acknowledgment of an old result clearing a newer completion's indicator. Handle historical records according to the documented migration choice without presenting them as freshly completed.
+
+Add focused persistence and UI regression tests for completion, acknowledgment, reversal, reload, repeat updates, and resumed completion.
+'''
+
+[[step]]
+name = "task-outcome-summary"
+project = "agent-conductor"
+worktree = true
+timeout_min = 75
+prompt = '''
+Trace how task result, STATUS/NEXT, notes, and log-tail content are produced and consumed. Preserve existing machine-facing handoff information and diagnostics. Add a clearly labeled human-facing outcome summary to the task modal, and expose it in the table where consistent with the existing layout.
+
+Make the existing worker completion/reporting path supply and persist a concise one-to-two-line summary of what that specific task actually accomplished. Include concrete achievements and material limitations, such as partial implementation, failed verification, or testing still pending. Do not substitute orchestration instructions, sibling-task progress, or generic "nothing left" text for achievements, and do not claim success unsupported by evidence.
+
+Preserve useful summaries through subsequent merge/resolver notes and refreshes. Handle resumed attempts so the displayed outcome reflects the current task result without losing relevant earlier accomplishments. For historical tasks without reliable summaries, show an honest unavailable state rather than inventing achievements.
+
+Keep STATUS/NEXT compatibility, use safe text rendering, and avoid introducing an external summarization service. Add tests for reporting/parsing, task attribution, successful and partial outcomes, missing summaries, and updates after completion.
+'''
+
+[[step]]
+name = "task-table-navigation"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Update agent-task table interactions. Activating the run name must apply the existing run filter for that run, using stable identity where available, rather than opening the task modal. Activating the step name must open that task's modal. Remove the behavior that opens a task modal by clicking arbitrary parts of its row, without breaking other row controls or text selection.
+
+Use keyboard-accessible links or buttons and prevent event bubbling from triggering unintended actions. Keep the selected task's row highlighted while its modal is open, independently of pointer hover. Navigating to the next or previous task must move the highlight to the displayed task; closing the modal must clear the selection highlight. Apply equivalent selected-row highlighting to run details where applicable.
+
+Handle filtering, sorting, refreshes, and missing run associations without highlighting the wrong row. Add focused interaction tests covering the new click targets, keyboard activation, filtering, modal navigation, and highlight lifecycle.
+'''
+
+[[step]]
+name = "modal-refresh-stability"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Reproduce the task-modal scroll reset during background updates using the existing refresh mechanism and safe test fixtures. Trace the actual cause before changing rendering or state management.
+
+Keep an open task modal's scroll position stable when the same task receives background updates, including status, log, elapsed-time, and review-state changes. Preserve modal identity, focus, and in-progress user input where applicable. Update content without unnecessarily remounting the modal or replacing its scrolling container, and handle content changes above the viewport without disruptive jumps.
+
+Scope any retained scroll state to the selected task. Deliberately switching tasks must follow an intentional navigation policy rather than inheriting another task's position accidentally. Prevent stale asynchronous responses from restoring the wrong task or scroll position.
+
+Add regression coverage for a scrolled modal receiving repeated updates, review actions, next/previous navigation, and out-of-order refresh responses, using existing test tooling.
+'''
+
+[[step]]
+name = "cumulative-elapsed-time"
+project = "agent-conductor"
+worktree = true
+timeout_min = 75
+prompt = '''
+Reproduce the loss of previously elapsed time when a failed execution is resumed. Trace whichever records and views correspond to the user's "transaction" terminology instead of assuming a particular storage entity. Add a failing regression test before fixing the timing lifecycle.
+
+Preserve prior execution intervals and calculate cumulative elapsed time across resumes, including the current active interval while running. Avoid double-counting on repeated resume, persistence reload, or refresh. Do not inflate active execution time with idle gaps between attempts. For run totals, measure the run's execution intervals rather than summing concurrent task durations.
+
+Keep overall start, current/final end, and attempt-specific timestamps coherent, preserving original start information and avoiding stale end times while resumed work is active. Reuse the authoritative timing calculation in affected task/transaction views and add the requested elapsed-time column to the runs table.
+
+Handle incomplete historical timing honestly instead of inventing durations. Add deterministic-clock tests for failure/resume, multiple resumes, stop and restart, completed executions, reload, concurrent tasks, and missing historical data.
+'''
+
+[[step]]
+name = "execution-context-labels"
+project = "agent-conductor"
+worktree = true
+timeout_min = 45
+prompt = '''
+Improve two execution-context indicators using actual project data.
+
+First, add a compact "wt" label to a runs-table row when the run's effective configuration schedules local tasks in worktrees. Derive it from the applicable run/step configuration, not incidental branch names or whether execution has already started. Cover mixed-isolation runs with an explanatory accessible label or tooltip, and avoid labeling runs that do not request local worktree execution.
+
+Second, investigate whether the warning "A live agent is watching this workspace; wait until it finishes before changing requests or manifests" is still reachable. Wherever that guard currently applies, include the available human-readable session, step, or task identity, with run context when helpful, using authoritative ownership information. Handle multiple watchers and missing identity metadata gracefully without exposing private data, weakening the guard, or reviving an obsolete flow just to display the message.
+
+Add focused tests for effective worktree labeling and watcher-warning identity/fallback behavior.
+'''
+
+[[step]]
+name = "manual-merge-guard"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Prevent the user-facing "Merge pending branches" action while its run is still executing. Disable or withhold the UI action with a clear explanation, and enforce the same rule in the underlying operation so stale pages or direct requests cannot bypass it.
+
+Permit manual merging only once the run is actually stopped or finished and existing ownership checks confirm the operation is safe. A stop request, paused state, or incomplete shutdown must not be treated as completed execution. Recheck state at execution time and coordinate with the project's existing ownership/locking mechanism to cover races with start or resume.
+
+Keep conductor-managed wave merges and automatic merge-resolver sessions working; this restriction targets the manual pending-branch action, not normal orchestration.
+
+Add regression tests for an active run with pending branches, stale-client requests, stopping versus fully stopped states, terminal runs, and a start/resume race. Use isolated fixtures or temporary repositories rather than manipulating live runs or real pending branches.
+'''
+
+[[step]]
+name = "integration-verification"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Verify the combined changes against the human request using isolated test data and the project's existing UI/integration tooling. Exercise fresh completion indicators for runs and tasks; review acknowledgment, reversal, and persistence; renewed review after resumed completion; truthful task-specific outcome summaries; run-name filtering; step-only modal opening; selected-row highlighting and next/previous navigation; modal scroll stability during refresh; worktree labels; watcher identity; cumulative timing and the runs elapsed column; and manual merge rejection while a run remains active.
+
+Check that review indicators do not obscure failures, existing STATUS/NEXT consumers still work, and conductor-managed merges are unaffected. Include keyboard accessibility and legacy/missing-data cases where supported by the existing tooling.
+
+Run python run_tests.py and applicable existing frontend checks. Add missing regression tests and fix integration defects within this requested scope only. Do not bypass verification or report unexecuted checks as passing. Record verified accomplishments, parked or unavailable prerequisite changes, remaining failures, and any manual checks still needed in ordinary task notes and STATUS/NEXT output.
+'''
+
+[[step]]
+name = "follow-up-plan"
+project = "agent-conductor"
+worktree = true
+timeout_min = 20
+prompt = '''
+Review what this run actually accomplished against every item in the human request. Read per-step logs, STATUS/NEXT lines, and notes under C:/Projects/agent-conductor/data/runs in the newest directory whose name ends in run-review-ux, alongside this project's .agent_tasks files and the actual merged changes and verification results. Distinguish completed and verified work from failed, parked, conflicted, or unverified work; a finished session alone is not evidence that its changes landed.
+
+Write a NEW conductor TOML manifest at C:/Projects/agent-conductor/manifests/run-review-ux-followup.toml proposing only still-unfinished work or newly discovered work directly related to this request. Give each proposed step a concrete scope and acceptance checks grounded in the review. Use registered project slugs, sequential worktree-isolated steps, the registered verification command, and the same required run/default settings, including max_attempts = 3 and merge_resolver = true. Do not reproduce credentials, private log contents, or other sensitive data in the manifest; refer to relevant project files instead.
+
+If nothing remains, represent that explicitly without inventing implementation work. Check TOML and existing conductor schema compatibility without starting a run. This step is review and proposal writing only: do not launch the follow-up or implement any follow-up items. A human will review the saved proposal.
+'''
