@@ -4982,6 +4982,315 @@ class LifecycleDisplayTests(unittest.TestCase):
                              "GPT-6 Astra")
 
 
+class TrajectoryDetailTests(unittest.TestCase):
+    """The modal's per-entry expansion serves the FULL retained text from
+    the ATIF export (message/reasoning/tool args/results) - not the
+    ~110-char arc head. Lazy via /trajectory endpoints, honest notes when
+    nothing was retained."""
+
+    def _export(self, td: str, steps) -> Path:
+        ex = Path(td) / "s.export.json"
+        ex.write_text(json.dumps({"steps": steps}), encoding="utf-8")
+        return ex
+
+    def _rich_steps(self):
+        return [
+            {"step_id": 1, "source": "system",
+             "timestamp": "2026-01-01T10:00:00",
+             "message": "sys prompt line one\nline two with   spacing"},
+            {"step_id": 4, "source": "agent",
+             "timestamp": "2026-01-01T10:01:00",
+             "model_name": "swe-2",
+             "message": "Detailed step:\n  1. audit\n  2. edit\n" +
+                      "very long line " * 30,
+             "reasoning_content": "thinking\nmore thinking",
+             "tool_calls": [
+                 {"tool_call_id": "c1", "function_name": "edit",
+                  "arguments": {"file_path": "/x/f.py",
+                                "content": "a\nb\n  indented"}},
+                 {"tool_call_id": "c2", "function_name": "exec",
+                  "arguments": {"command": "python run_tests.py"}}],
+             "observation": {"results": [
+                 {"source_call_id": "c1", "content": "edit ok\nmore"},
+                 {"source_call_id": "c2", "content": "suite green"},
+                 {"source_call_id": "cX", "content": "orphan result"}]},
+             "metrics": {"prompt_tokens": 10, "completion_tokens": 5}},
+            {"step_id": 5, "source": "agent",
+             "timestamp": "2026-01-01T10:02:00", "message": ""},
+        ]
+
+    def test_detail_returns_complete_text(self):
+        """Expansion shows the whole stored field, not the arc's head -
+        including long multiline messages (the 'detailed step' case)."""
+        with tempfile.TemporaryDirectory() as td:
+            det = conductor.trajectory_detail(self._export(
+                td, self._rich_steps()))
+        ents = det["entries"]
+        e4 = ents["4"]
+        self.assertIn("very long line " * 30, e4["msg"])  # untruncated
+        self.assertIn("\n  1. audit\n  2. edit\n", e4["msg"])  # ws kept
+        self.assertEqual(e4["think"], "thinking\nmore thinking")
+        self.assertEqual(e4["src"], "agent")
+        self.assertEqual(e4["model"], "swe-2")
+        # args render as 'key: value' lines - multiline values stay
+        # literal (an edit payload reads as written, not JSON-escaped)
+        c1, c2 = e4["calls"]
+        self.assertEqual(c1["name"], "edit")
+        self.assertIn("file_path: /x/f.py", c1["args"])
+        self.assertIn("content:\na\nb\n  indented", c1["args"])
+        self.assertEqual(c1["result"], "edit ok\nmore")
+        self.assertEqual(c2["result"], "suite green")
+        # an observation with no matching call still surfaces
+        self.assertEqual(e4["extra_obs"], ["orphan result"])
+        # system step keeps its full message; content-less step has none
+        self.assertIn("line two with   spacing", ents["1"]["msg"])
+        self.assertIsNone(ents["5"]["msg"])
+        self.assertIsNone(ents["5"]["think"])
+
+    def test_detail_caps_overlong_fields_honestly(self):
+        with tempfile.TemporaryDirectory() as td:
+            big = "x" * (conductor.ARC_DETAIL_CAP + 500)
+            ex = self._export(td, [{"step_id": 1, "source": "agent",
+                                    "message": big}])
+            det = conductor.trajectory_detail(ex)
+        e = det["entries"]["1"]
+        self.assertEqual(len(e["msg"]), conductor.ARC_DETAIL_CAP)
+        self.assertEqual(e["trunc"], {"message":
+                                     conductor.ARC_DETAIL_CAP + 500})
+
+    def test_detail_tolerates_junk(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertIsNone(conductor.trajectory_detail(td))
+            bad = Path(td) / "b.json"
+            bad.write_text("{no", encoding="utf-8")
+            self.assertIsNone(conductor.trajectory_detail(bad))
+            # a mock-shaped export has no steps -> None, never a fake row
+            mock_ex = Path(td) / "m.export.json"
+            mock_ex.write_text('{"mock": true, "session": "s"}')
+            self.assertIsNone(conductor.trajectory_detail(mock_ex))
+            # steps without step_id are skipped, not keyed 'None'
+            ex = self._export(td, [{"source": "agent", "message": "x"},
+                                   {"step_id": 2, "message": "y"}])
+            det = conductor.trajectory_detail(ex)
+            self.assertEqual(list(det["entries"]), ["2"])
+            self.assertIsNone(
+                conductor.cached_arc_detail(Path(td) / "none.json"))
+
+    def _run_with_export(self, td: str, steps, **rec_extra):
+        runs = Path(td) / "runs"
+        rd = runs / "20261016-000000-traj"
+        rd.mkdir(parents=True)
+        exp = rd / "s1.export.json"
+        exp.write_text(json.dumps({"steps": steps}), encoding="utf-8")
+        st = {"run": "traj",
+              "steps": {"s1": {"status": "done", "export": str(exp),
+                               **rec_extra}}}
+        (rd / "state.json").write_text(json.dumps(st), encoding="utf-8")
+        return runs, rd
+
+    def test_step_trajectory_endpoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run_with_export(td, self._rich_steps())
+            det = conductor.step_trajectory(rd.name, "s1", runs)
+            self.assertIn("very long line", det["entries"]["4"]["msg"])
+            # second call hits the mtime memo, same object
+            self.assertIs(det, conductor.step_trajectory(
+                rd.name, "s1", runs))
+
+    def test_step_trajectory_404s(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run_with_export(td, self._rich_steps())
+            raises = lambda *a: self.assertRaises(conductor.RequestError,
+                conductor.step_trajectory, *a)
+            raises(rd.name, "nope", runs)                # unknown step
+            raises("../x", "s1", runs)                   # bad run name
+            raises(rd.name, "../x", runs)                # bad step name
+            st = json.loads((rd / "state.json").read_text())
+            st["steps"]["s1"]["export"] = str(           # escapes the dir
+                Path(td) / "outside.json")
+            (rd / "state.json").write_text(json.dumps(st))
+            raises(rd.name, "s1", runs)
+            st["steps"]["s1"]["export"] = str(           # gone from disk
+                rd / "deleted.export.json")
+            (rd / "state.json").write_text(json.dumps(st))
+            raises(rd.name, "s1", runs)
+            st["steps"]["s1"].pop("export")              # never recorded
+            (rd / "state.json").write_text(json.dumps(st))
+            raises(rd.name, "s1", runs)
+            # a mock export (no steps) reports 'nothing retained'
+            mock_ex = rd / "s1.export.json"
+            mock_ex.write_text('{"mock": true}', encoding="utf-8")
+            st["steps"]["s1"]["export"] = str(mock_ex)
+            (rd / "state.json").write_text(json.dumps(st))
+            raises(rd.name, "s1", runs)
+
+    def test_request_trajectory_endpoint(self):
+        rid = "20261016-013719-deadbeef"
+        with tempfile.TemporaryDirectory() as td:
+            reqs = Path(td) / "requests"
+            reqs.mkdir()
+            (reqs / f"{rid}.gen.export.json").write_text(
+                json.dumps({"steps": self._rich_steps()}),
+                encoding="utf-8")
+            det = conductor.request_trajectory(rid, reqs)
+            self.assertIn("4", det["entries"])
+            with self.assertRaises(conductor.RequestError):
+                conductor.request_trajectory(
+                    "20261016-013719-00000000", reqs)    # no export file
+            with self.assertRaises(conductor.RequestError):
+                conductor.request_trajectory("../../etc", reqs)  # bad id
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_arc_expansion_markup_and_state(self):
+        """Entries render as closed <details class='arcent'> (compact
+        default preserved); Expand/Collapse all + per-entry toggles live
+        in trajOpen keyed per agent, so a rebuild or a run switch never
+        leaks expansion across agents."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, fetches=[];
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',scrollTop:9}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,fn)=>{handlers[ev]=fn;}};
+const fetch=async(path)=>{fetches.push(path);return {ok:true,
+  json:async()=>({entries:{'4':{sid:4,src:'agent',model:'m',
+    msg:'LINE1\nLINE2   spaced <b>html</b>',think:'r',
+    calls:[{name:'edit',args:'{\n "a": 1\n}',result:'ok'}],
+    extra_obs:[],trunc:null}}})};};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:(fn)=>{},fetch});
+vm.runInContext(src,ctx);
+const arc={steps:3,em:1,groups:[{span:'1-4',phase:'implement',n:3,
+  t0:'2026-01-01T10:00:00',tin:100,tout:5,tcached:50,head:'h',
+  entries:[{sid:4,ts:'2026-01-01T10:00:00',dur_s:60,in:10,out:5,
+    cached:1,head:'<img src=x onerror=alert(1)>'},
+   {sid:5,ts:'2026-01-01T10:01:00',in:2,out:1,cached:0,head:'e5'}]}]};
+const mk=(step,key,dir)=>({step,run:'r',run_dir:dir,run_key:key,
+  slug:'p',status:'done',task:'t',export:dir+'/s.export.json',arc,seq:1});
+const data={serve_boot:'b',generated_at:'2026-01-01',agents:[
+  mk('s1','rk1','D:/runs/r1'), mk('s1','rk2','D:/runs/r2')],
+  runs:[{run:'r',dir:'D:/runs/r1',key:'rk1',counts:{done:1}},
+        {run:'r',dir:'D:/runs/r2',key:'rk2',counts:{done:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const open=k=>vm.runInContext(
+  'showDetail(AGENTS.findIndex(a=>agentKey(a)==='+JSON.stringify(k)+'))',
+  ctx);
+(async()=>{
+  await open('rk1|s1');
+  let body=elem('dbody').innerHTML;
+  // compact default: entries are <details>, none open
+  assert.match(body,/data-arc-all/);
+  assert.match(body,/data-arc-none/);
+  assert.match(body,/<details class="arcgrp" data-ag="0">/);
+  assert.match(body,/<details class="arcent" data-asid="4">/);
+  assert.doesNotMatch(body,/class="arcent" data-asid="4" open/);
+  // hostile head text stays escaped in the row
+  assert.doesNotMatch(body,/<img src=x onerror/);
+  assert.match(body,/onerror=alert\(1\)&gt;/);
+  // expanding an entry: toggle persists it, kicks ONE fetch, fills body
+  const det4={classList:{contains:c=>c==='arcent'},
+    dataset:{asid:'4'},open:true,
+    closest:s=>({dataset:{akey:'rk1|s1'}}),
+    querySelector:()=>null};
+  handlers.toggle({target:det4});
+  await new Promise(r=>setImmediate(r));
+  assert.equal(fetches.length,1);
+  assert.match(fetches[0],/\/api\/runs\/r1\/steps\/s1\/trajectory/);
+  vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+  await open('rk1|s1');
+  body=elem('dbody').innerHTML;
+  assert.match(body,/class="arcent" data-asid="4" open/);
+  // the expanded body carries the FULL text - multiline, html-escaped,
+  // with a copy affordance; never the truncated head only
+  assert.match(body,/LINE1\nLINE2   spaced/);
+  assert.match(body,/&lt;b&gt;html&lt;\/b&gt;/);
+  assert.match(body,/data-arc-copy="4"/);
+  assert.match(body,/tool call 1 · edit/);
+  // second fetch? no - cached by export@mtime
+  assert.equal(fetches.length,1);
+  // collapse-all returns to the compact closed state
+  handlers.click({preventDefault:()=>{},target:{dataset:{},
+    closest:s=>s==='[data-arc-none]'?{dataset:{}}:null}});
+  body=elem('dbody').innerHTML;
+  assert.doesNotMatch(body,/class="arcent" data-asid="4" open/);
+  // expand-all opens every group+entry; run switch isolates the state
+  handlers.click({preventDefault:()=>{},target:{dataset:{},
+    closest:s=>s==='[data-arc-all]'?{dataset:{}}:null}});
+  body=elem('dbody').innerHTML;
+  assert.match(body,/class="arcgrp" data-ag="0" open/);
+  assert.match(body,/class="arcent" data-asid="5" open/);
+  await open('rk2|s1');                    // same step name, other run
+  body=elem('dbody').innerHTML;
+  assert.doesNotMatch(body,/data-asid="4" open/);   // no state leak
+  assert.equal(fetches.length,1);                   // nothing fetched yet
+  // expanding here hits the OTHER export - a different cache entry
+  handlers.toggle({target:{classList:{contains:c=>c==='arcent'},
+    dataset:{asid:'4'},open:true,
+    closest:s=>({dataset:{akey:'rk2|s1'}}),querySelector:()=>null}});
+  await new Promise(r=>setImmediate(r));
+  assert.equal(fetches.length,2);
+  assert.match(fetches[1],/\/api\/runs\/r2\/steps\/s1\/trajectory/);
+  // closing the modal + reopening keeps the expansion per agent key
+  await open('rk1|s1');
+  body=elem('dbody').innerHTML;
+  assert.match(body,/data-asid="4" open/);           // rk1 still expanded
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_copy_payload_is_verbatim_text(self):
+        """arcPlainText composes the complete retained text (all
+        sections, unescaped) - the Copy button never round-trips through
+        HTML."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const document={getElementById:()=>({innerHTML:'',hidden:true}),
+  querySelector:()=>null,querySelectorAll:()=>[],activeElement:null,
+  addEventListener:()=>{}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const ent={sid:4,src:'agent',model:'m',
+  msg:'line <b>one</b>\nline two',think:'why',
+  calls:[{name:'edit',args:'{"a":"<x>"}',result:'done\nok'}],
+  extra_obs:['loose'],trunc:{reasoning:300000}};
+const txt=vm.runInContext('arcPlainText('+JSON.stringify(ent)+')',ctx);
+assert.ok(txt.includes('line <b>one</b>\nline two'));   // verbatim
+assert.ok(txt.includes('{"a":"<x>"}'));
+assert.ok(txt.includes('done\nok'));
+assert.ok(txt.includes('--- observation ---\nloose'));
+assert.ok(txt.includes('reasoning=300000'));
+// and the HTML form escapes the same text
+const h=vm.runInContext(
+  'trajDetail["e@1"]={entries:{4:'+JSON.stringify(ent)+'}};'+
+  'arcFullHTML({export:"e",arc:{em:1}},4)',ctx);
+assert.ok(h.includes('&lt;b&gt;one&lt;/b&gt;'));
+assert.ok(!h.includes('line <b>one</b>'));
+assert.ok(h.includes('truncated for display'));
+// an empty entry explains rather than fabricating content
+const h2=vm.runInContext(
+  'arcFullHTML({export:"e",arc:{em:1}},99)',ctx);
+assert.ok(h2.includes('no detailed text was recorded'));
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
+
+
 class _RunControlBase(unittest.TestCase):
     """Shared helpers for driving a manifest run in a thread and poking
     its sentinels from the 'dashboard'."""

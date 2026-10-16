@@ -1400,7 +1400,17 @@ def trajectory_arc(export_path) -> dict | None:
                     "tcached": tcache,
                     "entries": [{k: v for k, v in e.items()
                                  if v is not None} for e in ents]})
-    return {"steps": len(steps), "groups": out[:40]}
+    try:
+        em = os.path.getmtime(export_path)
+    except OSError:
+        em = None
+    # em: export mtime - the dashboard keys its full-text detail cache on
+    # path+mtime, so a resumed step's rewritten export refetches cleanly.
+    # groups_total reports the pre-cap count: past 40 groups the UI shows
+    # an honest remainder note instead of dropping them silently (their
+    # detail is still served - the /trajectory endpoint knows every sid).
+    return {"steps": len(steps), "groups": out[:40], "em": em,
+            "groups_total": len(out)}
 
 
 _ARC_CACHE: dict[str, tuple[float, dict | None]] = {}
@@ -1423,6 +1433,134 @@ def cached_arc(path) -> dict | None:
     arc = trajectory_arc(path)
     _ARC_CACHE[key] = (m, arc)
     return arc
+
+
+# Full trajectory text: the arc rows carry only a ~110-char `head`, so
+# expanding an entry re-reads the SAME export file for the fields the
+# CLI retained verbatim - message, reasoning_content, tool-call
+# arguments, and the tool results under `observation`. Served on demand
+# (never inlined into the polled /api/state payload).
+ARC_DETAIL_CAP = 200_000   # chars served per text field
+
+
+def _arc_cut(text, trunc: dict, field: str) -> str | None:
+    """Cap one served field - a multi-MB blob would stall the modal, so
+    an overlong field ships its head with the ORIGINAL length recorded
+    in `trunc` (labeled honestly in the UI, never silently dropped)."""
+    if not isinstance(text, str) or not text:
+        return None
+    if len(text) <= ARC_DETAIL_CAP:
+        return text
+    trunc[field] = len(text)
+    return text[:ARC_DETAIL_CAP]
+
+
+def _arc_args_str(arguments) -> str | None:
+    """Tool-call arguments for display: dicts become 'key: value' lines -
+    a multiline string value (an edit payload, a command) stays literal
+    instead of JSON-escaped, so the text reads as it was written."""
+    if arguments is None:
+        return None
+    if isinstance(arguments, str):
+        return arguments
+    if not isinstance(arguments, dict):
+        try:
+            return json.dumps(arguments, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(arguments)
+    lines = []
+    for k, v in arguments.items():
+        if isinstance(v, str):
+            lines.append(f"{k}:\n{v}" if "\n" in v else f"{k}: {v}")
+        else:
+            try:
+                lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+            except (TypeError, ValueError):
+                lines.append(f"{k}: {v}")
+    return "\n".join(lines)
+
+
+def trajectory_detail(export_path) -> dict | None:
+    """Full per-entry text behind the arc rows. Returns
+    {"entries": {<sid>: {src, model, msg, think, calls:[{name,args,
+    result}], extra_obs, trunc}}}; None when the export is missing,
+    corrupt, or holds no steps (mock exports - nothing was recorded)."""
+    try:
+        d = json.loads(Path(export_path).read_text(
+            encoding="utf-8", errors="replace"))
+    except (OSError, ValueError, TypeError):
+        return None
+    steps = d.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return None
+    entries: dict[str, dict] = {}
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        sid = s.get("step_id")
+        if sid is None:
+            continue
+        trunc: dict[str, int] = {}
+        obs = s.get("observation")
+        results = [r for r in ((obs or {}).get("results") or [])
+                   if isinstance(r, dict)] if isinstance(obs, dict) else []
+        first_for: dict = {}     # source_call_id -> results[] index
+        for i, r in enumerate(results):
+            cid = r.get("source_call_id")
+            if cid is not None and cid not in first_for:
+                first_for[cid] = i
+        used: set[int] = set()
+        calls = []
+        for c in (s.get("tool_calls") or []):
+            if not isinstance(c, dict):
+                continue
+            args = _arc_args_str(c.get("arguments"))
+            ri = first_for.get(c.get("tool_call_id"))
+            res = results[ri].get("content") if ri is not None else None
+            if ri is not None:
+                used.add(ri)
+            calls.append({"name": c.get("function_name") or "?",
+                          "args": _arc_cut(args, trunc, "args"),
+                          "result": _arc_cut(res, trunc, "result")})
+        entries[str(sid)] = {
+            "sid": sid,
+            "src": s.get("source"),
+            "model": s.get("model_name"),
+            "msg": _arc_cut(s.get("message"), trunc, "message"),
+            "think": _arc_cut(s.get("reasoning_content"),
+                              trunc, "reasoning"),
+            "calls": calls,
+            # tool results that matched no call still surface -
+            # dropping them would hide retained text
+            "extra_obs": [_arc_cut(r.get("content"), trunc, "observation")
+                          for i, r in enumerate(results)
+                          if i not in used],
+            "trunc": trunc or None}
+    return {"entries": entries} if entries else None
+
+
+_ARC_DETAIL_CACHE: dict[str, tuple[float, dict | None]] = {}
+
+
+def cached_arc_detail(path) -> dict | None:
+    """mtime-keyed memo over trajectory_detail - same rationale as
+    cached_arc (the export lands once), plus a bound: detail payloads
+    are ~the export's own size, so only the last few stay resident."""
+    if not path:
+        return None
+    try:
+        m = os.path.getmtime(path)
+    except OSError:
+        return None
+    key = str(path)
+    hit = _ARC_DETAIL_CACHE.get(key)
+    if hit and hit[0] == m:
+        return hit[1]
+    det = trajectory_detail(path)
+    if len(_ARC_DETAIL_CACHE) >= 16:
+        del _ARC_DETAIL_CACHE[next(iter(_ARC_DETAIL_CACHE))]
+    _ARC_DETAIL_CACHE[key] = (m, det)
+    return det
 
 
 def _fmtK(n: int) -> str:
@@ -1570,6 +1708,53 @@ def step_summary(run_name: str, step_name: str,
         except OSError:
             pass
     return md
+
+
+def step_trajectory(run_name: str, step_name: str,
+                    runs_dir: Path = RUNS_DIR) -> dict:
+    """GET /api/runs/<run>/steps/<step>/trajectory - the full retained
+    text behind a step's arc entries, read from the same ATIF export the
+    arc was condensed from. Serves only what the export actually holds:
+    no export record, a deleted file, or a step-less (mock) export is a
+    404 with the reason, never a padded answer."""
+    if not RUN_DIR_RE.fullmatch(step_name):
+        raise RequestError("Invalid step name", 404)
+    d, st = _run_dir_checked(run_name, runs_dir)
+    rec = (st.get("steps") or {}).get(step_name)
+    if rec is None:
+        raise RequestError("Step not in this run", 404)
+    exp = rec.get("export")
+    if not exp:
+        raise RequestError("No trajectory export was recorded for this "
+                           "step - there is no retained full text", 404)
+    p = Path(exp).resolve()
+    if p.parent != d.resolve():
+        raise RequestError("Export path is outside the run dir", 404)
+    if not p.is_file():
+        raise RequestError("The export file is gone - this step's full "
+                           "text was not retained", 404)
+    det = cached_arc_detail(p)
+    if det is None:
+        raise RequestError("The export holds no readable trajectory "
+                           "(mock or corrupt export)", 404)
+    return det
+
+
+def request_trajectory(request_id: str,
+                       requests_dir: Path = REQUESTS_DIR) -> dict:
+    """GET /api/requests/<id>/trajectory - same full text for the
+    retained plan-proposal session. Mirrors plan_attempt_agents: only
+    the newest attempt's <id>.gen.export.json exists on disk."""
+    _request_path(request_id, requests_dir)   # REQUEST_ID_RE gate
+    p = (requests_dir / f"{request_id}.gen.export.json").resolve()
+    if p.parent != requests_dir.resolve() or not p.is_file():
+        raise RequestError("No planner export was retained for this "
+                           "request", 404)
+    det = cached_arc_detail(p)
+    if det is None:
+        raise RequestError("The export holds no readable trajectory "
+                           "(mock or corrupt export)", 404)
+    return det
 
 
 def _summary_body(md: str) -> str:
@@ -6996,17 +7181,15 @@ a { color:#58a6ff; text-decoration:none; }
 #detail .sumdoc code { background:#0d1117; border-radius:4px; padding:1px 5px; font-size:12px; }
 #detail .sumdoc strong { color:#e6edf3; }
 .arc { font-size:12px; border:1px solid #21262d; border-radius:6px; padding:6px 8px; max-height:280px; overflow-y:auto; background:#0d1117; }
-.arcrow { display:flex; gap:8px; padding:1px 0; }
 .arcspan { color:#8b949e; min-width:44px; text-align:right; flex:none; }
 .arcphase { flex:none; width:78px; }
 .archead { color:#8b949e; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.arcrow:hover .archead { color:#e6edf3; }
+details.arcent > summary:hover .archead { color:#e6edf3; }
 details.arcgrp > summary { display:flex; gap:8px; padding:1px 0; cursor:pointer; list-style:none; }
 details.arcgrp > summary::-webkit-details-marker { display:none; }
 details.arcgrp > summary::before { content:'▸'; color:#6e7681; flex:none; }
 details.arcgrp[open] > summary::before { content:'▾'; }
 .arcdetail { margin:2px 0 6px 18px; border-left:1px solid #21262d; padding-left:8px; }
-.arcdetail .arcrow { font-size:11px; }
 .arctime { color:#6e7681; min-width:60px; flex:none; }
 .arcdur { color:#6e7681; min-width:44px; text-align:right; flex:none; }
 .arctok { color:#6e7681; min-width:96px; text-align:right; flex:none; }
@@ -7016,6 +7199,29 @@ details.arcgrp[open] > summary::before { content:'▾'; }
 .arc-test { color:#ffa657; }
 .arc-docs { color:#7ee787; }
 .arc-commit { color:#3fb950; }
+/* per-entry expansion: each arc row is a <details> whose body carries
+   the step's full retained text, fetched from the export on demand */
+details.arcent > summary { display:flex; gap:8px; padding:1px 0; cursor:pointer; list-style:none; font-size:11px; }
+details.arcent > summary::-webkit-details-marker { display:none; }
+details.arcent > summary::before { content:'▸'; color:#6e7681; flex:none; }
+details.arcent[open] > summary::before { content:'▾'; }
+details.arcent[open] > summary .archead { color:#e6edf3; }
+.arcfull { margin:2px 0 8px 14px; border-left:1px solid #21262d; padding-left:8px;
+  /* skip layout/paint of offscreen bodies - expand-all on a big export
+     must not freeze the modal */
+  content-visibility:auto; contain-intrinsic-size:auto 120px; }
+.arclbl { color:#6e7681; font-size:11px; margin:7px 0 1px; }
+.arcmeta { color:#8b949e; font-size:11px; margin:2px 0 4px; }
+.arcnote { color:#6e7681; font-style:italic; padding:2px 0 4px; }
+#detail .arcpre { white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;
+  user-select:text; max-height:320px; overflow:auto; background:#0d1117;
+  border:1px solid #21262d; border-radius:4px; padding:6px 8px;
+  margin:3px 0; font-size:11px; color:#c9d1d9; }
+.arcbar { margin:5px 0 2px; }
+.arcbar .btn { padding:2px 8px; font-size:11px; }
+/* expanded entries get room to read: the arc list releases its compact
+   height cap and the modal scrolls instead */
+.arc:has(details.arcent[open]) { max-height:70vh; }
 
 .stage { display:inline-block; border-radius:9px; padding:1px 7px; font-size:11px; border:1px solid #30363d; white-space:nowrap; }
 /* a pill wider than its column clipped invisibly at the td edge
@@ -7267,10 +7473,145 @@ const qDismissed = new Set();   // request|qids sigs the human closed - the
                               // auto-popup never re-nags for the same set
 const promptDrafts = {};    // key -> unsaved 'Edit prompt' text
 const notesDrafts = {};     // key -> unsaved 'resume notes' text
+// Trajectory expansion: which arc groups/entries are open per agent, and
+// the fetched full text per export file. Both survive the 2s modal
+// rebuild - the rebuild re-renders open entries from cache instead of
+// refetching or collapsing them.
+const trajOpen = {};        // agentKey -> {g:Set<groupIdx>, e:Set<sid>}
+const trajDetail = {};      // export@mtime -> 'loading'|{entries}|{error}
 // run_key namespaces per run/request - run_dir alone collides for
 // unlaunched proposals (their dir is null), which would let the detail
 // modal (and a nav click) land on another request's same-named step.
 const agentKey = a => (a.run_key||a.run_dir||'') + '|' + a.step;
+const trajOpenFor = key => trajOpen[key] ||
+  (trajOpen[key] = {g:new Set(), e:new Set()});
+// the fetch body is keyed on path+mtime: a resumed step's rewritten
+// export is a different cache entry, never a stale reuse
+const trajKeyOf = a => a.export
+  ? a.export+'@'+((a.arc&&a.arc.em)||'') : null;
+const trajURL = a => a.run_dir
+  ? '/api/runs/'+encodeURIComponent(base(a.run_dir))+
+    '/steps/'+encodeURIComponent(a.step)+'/trajectory'
+  : (a.request_id
+    ? '/api/requests/'+encodeURIComponent(a.request_id)+'/trajectory'
+    : null);
+function trajEnsure(a){
+  const key=trajKeyOf(a), url=trajURL(a);
+  if (!key || !url || trajDetail[key]) return;
+  trajDetail[key] = 'loading';
+  fetch(url).then(async r=>{
+    const j = await r.json().catch(()=>({}));
+    trajDetail[key] = r.ok ? j
+      : {error:(j && j.error) || ('HTTP '+r.status)};
+    fillOpenArc(key);
+  }).catch(e=>{
+    trajDetail[key] = {error:'fetch failed: '+(e && e.message || e)};
+    fillOpenArc(key);
+  });
+}
+// patch the open entries' bodies the moment the fetch lands - no wait
+// for the next 2s rebuild, and no innerHTML reset while reading
+function fillOpenArc(key){
+  try{
+    const a = AGENTS.find(x=>agentKey(x)===detailKey);
+    if (!a || trajKeyOf(a)!==key) return;
+    document.querySelectorAll('#detail details.arcent[open]')
+      .forEach(d=>{
+        const body = d.querySelector('.arcfull');
+        if (body) body.innerHTML = arcFullHTML(a, d.dataset.asid);
+      });
+  }catch(e){}
+}
+const arcNote = s => '<div class="arcnote">'+esc(s)+'</div>';
+const arcBlock = (label, text) =>
+  '<div class="arclbl">'+esc(label)+'</div>'+
+  '<pre class="arcpre">'+esc(text)+'</pre>';
+function arcFullHTML(a, sid){
+  const key = trajKeyOf(a);
+  if (!key)
+    return arcNote('no export is linked to this step - its full text '+
+      'was not retained');
+  const det = trajDetail[key];
+  if (!det || det==='loading')
+    return arcNote('loading full text…');
+  if (det.error) return arcNote('full text unavailable: '+det.error);
+  const ent = det.entries && det.entries[String(sid)];
+  if (!ent)
+    return arcNote('no detailed text was recorded for this step - the '+
+      'export only carries its summary line');
+  let body = '';
+  if (ent.think) body += arcBlock('reasoning', ent.think);
+  if (ent.msg)   body += arcBlock('message', ent.msg);
+  (ent.calls||[]).forEach((c,i)=>{
+    body += arcBlock('tool call '+(i+1)+' · '+(c.name||'?'),
+                     c.args||'(no arguments)');
+    if (c.result!=null) body += arcBlock('result', c.result);
+  });
+  (ent.extra_obs||[]).forEach(o=>{ body += arcBlock('observation', o); });
+  if (!body)
+    return arcNote('no detailed text was recorded for this step - the '+
+      'export only carries its summary line');
+  let h = '';
+  if (ent.src || ent.model)
+    h += '<div class="arcmeta">source '+esc(ent.src||'?')+
+      (ent.model?' · model '+esc(ent.model):'')+'</div>';
+  h += body;
+  const tn = Object.keys(ent.trunc||{});
+  if (tn.length)
+    h += arcNote('truncated for display: '+
+      tn.map(f=>f+' ('+kfmt(ent.trunc[f])+' chars total)').join(', ')+
+      ' - the export file holds the rest');
+  h += '<div class="arcbar"><button type="button" '+
+    'class="btn secondary" data-arc-copy="'+esc(sid)+'" '+
+    'title="copy the full text of this step to the clipboard">'+
+    'Copy step text</button></div>';
+  return h;
+}
+// the verbatim text for the clipboard - complete, section-labeled, and
+// never through HTML (escaping is a display concern only)
+function arcPlainText(ent){
+  const NL = String.fromCharCode(10);
+  const parts = [];
+  if (ent.think) parts.push('--- reasoning ---'+NL+ent.think);
+  if (ent.msg)   parts.push('--- message ---'+NL+ent.msg);
+  (ent.calls||[]).forEach((c,i)=>{
+    let s = '--- tool call '+(i+1)+' '+(c.name||'?')+' ---'+NL+
+      (c.args||'');
+    if (c.result!=null) s += NL+'--- result ---'+NL+c.result;
+    parts.push(s);
+  });
+  (ent.extra_obs||[]).forEach(o=>parts.push('--- observation ---'+NL+o));
+  const tn = Object.keys(ent.trunc||{});
+  if (tn.length)
+    parts.push('(display-truncated fields: '+
+      tn.map(f=>f+'='+ent.trunc[f]+' chars').join(', ')+')');
+  return parts.join(NL+NL);
+}
+function copyText(s){
+  if (typeof navigator!=='undefined' && navigator.clipboard &&
+      navigator.clipboard.writeText)
+    return navigator.clipboard.writeText(s).then(()=>true,()=>false);
+  try{
+    const ta = document.createElement('textarea');
+    ta.value = s;
+    ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    const ok = document.execCommand && document.execCommand('copy');
+    ta.remove();
+    return Promise.resolve(!!ok);
+  }catch(e){ return Promise.resolve(false); }
+}
+// a text selection inside the open modal is mid-read (or mid-copy) - the
+// 2s rebuild would drop it, so it pauses the modal body rebuild only
+function modalSelActive(){
+  try{
+    const s = typeof window!=='undefined' && window.getSelection &&
+      window.getSelection();
+    const d = document.getElementById('detail');
+    return !!(s && !s.isCollapsed && d && d.contains &&
+              d.contains(s.anchorNode));
+  }catch(e){ return false; }
+}
 const qSig = (id, pend) => id + '|' + (pend||[]).map(q=>q.qid).join(',');
 function closeDetail(force=false, keepStack=false){
   if (!force && modalRequest?.dirty && !confirm('Discard unsaved edits?')) return false;
@@ -7621,8 +7962,21 @@ function showDetail(i, keepStack){
         ` <span class="sub" style="margin:0">${a.arc.steps} LLM steps, ` +
         `grouped by phase - expand a row for per-step times & real ` +
         `per-turn tokens</span></h3>` +
-        `<div class="arc">` + a.arc.groups.map(g =>
-          `<details class="arcgrp"><summary><span class="arcspan">` +
+        `<div class="actions" style="margin:2px 0 8px">` +
+        `<button type="button" class="btn secondary" data-arc-all ` +
+        `title="open every group and every step's full recorded text ` +
+        `(fetched once from the ATIF export)">Expand all</button>` +
+        `<button type="button" class="btn secondary" data-arc-none ` +
+        `title="back to the compact grouped view">Collapse all</button>` +
+        `<span class="sub">expanding a step reads its full text from ` +
+        `the .export.json on demand - nothing is re-generated or ` +
+        `estimated</span></div>` +
+        `<div class="arc" data-akey="${esc(detailKey)}">` +
+        a.arc.groups.map((g, gi) => {
+          const gOpen = trajOpenFor(detailKey).g.has(gi);
+          return `<details class="arcgrp" data-ag="${gi}"` +
+          (gOpen ? ' open' : '') +
+          `><summary><span class="arcspan">` +
           `${esc(g.span)}</span><span class="arcphase arc-` +
           `${esc(g.phase)}">${esc(g.phase)}</span>` +
           `<span class="arctime">${loc(g.t0)}</span>` +
@@ -7632,8 +7986,11 @@ function showDetail(i, keepStack){
               kfmt(g.tout||0)+'/'+kfmt(g.tcached||0)
             : ''}</span>` +
           `<span class="archead">${esc(g.head)}</span></summary>` +
-          `<div class="arcdetail">` + (g.entries||[]).map(e =>
-            `<div class="arcrow"><span class="arcspan">${esc(e.sid)}` +
+          `<div class="arcdetail">` + (g.entries||[]).map(e => {
+            const eOpen = trajOpenFor(detailKey).e.has(String(e.sid));
+            return `<details class="arcent" data-asid="${esc(e.sid)}"` +
+            (eOpen ? ' open' : '') +
+            `><summary><span class="arcspan">${esc(e.sid)}` +
             `</span><span class="arctime">${loc(e.ts)}</span>` +
             `<span class="arcdur">${e.dur_s!=null?fmtS(e.dur_s):''}` +
             `</span><span class="arctok" title="billed in / out / ` +
@@ -7643,8 +8000,19 @@ function showDetail(i, keepStack){
                 kfmt(e.out||0)+'/'+kfmt(e.cached||0)
               : ''}</span>` +
             `<span class="archead" title="${esc(e.head)}">` +
-            `${esc(e.head)}</span></div>`).join('') +
-          `</div></details>`).join('') + `</div>` : '');
+            `${esc(e.head)}</span></summary>` +
+            `<div class="arcfull">` +
+            (eOpen ? arcFullHTML(a, e.sid) : '') +
+            `</div></details>`;
+          }).join('') + `</div></details>`;
+        }).join('') +
+        (a.arc.groups_total > a.arc.groups.length
+          ? `<div class="arcnote">… ${a.arc.groups_total -
+              a.arc.groups.length} later phase group(s) not shown ` +
+            `(the list caps at ${a.arc.groups.length} - their full text ` +
+            `is still in the export)</div>`
+          : '') +
+        `</div>` : '');
   if (fsel){
     const el = document.getElementById(fid);
     if (el && el.focus){ el.focus();
@@ -8549,8 +8917,11 @@ function render(d){
     // the old index
     const j = detailKey==null ? detailIdx
       : AGENTS.findIndex(x=>agentKey(x)===detailKey);
-    if (j >= 0 && AGENTS[j]) showDetail(j, true);
-    else closeDetail(true);
+    if (j >= 0 && AGENTS[j]){
+      // a live selection inside the modal is mid-read/copy - rebuilding
+      // would destroy it, so the refresh defers until it's released
+      if (!modalSelActive()) showDetail(j, true);
+    } else closeDetail(true);
   }
   const modalRun = modalRequest?.id && d.runs.find(r=>r.request_id===modalRequest.id);
   const modalStage = modalRun && (modalRun.stage||'launched');
@@ -8648,6 +9019,40 @@ document.addEventListener('click', async e=>{
       const d = document.getElementById('detail');
       if (d) d.scrollTop = 0;
     }
+    return; }
+  // trajectory expansion controls - state lives in trajOpen (keyed per
+  // agent) so the 2s modal rebuild keeps what's open, and the full text
+  // is fetched once per export then served from trajDetail
+  const arcAll = t.closest && t.closest('[data-arc-all]');
+  if (arcAll){
+    const a = AGENTS.find(x=>agentKey(x)===detailKey);
+    if (!a || !a.arc) return;
+    const st = trajOpenFor(detailKey);
+    a.arc.groups.forEach((g,gi)=>{
+      st.g.add(gi);
+      (g.entries||[]).forEach(e=>st.e.add(String(e.sid))); });
+    trajEnsure(a);
+    const j = AGENTS.findIndex(x=>agentKey(x)===detailKey);
+    if (j>=0) showDetail(j, true);
+    return; }
+  const arcNone = t.closest && t.closest('[data-arc-none]');
+  if (arcNone){
+    const st = trajOpenFor(detailKey);
+    st.g.clear(); st.e.clear();
+    const j = AGENTS.findIndex(x=>agentKey(x)===detailKey);
+    if (j>=0) showDetail(j, true);
+    return; }
+  const arcCopy = t.closest && t.closest('[data-arc-copy]');
+  if (arcCopy){
+    const a = AGENTS.find(x=>agentKey(x)===detailKey);
+    const key = a && trajKeyOf(a);
+    const det = key && trajDetail[key];
+    const ent = det && det.entries &&
+      det.entries[arcCopy.dataset.arcCopy];
+    if (ent)
+      copyText(arcPlainText(ent)).then(ok=>{
+        arcCopy.textContent = ok ? 'Copied' : 'Copy failed';
+      });
     return; }
   if (t.dataset && t.dataset.resumeRun){
     if(!confirm('Resume this run? Every non-done step re-runs in a fresh ' +
@@ -8904,6 +9309,31 @@ document.addEventListener('click', async e=>{
   const row = t.closest && t.closest('tr.agen');
   if (row) showDetail(+row.dataset.i);
 });
+// <details> toggling: 'toggle' does not bubble, so this runs in the
+// CAPTURE phase to catch arc group/entry flips. Persisted in trajOpen
+// so the 2s modal rebuild doesn't collapse them; opening an entry also
+// kicks the one-shot detail fetch.
+document.addEventListener('toggle', e=>{
+  const d = e.target;
+  if (!d || !d.classList || !d.closest) return;
+  const box = d.closest('.arc[data-akey]');
+  if (!box) return;
+  const st = trajOpenFor(box.dataset.akey);
+  if (d.classList.contains('arcgrp')){
+    const gi = +d.dataset.ag;
+    if (d.open) st.g.add(gi); else st.g.delete(gi);
+    return;
+  }
+  if (!d.classList.contains('arcent')) return;
+  const sid = String(d.dataset.asid);
+  if (!d.open){ st.e.delete(sid); return; }
+  st.e.add(sid);
+  const a = AGENTS.find(x=>agentKey(x)===box.dataset.akey);
+  if (!a) return;
+  trajEnsure(a);
+  const body = d.querySelector('.arcfull');
+  if (body) body.innerHTML = arcFullHTML(a, sid);   // cache hit or a
+}, true);                                           // 'loading…' note
 document.addEventListener('input', e=>{
   // typed questionnaire text survives an option-toggle re-render
   if (modalQA && e.target.id==='q-free') modalQA.free=e.target.value;
@@ -9098,6 +9528,17 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                             md, f"{m.group(1)} / {m.group(2)}")
                             .encode("utf-8"),
                             "text/html; charset=utf-8")
+                elif (m := re.fullmatch(
+                        r"/api/runs/([^/]+)/steps/([^/]+)/trajectory",
+                        path)):
+                    # full per-entry text behind the modal's arc rows -
+                    # fetched on expansion, never part of /api/state
+                    self._json(step_trajectory(m.group(1), m.group(2),
+                                               runs_dir))
+                elif (m := re.fullmatch(
+                        r"/api/requests/([^/]+)/trajectory", path)):
+                    self._json(request_trajectory(m.group(1),
+                                                  requests_dir))
                 elif (m := re.fullmatch(r"/api/attachments/([^/]+)", path)):
                     data, ctype = read_attachment(
                         urllib.parse.unquote(m[1]), attachments_dir)
