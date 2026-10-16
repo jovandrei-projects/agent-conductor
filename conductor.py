@@ -4872,7 +4872,9 @@ const fmtTc = t => (!t||t.prompt==null) ? '-' :
   (t.llm_steps ? ` ${t.llm_steps}L` : '');
 const tokTitle = t => !t ? '' :
   `in ${t.prompt} (of which cached ${t.cached}) · out ${t.completion} · ` +
-  `${t.llm_steps??'?'} LLM steps (model turns)`;
+  `${t.llm_steps??'?'} LLM steps (model turns)` +
+  (t.prompt!=null&&t.cached!=null
+    ? ` · billed input (in-cached) = ${t.prompt-t.cached}` : '');
 const fmtC = c => !c ? '-' : c.usd==null ? 'n/a' :
   '$'+(c.usd===0 ? '0' : c.usd<0.01 ? c.usd.toFixed(4) : c.usd.toFixed(2));
 const costTitle = c => !c ? 'no token data yet' :
@@ -4910,7 +4912,8 @@ const tokenHelp = `<details class="tok-help"><summary aria-label="Explain tokens
   `history.<br>` +
   `<b>out</b>: output (completion) tokens.<br>` +
   `<b>cached</b>: the part of <b>in</b> served from cache - a share of ` +
-  `it, never added on top.<br>` +
+  `it, never added on top. <b>Billed input = in - cached</b>; ` +
+  `Desktop's card shows only that remainder.<br>` +
   `<b>turns</b>: LLM steps - model turns, not manifest steps. ` +
   `<b>M</b> in prices means one million tokens.<br><br>` +
   `<b>Estimated cost</b> = (prompt - cached) × input rate + ` +
