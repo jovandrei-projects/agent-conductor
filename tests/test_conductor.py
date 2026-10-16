@@ -2179,6 +2179,344 @@ assert.match(elem('rq-attach').innerHTML,/data-attach-rm="old\.png"/);
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class StopProposalTests(unittest.TestCase):
+    """'Stop proposal' cancels an in-flight planner pass: the
+    stopgen-<request_id> sentinel plus the _GEN_PROCS registry kill the
+    devin subprocess, the record returns to its last editable state, and
+    attempt-scoped (gen_id) writes keep a stale attempt's late output from
+    overwriting restored state or a newer attempt."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.proj = make_project(self.base)
+        self.runs = self.base / "runs"
+        self.requests = self.base / "requests"
+        self.manifests = self.base / "manifests"
+        self.manifests.mkdir()
+        patch = mock.patch.object(conductor, "load_projects", return_value={
+            "proj": {"path": self.proj, "cloud_ok": False}})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def proposal(self, description="Tidy the catalog"):
+        return f'''[run]
+name = "catalog-cleanup"
+description = "{description}"
+on_failure = "continue"
+checkpoint = true
+
+[defaults]
+project = "proj"
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+max_attempts = 3
+
+[[step]]
+name = "organize"
+prompt = "Organize the catalog and verify results."
+'''
+
+    def new(self):
+        return conductor.create_request(
+            {"raw": "Please tidy the catalog carefully", "project": "proj",
+             "model": "swe-2", "effort": "max"}, self.requests, self.runs)
+
+    def ready(self):
+        rec = self.new()
+        return conductor.save_request(
+            rec["id"], {"manifest": self.proposal()},
+            self.requests, self.manifests, self.runs)
+
+    def cleanup_flag(self, rid):
+        flag = conductor.gen_stop_flag(rid)
+        self.addCleanup(lambda: flag.unlink(missing_ok=True))
+        return flag
+
+    def wait_calls(self, calls, n, timeout=10):
+        deadline = time.time() + timeout
+        while len(calls) < n and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(calls), n)
+
+    def wait_attempts(self, n=0, timeout=10):
+        deadline = time.time() + timeout
+        while len(conductor._GENERATING) != n and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(conductor._GENERATING), n)
+
+    def test_stop_restores_draft_and_late_output_is_discarded(self):
+        rec = self.new()
+        flag = self.cleanup_flag(rec["id"])
+        gate = threading.Event()
+
+        def fake(r, projects, argv, log_path=None, fix_note=None, qa=None):
+            gate.wait(30)
+            return self.proposal()
+
+        with mock.patch.object(conductor, "_planner_response", fake):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs, ["devin"])
+            out = conductor.stop_generation(rec["id"], self.requests,
+                                            self.runs)
+            self.assertEqual(out["status"], "draft")
+            self.assertIsNone(out["error"])
+            self.assertTrue(out.get("generation_stopped_at"))
+            self.assertTrue(flag.is_file())
+            gate.set()
+            self.wait_attempts()
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests, self.runs)
+        self.assertEqual(rec["status"], "draft")
+        self.assertIsNone(rec["manifest"])
+        # the stopped pass's late TOML was never published
+        self.assertFalse(list(self.manifests.iterdir()))
+        self.assertEqual(rec["raw"], "Please tidy the catalog carefully")
+        self.assertEqual(rec["project"], "proj")
+        self.assertEqual(rec["model"], "swe-2")
+
+    def test_stop_with_previous_proposal_returns_to_ready(self):
+        rec = self.ready()
+        self.cleanup_flag(rec["id"])
+        original = Path(rec["manifest"]).read_text(encoding="utf-8")
+        gate = threading.Event()
+
+        def fake(r, projects, argv, log_path=None, fix_note=None, qa=None):
+            gate.wait(30)
+            return self.proposal("A different plan")
+
+        with mock.patch.object(conductor, "_planner_response", fake):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs, ["devin"])
+            out = conductor.stop_generation(rec["id"], self.requests,
+                                            self.runs)
+            self.assertEqual(out["status"], "ready")
+            gate.set()
+            self.wait_attempts()
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "ready")
+        # the earlier valid proposal is byte-for-byte intact, not the
+        # stopped pass's replacement
+        self.assertEqual(Path(rec["manifest"]).read_text(encoding="utf-8"),
+                         original)
+        self.assertEqual(rec["description"], "Tidy the catalog")
+        # and generation can be restarted right away (the sentinel is
+        # cleared at start - a stale flag would kill the new pass)
+        with mock.patch.object(conductor, "_planner_response",
+                               return_value=self.proposal(
+                                   "A different plan")):
+            rec = conductor.start_generation(
+                rec["id"], self.requests, self.manifests, self.runs,
+                ["devin"], background=False)
+        self.assertEqual(rec["status"], "ready")
+        self.assertEqual(rec["description"], "A different plan")
+
+    def test_stop_tree_kills_the_live_planner_process(self):
+        rec = self.new()
+        self.cleanup_flag(rec["id"])
+        procs = []
+
+        class FakeProc:
+            def __init__(self, cmd, **kwargs):
+                self.pid = 1            # taskkill of pid 1 errors ->
+                self._dead = False      # kill_tree falls back to proc.kill
+                procs.append(self)
+
+            def poll(self):
+                return 0 if self._dead else None
+
+            def wait(self, timeout=None):
+                if self._dead:
+                    return 0
+                raise subprocess.TimeoutExpired("planner", timeout or 0)
+
+            def kill(self):
+                self._dead = True
+
+        def fake_wait(proc, log, timeout_s, stop_flags=(), timeout_flag=None,
+                      stall_s=None):
+            # honor the sentinel like the real wait_worker: raise -> kill
+            for _ in range(500):
+                if stop_flags and conductor._flag_set(*stop_flags):
+                    proc.kill()
+                    return proc.wait(), False, False, True, 0.0
+                if proc.poll() is not None:
+                    return 0, False, False, False, 0.0
+                time.sleep(0.01)
+            return 0, False, False, False, 0.0
+
+        real_popen = subprocess.Popen
+
+        def popen_router(cmd, **kwargs):
+            # only the planner spawn is faked - taskkill (kill_tree's
+            # Windows path) and probes spawn for real
+            if isinstance(cmd, list) and "--prompt-file" in cmd:
+                return FakeProc(cmd, **kwargs)
+            return real_popen(cmd, **kwargs)
+
+        with mock.patch.object(conductor.subprocess, "Popen",
+                               popen_router), \
+                mock.patch.object(conductor, "wait_worker", fake_wait):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs, ["devin"])
+            deadline = time.time() + 10
+            while rec["id"] not in conductor._GEN_PROCS \
+                    and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertIs(conductor._GEN_PROCS.get(rec["id"]), procs[0])
+            out = conductor.stop_generation(rec["id"], self.requests,
+                                            self.runs)
+            self.assertEqual(out["status"], "draft")
+            self.wait_attempts()
+        self.assertTrue(procs[0]._dead)      # the sentinel kill landed
+        self.assertNotIn(rec["id"], conductor._GEN_PROCS)
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "draft")   # stopped, not 'error'
+
+    def test_stopped_attempt_cannot_overwrite_a_later_attempt(self):
+        rec = self.new()
+        flag = self.cleanup_flag(rec["id"])
+        gate1, gate2 = threading.Event(), threading.Event()
+        calls = []
+
+        def fake(r, projects, argv, log_path=None, fix_note=None, qa=None):
+            calls.append(len(calls))
+            (gate1 if len(calls) == 1 else gate2).wait(30)
+            return (self.proposal("old plan") if len(calls) == 1
+                    else self.proposal("new plan"))
+
+        with mock.patch.object(conductor, "_planner_response", fake):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs, ["devin"])
+            self.wait_calls(calls, 1)
+            conductor.stop_generation(rec["id"], self.requests, self.runs)
+            self.assertTrue(flag.is_file())
+            # editable immediately - attempt 1 is still unwinding
+            out = conductor.save_request(
+                rec["id"], {"raw": "Edited: tidy AND test the catalog"},
+                self.requests, self.manifests, self.runs)
+            self.assertEqual(out["status"], "draft")
+            # a fresh attempt clears the old sentinel before spawning
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs, ["devin"])
+            self.assertFalse(flag.is_file())
+            self.wait_calls(calls, 2)
+            gate1.set()          # stale attempt unwinds over the live slot
+            self.wait_attempts(1)          # only attempt 2 remains
+            gate2.set()
+            self.wait_attempts()
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "ready")
+        self.assertEqual(rec["description"], "new plan")
+        self.assertEqual(rec["raw"], "Edited: tidy AND test the catalog")
+        self.assertIn("new plan", Path(rec["manifest"]).read_text(
+            encoding="utf-8"))
+
+    def test_repeated_and_idle_stops_are_409(self):
+        rec = self.new()
+        self.cleanup_flag(rec["id"])
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.stop_generation(rec["id"], self.requests, self.runs)
+        self.assertEqual(e.exception.status, 409)
+        gate = threading.Event()
+
+        def fake(r, projects, argv, log_path=None, fix_note=None, qa=None):
+            gate.wait(30)
+            return self.proposal()
+
+        with mock.patch.object(conductor, "_planner_response", fake):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs, ["devin"])
+            conductor.stop_generation(rec["id"], self.requests, self.runs)
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.stop_generation(rec["id"], self.requests,
+                                          self.runs)
+            self.assertEqual(e.exception.status, 409)
+            gate.set()
+            self.wait_attempts()
+        # a finished generation 409s the same way - nothing left to cancel
+        with mock.patch.object(conductor, "_planner_response",
+                               return_value=self.proposal()):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs, ["devin"],
+                                       background=False)
+        with self.assertRaises(conductor.RequestError):
+            conductor.stop_generation(rec["id"], self.requests, self.runs)
+
+    def test_planner_response_raises_generation_stopped_on_flag(self):
+        rec = self.new()
+        flag = self.cleanup_flag(rec["id"])
+
+        class FakeProc:
+            def __init__(self, cmd, **kwargs):
+                self.pid = 1
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("planner", timeout or 0)
+
+            def kill(self):
+                pass
+
+        def fake_wait(proc, log, timeout_s, stop_flags=(), timeout_flag=None,
+                      stall_s=None):
+            conductor._flag_raise(flag.name)
+            return -9, False, False, True, 0.0
+
+        with mock.patch.object(conductor.subprocess, "Popen", FakeProc), \
+                mock.patch.object(conductor, "wait_worker", fake_wait):
+            with self.assertRaises(conductor.GenerationStopped):
+                conductor._planner_response(rec, {}, ["devin"])
+        self.assertNotIn(rec["id"], conductor._GEN_PROCS)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_dashboard_shows_stop_while_generating(self):
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, posts=[];
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',value:''}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,fn)=>{handlers[ev]=fn;}};
+const fetch=async(path,opts)=>{
+  if (path==='/api/requests/r1/stop'){posts.push(path);
+    return {ok:true,status:202,json:async()=>({id:'r1',status:'draft'})};}
+  if (path.startsWith('/api/state')) return {ok:true,status:200,
+    json:async()=>({serve_boot:'b',generated_at:'x',agents:[],runs:[],
+      project_options:[],defaults:{model:'swe-2',effort:'max'}})};
+  return {ok:true,status:200,
+    json:async()=>({id:'r1',status:'draft',raw:'tidy',attachments:[]})};};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},fetch,confirm:()=>true,alert:()=>{},
+  Event:class Event{constructor(){}}});
+vm.runInContext(src,ctx);
+vm.runInContext('modalRequest={id:"r1",status:"generating",dirty:false,' +
+  'originalManifest:"",record:{id:"r1",status:"generating",raw:"tidy"}};' +
+  'showRequestForm({id:"r1",status:"generating",raw:"tidy"})',ctx);
+assert.match(elem('dbody').innerHTML,/data-action="stop"/);
+assert.match(elem('dbody').innerHTML,/Stop proposal/);
+(async()=>{
+  await handlers.click({target:{dataset:{action:'stop'}}});
+  assert.ok(posts.some(p=>p==='/api/requests/r1/stop'));
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
 class BackgroundProcessTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows console flags")
     def test_periodic_dashboard_probes_are_headless(self):

@@ -1401,6 +1401,15 @@ def rnote_flag(run_dir: Path, step: str) -> Path:
     return _flag_dir() / f"rnote-{_flag_key(run_dir)}-{_safe_name(step)}"
 
 
+def gen_stop_flag(request_id: str) -> Path:
+    """Dashboard 'Stop proposal' sentinel: polled by the planner's
+    wait_worker while a request generates. Request ids are already
+    filename-safe (YYYYMMDD-HHMMSS-<8hex>, REQUEST_ID_RE), and unlike run
+    sentinels they cannot collide across checkouts - each id exists in
+    exactly one requests dir."""
+    return _flag_dir() / f"stopgen-{request_id}"
+
+
 def _flag_text(flag: Path) -> str | None:
     try:
         return flag.read_text(encoding="utf-8") if flag.is_file() else None
@@ -2792,13 +2801,27 @@ REQUEST_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}$")
 RUN_DIR_RE = re.compile(r"^[A-Za-z0-9][\w.-]*$")
 _LAUNCH_PIDS: dict[str, int] = {}
 _RESUME_PIDS: dict[str, int] = {}
+# In-flight proposal generations, keyed by the attempt's gen_id (minted per
+# attempt and stamped on the request record). Keyed by attempt, not request
+# id, so a stopped attempt unwinding can never discard a newer attempt's
+# membership or write over its state.
 _GENERATING: set[str] = set()
+# Live planner Popen per request id - lets 'Stop proposal' tree-kill the
+# devin process now instead of waiting out the wait_worker poll.
+_GEN_PROCS: dict = {}
 
 
 class RequestError(ValueError):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
         self.status = status
+
+
+class GenerationStopped(Exception):
+    """Raised inside _planner_response when the stopgen-<request_id>
+    sentinel appears (dashboard 'Stop proposal'). _finish_generation banks
+    the attempt's token usage and leaves the request exactly as
+    stop_generation restored it - a stop is not an error."""
 
 
 class PlannerQuestions(Exception):
@@ -3614,13 +3637,28 @@ STATUS: done
             if pe and pm != "adaptive" else pm,
             "--permission-mode", "normal", "--export", str(export_path),
             "--respect-workspace-trust", "false"]
+        rid = rec.get("id")
+        sflag = gen_stop_flag(rid) if rid else None
         with open(log, "ab" if fix_note else "wb") as out:
             proc = subprocess.Popen(cmd, cwd=wd, stdout=out,
                                     stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL,
                                     env=clean_devin_env(),
                                     **hidden_subprocess_kwargs())
-            rc, timed_out, _hung, _stopped, _ext = wait_worker(proc, log, 600)
+            if rid:
+                with REQUEST_LOCK:
+                    _GEN_PROCS[rid] = proc
+            try:
+                rc, timed_out, _hung, stopped, _ext = wait_worker(
+                    proc, log, 600,
+                    stop_flags=(sflag,) if sflag is not None else ())
+            finally:
+                if rid:
+                    with REQUEST_LOCK:
+                        if _GEN_PROCS.get(rid) is proc:
+                            _GEN_PROCS.pop(rid, None)
+        if stopped or (sflag is not None and sflag.is_file()):
+            raise GenerationStopped(f"request {rid} proposal stopped")
         if timed_out or rc != 0:
             raise RequestError("Planner did not finish; check CLI auth and "
                                "retry generation", 502)
@@ -3639,8 +3677,17 @@ STATUS: done
 
 def _finish_generation(request_id: str, requests_dir: Path,
                        manifests_dir: Path, runs_dir: Path,
-                       devin_argv: list[str]) -> None:
+                       devin_argv: list[str], gen_id: str) -> None:
+    """One planning attempt. Every state write re-checks BOTH
+    status=='generating' AND gen_id - stop_generation restores the record
+    while the planner unwinds, and an immediate Regenerate already owns the
+    'generating' slot then, so a stale attempt must not touch the record."""
     tok_plan: dict[str, int] = {}
+
+    def still_mine(rec: dict) -> bool:
+        return rec["status"] == "generating" \
+            and rec.get("gen_id") == gen_id
+
     try:
         rec = _read_request(request_id, requests_dir)
         log_path = requests_dir / f"{request_id}.gen.log"
@@ -3667,10 +3714,13 @@ def _finish_generation(request_id: str, requests_dir: Path,
             # modal at a time; answer_request restarts this function as the
             # refine pass once every question has an answer or a skip.
             _merge_tokens(tok_plan, tail_metrics(export_path))
+            with REQUEST_LOCK:
+                if not still_mine(_read_request(request_id, requests_dir)):
+                    return      # stopped/superseded - nothing to park
             _wait_writable(runs_dir, requests_dir)
             with REQUEST_LOCK:
                 rec = _read_request(request_id, requests_dir)
-                if rec["status"] == "generating":
+                if still_mine(rec):
                     rounds = int(rec.get("qa_rounds") or 0) + 1
                     plan_tok = _merge_tokens(
                         dict(rec.get("plan_tokens") or {}), tok_plan)
@@ -3705,11 +3755,15 @@ def _finish_generation(request_id: str, requests_dir: Path,
             raise RequestError("Planner ignored the selected max_attempts; "
                                "regenerate or edit the TOML directly")
         while True:
+            with REQUEST_LOCK:
+                if not still_mine(
+                        _read_request(request_id, requests_dir)):
+                    return      # stopped/superseded - nothing to publish
             _wait_writable(runs_dir, requests_dir, manifests_dir)
             try:
                 with REQUEST_LOCK:
                     rec = _read_request(request_id, requests_dir)
-                    if rec["status"] == "generating":
+                    if still_mine(rec):
                         plan_tok = _merge_tokens(
                             dict(rec.get("plan_tokens") or {}), tok_plan)
                         if plan_tok:
@@ -3723,6 +3777,22 @@ def _finish_generation(request_id: str, requests_dir: Path,
                 except RequestError:
                     continue
                 raise
+    except GenerationStopped:
+        # stop_generation already restored the record (draft, or ready with
+        # the previous proposal). Bank the killed attempt's token usage -
+        # plan_tokens accumulates across attempts - and touch nothing else;
+        # a newer attempt may already own the 'generating' slot.
+        try:
+            _assert_unwatched(runs_dir, requests_dir)
+            with REQUEST_LOCK:
+                rec = _read_request(request_id, requests_dir)
+                plan_tok = _merge_tokens(
+                    dict(rec.get("plan_tokens") or {}), tok_plan)
+                if plan_tok:
+                    rec["plan_tokens"] = plan_tok
+                    _save_request(rec, requests_dir)
+        except RequestError:
+            pass
     except Exception as exc:
         _wait_writable(runs_dir, requests_dir, LOGS_DIR)
         LOG.warning("request %s generation failed: %s", request_id, exc)
@@ -3730,7 +3800,7 @@ def _finish_generation(request_id: str, requests_dir: Path,
                if isinstance(exc, tomllib.TOMLDecodeError) else str(exc))
         with REQUEST_LOCK:
             rec = _read_request(request_id, requests_dir)
-            if rec["status"] == "generating":
+            if still_mine(rec):
                 plan_tok = _merge_tokens(
                     dict(rec.get("plan_tokens") or {}), tok_plan)
                 if plan_tok:
@@ -3739,7 +3809,7 @@ def _finish_generation(request_id: str, requests_dir: Path,
                 _save_request(rec, requests_dir)
     finally:
         with REQUEST_LOCK:
-            _GENERATING.discard(request_id)
+            _GENERATING.discard(gen_id)
 
 
 def start_generation(request_id: str,
@@ -3754,15 +3824,19 @@ def start_generation(request_id: str,
         if _request_status(rec, runs_dir) not in (
                 "draft", "ready", "error", "launch_failed", "questions"):
             raise RequestError("Only drafts or unrun proposals can be generated", 409)
+        # A leftover sentinel from a stopped attempt would kill this new
+        # pass on the first wait_worker poll - clear before marking.
+        gen_stop_flag(request_id).unlink(missing_ok=True)
+        gen_id = secrets.token_hex(4)
         # A manual (Re)generate starts planning from scratch - any parked
         # questionnaire and its collected answers are dropped on purpose.
-        rec.update(status="generating", error=None,
+        rec.update(status="generating", error=None, gen_id=gen_id,
                    generation_started_at=now_iso(), pending_questions=[],
                    qa=[], qa_rounds=0)
         _save_request(rec, requests_dir)
-        _GENERATING.add(request_id)
+        _GENERATING.add(gen_id)
     args = (request_id, requests_dir, manifests_dir, runs_dir,
-            devin_argv or ["devin"])
+            devin_argv or ["devin"], gen_id)
     if background:
         threading.Thread(target=_finish_generation, args=args,
                          daemon=True).start()
@@ -3825,18 +3899,57 @@ def answer_request(request_id: str, payload: dict,
         if pend:
             _save_request(rec, requests_dir)
             return dict(rec)
-        rec.update(status="generating", error=None,
+        gen_stop_flag(request_id).unlink(missing_ok=True)
+        gen_id = secrets.token_hex(4)
+        rec.update(status="generating", error=None, gen_id=gen_id,
                    generation_started_at=now_iso())
         _save_request(rec, requests_dir)
-        _GENERATING.add(request_id)
+        _GENERATING.add(gen_id)
     args = (request_id, requests_dir, manifests_dir, runs_dir,
-            devin_argv or ["devin"])
+            devin_argv or ["devin"], gen_id)
     if background:
         threading.Thread(target=_finish_generation, args=args,
                          daemon=True).start()
         return dict(rec)
     _finish_generation(*args)
     return request_details(request_id, requests_dir, manifests_dir)
+
+
+def stop_generation(request_id: str,
+                    requests_dir: Path = REQUESTS_DIR,
+                    runs_dir: Path = RUNS_DIR) -> dict:
+    """Dashboard 'Stop proposal': cancel the in-flight planning pass and
+    hand the request back to editing.
+
+    The sentinel does the scoped kill - only this request's planner polls
+    it, so unrelated generations and runs are untouched - and the live
+    Popen registry makes it immediate rather than next-poll. The record is
+    restored to the last editable state: 'ready' when a previous proposal
+    exists (stale flag and TOML untouched), 'draft' otherwise; inputs and
+    collected Q&A were never modified by generation, so nothing else needs
+    restoring. _finish_generation's gen_id check keeps late output or an
+    error callback from overwriting this state, so the user can edit and
+    Generate again at once.
+
+    A stop on an orphaned 'generating' record (server died mid-plan, no
+    thread left) works the same way and clears the stuck stage early; a
+    stop after the attempt already finished 409s like stop_run on an ended
+    run."""
+    with REQUEST_LOCK:
+        _assert_unwatched(runs_dir, requests_dir)
+        rec = _read_request(request_id, requests_dir)
+        if _request_status(rec, runs_dir) != "generating":
+            raise RequestError(
+                "This request is not preparing a proposal", 409)
+        _flag_raise(gen_stop_flag(request_id).name)
+        rec["status"] = "ready" if rec.get("manifest") else "draft"
+        rec["error"] = None
+        rec["generation_stopped_at"] = now_iso()
+        _save_request(rec, requests_dir)
+        proc = _GEN_PROCS.get(request_id)
+    if proc is not None:
+        kill_tree(proc)
+    return dict(rec)
 
 
 def _request_run_dir(request_id: str, runs_dir: Path) -> Path | None:
@@ -3853,7 +3966,8 @@ def _request_run_dir(request_id: str, runs_dir: Path) -> Path | None:
 def _request_status(rec: dict, runs_dir: Path) -> str:
     if _request_run_dir(rec["id"], runs_dir):
         return "launched"
-    if rec["status"] == "generating" and rec["id"] not in _GENERATING \
+    if rec["status"] == "generating" \
+            and rec.get("gen_id") not in _GENERATING \
             and time.time() - (_iso_ts(rec.get("generation_started_at"))
                                or time.time()) > 660:
         return "error"
@@ -5758,7 +5872,13 @@ function showDetail(i){
             `<span class="sub">appended to this step's next dispatched ` +
             `prompt - the original prompt is never edited. Empty + ` +
             `Save clears stored notes.</span></div>` : '')) : '') +
-    (a.request_id ? `<div class="actions"><button type="button" class="btn secondary" ` +
+    (a.request_id ? `<div class="actions">` +
+      (a.step==='plan-proposal' && a.status==='running'
+        ? `<button type="button" class="btn danger" ` +
+          `data-stop-gen="${esc(a.request_id)}" ` +
+          `title="cancel this planning pass - the request stays editable ` +
+          `and any previous proposal is kept">Stop proposal</button>` : '') +
+      `<button type="button" class="btn secondary" ` +
       `data-open-request="${esc(a.request_id)}">View request / runbook</button></div>` : '') +
     (a.tail ? `<h3 style="margin-top:14px">stdout tail</h3><pre id="dtail">${esc(a.tail)}</pre>` : '') +
     (a.arc && a.arc.groups && a.arc.groups.length
@@ -5852,6 +5972,11 @@ function showRunDetails(key){
     `data-filter-run="${esc(key)}">Show only this run</button>` +
     (r.request_id ? `<button type="button" class="btn secondary" ` +
       `data-open-request="${esc(r.request_id)}">View original request / TOML</button>` : '') +
+    (r.stage==='generating' && r.request_id
+      ? `<button type="button" class="btn danger" ` +
+        `data-stop-gen="${esc(r.request_id)}" ` +
+        `title="cancel this planning pass - the request stays editable ` +
+        `and any previous proposal is kept">Stop proposal</button>` : '') +
     (pendingMerge ? `<button type="button" class="btn" ` +
       `data-merge-run="${esc(base(r.dir))}" ` +
       `data-rk="${esc(key)}">Merge pending branches</button>` : '') +
@@ -5962,7 +6087,9 @@ function showRequestForm(rec){
       `the manifest without regenerating (request text and project ` +
       `changes need regeneration).</div>`:'') +
     (stage==='generating'?`<div class="notice warn">Planning in progress. ` +
-      `The previous proposal, if any, remains available if generation fails.</div>`:'') +
+      `The previous proposal, if any, remains available if generation ` +
+      `fails. <b>Stop proposal</b> cancels this pass and returns the form ` +
+      `to editing.</div>`:'') +
     (stage==='questions'?`<div class="notice warn">The planner paused for ` +
       `your answers before writing the TOML ` +
       `(${(rec.pending_questions||[]).length} pending). Answer them via the ` +
@@ -6054,6 +6181,11 @@ function showRequestForm(rec){
       `${esc(rec.manifest_text||'')}</textarea></details>`:'') +
     `<div id="form-msg" class="notice" hidden></div>` +
     `<div class="actions">` +
+    (stage==='generating'
+      ? `<button type="button" class="btn danger" data-action="stop" ` +
+        `title="cancel this planning pass - the request fields stay as ` +
+        `they were and any previous proposal is kept">` +
+        `Stop proposal</button>`:'') +
     (stage==='questions'&&(rec.pending_questions||[]).length
       ? `<button type="button" class="btn attn" ` +
         `data-open-questions="${esc(rec.id)}">Answer questions (` +
@@ -6191,6 +6323,9 @@ async function requestAction(action){
   if (action==='discard' && !confirm('Discard this request, its proposal TOML, and all planned steps?')) return;
   if (action==='generate' && rec.manifest && !confirm(
       'Regenerate the proposal? Your current TOML will be replaced only if generation succeeds.')) return;
+  if (action==='stop' && !confirm(
+      'Stop preparing this proposal? The planner session is cancelled - ' +
+      'your request and any previous proposal are kept.')) return;
   if (action==='run'){
     if (modalRequest.dirty){ formError('Save and review edits before starting.'); return; }
     if (!confirm(`Start ${rec.run} now? This will execute ${rec.proposed_steps?.length||0} ` +
@@ -6222,6 +6357,9 @@ async function requestAction(action){
         await api('POST',`/api/requests/${rid}/generate`,{});
     } else if (action==='run'){
       await api('POST',`/api/requests/${rid}/run`,{});
+    } else if (action==='stop'){
+      if (!rid) return;
+      await api('POST',`/api/requests/${rid}/stop`,{});
     } else if (action==='discard'){
       await api('POST',`/api/requests/${rid}/discard`,{confirm:true});
       selectedRun=null;
@@ -6777,6 +6915,17 @@ document.addEventListener('click', async e=>{
       closeDetail(true); await refresh();
     } catch(err){ alert('Stop failed: '+err.message); t.disabled=false; }
     return; }
+  if (t.dataset && t.dataset.stopGen){
+    if(!confirm('Stop preparing this proposal? The planner session is ' +
+                'cancelled - the request stays editable and any previous ' +
+                'proposal is kept.')) return;
+    t.disabled=true;
+    try {
+      await api('POST',
+        `/api/requests/${encodeURIComponent(t.dataset.stopGen)}/stop`,{});
+      closeDetail(true); await refresh();
+    } catch(err){ alert('Stop failed: '+err.message); t.disabled=false; }
+    return; }
   if (t.dataset && t.dataset.setTimeout){
     const inp=document.getElementById('d-timeout');
     const mins=parseFloat(inp?.value);
@@ -7171,7 +7320,7 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     self._json(create_request(body, requests_dir, runs_dir), 201)
                 elif (m := re.fullmatch(r"/api/requests/([^/]+)/"
                                          r"(save|generate|run|discard|apply"
-                                         r"|answer)", path)):
+                                         r"|answer|stop)", path)):
                     request_id, action = m.groups()
                     if action == "save":
                         self._json(save_request(request_id, body, requests_dir,
@@ -7180,6 +7329,9 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                         self._json(start_generation(request_id, requests_dir,
                                                     manifests_dir, runs_dir,
                                                     devin_argv), 202)
+                    elif action == "stop":
+                        self._json(stop_generation(request_id, requests_dir,
+                                                   runs_dir), 202)
                     elif action == "run":
                         self._json(launch_request(request_id, requests_dir,
                                                   manifests_dir, runs_dir,

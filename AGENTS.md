@@ -198,6 +198,21 @@ block, and changing them marks an existing proposal stale. Uploads take
 the same `_assert_unwatched` trap-5 guard as request writes, since
 `data/` sits inside a self-hosted run's watched cwd. Removed/unsaved
 uploads leave orphan files in `data/` - ignored, same class as runs/.
+**Stop proposal** (`POST /api/requests/<id>/stop`, a button while the
+stage is `generating` - request modal, request-run modal, plan-proposal
+agent modal) cancels the in-flight planner pass: `stop_generation` raises
+a `stopgen-<id>` sentinel (polled by the planner's own `wait_worker`
+stop_flags, so the kill is scoped to that request) and tree-kills the
+registered `_GEN_PROCS` Popen immediately, then restores the last
+editable state - `ready` when a previous proposal exists, `draft`
+otherwise, inputs and collected Q&A untouched. Every generation attempt
+carries a `gen_id` (`_GENERATING` is the set of live attempt ids, and all
+`_finish_generation` writes check it), so a stopped attempt's late TOML,
+error callback or questionnaire can never overwrite restored state or a
+newer attempt - and its `finally` can't discard the successor's
+membership. Repeated stops and stopping a finished generation 409 like
+`stop_run` on an ended run; stopping an orphaned `generating` record
+clears the stuck stage early.
 Real runs still use `state.json` as their registry. Run controls use one
 naming system - each visible name a distinct semantics: **Pause run**
 (POST `/api/runs/<dir>/pause`) is the graceful hold - in-flight steps
