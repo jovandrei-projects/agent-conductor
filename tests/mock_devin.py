@@ -153,6 +153,10 @@ def main() -> int:
             json.dumps({"mock": True, "session": sid, "cloud": cloud}),
             encoding="utf-8")
 
+    env_line = " ".join(f"{k}={v}" for k, v in sorted(os.environ.items())
+                        if k.startswith("CONDUCTOR_"))
+    if env_line:
+        print(env_line)
     print(f"mock worker ran: prompt={len(body)} chars model={model} "
           f"cloud={cloud} session={sid}")
     print("STATUS: done")
