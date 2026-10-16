@@ -2425,6 +2425,113 @@ assert.match(elem('rq-attach').innerHTML,/data-attach-rm="old\.png"/);
                            timeout=10)
         self.assertEqual(p.returncode, 0, p.stderr)
 
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_request_attachments_file_picker(self):
+        """The paperclip control opens the hidden input[type=file] and a
+        selection takes the same upload path as drop/paste: a picked image
+        POSTs to /api/attachments, thumbnails, and inserts its path. A
+        canceled dialog uploads nothing and changes nothing; non-images
+        get the shared validation error; a server-name duplicate stays one
+        attachment; a saved draft reopens with its strip + remove."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, posts=[];
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',value:'',classList:{add(){},remove(){},toggle(){}}});
+  return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,fn)=>{handlers[ev]=fn;}};
+const REC={id:'r1',status:'draft',raw:'tidy',
+  attachments:[{name:'a1.png',path:'D:/data/attachments/a1.png'}]};
+const fetch=async(path,opts)=>{posts.push(String(path));
+  if(path==='/api/attachments')
+    return {ok:true,status:201,json:async()=>(
+      {name:'a1.png',path:'D:/data/attachments/a1.png'})};
+  if(String(path).startsWith('/api/requests/'))
+    return {ok:true,status:200,json:async()=>JSON.parse(JSON.stringify(REC))};
+  return {ok:true,status:200,json:async()=>({})};};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  confirm:()=>true,setTimeout:()=>{},fetch,
+  Event:class Event{constructor(){}}});
+vm.runInContext(src,ctx);
+const d={serve_boot:'b',generated_at:'2026-10-14',agents:[],runs:[],
+  project_options:[{slug:'p',cloud_ok:false}],
+  defaults:{model:'swe-2',effort:'max'}};
+vm.runInContext('render('+JSON.stringify(d)+')',ctx);
+vm.runInContext('openNew()',ctx);
+const html=elem('dbody').innerHTML;
+// a real labeled button holding an svg glyph, plus a hidden image-only
+// multi-select file input - present only while the form is editable
+assert.match(html,/class="attach-btn" data-attach-pick/);
+assert.match(html,/aria-label="Choose image files to attach"/);
+assert.match(html,/<svg viewBox="0 0 24 24"/);
+assert.match(html,/<input type="file" id="rq-file" accept="image\/\*" multiple\s+hidden>/);
+const fi=elem('rq-file'); let picked=0; fi.click=()=>{picked++;};
+const ta=elem('rq-raw'); ta.value='Do this'; ta.selectionStart=7;
+ta.selectionEnd=7;
+const atts=()=>JSON.stringify(vm.runInContext(
+  'requestFields()',ctx).attachments);
+const uploads=()=>posts.filter(p=>p==='/api/attachments').length;
+const clickSel=(sel,dataset)=>handlers.click({preventDefault:()=>{},
+  target:{dataset:{},closest:s=>s===sel?{dataset:dataset||{}}:null}});
+const pick=files=>{fi.files=files;handlers.change({target:fi});
+  return new Promise(r=>setImmediate(r));};
+(async()=>{
+  // the paperclip click drives the hidden input's click()
+  await clickSel('[data-attach-pick]');
+  assert.equal(picked,1);
+  // canceling the dialog delivers no files: no upload, no thumbnail,
+  // no dirty mark, the request text untouched
+  await pick([]);
+  assert.equal(uploads(),0);
+  assert.equal(atts(),'[]');
+  assert.equal(ta.value,'Do this');
+  assert.notEqual(vm.runInContext('modalRequest.dirty',ctx),true);
+  // a non-image selection is refused by the shared validation
+  await pick([{type:'text/plain'}]);
+  assert.equal(uploads(),0);
+  assert.match(elem('form-msg').textContent,/Only image files/);
+  // a picked image uploads, thumbnails, lands at the caret, marks the
+  // form dirty, and the input value resets so re-picking re-fires
+  await pick([{type:'image/png',name:'shot.png'}]);
+  assert.equal(uploads(),1);
+  assert.match(ta.value,/Do this\nD:\/data\/attachments\/a1\.png\n/);
+  assert.match(elem('rq-attach').innerHTML,/api\/attachments\/a1\.png/);
+  assert.equal(elem('rq-attach').hidden,false);
+  assert.equal(vm.runInContext('modalRequest.dirty',ctx),true);
+  assert.equal(fi.value,'');
+  // re-picking re-fires 'change'; the name dedupe keeps ONE attachment
+  // - the same contract drop/paste holds
+  await pick([{type:'image/png',name:'shot.png'}]);
+  assert.equal(uploads(),2);
+  assert.equal(atts(),JSON.stringify(
+    [{name:'a1.png',path:'D:/data/attachments/a1.png'}]));
+  // a saved draft reopens with its attachments rendered + round-trips
+  await vm.runInContext('openRequest("r1")',ctx);
+  await new Promise(r=>setImmediate(r));
+  assert.match(elem('rq-attach').innerHTML,/api\/attachments\/a1\.png/);
+  assert.match(elem('rq-attach').innerHTML,/data-attach-rm="a1\.png"/);
+  assert.equal(atts(),JSON.stringify(
+    [{name:'a1.png',path:'D:/data/attachments/a1.png'}]));
+  // the per-image remove control works on the reopened draft
+  await clickSel('[data-attach-rm]',{attachRm:'a1.png'});
+  assert.equal(atts(),'[]');
+  assert.equal(elem('rq-attach').hidden,true);
+  // non-editable stages render neither the picker nor its input
+  vm.runInContext('showRequestForm({status:"launched",raw:"x"})',ctx);
+  assert.equal(/data-attach-pick/.test(elem('dbody').innerHTML),false);
+  assert.equal(/id="rq-file"/.test(elem('dbody').innerHTML),false);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
 
 class StopProposalTests(unittest.TestCase):
     """'Stop proposal' cancels an in-flight planner pass: the
