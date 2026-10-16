@@ -12,6 +12,7 @@ wait, repeat. The conductor does the same thing from a TOML manifest - one
     python conductor.py run   night.toml --resume [dir]   skip finished steps
     python conductor.py status [run_dir]      table from the latest run
     python conductor.py serve [--port 8773]   live dashboard of every agent
+    python conductor.py merge  <run_dir>      land a run's pending branches
     python conductor.py sweep                 mark orphaned records 'lost'
     python conductor.py sessions [--rm]       list/clean spawned devin sessions
     python conductor.py demo                  end-to-end against a mock devin
@@ -216,6 +217,10 @@ class Step:
     cloud: bool = False
     wave: int | None = None            # adjacent steps sharing a wave run in parallel
     worktree: bool = False             # run in a temp git worktree + branch, merged after
+    merge: str = "auto"                # auto = merge after step (legacy);
+                                       # deferred = retain branch+worktree as a
+                                       # pending merge until merge_run is asked
+                                       # (implies worktree)
     effort: str | None = None          # thinking-effort variant suffix fused onto
                                        # the model id ("min" -> "model-min")
     merge_resolver: bool = False       # on merge conflict, spawn a resolver
@@ -241,6 +246,7 @@ class Manifest:
     max_hours: float | None            # wall-clock cap for the whole run
     max_parallel: int | None           # cap on concurrent agents; None = auto
     merge_resolver: bool               # run-wide default for step.merge_resolver
+    merge_policy: str                  # run-wide default for step.merge
     steps: list[Step]
     description: str | None = None
 
@@ -260,6 +266,10 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
     on_failure = run.get("on_failure", "stop")
     if on_failure not in ("stop", "continue"):
         raise ManifestError(f"run.on_failure must be stop|continue, got {on_failure!r}")
+    run_merge = str(run.get("merge", "auto"))
+    if run_merge not in ("auto", "deferred"):
+        raise ManifestError(
+            f"run.merge must be auto|deferred, got {run_merge!r}")
     preamble = run.get("preamble")
     if run.get("preamble_file"):
         preamble = (path.parent / run["preamble_file"]).read_text(encoding="utf-8")
@@ -288,6 +298,22 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
         mr = merged.get("merge_resolver")
         if mr is None:
             mr = run.get("merge_resolver", False)
+        merge_pol = str(merged.get("merge") or run.get("merge", "auto"))
+        if merge_pol not in ("auto", "deferred"):
+            raise ManifestError(
+                f"step {merged['name']!r}: merge must be auto|deferred, got "
+                f"{merge_pol!r}")
+        if merge_pol == "deferred":
+            if merged.get("worktree") is False:
+                raise ManifestError(
+                    f"step {merged['name']!r}: merge=deferred needs worktree "
+                    f"isolation (it implies worktree=true - drop the "
+                    f"explicit worktree=false)")
+            if merged.get("cloud"):
+                raise ManifestError(
+                    f"step {merged['name']!r}: merge=deferred retains a local "
+                    f"branch - it makes no sense with cloud=true")
+            merged["worktree"] = True
         # A step without verify inherits the project's registered gate
         # (projects.toml `verify = "..."`). Explicit verify = "" opts out.
         # Cloud steps never inherit - a local verify of an untouched
@@ -318,6 +344,7 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
             cloud=bool(merged.get("cloud", False)),
             wave=merged.get("wave"),
             worktree=bool(merged.get("worktree", False)),
+            merge=merge_pol,
             effort=merged.get("effort") or None,
             merge_resolver=bool(mr), max_attempts=ma,
             stall_min=float(merged.get("stall_min", 20))))
@@ -333,6 +360,7 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
                     preamble=preamble, max_hours=run.get("max_hours"),
                     max_parallel=max_parallel,
                     merge_resolver=bool(run.get("merge_resolver", False)),
+                    merge_policy=run_merge,
                     steps=steps, description=description)
 
 
@@ -754,10 +782,14 @@ def sanitize_branch(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._/-]", "-", s)
 
 
-def worktree_add(repo_dir: Path, wt_path: Path, branch: str) -> bool:
+def worktree_add(repo_dir: Path, wt_path: Path, branch: str,
+                 start: str | None = None) -> bool:
     if wt_path.is_dir():
         return True   # resume: reuse the worktree left by an earlier attempt
-    r = _git(repo_dir, "worktree", "add", str(wt_path), "-b", branch)
+    cmd = ["worktree", "add", str(wt_path), "-b", branch]
+    if start:
+        cmd.append(start)
+    r = _git(repo_dir, *cmd)
     if r.returncode != 0 and "already exists" in r.stderr:
         r = _git(repo_dir, "worktree", "add", str(wt_path), branch)
     return r.returncode == 0
@@ -810,13 +842,35 @@ def has_conflict_markers(repo_dir: Path, rel: str) -> bool:
         return False
 
 
+def _repo_merge_busy(repo_dir: Path) -> bool:
+    """A live process holds this repo's merge lockfile - another conductor's
+    merge (or staged deferred-merge op) is in flight; don't touch its
+    in-progress merge state."""
+    gd = _git_dir(repo_dir)
+    if gd is None:
+        return False
+    lock = gd / "conductor-merge.lock"
+    try:
+        info = json.loads(lock.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return False
+    pid = info.get("pid")
+    if pid == os.getpid():
+        return False                # our own lock, taken upstream
+    return pid_alive(pid)
+
+
 def abort_own_merge(repo_dir: Path) -> bool:
     """Abort an in-progress merge ONLY if it is conductor's own: MERGE_HEAD
     must sit on a conductor/* branch. A merge a human started (or one on an
     unrelated branch) is left alone. Covers 'conductor died mid-resolution':
-    resume finds the stale merge and backs it out before re-running."""
+    resume finds the stale merge and backs it out before re-running.
+    A live repo merge lock means another conductor is mid-merge right now -
+    aborting 'our' conductor/* merge would be killing THEIR live op."""
     mh = _git(repo_dir, "rev-parse", "-q", "--verify", "MERGE_HEAD")
     if mh.returncode != 0:
+        return False
+    if _repo_merge_busy(repo_dir):
         return False
     sha = mh.stdout.strip()
     brs = _git(repo_dir, "branch", "--contains", sha,
@@ -824,6 +878,212 @@ def abort_own_merge(repo_dir: Path) -> bool:
     if "conductor/" not in brs.stdout:
         return False
     return _git(repo_dir, "merge", "--abort").returncode == 0
+
+
+# ---------------------------------------------------- deferred merge engine
+#
+# merge="deferred" separates worktree isolation from the merge-back: a step's
+# branch, worktree, commits and verify result are RETAINED as a pending merge
+# (state["pending_merges"], one group per project repo) until a human asks
+# merge_run to land them. Sequential deferred steps on the same project must
+# still see their verified predecessors' work, so each run keeps an isolated
+# per-project integration baseline branch (conductor/<run>/baseline-<slug>)
+# that fast-forwards over each verified sequential step's tip and absorbs
+# target-branch movement via plumbing merges. Parallel same-project wave
+# members are alternatives: they share the baseline tip as their merge base
+# but never join it - each stays an individually identifiable pending entry.
+
+def _baseline_name(run_name: str, slug: str) -> str:
+    return sanitize_branch(f"conductor/{run_name}/baseline-{slug}")
+
+
+def _repo_key(repo_dir: Path) -> str:
+    return os.path.normcase(str(repo_dir.resolve()))
+
+
+def _pending_groups(state: dict) -> dict:
+    return state.setdefault("pending_merges", {})
+
+
+def _baseline_tip(repo_dir: Path, ref: str) -> str | None:
+    r = _git(repo_dir, "rev-parse", "--verify", ref)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _merge_tree(repo_dir: Path, ours: str, theirs: str) -> str | None:
+    """Plumbing 3-way merge (git>=2.38): returns the merged tree's commit oid
+    (parents ours,theirs) or None on conflict/unsupported. Never touches any
+    checkout - the baseline absorbs target movement without a worktree."""
+    r = _git(repo_dir, "merge-tree", "--write-tree", ours, theirs)
+    if r.returncode != 0:
+        return None
+    tree = r.stdout.splitlines()[0].strip() if r.stdout.strip() else ""
+    if not tree:
+        return None
+    c = subprocess.run(["git", "-C", str(repo_dir), "commit-tree", tree,
+                        "-p", ours, "-p", theirs,
+                        "-m", "conductor: absorb target movement into "
+                              "baseline"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=120,
+                       **hidden_subprocess_kwargs())
+    return c.stdout.strip() if c.returncode == 0 and c.stdout.strip() else None
+
+
+def _baseline_rebuild(repo_dir: Path, grp: dict, steps: dict,
+                      run_dir: Path) -> bool:
+    """The baseline ref is gone but pending entries remain (a deleted
+    branch, or state/ref mismatch after manual cleanup): rebuild it by
+    folding each verified sequential entry's branch tip over the recorded
+    target sha, in entry order. A conflict mid-fold keeps what folded -
+    the rest still reconciles at explicit-merge time."""
+    cur = grp.get("target_sha") or ""
+    if not cur or _baseline_tip(repo_dir, cur) is None:
+        return False
+    for n in grp.get("entries") or []:
+        rec = steps.get(n) or {}
+        if rec.get("merge_kind") != "sequential" \
+                or not rec.get("deferred_verified"):
+            continue
+        tip = _baseline_tip(repo_dir, rec.get("branch") or "?")
+        if tip is None or _git(repo_dir, "merge-base", "--is-ancestor",
+                               tip, cur).returncode == 0:
+            continue
+        nxt = _merge_tree(repo_dir, cur, tip)
+        if nxt is None:
+            break
+        cur = nxt
+    ok = _git(repo_dir, "update-ref", f"refs/heads/{grp['baseline']}",
+              cur).returncode == 0
+    if ok:
+        log_event(run_dir, event="baseline_rebuild",
+                  project=str(repo_dir), baseline=grp["baseline"], tip=cur)
+    return ok
+
+
+def _baseline_ensure(repo_dir: Path, slug: str, run_name: str,
+                     state: dict, run_dir: Path) -> dict | None:
+    """Get-or-create the run's integration baseline group for this repo.
+
+    The recorded target is the branch checked out when the FIRST deferred
+    step on this repo was prepared (+ its tip sha); later deferred merges aim
+    at that recorded ref, not wherever HEAD happens to point by then. The
+    baseline branch itself is created at that same recorded tip - or, when
+    the group exists but the ref was lost, rebuilt from the verified
+    sequential entries it used to carry."""
+    groups = _pending_groups(state)
+    key = _repo_key(repo_dir)
+    grp = groups.get(key)
+    if grp and _baseline_tip(repo_dir, grp["baseline"]):
+        return grp
+    target = _git(repo_dir, "rev-parse", "--abbrev-ref",
+                  "HEAD").stdout.strip()
+    sha = _git(repo_dir, "rev-parse", "HEAD").stdout.strip()
+    if target == "HEAD" or not sha:
+        # detached HEAD or unborn branch: no sane recorded target
+        return None
+    baseline = (grp or {}).get("baseline") or _baseline_name(run_name, slug)
+    # Two projects can slug-collide (literal paths share p.name); keep the
+    # ref unique per repo within the run.
+    used = {g["baseline"] for k, g in groups.items() if k != key}
+    if baseline in used:
+        baseline = sanitize_branch(
+            f"{baseline}-{_repo_key(repo_dir)[-6:]}")
+    grp = dict(grp or {})
+    grp.update(repo_dir=str(repo_dir), slug=slug,
+               target_branch=(grp or {}).get("target_branch") or target,
+               target_sha=(grp or {}).get("target_sha") or sha,
+               baseline=baseline,
+               baseline_stuck=bool(grp.get("baseline_stuck")),
+               entries=list((grp or {}).get("entries") or []))
+    if _baseline_tip(repo_dir, baseline) is None:
+        if grp["entries"] and _baseline_rebuild(
+                repo_dir, grp, state.get("steps") or {}, run_dir):
+            pass
+        elif _git(repo_dir, "update-ref", f"refs/heads/{baseline}",
+                  sha).returncode != 0:
+            return None
+        else:
+            log_event(run_dir, event="baseline_create",
+                      project=str(repo_dir), baseline=baseline,
+                      target=grp["target_branch"], sha=sha)
+    else:
+        log_event(run_dir, event="baseline_reattach", project=str(repo_dir),
+                  baseline=baseline)
+    groups[key] = grp
+    return grp
+
+
+def _baseline_sync(repo_dir: Path, grp: dict, run_dir: Path) -> str | None:
+    """Absorb recorded-target movement (human commits, auto-mode merges) into
+    the baseline so later deferred steps see it. Returns the baseline tip to
+    branch from. A conflicting absorb keeps the old tip and marks the group
+    baseline_stuck - the staged merge reconciles main-vs-run at land time."""
+    ref = grp["baseline"]
+    tip = _baseline_tip(repo_dir, ref)
+    target_tip = _baseline_tip(repo_dir, grp["target_branch"])
+    if tip is None or target_tip is None:
+        return tip
+    if _git(repo_dir, "merge-base", "--is-ancestor",
+            target_tip, tip).returncode == 0:
+        return tip                      # baseline already covers the target
+    merged = _merge_tree(repo_dir, tip, target_tip)
+    if merged is None:
+        grp["baseline_stuck"] = True
+        log_event(run_dir, event="baseline_stuck", project=str(repo_dir),
+                  baseline=ref, target_tip=target_tip)
+        return tip
+    if _git(repo_dir, "update-ref", f"refs/heads/{ref}", merged,
+            tip).returncode == 0:
+        grp["baseline_stuck"] = False
+        grp["target_sha"] = target_tip
+        log_event(run_dir, event="baseline_sync", project=str(repo_dir),
+                  baseline=ref, tip=merged)
+        return merged
+    return tip
+
+
+def _baseline_advance(repo_dir: Path, grp: dict, step_branch: str,
+                      step_name: str, run_dir: Path) -> bool:
+    """Fast-forward the baseline over a verified sequential step's tip. The
+    step branched off the baseline tip, so its tip already contains it - the
+    update-ref expected-value makes the advance atomic."""
+    tip = _baseline_tip(repo_dir, grp["baseline"])
+    step_tip = _baseline_tip(repo_dir, step_branch)
+    if tip is None or step_tip is None:
+        return False
+    if _git(repo_dir, "merge-base", "--is-ancestor",
+            step_tip, tip).returncode == 0:
+        return True                     # nothing new (e.g. zero-commit step)
+    ok = _git(repo_dir, "update-ref", f"refs/heads/{grp['baseline']}",
+              step_tip, tip).returncode == 0
+    if ok:
+        log_event(run_dir, event="baseline_advance", project=str(repo_dir),
+                  baseline=grp["baseline"], step=step_name, tip=step_tip)
+    else:
+        log_event(run_dir, event="baseline_advance_failed",
+                  project=str(repo_dir), baseline=grp["baseline"],
+                  step=step_name)
+    return ok
+
+
+def _deferred_pending_note(rec: dict, grp: dict, wt: Path) -> None:
+    _append_note(
+        rec, f"deferred merge: retained at {wt} as pending work on "
+             f"{grp['baseline']} (target {grp['target_branch']}); "
+             "lands only via an explicit merge")
+
+
+def _deferred_record(rec: dict, grp: dict, kind: str, step_name: str) -> None:
+    """Attach the step to its repo's pending-merge group and stamp the
+    deferred metadata the merge op + dashboard read. Verified here means:
+    the step reported done and no verify gate went red."""
+    rec.update(deferred=True, merge_kind=kind, baseline=grp["baseline"],
+               target_branch=grp["target_branch"],
+               deferred_verified=(rec.get("status") == "done"
+                                  and rec.get("verify_ok") is not False))
+    if step_name not in grp["entries"]:
+        grp["entries"].append(step_name)
 
 
 # ---------------------------------------------------------------- run state
@@ -1948,10 +2208,18 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
 def resolve_merge_conflict(step: Step, slug: str, repo_dir: Path,
                            work_dir: Path, branch: str, cfg: Manifest,
                            run_dir: Path, devin_argv: list[str],
-                           state: dict) -> bool:
-    """A worktree branch conflicted at merge-back: re-enter the merge in the
-    MAIN checkout and hand the resolution to a fresh session (manifest
-    `merge_resolver`). Returns True when the merge was completed.
+                           state: dict, merge_dir: Path | None = None,
+                           already_started: bool = False,
+                           remove_on_success: bool = True,
+                           dirty_guard: bool = True) -> bool:
+    """A worktree branch conflicted at merge-back: re-enter the merge and
+    hand the resolution to a fresh session (manifest `merge_resolver`).
+    Returns True when the merge was completed.
+
+    merge_dir is where the merge runs and the resolver session works - the
+    main checkout (default) or, for deferred merges, the isolated staging
+    worktree. already_started=True means the caller already ran `git merge`
+    there and it conflicted, so only the resolution remains.
 
     Safety shape: the resolver may stage a fix without committing - the
     conductor finishes `git commit --no-edit` itself once the index is
@@ -1961,22 +2229,26 @@ def resolve_merge_conflict(step: Step, slug: str, repo_dir: Path,
 
     Refuses entirely on a dirty main checkout: another agent's uncommitted
     work sitting in the tree would get swept into the merge commit
-    (trap 10 shape) - that is human territory.
+    (trap 10 shape) - that is human territory. dirty_guard=False is for the
+    disposable staging worktree, where mid-merge dirt is ours alone.
     """
-    if git_dirty_tracked(repo_dir):
-        LOG.warning("%s: main checkout has modified tracked files; not "
+    merge_dir = merge_dir or repo_dir
+    if dirty_guard and git_dirty_tracked(merge_dir):
+        LOG.warning("%s: merge checkout has modified tracked files; not "
                     "spawning a merge resolver", step.name)
         rec = state["steps"].get(step.name, {})
         _append_note(rec, "merge resolver refused: modified tracked files "
-                          "in main checkout (trap 10/11 - commit or stash "
-                          "them, then resume)")
+                          "in the merge checkout (trap 10/11 - commit or "
+                          "stash them, then resume)")
         save_state(run_dir, state)
         return False
-    r = _git(repo_dir, "merge", "--no-edit", branch)
-    if r.returncode == 0:                    # raced clean after all
-        worktree_remove(repo_dir, work_dir, branch)
-        return True
-    conflicted = unmerged_paths(repo_dir)
+    if not already_started:
+        r = _git(merge_dir, "merge", "--no-edit", branch)
+        if r.returncode == 0:                # raced clean after all
+            if remove_on_success:
+                worktree_remove(repo_dir, work_dir, branch)
+            return True
+    conflicted = unmerged_paths(merge_dir)
     body = RESOLVE_BODY.format(
         branch=branch, worktree=work_dir,
         files="\n".join(f"- {f}" for f in conflicted) or "- (see git status)")
@@ -1988,34 +2260,35 @@ def resolve_merge_conflict(step: Step, slug: str, repo_dir: Path,
     # that, so a conductor dying mid-resolution resumes through late-merge.
     rec = state["steps"].get(step.name, {})
     rec.update(note=f"merge conflict on {branch}; resolver session "
-                    f"{rstep.name} spawned in the main checkout",
+                    f"{rstep.name} spawned in {merge_dir}",
                merged=False)   # orange 'unmerged' chip while resolving
     save_state(run_dir, state)
     log_event(run_dir, event="resolve_start", step=step.name, branch=branch,
               files=conflicted)
-    status = run_step(rstep, slug, repo_dir, cfg, run_dir, devin_argv,
+    status = run_step(rstep, slug, merge_dir, cfg, run_dir, devin_argv,
                       state, do_checkpoint=False, post_commit=False)
     log_event(run_dir, event="resolve_end", step=step.name, status=status)
 
     # Adopt any resolved-but-unstaged file that carries no markers, then
     # decide. A file still holding markers is never staged.
     for f in conflicted:
-        if not has_conflict_markers(repo_dir, f):
-            _git(repo_dir, "add", f)
-    if status == "done" and not unmerged_paths(repo_dir) \
-            and not any(has_conflict_markers(repo_dir, f)
+        if not has_conflict_markers(merge_dir, f):
+            _git(merge_dir, "add", f)
+    if status == "done" and not unmerged_paths(merge_dir) \
+            and not any(has_conflict_markers(merge_dir, f)
                         for f in conflicted) \
-            and merge_in_progress(repo_dir):
+            and merge_in_progress(merge_dir):
         # Index clean, merge still open -> conductor commits the resolution.
-        _git(repo_dir, "commit", "--no-edit")
+        _git(merge_dir, "commit", "--no-edit")
     tip = _git(repo_dir, "rev-parse", branch).stdout.strip()
-    landed = bool(tip) and _git(repo_dir, "merge-base", "--is-ancestor",
+    landed = bool(tip) and _git(merge_dir, "merge-base", "--is-ancestor",
                                 tip, "HEAD").returncode == 0
-    if status == "done" and landed and not unmerged_paths(repo_dir):
-        worktree_remove(repo_dir, work_dir, branch)
+    if status == "done" and landed and not unmerged_paths(merge_dir):
+        if remove_on_success:
+            worktree_remove(repo_dir, work_dir, branch)
         return True
-    if merge_in_progress(repo_dir):
-        _git(repo_dir, "merge", "--abort")
+    if merge_in_progress(merge_dir):
+        _git(merge_dir, "merge", "--abort")
     return False
 
 
@@ -2128,6 +2401,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         # tracks the resumed conductor, not the dead original.
         state["driver_pid"] = os.getpid()
         state["driver_started_at"] = now_iso()
+        # The current manifest's policy applies to steps prepared from now
+        # on; already-recorded recs keep their own `deferred` flags.
+        state["merge_policy"] = cfg.merge_policy
         save_state(run_dir, state)
         print(f"[resume] {run_dir.name}")
         # Resume must be able to start work again: drop any stop/drain
@@ -2138,6 +2414,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         state = {"run": cfg.name, "description": cfg.description,
                  "request_id": getattr(args, "request_id", None),
                  "manifest": str(manifest_path),
+                 "merge_policy": cfg.merge_policy,
                  "started_at": now_iso(), "devin": " ".join(devin_argv),
                  "devin_argv": devin_argv,
                  "run_dir": str(run_dir), "max_parallel": cap,
@@ -2237,10 +2514,19 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Materialize worktrees for members that want isolation.
         prepared: list[tuple[Step, str, Path, Path, str | None]] = []
         wave_ckpt_done = False
+        # Deferred steps sharing a repo inside this group are alternatives:
+        # they all branch off the same baseline tip and none of them joins
+        # it (a lone deferred member is 'sequential' and advances it).
+        deferred_counts: dict[str, int] = {}
+        for _pd, _sl, _st in members:
+            if _st.merge == "deferred":
+                k = _repo_key(_pd)
+                deferred_counts[k] = deferred_counts.get(k, 0) + 1
         for project_dir, slug, step in members:
             prior = state["steps"].get(step.name, {})
             unmerged = bool(prior.get("branch")) \
-                and prior.get("merged") is not True
+                and prior.get("merged") is not True \
+                and not prior.get("deferred")
             if args.resume is not None and unmerged:
                 # Finalize the merge before anything else: the step's product
                 # is a branch that never landed. Covers 'done' (conductor
@@ -2253,12 +2539,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                     run_dir.name) / step.name
                 if _git(project_dir, "rev-parse", "-q", "--verify",
                         prior["branch"]).returncode == 0:
-                    abort_own_merge(project_dir)
-                    ok = worktree_merge(project_dir, wt, prior["branch"])
-                    if not ok and step.merge_resolver:
-                        ok = resolve_merge_conflict(
-                            step, slug, project_dir, wt, prior["branch"],
-                            cfg, run_dir, devin_argv, state)
+                    try:
+                        with _RepoMergeLock(project_dir):
+                            abort_own_merge(project_dir)
+                            ok = worktree_merge(project_dir, wt,
+                                                prior["branch"])
+                            if not ok and step.merge_resolver:
+                                ok = resolve_merge_conflict(
+                                    step, slug, project_dir, wt,
+                                    prior["branch"], cfg, run_dir,
+                                    devin_argv, state)
+                    except RequestError:
+                        ok = False
                     if ok:
                         was = prior.get('status')
                         prior.update(status="done", merged=True)
@@ -2316,7 +2608,37 @@ def cmd_run(args: argparse.Namespace) -> int:
                 branch = sanitize_branch(
                     f"conductor/{run_dir.name}/{step.name}")
                 wt = runs_dir.parent / "worktrees" / run_dir.name / step.name
-                if not worktree_add(project_dir, wt, branch):
+                dgrp = None
+                start = None
+                kind = None
+                if step.merge == "deferred":
+                    # Deferred work branches off the run's per-project
+                    # integration baseline (created at the recorded target
+                    # tip, then synced over target movement) - never off
+                    # bare HEAD, or each step would restart from unchanged
+                    # main and lose its verified predecessors.
+                    dgrp = _baseline_ensure(project_dir, slug, run_dir.name,
+                                            state, run_dir)
+                    start = (dgrp and
+                             _baseline_sync(project_dir, dgrp, run_dir))
+                    kind = ("alternative"
+                            if deferred_counts.get(
+                                _repo_key(project_dir), 0) > 1
+                            else "sequential")
+                    if start is None:
+                        with STATE_LOCK:
+                            state["steps"].setdefault(step.name, {}).update(
+                                name=step.name, slug=slug, status="failed",
+                                note="deferred merge needs a branch "
+                                     "checked out in the project "
+                                     "(detached/unborn HEAD)")
+                            save_state(run_dir, state)
+                        print(f"[  failed] {step.name} (no merge target)")
+                        if cfg.on_failure == "stop":
+                            stop = True
+                            break
+                        continue
+                if not worktree_add(project_dir, wt, branch, start):
                     with STATE_LOCK:
                         state["steps"].setdefault(step.name, {}).update(
                             name=step.name, slug=slug,
@@ -2327,10 +2649,22 @@ def cmd_run(args: argparse.Namespace) -> int:
                         stop = True
                         break
                     continue
-                prepared.append((step, slug, wt, project_dir, branch, rnote))
+                if dgrp is not None:
+                    # Stamp deferred + pending-entry NOW: a driver dying
+                    # between prep and the post-wave pass would otherwise
+                    # leave a branch that resume reads as a legacy
+                    # unmerged auto-merge (and finalize it into main).
+                    with STATE_LOCK:
+                        _deferred_record(
+                            state["steps"].setdefault(
+                                step.name, {"name": step.name}),
+                            dgrp, kind, step.name)
+                        save_state(run_dir, state)
+                prepared.append((step, slug, wt, project_dir, branch, rnote,
+                                 dgrp))
             else:
                 prepared.append((step, slug, project_dir, project_dir,
-                                 None, rnote))
+                                 None, rnote, None))
         if stop:
             break
         if not prepared:
@@ -2339,13 +2673,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Mark members queued up front: the pool may hold them while a
         # max_parallel-sized set runs, and the dashboard shows the queue.
         with STATE_LOCK:
-            for step, _s, _w, _r, _b, _n in prepared:
+            for step, _s, _w, _r, _b, _n, _g in prepared:
                 state["steps"].setdefault(step.name, {}).update(
                     status="queued", name=step.name)
             save_state(run_dir, state)
 
         if len(prepared) == 1:
-            step, slug, work_dir, _repo, branch, rnote = prepared[0]
+            step, slug, work_dir, _repo, branch, rnote, _dg = prepared[0]
             statuses = {step.name: run_step(step, slug, work_dir, cfg,
                                             run_dir, devin_argv, state,
                                             do_checkpoint=(branch is None),
@@ -2361,27 +2695,58 @@ def cmd_run(args: argparse.Namespace) -> int:
                                   do_checkpoint=(branch is None),
                                   branch=branch,
                                   resume_note=rnote): step.name
-                        for step, slug, work_dir, _r, branch, rnote
+                        for step, slug, work_dir, _r, branch, rnote, _g
                         in prepared}
                 for f in concurrent.futures.as_completed(futs):
                     statuses[futs[f]] = f.result()
                     hub_update(tid, state)
 
         # Merge worktree branches back into the main checkout, in order.
-        for step, slug, work_dir, repo_dir, branch, _n in prepared:
+        for step, slug, work_dir, repo_dir, branch, _n, dgrp in prepared:
             status = statuses.get(step.name)
             print(f"[{status or 'skipped':>8}] {step.name}")
+            if branch and dgrp is not None:
+                # Deferred merge: the branch, worktree, commits and verify
+                # result are retained as a pending merge for an explicit
+                # human-requested land - never merged here. A verified
+                # SEQUENTIAL step also fast-forwards the run baseline so
+                # later steps on this project see it; wave siblings are
+                # alternatives and never join the baseline. Retained
+                # worktrees are never debris-cleaned - their recorded
+                # branch is the recoverable state.
+                rec = state["steps"].setdefault(
+                    step.name, {"name": step.name})
+                kind = ("alternative"
+                        if deferred_counts.get(_repo_key(repo_dir), 0) > 1
+                        else "sequential")
+                _deferred_record(rec, dgrp, kind, step.name)
+                if kind == "sequential" and rec.get("deferred_verified"):
+                    _baseline_advance(repo_dir, dgrp, branch, step.name,
+                                      run_dir)
+                _deferred_pending_note(rec, dgrp, work_dir)
+                save_state(run_dir, state)
+                continue
             if branch:
                 rec = state["steps"].get(step.name, {})
                 if status in ("done", "partial", "blocked"):
-                    if worktree_merge(repo_dir, work_dir, branch):
+                    try:
+                        with _RepoMergeLock(repo_dir):
+                            ok = worktree_merge(repo_dir, work_dir, branch)
+                            if not ok and step.merge_resolver:
+                                ok = resolve_merge_conflict(
+                                    step, slug, repo_dir, work_dir, branch,
+                                    cfg, run_dir, devin_argv, state)
+                                if ok:
+                                    _append_note(
+                                        rec, "merge conflict resolved by "
+                                             f"resolve-{step.name}")
+                    except RequestError as exc:
+                        ok = False
+                        _append_note(rec, "another merge holds this repo "
+                                          f"({exc}); worktree kept at "
+                                          f"{work_dir}")
+                    if ok:
                         rec["merged"] = True
-                    elif step.merge_resolver and resolve_merge_conflict(
-                            step, slug, repo_dir, work_dir, branch, cfg,
-                            run_dir, devin_argv, state):
-                        rec["merged"] = True
-                        _append_note(rec, "merge conflict resolved by "
-                                          f"resolve-{step.name}")
                     else:
                         rec.update(status="failed", merged=False)
                         _append_note(rec, "merge conflict; worktree kept "
@@ -2464,7 +2829,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
             print(f"    note: cloud workers see origin, not local state ({dirty})")
         tags = cloud + (" [worktree]" if s.worktree else "") \
             + (f" [wave {s.wave}]" if s.wave is not None else "") \
-            + (" [resolver]" if s.merge_resolver else "")
+            + (" [resolver]" if s.merge_resolver else "") \
+            + (" [deferred]" if s.merge == "deferred" else "")
         tries = f" x{s.max_attempts}" if s.max_attempts > 1 else ""
         print(f"  {s.name:<20} {slug:<22} model={s.model or '-':<10} "
               f"mode={s.mode:<8} timeout={s.timeout_min:g}m{tries}{tags}")
@@ -4659,33 +5025,366 @@ def resume_run(name: str, runs_dir: Path = RUNS_DIR,
     return {"resumed": name, "pid": _RESUME_PIDS[name]}
 
 
+def _git_dir(repo_dir: Path) -> Path | None:
+    r = _git(repo_dir, "rev-parse", "--git-dir")
+    if r.returncode != 0:
+        return None
+    p = Path(r.stdout.strip())
+    return p if p.is_absolute() else (repo_dir / p).resolve()
+
+
+class _RepoMergeLock:
+    """Serialize merge operations on one repo across conductor PROCESSES.
+
+    Two drivers (or a dashboard merge plus a CLI one) must never run `git
+    merge` against the same checkout/stage at once - merges are not
+    composable. The lock is an O_EXCL file under the repo's git dir holding
+    the holder's pid + timestamp; a lock left by a dead process is broken
+    once and retaken. `.git` is never a watched work tree, so this cannot
+    trip a live worker's user-edit awareness (trap 5).
+    """
+
+    def __init__(self, repo_dir: Path):
+        self.repo_dir = repo_dir
+        self.path: Path | None = None
+
+    def __enter__(self):
+        gd = _git_dir(self.repo_dir)
+        if gd is None:
+            raise RequestError(f"not a git repo: {self.repo_dir}", 500)
+        self.path = gd / "conductor-merge.lock"
+        for _attempt in (0, 1):
+            try:
+                fd = os.open(self.path,
+                             os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    info = json.loads(self.path.read_text(
+                        encoding="utf-8", errors="replace"))
+                except (OSError, ValueError):
+                    info = {}
+                # plain liveness, no since-window: a long-running serve
+                # process legitimately takes locks far after its start
+                if pid_alive(info.get("pid")):
+                    raise RequestError(
+                        f"another merge is already operating on "
+                        f"{self.repo_dir} (pid {info.get('pid')})", 409)
+                self.path.unlink(missing_ok=True)   # stale lock: break once
+                continue
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps({"pid": os.getpid(), "at": now_iso()}))
+            return self
+        raise RequestError(
+            f"another merge is already operating on {self.repo_dir}", 409)
+
+    def __exit__(self, *exc) -> None:
+        if self.path is not None:
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _branch_checked_out_at(repo_dir: Path, branch: str) -> Path | None:
+    """The worktree path where `branch` is checked out, if any."""
+    r = _git(repo_dir, "worktree", "list", "--porcelain")
+    if r.returncode != 0:
+        return None
+    want = f"refs/heads/{branch}"
+    wt: Path | None = None
+    for ln in r.stdout.splitlines():
+        if ln.startswith("worktree "):
+            wt = Path(ln[9:])
+        elif ln == f"branch {want}" and wt is not None:
+            return wt
+        elif ln.strip() == "" or ln.startswith("worktree "):
+            continue
+    return None
+
+
+def _any_live_step_in(repo_dir: Path, runs_dir: Path,
+                      exclude_run: str) -> str | None:
+    """Name of a live step (any run) whose worker watches `repo_dir` as its
+    work_dir - landing a merge into a checked-out target rewrites files
+    under it, which a live session reads as external edits (trap 5)."""
+    want = os.path.normcase(str(repo_dir.resolve()))
+    for sj in runs_dir.glob("*/state.json"):
+        if sj.parent.name == exclude_run:
+            continue
+        try:
+            st = json.loads(sj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        drv = driver_alive(st)
+        for n, rec in (st.get("steps") or {}).items():
+            if not step_live(rec, drv):
+                continue
+            wd = rec.get("work_dir") or rec.get("project")
+            if not wd:
+                continue
+            try:
+                wdp = os.path.normcase(str(Path(wd).resolve()))
+            except OSError:
+                continue
+            if wdp == want or want.startswith(wdp + os.sep):
+                return f"{sj.parent.name}:{n}"
+    return None
+
+
+def _land_staged(repo_dir: Path, target: str, staged_tip: str,
+                 staged_base: str, runs_dir: Path,
+                 exclude_run: str) -> tuple[bool, str]:
+    """Move the recorded target ref to the verified staged tip, atomically.
+
+    Target checked out in the main checkout -> `merge --ff-only`, which
+    refuses when the target moved past the staging base or local changes
+    overlap; a live agent watching the checkout blocks it first (trap 5).
+    Target not checked out anywhere -> `update-ref` with the expected old
+    value: the recheck of target movement is the atomicity mechanism.
+    """
+    co = _branch_checked_out_at(repo_dir, target)
+    if co is not None and os.path.normcase(str(co.resolve())) == \
+            os.path.normcase(str(repo_dir.resolve())):
+        watcher = _any_live_step_in(repo_dir, runs_dir, exclude_run)
+        if watcher:
+            return False, f"a live agent watches the checkout ({watcher})"
+        if merge_in_progress(repo_dir):
+            return False, "a merge is already in progress in the checkout"
+        r = _git(repo_dir, "merge", "--ff-only", staged_tip)
+        if r.returncode != 0:
+            return False, ("target moved or checkout not clean: "
+                           + (r.stderr or r.stdout).strip()[:200])
+        return True, ""
+    if co is not None:
+        return False, f"target branch is checked out at {co}"
+    r = _git(repo_dir, "update-ref", f"refs/heads/{target}",
+             staged_tip, staged_base)
+    if r.returncode != 0:
+        return False, ("target moved since staging (expected "
+                       f"{staged_base[:12]}): {(r.stderr or '').strip()[:160]}")
+    return True, ""
+
+
+def _merge_deferred_group(d: Path, st: dict, grp: dict, names: list[str],
+                          cfg: Manifest, devin_argv: list[str],
+                          runs_dir: Path, results: dict) -> None:
+    """Land one repo's pending VERIFIED deferred branches onto its recorded
+    target. The combination is prepared and verified in an isolated staging
+    worktree first; the target ref moves only on a fully merged + verified
+    stage, and only if it hasn't moved since staging began.
+
+    Unverified entries (failed/partial/blocked/verify-red) are never
+    included - they stay pending and surface in results['unverified'].
+    A conflict without a working resolver or a red combined verify keeps
+    the stage dir as recoverable state and leaves every unlanded entry
+    pending. Nothing here deletes retained work.
+    """
+    steps = st.get("steps") or {}
+    repo_dir = Path(grp["repo_dir"])
+    slug = grp.get("slug") or repo_dir.name
+    target = grp.get("target_branch")
+    order = {s.name: i for i, s in enumerate(cfg.steps)}
+    by_name = {s.name: s for s in cfg.steps}
+    verified: list[tuple[str, dict]] = []
+    for n in sorted(names, key=lambda x: order.get(x, 1 << 30)):
+        rec = steps.get(n)
+        if rec is None or not rec.get("branch") or rec.get("merged") is True:
+            continue
+        if rec.get("deferred_verified"):
+            verified.append((n, rec))
+        else:
+            results["unverified"].append(n)
+            _append_note(rec, "not merged: step is not verified "
+                              "(needs status=done and no red verify)")
+    if not verified:
+        return
+    if not target:
+        for n, _r in verified:
+            results["skipped"].append(n)
+        log_event(d, event="merge_skipped", reason="no recorded target",
+                  project=str(repo_dir))
+        return
+    thash = hashlib.sha1(
+        f"{_repo_key(repo_dir)}|{target}".encode()).hexdigest()[:10]
+    stage_wt = runs_dir.parent / "worktrees" / d.name / f"stage-{thash}"
+    stage_ref = sanitize_branch(f"conductor/{d.name}/stage-{thash}")
+    target_tip = _baseline_tip(repo_dir, target)
+    if target_tip is None:
+        for n, _r in verified:
+            results["skipped"].append(n)
+            _append_note(steps[n], f"not merged: target branch {target!r} "
+                                   "is gone")
+        return
+    with _RepoMergeLock(repo_dir):
+        if stage_wt.is_dir():
+            if merge_in_progress(stage_wt) or git_dirty_tracked(stage_wt):
+                # A prior attempt's stage is mid-merge or holds edited
+                # tracked files - recoverable state a human may be
+                # resolving in. Never clobber it. (A CLEAN kept stage is
+                # reproducible scratch: the pending branches are the real
+                # state, so a retry just rebuilds it.)
+                for n, _r in verified:
+                    results["kept"].append(n)
+                log_event(d, event="merge_kept", stage=str(stage_wt),
+                          project=str(repo_dir))
+                return
+            worktree_remove(repo_dir, stage_wt, stage_ref)
+            if stage_wt.is_dir():
+                # an unregistered leftover dir (crashed mid-remove)
+                shutil.rmtree(stage_wt, ignore_errors=True)
+        else:
+            _git(repo_dir, "branch", "-D", stage_ref)   # orphan ref cleanup
+        if not worktree_add(repo_dir, stage_wt, stage_ref, target_tip):
+            for n, _r in verified:
+                results["skipped"].append(n)
+            log_event(d, event="merge_stage_failed", project=str(repo_dir))
+            return
+        staged_base = target_tip
+        staged: list[tuple[str, dict]] = []
+        dv = (st.get("devin_argv")
+              or (shlex.split(st["devin"]) if st.get("devin") else None)
+              or devin_argv or ["devin"])
+        for n, rec in verified:
+            branch = rec["branch"]
+            tip = _baseline_tip(repo_dir, branch)
+            head = _git(stage_wt, "rev-parse", "HEAD").stdout.strip()
+            if tip is None:
+                results["skipped"].append(n)
+                _append_note(rec, "not merged: branch is gone")
+                continue
+            if head and _git(repo_dir, "merge-base", "--is-ancestor",
+                             tip, head).returncode == 0:
+                # tip already inside the stage (sequential chain covered
+                # by a later branch, or a zero-commit branch)
+                staged.append((n, rec))
+                continue
+            r = _git(stage_wt, "merge", "--no-edit", branch)
+            ok = r.returncode == 0
+            if not ok:
+                step_obj = by_name.get(n) or Step(
+                    name=n, project=slug, prompt="",
+                    merge_resolver=cfg.merge_resolver)
+                if (by_name.get(n) or step_obj).merge_resolver:
+                    ok = resolve_merge_conflict(
+                        step_obj, slug, repo_dir,
+                        Path(rec.get("work_dir") or stage_wt), branch, cfg,
+                        d, dv, st, merge_dir=stage_wt, already_started=True,
+                        remove_on_success=False, dirty_guard=False)
+                if not ok:
+                    if merge_in_progress(stage_wt):
+                        _git(stage_wt, "merge", "--abort")
+                    results["conflicted"].append(n)
+                    _append_note(rec, f"merge conflicts staging into "
+                                      f"{target}; kept pending, stage at "
+                                      f"{stage_wt}")
+                    continue
+            staged.append((n, rec))
+        if not staged:
+            worktree_remove(repo_dir, stage_wt, stage_ref)
+            return
+        # The combined result must pass each merged step's verify gate
+        # again - what lands on the target is the union, not each branch
+        # in isolation.
+        verify_failed: list[str] = []
+        seen_v: set[str] = set()
+        for n, _r in staged:
+            sobj = by_name.get(n)
+            v = sobj.verify if sobj and sobj.verify_must_pass else None
+            if not v or v in seen_v:
+                continue
+            seen_v.add(v)
+            try:
+                vp = subprocess.run(v, cwd=str(stage_wt), shell=True,
+                                    capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace",
+                                    timeout=600,
+                                    **hidden_subprocess_kwargs())
+                ok_v = vp.returncode == 0
+                out = (vp.stdout or "") + (vp.stderr or "")
+            except subprocess.TimeoutExpired:
+                ok_v = False
+                out = "staged verify timed out after 600s\n"
+            (d / f"{n}.mergeverify.log").write_text(
+                out, encoding="utf-8", errors="replace")
+            if not ok_v:
+                verify_failed.append(n)
+        if verify_failed:
+            results["verify_failed"].extend(verify_failed)
+            grp["stage_kept"] = str(stage_wt)
+            for n, _r in staged:
+                _append_note(steps[n], "combined result failed verify in "
+                                       f"the staging worktree; kept at "
+                                       f"{stage_wt} - nothing landed")
+            log_event(d, event="merge_verify_failed", project=str(repo_dir),
+                      steps=verify_failed)
+            return
+        staged_tip = _git(stage_wt, "rev-parse", "HEAD").stdout.strip()
+        landed, why = _land_staged(repo_dir, target, staged_tip,
+                                   staged_base, runs_dir, d.name)
+        if not landed:
+            # The target moved under us (or is dirty/watched) - the staged
+            # work is reproducible from the pending branches, so drop the
+            # stale stage and keep every entry pending for the next try.
+            results["moved"].append(slug)
+            grp["moved_reason"] = why
+            for n, _r in staged:
+                _append_note(steps[n], f"merge not landed: {why}")
+            worktree_remove(repo_dir, stage_wt, stage_ref)
+            log_event(d, event="merge_moved", project=str(repo_dir),
+                      reason=why)
+            return
+        for n, rec in staged:
+            rec["merged"] = True
+            _append_note(rec, f"deferred merge landed on {target} via "
+                              "staged+verified merge")
+            wt = Path(rec["work_dir"]) if rec.get("work_dir") else None
+            if wt and wt != stage_wt:
+                worktree_remove(repo_dir, wt, rec["branch"])
+            if n in grp["entries"]:
+                grp["entries"].remove(n)
+            results["merged"].append(n)
+        worktree_remove(repo_dir, stage_wt, stage_ref)
+        grp.pop("stage_kept", None)
+        log_event(d, event="merge_landed", project=str(repo_dir),
+                  target=target, steps=[n for n, _r in staged],
+                  tip=staged_tip)
+
+
 _MERGE_BUSY: set[str] = set()
 _MERGE_LOCK = threading.Lock()
 
 
 def merge_run(name: str, runs_dir: Path = RUNS_DIR,
-              devin_argv: list[str] | None = None) -> dict:
-    """Merge a finished run's pending worktree branches back into their main
-    checkouts - the dashboard's manual counterpart to the post-wave merge.
-    Same rules: a clean merge lands and removes the worktree; a conflict
-    parks it (or, when the step has merge_resolver, spawns a resolve-*
-    session). Refused while the run has a live step, an in-flight resume,
-    or another merge already running - a resolve-* session can take
-    minutes and two callers must never race the same merge."""
+              devin_argv: list[str] | None = None,
+              only: list[str] | None = None) -> dict:
+    """Merge a finished run's pending worktree branches - the dashboard's
+    manual counterpart to the post-wave merge, and the explicit human
+    request that lands deferred work.
+
+    Legacy parked branches (auto-policy conflicts) keep the direct
+    merge-into-checkout path. Deferred entries go through the staged
+    pipeline: prepared + verified in an isolated worktree, target movement
+    rechecked, landed atomically, serialized per repo, resolver-honored;
+    unverified work is never included and retained work is never deleted.
+
+    `only` restricts the operation to the named steps (for landing one
+    alternative instead of combining them all). Refused while the run has
+    a live step, an in-flight resume, or another merge already running."""
     with _MERGE_LOCK:
         if name in _MERGE_BUSY:
             raise RequestError("A merge is already running for this run",
                                409)
         _MERGE_BUSY.add(name)
     try:
-        return _merge_run(name, runs_dir, devin_argv)
+        return _merge_run(name, runs_dir, devin_argv, only)
     finally:
         with _MERGE_LOCK:
             _MERGE_BUSY.discard(name)
 
 
 def _merge_run(name: str, runs_dir: Path,
-               devin_argv: list[str] | None) -> dict:
+               devin_argv: list[str] | None,
+               only: list[str] | None = None) -> dict:
     if not RUN_DIR_RE.fullmatch(name):
         raise RequestError("Invalid run dir", 404)
     d = (runs_dir / name).resolve()
@@ -4702,21 +5401,31 @@ def _merge_run(name: str, runs_dir: Path,
     pid = _RESUME_PIDS.get(name)
     if pid and pid_alive(pid):
         raise RequestError("A resume is already running for this run", 409)
+    onlyset = set(only) if only else None
     pending = {n for n, r in steps.items()
-               if r.get("branch") and r.get("merged") is not True}
-    if not pending:
-        return {"dir": name, "merged": [], "conflicted": [], "skipped": []}
+               if r.get("branch") and r.get("merged") is not True
+               and not r.get("deferred")}
+    if onlyset is not None:
+        pending &= onlyset
+    if not pending and not (st.get("pending_merges") or {}):
+        return {"dir": name, "merged": [], "conflicted": [], "skipped": [],
+                "unverified": [], "verify_failed": [], "moved": [],
+                "busy": [], "kept": []}
     manifest = st.get("manifest")
     if not manifest or not Path(manifest).is_file():
         raise RequestError("Run's manifest is gone; merge the branches "
                            "by hand from each kept worktree", 409)
     cfg = load_manifest(Path(manifest))
     projects = load_projects()
-    results = {"dir": name, "merged": [], "conflicted": [], "skipped": []}
+    results = {"dir": name, "merged": [], "conflicted": [], "skipped": [],
+               "unverified": [], "verify_failed": [], "moved": [],
+               "busy": [], "kept": []}
     for step in cfg.steps:                    # manifest order, like cmd_run
         rec = steps.get(step.name) or {}
         branch = rec.get("branch")
-        if not branch or rec.get("merged") is True:
+        if not branch or rec.get("merged") is True \
+                or rec.get("deferred") \
+                or (onlyset is not None and step.name not in onlyset):
             continue
         try:
             repo_dir, slug = resolve_project(step, projects,
@@ -4734,16 +5443,25 @@ def _merge_run(name: str, runs_dir: Path,
             continue
         # Clear a stale conductor merge left by a dead run before trying
         # ours; a human's merge in progress makes worktree_merge refuse.
-        if abort_own_merge(repo_dir):
-            log_event(d, event="merge_abort_stale", step=step.name,
-                      project=str(repo_dir))
-        ok = worktree_merge(repo_dir, wt, branch)
-        if not ok and step.merge_resolver:
-            dv = (st.get("devin_argv")
-                  or (shlex.split(st["devin"]) if st.get("devin") else None)
-                  or devin_argv or ["devin"])
-            ok = resolve_merge_conflict(step, slug, repo_dir, wt, branch,
-                                        cfg, d, dv, st)
+        # The repo merge lock serializes us against other conductors'
+        # in-flight merges on the same repo.
+        try:
+            with _RepoMergeLock(repo_dir):
+                if abort_own_merge(repo_dir):
+                    log_event(d, event="merge_abort_stale", step=step.name,
+                              project=str(repo_dir))
+                ok = worktree_merge(repo_dir, wt, branch)
+                if not ok and step.merge_resolver:
+                    dv = (st.get("devin_argv")
+                          or (shlex.split(st["devin"])
+                              if st.get("devin") else None)
+                          or devin_argv or ["devin"])
+                    ok = resolve_merge_conflict(step, slug, repo_dir, wt,
+                                                branch, cfg, d, dv, st)
+        except RequestError as exc:
+            rec["note"] = f"merge deferred: {exc}"
+            results["busy"].append(step.name)
+            continue
         if ok:
             rec.update(status="done" if rec.get("status") == "failed"
                        else rec.get("status"),
@@ -4761,14 +5479,57 @@ def _merge_run(name: str, runs_dir: Path,
         # recorded branch belongs to a step the manifest no longer names
         steps[n]["note"] = "merge skipped: step not in the manifest anymore"
         results["skipped"].append(n)
+    # Deferred pending merges: per-repo groups land through the staged
+    # pipeline, entries in manifest order.
+    for key, grp in (st.get("pending_merges") or {}).items():
+        names = [n for n in grp.get("entries") or []
+                 if onlyset is None or n in onlyset]
+        if not names:
+            continue
+        try:
+            _merge_deferred_group(d, st, grp, names, cfg,
+                                  devin_argv, runs_dir, results)
+        except RequestError as exc:
+            results["busy"].append(grp.get("slug") or key)
+            log_event(d, event="merge_busy", project=grp.get("repo_dir"),
+                      reason=str(exc))
     save_state(d, st)
     log_event(d, event="merge_manual", merged=results["merged"],
-              conflicted=results["conflicted"], skipped=results["skipped"])
+              conflicted=results["conflicted"], skipped=results["skipped"],
+              unverified=results["unverified"],
+              verify_failed=results["verify_failed"],
+              moved=results["moved"], busy=results["busy"],
+              kept=results["kept"])
     try:
         (runs_dir.parent / "worktrees" / d.name).rmdir()
     except OSError:
         pass
     return results
+
+
+def cmd_merge(args: argparse.Namespace) -> int:
+    """CLI handle for the explicit merge: land a run's pending branches -
+    the same op the dashboard's 'Merge pending branches' button runs.
+    For deferred runs this is THE merge: staged, verified, serialized."""
+    try:
+        out = merge_run(args.run_dir,
+                        Path(args.runs_dir).resolve()
+                        if args.runs_dir else RUNS_DIR,
+                        shlex.split(args.devin) if args.devin else None,
+                        only=args.steps or None)
+    except RequestError as exc:
+        print(f"merge: {exc}")
+        return 2
+    for key in ("merged", "conflicted", "skipped", "unverified",
+                "verify_failed", "moved", "busy", "kept"):
+        if out.get(key):
+            print(f"  {key}: {', '.join(out[key])}")
+    if not any(out.get(k) for k in
+               ("merged", "conflicted", "skipped", "unverified",
+                "verify_failed", "moved", "busy", "kept")):
+        print("nothing pending to merge")
+    return 1 if (out["conflicted"] or out["verify_failed"] or out["moved"]
+                 or out["busy"] or out["kept"]) else 0
 
 
 def _run_dir_checked(name: str, runs_dir: Path) -> tuple[Path, dict]:
@@ -7607,6 +8368,16 @@ document.addEventListener('click', async e=>{
       if (out.conflicted?.length)
         bits.push(`still conflicted (worktree kept): ${out.conflicted.join(', ')}`);
       if (out.skipped?.length) bits.push(`skipped: ${out.skipped.join(', ')}`);
+      if (out.unverified?.length)
+        bits.push(`not verified, kept pending: ${out.unverified.join(', ')}`);
+      if (out.verify_failed?.length)
+        bits.push(`combined verify failed (stage kept): ${out.verify_failed.join(', ')}`);
+      if (out.moved?.length)
+        bits.push(`target moved mid-merge, nothing landed: ${out.moved.join(', ')}`);
+      if (out.busy?.length)
+        bits.push(`repo busy with another merge: ${out.busy.join(', ')}`);
+      if (out.kept?.length)
+        bits.push(`prior merge attempt kept for inspection: ${out.kept.join(', ')}`);
       await refresh();
       if (rk) showRunDetails(rk);
       alert(bits.length ? bits.join(' | ') : 'Nothing pending to merge.');
@@ -8085,7 +8856,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     self._json(resume_run(m.group(1), runs_dir,
                                           devin_argv), 202)
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/merge", path)):
-                    self._json(merge_run(m.group(1), runs_dir, devin_argv))
+                    only = body.get("steps") if isinstance(
+                        body.get("steps"), list) else None
+                    self._json(merge_run(m.group(1), runs_dir, devin_argv,
+                                         only=only))
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/stop", path)):
                     self._json(stop_run(m.group(1), body, runs_dir), 202)
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/pause", path)):
@@ -8232,6 +9006,8 @@ def main(argv: list[str] | None = None) -> int:
             ("status", cmd_status, "show a run's step table"),
             ("serve", cmd_serve, "live dashboard of all runs + agents"),
             ("sweep", cmd_sweep, "mark orphaned running/queued records lost"),
+            ("merge", cmd_merge,
+             "land a run's pending (deferred/parked) branches"),
             ("sessions", cmd_sessions,
              "list / clean up conductor-spawned devin sessions"),
             ("demo", cmd_demo, "self-test against a mock devin")):
@@ -8245,12 +9021,12 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--max-parallel", type=int, default=None,
                            help="cap concurrent agents (overrides the "
                                 "manifest's run.max_parallel)")
-        if name in ("plan", "run", "demo", "sessions", "sweep"):
+        if name in ("plan", "run", "demo", "sessions", "sweep", "merge"):
             p.add_argument("--devin", default=None,
                            help="devin command override (e.g. mock shim). "
                                 "Split with shlex - quote or use forward "
                                 "slashes in Windows paths")
-        if name in ("run", "demo", "serve", "sweep", "sessions"):
+        if name in ("run", "demo", "serve", "sweep", "sessions", "merge"):
             p.add_argument("--runs-dir", default=None, help=argparse.SUPPRESS)
         if name in ("sessions", "sweep"):
             p.add_argument("--keep-hours", type=float, default=48,
@@ -8270,9 +9046,14 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--port", type=int, default=SERVE_PORT)
         if name == "status":
             p.add_argument("run_dir", nargs="?", default=None)
+        if name == "merge":
+            p.add_argument("run_dir")
+            p.add_argument("--steps", nargs="+", default=None,
+                           help="merge only these steps (pick one of "
+                                "several parked alternatives)")
     args = ap.parse_args(argv)
     return {"plan": cmd_plan, "run": cmd_run, "status": cmd_status,
-            "serve": cmd_serve, "sweep": cmd_sweep,
+            "serve": cmd_serve, "sweep": cmd_sweep, "merge": cmd_merge,
             "sessions": cmd_sessions, "demo": cmd_demo}[args.cmd](args)
 
 

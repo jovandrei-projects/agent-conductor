@@ -99,3 +99,20 @@ the worktree and fails the step - unless `merge_resolver = true` ([run]
 or per-step), which spawns a `resolve-<step>` session in the main
 checkout mid-merge to finish it. See `lab-merge-stress.toml` for a
 4-wave manifest exercising every merge case against lab-a/b/c fixtures.
+
+## Deferred merges
+
+`merge = "deferred"` (on `[run]` or a `[[step]]`; default `"auto"`)
+separates worktree isolation from merging: every step branch, worktree,
+commit and verify result is RETAINED in `state.json`'s `pending_merges`
+until a human runs `python conductor.py merge <run_dir>` (or clicks the
+dashboard's Merge pending branches; `{"steps":[...]}` in the POST body
+picks out one alternative). Sequential deferred steps on a project still
+see each other's verified work: each branches off the run's integration
+baseline `conductor/<run>/baseline-<slug>`, which fast-forwards over a
+step only after it verifies. Same-wave same-project steps are
+alternatives - parked apart, never auto-combined. The explicit merge
+stages the verified entries in an isolated worktree, re-runs their
+verify gates there, and moves the recorded target ref only when the
+combination is clean and the target hasn't moved. A red combined verify,
+a conflict, or a busy repo keeps every pending branch for inspection.

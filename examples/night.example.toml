@@ -29,6 +29,18 @@ checkpoint = true
                      # finish the merge (mid-merge) instead of only parking
                      # the worktree for a human. Also settable per step.
                      # Refused on a dirty main checkout. Default: off.
+# merge = "deferred"     # default "auto": worktree branches merge back
+                     # after each step. "deferred" instead RETAINS every
+                     # branch, worktree, commit and verify result as a
+                     # pending merge (state.json -> pending_merges) until a
+                     # human runs `conductor.py merge <run_dir>` or clicks
+                     # Merge pending branches. Sequential steps then branch
+                     # off a per-run integration baseline branch so each
+                     # still sees its verified predecessors; same-wave
+                     # same-project steps stay separate alternatives. The
+                     # explicit merge stages+re-verifies the combination in
+                     # an isolated worktree before the target moves - a
+                     # failed verify there lands nothing.
 
 [defaults]
 model = "swe"          # cheap model for grind phases; use "opus"/"gpt" for planning

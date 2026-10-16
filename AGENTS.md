@@ -129,7 +129,32 @@ resolver that can't finish -> same abort+keep path). `--resume`
 finalizes unmerged branches instead of re-running them (a conflicted
 branch can't be fixed by re-running - it shares the merge base), and
 aborts a stale `conductor/*` merge-in-progress first - a human's merge is
-never touched.
+never touched. All merges - post-wave, resume-finalize, dashboard,
+deferred staging - serialize on a per-repo `.git/conductor-merge.lock`
+(pid + timestamp, broken when the holder pid is dead) since two drivers
+have raced merges and stale-aborts on the same checkout before.
+
+`merge = "deferred"` (per-step or `[run]` default; implies
+`worktree = true`, incompatible with `cloud`) separates isolation from
+merging: nothing lands after the wave - branch, worktree, commits and
+verify results stay pending in `state.json`'s `pending_merges` until a
+human runs `python conductor.py merge <run_dir>` or clicks Merge pending
+branches (`{"steps": [...]}` lands a subset). Sequential deferred steps
+on one project still see verified predecessors: each branches off the
+run's integration baseline `conductor/<run>/baseline-<slug>`, which
+fast-forwards over a step only after status=done AND a green verify, and
+absorbs target-branch movement via `merge-tree` plumbing between steps.
+Same-wave same-project members are `alternative`s - parked apart, never
+auto-combined. The explicit merge stages the verified entries in an
+isolated `stage-<hash>` worktree, re-runs their `verify` gates on the
+combination (`verify_must_pass=false` gates skipped; a verify-red step
+is never even staged), resolves conflicts via merge_resolver IN the
+stage, then moves the recorded target atomically (`update-ref` expected
+value when the target isn't checked out, `merge --ff-only` when it is -
+refused while dirty or watched by a live agent). A red combined verify
+or a mid-merge/dirty stage keeps everything pending (stage kept for
+inspection); a moved target drops the scratch stage - pending branches
+are always the durable state, never deleted by cleanup paths.
 
 `manifests/` holds real manifests (hand-written `<project>-<what>.toml` and
 UI-generated `<YYYYMMDD-HHMMSS>-<random>-<run>.toml`, flat; see its README);
