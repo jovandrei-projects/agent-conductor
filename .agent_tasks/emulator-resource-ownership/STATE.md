@@ -5,7 +5,7 @@ concurrent mobile steps allocate/target Android devices, then implement the
 minimum reliable coordination if unsafe: serial assignment, cross-run
 ownership, queueing on a shared device, safe lifecycle/cleanup.
 
-**Status:** in progress   **Started:** 2026-10-16   **Last touched:** 2026-10-16
+**Status:** done   **Started:** 2026-10-16   **Last touched:** 2026-10-16
 
 ## Findings (evidence, not assumptions)
 
@@ -77,11 +77,13 @@ ownership, queueing on a shared device, safe lifecycle/cleanup.
 - [x] Tests: 14 DeviceOwnershipTests - competing projects, explicit
       targeting, cancellation, stale recovery, unavailable, boot+image-guard
       reap, verify env, manifest validation, no-device regression
-- [ ] Full suite green + commit + notes
+- [x] Full suite green + commit + notes
 
 ## Where it stopped
 
-All code + tests landed; final full-suite run in flight, then commits.
+Done - landed on branch
+conductor/20261016-013719-workflow-ux-safety/emulator-resource-ownership
+as 4875390 + dac3f18; 380/380 + demo green.
 
 ## Deferred or blocked
 
