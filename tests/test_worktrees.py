@@ -1167,5 +1167,604 @@ class TimeoutOverrideTests(unittest.TestCase):
                     missing_ok=True)
 
 
+class DeferredMergeTests(unittest.TestCase):
+    """merge="deferred": worktree isolation WITHOUT the automatic merge-back.
+
+    Branches, worktrees, commits and verify results stay pending in
+    state["pending_merges"] until merge_run (the explicit human merge)
+    stages + verifies + lands them onto the recorded target. Sequential
+    steps see verified predecessors via the per-run/per-project
+    integration baseline; wave siblings stay separate alternatives.
+    """
+
+    def _deferred_manifest(self, base: Path, proj: Path,
+                           steps: list[str], extra: str = "") -> Path:
+        """steps: raw [[step]] TOML strings; merge=deferred set run-wide."""
+        return write_manifest(base, "\n".join(steps),
+                              extra='merge = "deferred"\n' + extra)
+
+    def _dstep(self, proj: Path, name: str, prompt: str,
+               more: str = "") -> str:
+        return f'''[[step]]
+name = "{name}"
+project = "{proj.as_posix()}"
+prompt = "{prompt}"
+{more}'''
+
+    def _pending(self, st: dict, proj: Path) -> dict:
+        key = conductor._repo_key(proj)
+        return (st.get("pending_merges") or {}).get(key) or {}
+
+    # ------------------------------------------------ manifest validation
+
+    def test_deferred_implies_worktree_and_validates(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            m = self._deferred_manifest(
+                base, proj, [self._dstep(proj, "a", "write A.txt")])
+            cfg = conductor.load_manifest(m)
+            self.assertTrue(cfg.steps[0].worktree)      # implied
+            self.assertEqual(cfg.steps[0].merge, "deferred")
+            bad = write_manifest(base, f'''[[step]]
+name = "x"
+project = "{proj.as_posix()}"
+prompt = "x"
+worktree = false
+merge = "deferred"
+''')
+            with self.assertRaises(conductor.ManifestError):
+                conductor.load_manifest(bad)
+            bad2 = write_manifest(base, f'''[[step]]
+name = "x"
+project = "{proj.as_posix()}"
+prompt = "x"
+cloud = true
+merge = "deferred"
+''')
+            with self.assertRaises(conductor.ManifestError):
+                conductor.load_manifest(bad2)
+            bad3 = write_manifest(base, f'''[[step]]
+name = "x"
+project = "{proj.as_posix()}"
+prompt = "x"
+merge = "whenever"
+''')
+            with self.assertRaises(conductor.ManifestError):
+                conductor.load_manifest(bad3)
+
+    # ------------------------------------------------------- retention
+
+    def test_deferred_retains_everything_as_pending(self):
+        """The run ends with main untouched: branch, worktree, commits,
+        verify result and pending-merge metadata all persist."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = self._deferred_manifest(
+                base, proj, [self._dstep(
+                    proj, "one", "write A.txt",
+                    'verify = "if not exist A.txt exit 1"')])
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, rd = state_of(runs)
+            rec = st["steps"]["one"]
+            self.assertEqual(rec["status"], "done")
+            self.assertTrue(rec["deferred"])
+            self.assertTrue(rec["deferred_verified"])
+            self.assertEqual(rec["verify_ok"], True)
+            self.assertIsNot(rec.get("merged"), True)
+            self.assertEqual(rec["merge_kind"], "sequential")
+            self.assertTrue(Path(rec["work_dir"]).is_dir())
+            self.assertTrue(rec.get("branch"))
+            # main untouched, worktree has the work
+            self.assertFalse((proj / "A.txt").exists())
+            self.assertTrue((Path(rec["work_dir"]) / "A.txt").is_file())
+            grp = self._pending(st, proj)
+            self.assertEqual(grp["entries"], ["one"])
+            self.assertEqual(grp["target_branch"],
+                             git(proj, "rev-parse", "--abbrev-ref",
+                                 "HEAD").stdout.strip())
+            baseline = grp["baseline"]
+            self.assertIn("baseline", baseline)
+            # recorded target tip = where the target branch sat at prep
+            self.assertEqual(
+                grp["target_sha"],
+                git(proj, "rev-parse", grp["target_branch"]).stdout.strip())
+            # a verified SEQUENTIAL step fast-forwards the baseline over
+            # its own tip
+            self.assertEqual(
+                git(proj, "rev-parse", baseline).stdout.strip(),
+                git(proj, "rev-parse", rec["branch"]).stdout.strip())
+            # retained work is never debris/deleted: worktree list shows
+            # the step worktree AND nothing merged into the checkout
+            self.assertIn(rd.name, git(proj, "worktree", "list",
+                                       "--porcelain").stdout)
+
+    # ------------------------------------------------- sequential chain
+
+    def test_sequential_steps_see_verified_predecessors(self):
+        """s2 branches off the baseline AFTER s1 verified - its worktree
+        contains s1's A.txt even though main never merged it."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = self._deferred_manifest(base, proj, [
+                self._dstep(proj, "s1", "write A.txt"),
+                # gate fails unless s1's A.txt is visible in s2's worktree
+                self._dstep(proj, "s2", "append A.txt",
+                            'verify = "if not exist A.txt exit 1"')])
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, rd = state_of(runs)
+            for n in ("s1", "s2"):
+                self.assertEqual(st["steps"][n]["status"], "done")
+                self.assertTrue(st["steps"][n]["deferred_verified"])
+                self.assertEqual(st["steps"][n]["merge_kind"],
+                                 "sequential")
+            self.assertFalse((proj / "A.txt").exists())   # still pending
+            # baseline advanced over BOTH verified sequential steps
+            grp = self._pending(st, proj)
+            self.assertEqual(
+                git(proj, "rev-parse", grp["baseline"]).stdout.strip(),
+                git(proj, "rev-parse",
+                    st["steps"]["s2"]["branch"]).stdout.strip())
+            # the s2 worktree really saw s1's file (2 mock lines on A.txt)
+            wt2 = Path(st["steps"]["s2"]["work_dir"])
+            self.assertEqual(
+                len((wt2 / "A.txt").read_text().splitlines()), 2)
+            # explicit merge lands both onto the recorded target
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], ["s1", "s2"])
+            self.assertEqual(len((proj / "A.txt")
+                                 .read_text().splitlines()), 2)
+            st, _ = state_of(runs)
+            grp = self._pending(st, proj)
+            self.assertEqual(grp["entries"], [])
+            for n in ("s1", "s2"):
+                self.assertTrue(st["steps"][n]["merged"])
+                self.assertFalse(
+                    Path(st["steps"][n]["work_dir"]).is_dir())
+
+    def test_failed_step_blocks_dependents_baseline(self):
+        """s1 fails verify -> baseline does not advance -> s2 (its own
+        work aside) does NOT see s1's file, and stays unverified itself
+        when it depends on it. s2's verify gate trips."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = self._deferred_manifest(base, proj, [
+                self._dstep(proj, "s1", "write A.txt",
+                            'verify = "exit 1"'),   # red gate
+                self._dstep(proj, "s2", "write B.txt",
+                            'verify = "if not exist A.txt exit 1"')],
+                extra='on_failure = "continue"\n')
+            # s2's verify cannot pass - s1's output never reached it
+            # (s2 writes its own B.txt, only CHECKS for A.txt)
+            run_manifest(m, runs)
+            st, _ = state_of(runs)
+            self.assertEqual(st["steps"]["s1"]["verify_ok"], False)
+            self.assertFalse(st["steps"]["s1"]["deferred_verified"])
+            self.assertEqual(st["steps"]["s2"]["verify_ok"], False)
+            self.assertFalse(st["steps"]["s2"]["deferred_verified"])
+            self.assertTrue((Path(st["steps"]["s2"]["work_dir"])
+                             / "B.txt").is_file())     # its own work done
+            # baseline never advanced over s1's unverified tip (sync may
+            # still fold in target-branch movement - what it must NOT
+            # contain is the failed step's work)
+            grp = self._pending(st, proj)
+            self.assertNotEqual(
+                git(proj, "merge-base", "--is-ancestor",
+                    st["steps"]["s1"]["branch"],
+                    grp["baseline"]).returncode, 0)
+
+    # ---------------------------------------------------- alternatives
+
+    def test_wave_alternatives_stay_separate_and_selectable(self):
+        """Two same-project wave members are 'alternative' kind: neither
+        joins the baseline, merge_run can land ONE without the other."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = self._deferred_manifest(base, proj, [
+                self._dstep(proj, "altA", "write A.txt", "wave = 1"),
+                self._dstep(proj, "altB", "write B.txt", "wave = 1")])
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, rd = state_of(runs)
+            for n in ("altA", "altB"):
+                self.assertEqual(st["steps"][n]["merge_kind"],
+                                 "alternative")
+                self.assertTrue(st["steps"][n]["deferred_verified"])
+            grp = self._pending(st, proj)
+            self.assertEqual(
+                git(proj, "rev-parse", grp["baseline"]).stdout.strip(),
+                grp["target_sha"])          # baseline untouched by them
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK),
+                                      only=["altB"])
+            self.assertEqual(out["merged"], ["altB"])
+            self.assertTrue((proj / "B.txt").is_file())
+            self.assertFalse((proj / "A.txt").exists())     # altA held back
+            st, _ = state_of(runs)
+            self.assertTrue(st["steps"]["altB"]["merged"])
+            self.assertIsNot(st["steps"]["altA"].get("merged"), True)
+            self.assertTrue(
+                Path(st["steps"]["altA"]["work_dir"]).is_dir())
+            self.assertEqual(self._pending(st, proj)["entries"], ["altA"])
+
+    # -------------------------------------------------------- retries
+
+    def test_retry_resume_keeps_pending_identity(self):
+        """A failed deferred step re-runs on resume in the SAME worktree on
+        the SAME branch; the pending entry survives, then verifies and can
+        be landed."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = self._deferred_manifest(
+                base, proj, [self._dstep(proj, "flaky",
+                                         "mockfail write A.txt")],
+                extra='on_failure = "continue"\n')
+            self.assertEqual(run_manifest(m, runs), 1)
+            st, rd = state_of(runs)
+            rec = st["steps"]["flaky"]
+            self.assertEqual(rec["status"], "failed")
+            self.assertTrue(rec["deferred"])
+            self.assertFalse(rec["deferred_verified"])
+            self.assertTrue(Path(rec["work_dir"]).is_dir())
+            self.assertEqual(self._pending(st, proj)["entries"], ["flaky"])
+            # resume with the mockfail removed -> same branch+worktree
+            m2 = self._deferred_manifest(
+                base, proj, [self._dstep(proj, "flaky", "write A.txt")],
+                extra='on_failure = "continue"\n')
+            self.assertEqual(run_manifest(m2, runs, resume=str(rd)), 0)
+            st, _ = state_of(runs)
+            rec2 = st["steps"]["flaky"]
+            self.assertEqual(rec2["status"], "done")
+            self.assertTrue(rec2["deferred_verified"])
+            self.assertEqual(rec2["branch"], rec["branch"])
+            self.assertEqual(rec2["work_dir"], rec["work_dir"])
+            self.assertEqual(self._pending(st, proj)["entries"], ["flaky"])
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], ["flaky"])
+            self.assertTrue((proj / "A.txt").is_file())
+
+    # ------------------------------------------------ restart recovery
+
+    def test_restart_preserves_pending_merges(self):
+        """After the run ends, a fresh process (--resume or merge_run)
+        sees the same pending state - nothing is recomputed or lost."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = self._deferred_manifest(base, proj, [
+                self._dstep(proj, "one", "write A.txt"),
+                self._dstep(proj, "two", "write B.txt")])
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, rd = state_of(runs)
+            grp0 = self._pending(st, proj)
+            # --resume on an all-done deferred run: no step re-runs, no
+            # merge happens, pending entries untouched
+            self.assertEqual(run_manifest(m, runs, resume=str(rd)), 0)
+            st, _ = state_of(runs)
+            grp = self._pending(st, proj)
+            self.assertEqual(grp["entries"], ["one", "two"])
+            self.assertEqual(grp["baseline"], grp0["baseline"])
+            self.assertEqual(grp["target_branch"], grp0["target_branch"])
+            self.assertEqual(grp["target_sha"], grp0["target_sha"])
+            self.assertFalse((proj / "A.txt").exists())
+            # merge_run still works purely from disk state
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(sorted(out["merged"]), ["one", "two"])
+
+    def test_interrupted_stage_is_never_clobbered(self):
+        """A stage left mid-merge (human resolving, or a crash) is kept:
+        the next merge_run reports 'kept' and changes nothing."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = self._deferred_manifest(
+                base, proj, [self._dstep(proj, "one", "write A.txt")])
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, rd = state_of(runs)
+            grp = self._pending(st, proj)
+            # fabricate the stage dir with a merge in progress
+            thash = __import__("hashlib").sha1(
+                f"{conductor._repo_key(proj)}|{grp['target_branch']}"
+                .encode()).hexdigest()[:10]
+            stage = runs.parent / "worktrees" / rd.name / f"stage-{thash}"
+            stage.mkdir(parents=True)
+            git(proj, "worktree", "add", "--detach", str(stage),
+                grp["target_sha"])
+            (stage / "WORK.txt").write_text("conflict\n", encoding="utf-8")
+            git(stage, "add", "-A")
+            git(stage, "commit", "-m", "stage side")
+            git(proj, "checkout", "-b", "tmp-other")
+            (proj / "WORK.txt").write_text("other\n", encoding="utf-8")
+            git(proj, "add", "-A")
+            git(proj, "commit", "-m", "other")
+            git(proj, "checkout", grp["target_branch"])
+            git(stage, "merge", "--no-edit", "tmp-other")  # conflicts
+            self.assertTrue(conductor.merge_in_progress(stage))
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["kept"], ["one"])
+            self.assertEqual(out["merged"], [])
+            self.assertTrue(conductor.merge_in_progress(stage))
+            # nothing landed; entry still pending
+            st, _ = state_of(runs)
+            self.assertEqual(self._pending(st, proj)["entries"], ["one"])
+            git(stage, "merge", "--abort")                 # fixture clean
+            git(proj, "branch", "-D", "tmp-other")
+
+    # --------------------------------------------------- non-main target
+
+    def test_non_main_recorded_target(self):
+        """Project checked out on 'release' when the run starts: pending
+        merges record it as their target and land on it, not on master."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            git(proj, "checkout", "-b", "release")
+            runs = base / "runs"
+            m = self._deferred_manifest(
+                base, proj, [self._dstep(proj, "one", "write A.txt")])
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, rd = state_of(runs)
+            grp = self._pending(st, proj)
+            self.assertEqual(grp["target_branch"], "release")
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], ["one"])
+            self.assertTrue((proj / "A.txt").is_file())
+            self.assertEqual(git(proj, "rev-parse", "--abbrev-ref",
+                                 "HEAD").stdout.strip(), "release")
+            # master never received it
+            self.assertEqual(
+                git(proj, "rev-parse", "master").stdout.strip(),
+                git(proj, "rev-list", "--max-parents=0",
+                    "master").stdout.strip())
+
+    def test_unborn_or_detached_target_fails_clean(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            git(proj, "checkout", "--detach", "HEAD")
+            runs = base / "runs"
+            m = self._deferred_manifest(
+                base, proj, [self._dstep(proj, "one", "write A.txt")])
+            self.assertEqual(run_manifest(m, runs), 1)
+            st, _ = state_of(runs)
+            self.assertEqual(st["steps"]["one"]["status"], "failed")
+            self.assertIn("detached", st["steps"]["one"]["note"])
+
+    # ------------------------------------------- failed verification
+
+    def test_failed_verify_never_merges_its_output(self):
+        """A done-but-verify-red step stays pending and its branch's work
+        never reaches the target - while a verified sibling still lands."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = self._deferred_manifest(base, proj, [
+                self._dstep(proj, "bad", "write BAD.txt",
+                            'verify = "exit 1"'),
+                self._dstep(proj, "good", "write G.txt",
+                            'verify = "exit 0"')],
+                extra='on_failure = "continue"\n')
+            run_manifest(m, runs)
+            st, rd = state_of(runs)
+            self.assertFalse(st["steps"]["bad"]["deferred_verified"])
+            self.assertTrue(st["steps"]["good"]["deferred_verified"])
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["unverified"], ["bad"])
+            self.assertEqual(out["merged"], ["good"])
+            self.assertTrue((proj / "G.txt").is_file())
+            self.assertFalse((proj / "BAD.txt").exists())   # excluded
+            # retained for inspection, entry still pending
+            st, _ = state_of(runs)
+            self.assertTrue(
+                Path(st["steps"]["bad"]["work_dir"]).is_dir())
+            self.assertTrue((Path(st["steps"]["bad"]["work_dir"])
+                             / "BAD.txt").is_file())
+            self.assertEqual(self._pending(st, proj)["entries"], ["bad"])
+
+    def test_combined_verify_failure_lands_nothing(self):
+        """Each branch verified alone, but the UNION fails a step's gate:
+        s2's GATE.txt trips s1's verify in the stage -> nothing lands,
+        stage kept, all entries stay pending."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = self._deferred_manifest(base, proj, [
+                self._dstep(proj, "s1", "write A.txt",
+                            'verify = "if exist GATE.txt exit 1"'),
+                self._dstep(proj, "s2", "write GATE.txt")])
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, rd = state_of(runs)
+            self.assertTrue(st["steps"]["s1"]["deferred_verified"])
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["verify_failed"], ["s1"])
+            self.assertEqual(out["merged"], [])
+            self.assertFalse((proj / "A.txt").exists())
+            self.assertFalse((proj / "GATE.txt").exists())
+            st, _ = state_of(runs)         # merge_run persisted the updates
+            grp = self._pending(st, proj)
+            self.assertEqual(grp["entries"], ["s1", "s2"])
+            self.assertTrue(Path(grp["stage_kept"]).is_dir())
+            # branches/worktrees retained for inspection
+            for n in ("s1", "s2"):
+                self.assertTrue(
+                    Path(st["steps"][n]["work_dir"]).is_dir())
+
+    # --------------------------------------------- target movement + lock
+
+    def test_target_movement_between_run_and_merge(self):
+        """Main gained human commits after the run: the stage is built at
+        the NEW tip and the merge still lands cleanly."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = self._deferred_manifest(
+                base, proj, [self._dstep(proj, "one", "write A.txt")])
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, rd = state_of(runs)
+            (proj / "HUMAN.txt").write_text("human work\n",
+                                           encoding="utf-8")
+            git(proj, "add", "-A")
+            git(proj, "commit", "-m", "human commit")
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], ["one"])
+            self.assertTrue((proj / "A.txt").is_file())
+            self.assertTrue((proj / "HUMAN.txt").is_file())
+
+    def test_land_recheck_blocks_a_moved_target(self):
+        """_land_staged's recheck: a stage built on a stale base can never
+        fast-forward the moved target - refuses, nothing updates."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            tip = git(proj, "rev-parse", "HEAD").stdout.strip()
+            git(proj, "checkout", "-b", "stage-tmp")
+            (proj / "X.txt").write_text("x\n", encoding="utf-8")
+            git(proj, "add", "-A")
+            git(proj, "commit", "-m", "staged")
+            staged = git(proj, "rev-parse", "HEAD").stdout.strip()
+            git(proj, "checkout", "master")
+            # move the target past the staged base -> stage is a divergent
+            # side, not a descendant: --ff-only must refuse
+            (proj / "Y.txt").write_text("y\n", encoding="utf-8")
+            git(proj, "add", "-A")
+            git(proj, "commit", "-m", "moved")
+            landed, why = conductor._land_staged(
+                proj, "master", staged, tip, base / "runs", "x")
+            self.assertFalse(landed)
+            self.assertTrue(why)
+            self.assertFalse((proj / "X.txt").exists())
+            # a stage built ON the moved tip fast-forwards cleanly
+            git(proj, "checkout", "-b", "stage-ok")
+            (proj / "Z.txt").write_text("z\n", encoding="utf-8")
+            git(proj, "add", "-A")
+            git(proj, "commit", "-m", "staged2")
+            staged2 = git(proj, "rev-parse", "HEAD").stdout.strip()
+            git(proj, "checkout", "master")
+            cur = git(proj, "rev-parse", "HEAD").stdout.strip()
+            landed, _ = conductor._land_staged(
+                proj, "master", staged2, cur, base / "runs", "x")
+            self.assertTrue(landed)
+            self.assertTrue((proj / "Z.txt").is_file())
+
+    def test_repo_merge_lock_serializes(self):
+        """A live conductor-merge.lock on the repo makes merge_run report
+        busy and touch nothing; a dead-pid lock is broken and merged."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = self._deferred_manifest(
+                base, proj, [self._dstep(proj, "one", "write A.txt")])
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, rd = state_of(runs)
+            lock = proj / ".git" / "conductor-merge.lock"
+            lock.write_text(json.dumps({"pid": os.getpid(),
+                                        "at": conductor.now_iso()}))
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["busy"], ["proj"])
+            self.assertEqual(out["merged"], [])
+            self.assertFalse((proj / "A.txt").exists())
+            # stale lock (dead pid) is broken and the merge proceeds
+            dead = subprocess.Popen(["cmd", "/c", "exit"])
+            dead.wait()
+            lock.write_text(json.dumps({"pid": dead.pid,
+                                        "at": "2020-01-01T00:00:00"}))
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], ["one"])
+            self.assertTrue((proj / "A.txt").is_file())
+
+    # --------------------------------------------- deferred merge-resolve
+
+    def test_resolver_lands_conflicting_alternative(self):
+        """Alternatives that conflict in the stage honor merge_resolver:
+        a resolve-* session finishes it there and both land."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = self._deferred_manifest(base, proj, [
+                self._dstep(proj, "altA", "append to WORK.txt",
+                            "wave = 1"),
+                self._dstep(proj, "altB", "append to WORK.txt",
+                            "wave = 1")],
+                extra='merge_resolver = true\non_failure = "continue"\n')
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, rd = state_of(runs)
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(sorted(out["merged"]), ["altA", "altB"])
+            self.assertEqual(len((proj / "WORK.txt")
+                                 .read_text().splitlines()), 2)
+            st, _ = state_of(runs)
+            self.assertEqual(st["steps"]["resolve-altB"]["status"],
+                             "done")
+
+    # ----------------------------------------- backward-compatible auto
+
+    def test_auto_mode_unchanged_no_pending(self):
+        """Default (no merge= key): worktree steps merge post-wave exactly
+        as before, and no pending_merges state appears."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, wt_steps(proj, [
+                ("a", "write A.txt"), ("b", "write B.txt")]))
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, _ = state_of(runs)
+            self.assertTrue(st["steps"]["a"]["merged"])
+            self.assertTrue(st["steps"]["b"]["merged"])
+            self.assertNotIn("pending_merges", st)
+            self.assertFalse(st["steps"]["a"].get("deferred"))
+            self.assertTrue((proj / "A.txt").is_file())
+
+    def test_mixed_auto_and_deferred_same_run(self):
+        """A run can mix policies: the auto step lands post-wave, the
+        deferred one parks - and the deferred step's baseline absorbed
+        the auto merge (it branched after it)."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "auto"
+project = "{proj.as_posix()}"
+prompt = "write AUTO.txt"
+worktree = true
+merge = "auto"
+
+[[step]]
+name = "dfr"
+project = "{proj.as_posix()}"
+prompt = "write DFR.txt"
+merge = "deferred"
+verify = "if not exist AUTO.txt exit 1"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            st, rd = state_of(runs)
+            self.assertTrue(st["steps"]["auto"]["merged"])
+            self.assertNotIn("deferred", st["steps"]["auto"])
+            self.assertTrue(st["steps"]["dfr"]["deferred_verified"])
+            # baseline absorbed the auto-mode merge: dfr saw AUTO.txt
+            self.assertTrue(st["steps"]["dfr"]["deferred"])
+            self.assertFalse((proj / "DFR.txt").exists())
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], ["dfr"])
+            self.assertTrue((proj / "DFR.txt").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()
