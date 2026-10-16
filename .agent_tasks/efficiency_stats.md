@@ -51,3 +51,4 @@ accounted for.
 | agent-conductor / follow-up-plan (proposal-ui-fixes run review: 1/2 steps landed, compact-live-output parked on flaky-verify false-fail; drafted proposal-ui-fixes-followup.toml - merge parked branch + harden _flag_soon family + live smoke) | n/a | n/a | n/a | n/a |
 | agent-conductor / resolve-compact-live-output (merge resolution: both-append conflicts on QUEUE.md + efficiency_stats.md; merge 7e5f3cf) | n/a | n/a | n/a | n/a |
 | agent-conductor / isolate-proposal-planning (planner output spooled outside watched cwds; publish-only waits on merge/watch; spool drain survives restart; 215/215 + demo green) | n/a | n/a | n/a | n/a |
+| agent-conductor / fix-compact-labels (.rlabels block keeps run-row chips visible in compact; .toksub unhides planner:/steps:/est labels; stage pills ellipsize; render sig includes density; Playwright screenshots; 225 tests - 2 pre-existing StopProposalTests fails stash-verified at base) | n/a | n/a | n/a | n/a |
