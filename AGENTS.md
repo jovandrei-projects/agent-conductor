@@ -56,6 +56,8 @@ python conductor.py run  <manifest> --resume [dir]   skip done steps
 python conductor.py status [run_dir]        step table of latest run
 python conductor.py serve [--port 8773]     live dashboard of all agents
 python conductor.py sweep                   re-mark orphaned records 'lost'
+python conductor.py merge <run_dir>         land pending (deferred/parked) branches
+python conductor.py summarize <run_dir>     write the run's LLM executive summary
 python conductor.py sessions [--rm]         list/clean spawned devin sessions
 python conductor.py demo                    end-to-end vs tests/mock_devin.py
 python run_tests.py                         unittest suite (mock-only, no auth)
@@ -141,6 +143,28 @@ status it replaces, `resolver` when a resolve-* session saved it),
 `worktree_removed` for no-product debris, the `merge_*` family for the
 deferred pipeline, and `merged_at` on the step record for when the branch
 landed.
+
+Summaries: the step summary (`Session summary` in the task modal,
+`<step>.summary.md`) leads with `## Report` - the worker's OWN closing
+report, lifted from the trailing agent messages of its ATIF export with
+the `STATUS:`/`NEXT:` contract lines stripped (`final_report`); a step
+whose turn ended mid-report shows the forensic sections without it. The
+run-level equivalent is `run.summary.md`: with `[run] summarize = true`
+(or `= "<model>"` to pin a cheap model) the driver spawns a detached
+`conductor.py summarize` session after `run_end` that reads run stats +
+every step's closing report (never the projects themselves - cwd is a
+tempdir) and writes one executive summary; the same op runs via `python
+conductor.py summarize <run_dir>` or the run modal's **Generate LLM
+summary** (`POST /api/runs/<dir>/summarize`, refused while a step is
+live or one is already generating - `.summarizing` marker + `Run
+summary`/`has_summary` in the runs payload). `summarize.stdout.log` /
+`summarize.export.json` record the session, `run_summarized` /
+`run_summary_failed` land in events.jsonl, `state.run_summary` carries
+session/model/generated_at. The summarizer NEVER changes step or run
+status - when it fails or was never run, GET `/api/runs/<dir>/summary`
+serves the deterministic roll-up (`run_report_md`: stats + each step's
+closing report verbatim). The request form's `summarize` checkbox maps
+to `run.summarize` like the other guarantee checkboxes.
 
 `merge = "deferred"` (per-step or `[run]` default; implies
 `worktree = true`, incompatible with `cloud`) separates isolation from

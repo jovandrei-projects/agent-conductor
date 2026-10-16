@@ -149,9 +149,17 @@ def main() -> int:
         time.sleep(float(slow_after.group(1)))
 
     if export:
-        Path(export).write_text(
-            json.dumps({"mock": True, "session": sid, "cloud": cloud}),
-            encoding="utf-8")
+        doc = {"mock": True, "session": sid, "cloud": cloud}
+        if "conductor-run-summary" in body:
+            # the run summarizer's prompt marker - answer with an ATIF
+            # closing message so conductor's final_report() has prose
+            # to lift into run.summary.md
+            doc["steps"] = [{"step_id": 1, "source": "agent",
+                             "tool_calls": [], "model_name": "mock",
+                             "message": "Executive summary (mock): the "
+                                        "run's steps reported done; "
+                                        "everything landed."}]
+        Path(export).write_text(json.dumps(doc), encoding="utf-8")
 
     print(f"mock worker ran: prompt={len(body)} chars model={model} "
           f"cloud={cloud} session={sid}")

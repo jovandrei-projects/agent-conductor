@@ -24,6 +24,13 @@ checkpoint = true
 # max_parallel = 2   # concurrent-agent cap. Default is conservative
                      # (about 1 per 4 logical cores, max 4). Each agent is a
                      # full Devin session - don't set 100 on a desktop.
+# summarize = true       # after the run ends, spawn one small session
+                         # that writes run.summary.md - an executive
+                         # roll-up of every step's own closing report,
+                         # readable from the run modal's "Run summary".
+                         # `summarize = "<model>"` pins the model;
+                         # default off (the deterministic per-step
+                         # roll-up is always served regardless).
 # merge_resolver = true  # on a worktree merge conflict, spawn a
                      # "resolve-<step>" session in the main checkout to
                      # finish the merge (mid-merge) instead of only parking

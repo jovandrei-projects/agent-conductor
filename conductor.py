@@ -311,6 +311,9 @@ class Manifest:
     merge_policy: str                  # run-wide default for step.merge
     steps: list[Step]
     description: str | None = None
+    summarize: str | None = None       # end-of-run LLM summary session:
+                                       # None = off, "" = on with the CLI
+                                       # default model, "<model>" pins one
 
 
 class ManifestError(ValueError):
@@ -417,13 +420,24 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
         max_parallel = int(max_parallel)
         if max_parallel < 1:
             raise ManifestError("run.max_parallel must be >= 1")
+    sz = run.get("summarize")
+    if sz is True:
+        summarize = ""                  # on, CLI default model
+    elif sz in (None, False):
+        summarize = None
+    elif isinstance(sz, str) and sz.strip():
+        summarize = sz.strip()
+    else:
+        raise ManifestError(
+            'run.summarize must be true, false or a "<model>" string')
     return Manifest(path=path, name=name, on_failure=on_failure,
                     checkpoint=bool(run.get("checkpoint", True)),
                     preamble=preamble, max_hours=run.get("max_hours"),
                     max_parallel=max_parallel,
                     merge_resolver=bool(run.get("merge_resolver", False)),
                     merge_policy=run_merge,
-                    steps=steps, description=description)
+                    steps=steps, description=description,
+                    summarize=summarize)
 
 
 def load_projects() -> dict[str, dict]:
@@ -1266,6 +1280,36 @@ def tail_session_id(export_path: Path) -> str | None:
     return sid if isinstance(sid, str) and sid else None
 
 
+def final_report(export_path) -> str | None:
+    """The worker's own closing report - the trailing run of agent
+    messages with no tool calls in the ATIF export, minus the STATUS:/
+    NEXT: contract lines. That prose is the same 'what I did / what I
+    found / what's left' wrap-up a chat session ends with; conductor
+    summaries surface it instead of re-describing the session
+    mechanically. None when the export is missing/unreadable or the turn
+    ended without a report (crash, no-op spawn, truncated mid-turn)."""
+    try:
+        d = json.loads(Path(export_path).read_text(encoding="utf-8",
+                                                   errors="replace"))
+    except (OSError, ValueError, TypeError):
+        return None
+    texts: list[str] = []
+    for s in reversed(d.get("steps") or []):
+        if not isinstance(s, dict) or s.get("source") != "agent" \
+                or s.get("tool_calls"):
+            break
+        msg = (s.get("message") or "").strip()
+        if msg:
+            texts.append(msg)
+    if not texts:
+        return None
+    lines = "\n\n".join(reversed(texts)).splitlines()
+    while lines and lines[-1].startswith(("STATUS:", "NEXT:")):
+        lines.pop()
+    body = "\n".join(lines).rstrip()
+    return body or None
+
+
 # Trajectory arc: condense an ATIF export's `steps` array into labeled
 # phase spans (setup -> audit -> implement -> test -> ... -> commit) so
 # the task modal can show "what the session did" in ~15 lines instead of
@@ -1652,6 +1696,11 @@ def step_summary_md(rec: dict, st: dict, run_name: str) -> str:
     L.append("")
     if rec.get("task"):
         L += ["## Task", "", task_display(rec["task"]), ""]
+    report = final_report(rec.get("export"))
+    if report:
+        # the worker's own closing message - the same end-of-session
+        # wrap-up Devin prints in a chat, lifted verbatim from the export
+        L += ["## Report", "", report, ""]
     arc = cached_arc(rec.get("export"))
     if arc and arc.get("groups"):
         L += [f"## Trajectory ({arc['steps']} turns, times UTC)", ""]
@@ -1757,27 +1806,326 @@ def request_trajectory(request_id: str,
     return det
 
 
+SUMMARIZE_TIMEOUT_S = 900      # one cheap prose pass, not a work session
+
+
+def _elapsed_md(rec: dict) -> str:
+    span = rec.get("elapsed_s")
+    return (f"{int(span // 60)}m{int(span % 60):02d}s"
+            if isinstance(span, (int, float)) else "-")
+
+
+def _summary_marker(run_dir: Path) -> Path:
+    return run_dir / ".summarizing"          # holds the summarizer pid
+
+
+def _summarizing(run_dir: Path) -> bool:
+    """Is a run-summary session currently live for this run dir? The
+    marker holds the subprocess pid; a stale marker whose pid is gone
+    (crash between launch and write, or an orphaned file) doesn't
+    count."""
+    try:
+        pid = int(_summary_marker(run_dir).read_text().strip())
+    except (OSError, ValueError):
+        return False
+    return pid_alive(pid)
+
+
+def _run_step_stats(st: dict) -> dict:
+    """Aggregate run-level stats from step records - status counts,
+    token sums, merge tallies - for both the deterministic roll-up and
+    the summarizer prompt."""
+    steps = st.get("steps") or {}
+    counts: dict[str, int] = {}
+    prompt = completion = cached = merged = parked = 0
+    for rec in steps.values():
+        status = rec.get("status") or "?"
+        counts[status] = counts.get(status, 0) + 1
+        tk = rec.get("tokens") or {}
+        prompt += tk.get("prompt") or 0
+        completion += tk.get("completion") or 0
+        cached += tk.get("cached") or 0
+        if rec.get("merged"):
+            merged += 1
+        elif rec.get("branch"):
+            parked += 1
+    return {"counts": counts, "prompt": prompt, "completion": completion,
+            "cached": cached, "merged": merged, "parked": parked}
+
+
+def run_report_md(st: dict) -> str:
+    """Deterministic run roll-up - run stats plus each step's own closing
+    report in record order. Served by the run summary endpoint whenever
+    no LLM-written run.summary.md exists, and embedded verbatim in the
+    summarizer prompt as the source material."""
+    agg = _run_step_stats(st)
+    L = [f"# {st.get('run') or '?'} - run summary", "",
+         "- **steps:** " + (", ".join(
+             f"{n} {k}" for k, n in sorted(agg["counts"].items()))
+             or "none"),
+         f"- **started:** {st.get('started_at') or '-'} · "
+         f"**ended:** {st.get('ended_at') or '-'}"]
+    if agg["prompt"] or agg["completion"]:
+        L.append(f"- **tokens:** {_fmtK(agg['prompt'])} prompt + "
+                 f"{_fmtK(agg['completion'])} completion"
+                 + (f" ({_fmtK(agg['cached'])} cached)"
+                    if agg["cached"] else ""))
+    L.append(f"- **merged:** {agg['merged']} · "
+             f"**parked branch:** {agg['parked']}")
+    for name, rec in (st.get("steps") or {}).items():
+        meta = [_elapsed_md(rec),
+                rec.get("model_actual") or rec.get("model") or "?"]
+        if (rec.get("attempts") or 0) > 1:
+            meta.append(f"{rec['attempts']} attempts")
+        if rec.get("note"):
+            meta.append(f"note: {rec['note']}")
+        if rec.get("merged"):
+            meta.append("merged" + (f" @{rec['merged_at']}"
+                                    if rec.get("merged_at") else ""))
+        L += ["", f"## {name} - {rec.get('status') or '?'}", "",
+              "- " + " · ".join(meta), ""]
+        L.append(final_report(rec.get("export"))
+                 or "_the worker's turn ended without a closing report - "
+                    "see its session summary or stdout log for what ran_")
+    return "\n".join(L) + "\n"
+
+
+def _summary_prompt(st: dict) -> str:
+    """Prompt for the end-of-run summarizer session: the run stats plus
+    each step's task text and own closing report, so the model weighs
+    intent against outcome. `conductor-run-summary` marks the document -
+    the mock devin keys on it."""
+    agg = _run_step_stats(st)
+    counts = ", ".join(f"{n} {k}" for k, n in sorted(
+        agg["counts"].items())) or "none"
+    parts = [
+        "# conductor-run-summary",
+        "",
+        "You are writing the end-of-run report for an automated pipeline",
+        "of fresh Devin CLI sessions (agent-conductor). The run below",
+        "just finished. Write ONE executive summary for the operator",
+        "reading the dashboard in the morning:",
+        "",
+        "- what the run set out to do and whether it got there",
+        "- what actually landed (merged vs parked vs failed); group by",
+        "  theme when that reads better than step order",
+        "- failures, surprises, unfinished work, anything worth a",
+        "  human look in the morning",
+        "- do NOT invent work or verification - only report what the",
+        "  step statuses and their closing reports below actually say;",
+        "  a missing closing report means the session ended mid-turn",
+        "",
+        "Plain markdown, ~300-600 words unless the run earned more.",
+        "Your final message IS the document - output only the summary,",
+        "no preamble, no sign-off.",
+        "",
+        "## Run",
+        "",
+        f"- name: {st.get('run') or '?'}",
+        f"- description: {st.get('description') or '(none)'}",
+        f"- steps: {counts}",
+        f"- started: {st.get('started_at') or '-'}",
+        f"- ended: {st.get('ended_at') or '-'}",
+        f"- tokens: {agg['prompt']} prompt + "
+        f"{agg['completion']} completion",
+        f"- merged: {agg['merged']} · parked branches: {agg['parked']}",
+        "",
+        "## Steps",
+    ]
+    for name, rec in (st.get("steps") or {}).items():
+        task = (rec.get("task") or "?").strip()
+        if len(task) > 1500:
+            task = task[:1500] + " [...task truncated...]"
+        report = final_report(rec.get("export"))
+        if report and len(report) > 6000:
+            report = report[:6000] + "\n\n[...report truncated...]"
+        parts += [
+            "",
+            f"### {name} - {rec.get('status') or '?'}",
+            "",
+            f"task: {task}",
+            "",
+            f"elapsed: {_elapsed_md(rec)} · "
+            f"exit: {rec.get('exit_code')} · "
+            f"verify: {rec.get('verify_ok')} · "
+            f"merged: {'yes' if rec.get('merged') else 'no'}",
+            f"note: {rec.get('note') or '-'}",
+            "",
+            "closing report:",
+            "",
+            report or "(none - the session ended without one)",
+        ]
+    return "\n".join(parts) + "\n"
+
+
+def summarize_run(run_dir: Path, devin_argv: list[str] | None = None,
+                  model: str = "") -> bool:
+    """One fresh `devin -p` session whose only job is prose: it reads the
+    run record plus every step's own closing report from a tempdir and
+    answers with an executive run summary, lifted out of the export and
+    written as run.summary.md. Spawned detached by the driver at run end
+    when the manifest opts in ([run] summarize), or on demand from the
+    dashboard. Never alters step or run status - a failure just leaves
+    the deterministic roll-up serving at the endpoint."""
+    devin_argv = devin_argv or ["devin"]
+    try:
+        st = json.loads((run_dir / "state.json").read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"summarize: cannot read run state: {exc}")
+        return False
+    steps = st.get("steps") or {}
+    if not steps:
+        print("summarize: run has no steps - nothing to summarize")
+        return False
+    if any(step_live(r, driver_alive(st)) for r in steps.values()):
+        print("summarize: a step is still live - refusing to write into "
+              "an active run dir")
+        return False
+    marker = _summary_marker(run_dir)
+    try:
+        marker.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        log = run_dir / "summarize.stdout.log"
+        export_path = run_dir / "summarize.export.json"
+        with tempfile.TemporaryDirectory(
+                prefix="conductor-summary-") as wd:
+            pf = Path(wd) / "summarize.md"
+            pf.write_text(_summary_prompt(st), encoding="utf-8")
+            cmd = devin_argv + [
+                "--print", "--prompt-file", str(pf),
+                "--permission-mode", "bypass",
+                "--respect-workspace-trust", "false",
+                "--export", str(export_path)]
+            if model:
+                cmd += ["--model", model]
+            print(f"[summary] spawning: {shlex.join(cmd)}")
+            with open(log, "wb") as out:
+                proc = subprocess.Popen(
+                    cmd, cwd=wd, stdout=out, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, env=clean_devin_env(),
+                    **_detached_kwargs())
+                rc, timed_out, _hung, _stopped, _ext = wait_worker(
+                    proc, log, SUMMARIZE_TIMEOUT_S)
+            if timed_out or rc != 0:
+                print(f"[summary] session exited rc={rc}"
+                      + (" (timed out)" if timed_out else ""))
+                log_event(run_dir, event="run_summary_failed",
+                          exit_code=rc, timed_out=timed_out)
+                return False
+        report = final_report(export_path)
+        if not report:
+            print("[summary] session produced no closing report")
+            log_event(run_dir, event="run_summary_failed",
+                      reason="no closing report in export")
+            return False
+        sid = tail_session_id(export_path)
+        header = (f"# {st.get('run') or run_dir.name} - run summary\n\n"
+                  f"_written {now_iso()}"
+                  + (f" · session `{sid}`" if sid else "") + "_\n\n")
+        (run_dir / "run.summary.md").write_text(
+            header + report.rstrip() + "\n", encoding="utf-8")
+        st["run_summary"] = {"generated_at": now_iso(),
+                             "model": model or None, "session": sid}
+        save_state(run_dir, st)
+        log_event(run_dir, event="run_summarized",
+                  model=model or None, session=sid)
+        print(f"[summary] wrote {run_dir / 'run.summary.md'}")
+        return True
+    finally:
+        marker.unlink(missing_ok=True)
+
+
+def run_summary_doc(name: str, runs_dir: Path = RUNS_DIR) -> str:
+    """GET /api/runs/<run>/summary - the LLM-written run.summary.md when
+    a summarizer session produced one, otherwise the deterministic
+    roll-up built live from the step records."""
+    d, st = _run_dir_checked(name, runs_dir)
+    f = d / "run.summary.md"
+    if f.is_file():
+        return f.read_text(encoding="utf-8", errors="replace")
+    return run_report_md(st)
+
+
+def summarize_run_start(name: str, runs_dir: Path = RUNS_DIR,
+                        devin_argv: list[str] | None = None,
+                        model: str | None = None) -> dict:
+    """POST /api/runs/<run>/summarize - spawn the LLM run-summary session
+    out of process (same detach discipline as resume/merge launches).
+    The subprocess owns the run dir writes; this process only plants the
+    marker so the dashboard can show 'Generating...' immediately."""
+    d, st = _run_dir_checked(name, runs_dir)
+    steps = st.get("steps") or {}
+    if not steps:
+        raise RequestError("No steps ran yet - nothing to summarize", 409)
+    if any(step_live(r, driver_alive(st)) for r in steps.values()):
+        raise RequestError("A step is still live - wait for the run to "
+                           "finish before summarizing", 409)
+    pid = _SUM_PIDS.get(name)
+    if (pid and pid_alive(pid)) or _summarizing(d):
+        raise RequestError("A summary session is already running for "
+                           "this run", 409)
+    if model is None:
+        model = st.get("summarize_model") or ""
+    # The run's own worker binary wins over the server's env default -
+    # same rule as resume.
+    argv = (st.get("devin_argv")
+            or (shlex.split(st["devin"]) if st.get("devin") else None)
+            or devin_argv or ["devin"])
+    cmd = [sys.executable, str(ROOT / "conductor.py"), "summarize",
+           str(d), "--runs-dir", str(runs_dir)]
+    if argv != ["devin"]:
+        cmd += ["--devin", shlex.join(argv)]
+    if model:
+        cmd += ["--model", model]
+    try:
+        pid = _launch_process(cmd, d / "summarize.launch.log")
+    except OSError as exc:
+        raise RequestError("Could not start the summarizer process",
+                           500) from exc
+    _SUM_PIDS[name] = pid
+    try:
+        _summary_marker(d).write_text(str(pid), encoding="utf-8")
+    except OSError:
+        pass
+    return {"summarizing": name, "pid": pid}
+
+
 def _summary_body(md: str) -> str:
     """Inner markup of a generated summary report - the in-app summary
     modal embeds it via ``?frag=1`` while the standalone page wraps it in
     a document shell.
 
-    We only emit a narrow markdown subset (#, ##, - bullets, ``` fences,
-    **bold**, `code`), and every line is HTML-escaped BEFORE inline
-    markup is applied, so agent-authored content (task text, stdout,
-    trajectory heads) can never inject markup."""
+    We only emit a narrow markdown subset (#-####, - and 1. bullets, ```
+    fences, **bold**, *italics*, `code`, ---), and every line is
+    HTML-escaped BEFORE inline markup is applied, so agent-authored
+    content (task text, stdout, trajectory heads, the LLM run summary)
+    can never inject markup."""
     def inline(s: str) -> str:
         s = html.escape(s)
         s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+        s = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", s)
         return re.sub(r"`(.+?)`", r"<code>\1</code>", s)
 
-    body, in_ul, in_pre = [], False, False
+    body, in_ul, in_ol, in_pre = [], False, False, False
 
     def close_ul() -> None:
         nonlocal in_ul
         if in_ul:
             body.append("</ul>")
             in_ul = False
+
+    def close_ol() -> None:
+        nonlocal in_ol
+        if in_ol:
+            body.append("</ol>")
+            in_ol = False
+
+    def close_lists() -> None:
+        close_ul()
+        close_ol()
 
     for ln in md.splitlines():
         if in_pre:
@@ -1788,26 +2136,36 @@ def _summary_body(md: str) -> str:
                 body.append(html.escape(ln))
             continue
         if ln.strip() == "```":
-            close_ul()
+            close_lists()
             body.append("<pre>")
             in_pre = True
-        elif ln.startswith("## "):
-            close_ul()
-            body.append(f"<h2>{inline(ln[3:])}</h2>")
-        elif ln.startswith("# "):
-            close_ul()
-            body.append(f"<h1>{inline(ln[2:])}</h1>")
+            continue
+        m = re.match(r"^(#{1,4}) ", ln)
+        if m:
+            close_lists()
+            lvl = len(m.group(1))
+            body.append(f"<h{lvl}>{inline(ln[lvl + 1:])}</h{lvl}>")
+        elif re.fullmatch(r"-{3,}", ln.strip()):
+            close_lists()
+            body.append("<hr>")
         elif ln.startswith("- "):
+            close_ol()
             if not in_ul:
                 body.append("<ul>")
                 in_ul = True
             body.append(f"<li>{inline(ln[2:])}</li>")
+        elif (m := re.match(r"^\d+\. ", ln)):
+            close_ul()
+            if not in_ol:
+                body.append("<ol>")
+                in_ol = True
+            body.append(f"<li>{inline(ln[m.end():])}</li>")
         elif not ln.strip():
-            close_ul()
+            close_lists()
         else:
-            close_ul()
+            close_lists()
             body.append(f"<p>{inline(ln)}</p>")
-    close_ul()
+    close_lists()
     if in_pre:
         body.append("</pre>")
     return "".join(body)
@@ -2673,6 +3031,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # The current manifest's policy applies to steps prepared from now
         # on; already-recorded recs keep their own `deferred` flags.
         state["merge_policy"] = cfg.merge_policy
+        state["summarize_model"] = cfg.summarize
         save_state(run_dir, state)
         print(f"[resume] {run_dir.name}")
         # Resume must be able to start work again: drop any stop/drain
@@ -2688,6 +3047,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                  "devin_argv": devin_argv,
                  "run_dir": str(run_dir), "max_parallel": cap,
                  "flags": "v2",
+                 "summarize_model": cfg.summarize,
                  "driver_pid": os.getpid(),
                  "driver_started_at": now_iso(),
                  "free_ram_gb": free_ram_gb(), "steps": {}}
@@ -3099,6 +3459,29 @@ def cmd_run(args: argparse.Namespace) -> int:
     for rec in state["steps"].values():
         counts[rec["status"]] = counts.get(rec["status"], 0) + 1
     print(f"run {cfg.name}: {dict(counts)}  ({run_dir})")
+    # [run] summarize: a detached `conductor.py summarize` session reads
+    # the step exports and writes run.summary.md - out of process so the
+    # run's exit code is already fixed and a hung session can't hold the
+    # driver. _launch_process is the same spawn path the dashboard uses.
+    if cfg.summarize is not None and any(
+            r.get("export") for r in state["steps"].values()):
+        cmd = [sys.executable, str(ROOT / "conductor.py"), "summarize",
+               str(run_dir), "--runs-dir", str(runs_dir)]
+        if devin_argv != ["devin"]:
+            cmd += ["--devin", shlex.join(devin_argv)]
+        if cfg.summarize:
+            cmd += ["--model", cfg.summarize]
+        try:
+            pid = _launch_process(cmd, run_dir / "summarize.launch.log")
+            try:
+                _summary_marker(run_dir).write_text(
+                    str(pid), encoding="utf-8")
+            except OSError:
+                pass
+            print("[summary] LLM run-summary session launched "
+                  "(run.summary.md lands when it finishes)")
+        except OSError as exc:
+            print(f"[summary] summarizer launch failed: {exc}")
     return 0 if set(counts) <= {"done", "partial"} else 1
 
 
@@ -3475,6 +3858,10 @@ REQUEST_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}$")
 RUN_DIR_RE = re.compile(r"^[A-Za-z0-9][\w.-]*$")
 _LAUNCH_PIDS: dict[str, int] = {}
 _RESUME_PIDS: dict[str, int] = {}
+# In-flight run summarizer subprocesses by run-dir name - guards the
+# spawn gap between the endpoint's launch and the subprocess's own
+# .summarizing marker write (same shape as _RESUME_PIDS).
+_SUM_PIDS: dict[str, int] = {}
 # In-flight proposal generations, keyed by the attempt's gen_id (minted per
 # attempt and stamped on the request record). Keyed by attempt, not request
 # id, so a stopped attempt unwinding can never discard a newer attempt's
@@ -3700,7 +4087,8 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
             "raw", "label", "project", "model", "effort", "manifest",
             "followup", "on_failure", "max_attempts",
             "plan_model", "plan_effort",
-            "worktrees", "merge_resolver", "ask", "attachments"}:
+            "worktrees", "merge_resolver", "summarize", "ask",
+            "attachments"}:
         raise RequestError("Invalid request fields")
     model, effort = default_model_effort()
     fields = {k: (rec or {}).get(k, v) for k, v in (
@@ -3712,7 +4100,8 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
             if not isinstance(payload[key], str):
                 raise RequestError(f"{key} must be text")
             fields[key] = payload[key].strip()
-    for bkey in ("followup", "worktrees", "merge_resolver", "ask"):
+    for bkey in ("followup", "worktrees", "merge_resolver", "summarize",
+                 "ask"):
         fields[bkey] = bool((rec or {}).get(bkey))
         if bkey in payload:
             v = payload[bkey]
@@ -4013,6 +4402,9 @@ def _apply_fields_to_toml(text: str, fields: dict,
     if "merge_resolver" in fields:
         _toml_set(lines, *ensure("run"), "merge_resolver",
                   "true" if fields["merge_resolver"] else "false")
+    if "summarize" in fields:
+        _toml_set(lines, *ensure("run"), "summarize",
+                  "true" if fields["summarize"] else "false")
     # Per-step overrides of fields the form owns would silently fight the
     # applied value - strip them so defaults/run keys are the sole source.
     drop_keys = ({"merge_resolver"} if "merge_resolver" in fields else
@@ -4080,6 +4472,8 @@ def _guarantee_isolation(text: str, rec: dict,
         fields["worktrees"] = True
     if rec.get("merge_resolver"):
         fields["merge_resolver"] = True
+    if rec.get("summarize"):
+        fields["summarize"] = True
     if not fields:
         return text
     try:
@@ -6032,6 +6426,24 @@ def cmd_merge(args: argparse.Namespace) -> int:
                  or out["busy"] or out["kept"]) else 0
 
 
+def cmd_summarize(args: argparse.Namespace) -> int:
+    """CLI handle for the LLM run summary - the same op the dashboard's
+    'Generate LLM summary' button and a `[run] summarize = true` run's
+    end-of-run spawn run. run_dir is the run name or its path."""
+    d = Path(args.run_dir)
+    if not d.is_dir():
+        alt = (Path(args.runs_dir).resolve() if args.runs_dir
+               else RUNS_DIR) / args.run_dir
+        if alt.is_dir():
+            d = alt
+    if not d.is_dir():
+        print(f"summarize: run dir not found: {args.run_dir}")
+        return 2
+    ok = summarize_run(d, shlex.split(args.devin) if args.devin else None,
+                       args.model or "")
+    return 0 if ok else 1
+
+
 def _run_dir_checked(name: str, runs_dir: Path) -> tuple[Path, dict]:
     """Resolve + load a run dir for dashboard mutation endpoints."""
     if not RUN_DIR_RE.fullmatch(name):
@@ -7129,6 +7541,9 @@ def collect_dashboard(runs_dir: Path,
                                     if (sj.parent /
                                         "resume.launch.log").is_file()
                                     else None),
+                     "has_summary": (sj.parent / "run.summary.md")
+                                    .is_file(),
+                     "summarizing": _summarizing(sj.parent),
                      "tokens": tok_run or None,
                      "cost": ({"usd": round(run_cost, 4) if run_priced
                                else None, "unpriced": run_unpriced}
@@ -7972,6 +8387,10 @@ function pushHist(snap){
   if (modalHist.length>20) modalHist.shift();
 }
 function histLabel(snap){
+  if (snap.kind==='summary' && String(snap.key).startsWith('run|')){
+    const r=(lastData?.runs||[]).find(x=>runKey(x)===snap.key.slice(4));
+    return 'summary: '+(r?r.run:'run');
+  }
   if (snap.kind==='agent'||snap.kind==='summary'){
     const a=AGENTS.find(x=>agentKey(x)===snap.key);
     return (snap.kind==='summary'?'summary: ':'')+(a?a.step:'task');
@@ -8028,6 +8447,8 @@ function modalBack(){
 // + target=_blank so the /summary URL stays usable (copy link, middle or
 // ctrl-click opens the standalone page).
 async function openSummary(key, push=true){
+  if (String(key).startsWith('run|'))
+    return openRunSummary(key.slice(4), push);   // run-level summary view
   const a=AGENTS.find(x=>agentKey(x)===key);
   if (!a) return;
   const snap = push ? snapshotModal() : null;
@@ -8084,6 +8505,49 @@ function renderSummaryFrame(a, frag, err){
       : '');
   // the loading frame consumed modalScroll already, so a Back restore
   // keeps its offset through the async fetch below
+  applyModalScroll();
+}
+// The run modal's 'Run summary' opens the whole-run report in the same
+// modal: the LLM-written run.summary.md when a summarizer session has
+// produced one, otherwise the deterministic roll-up of each step's own
+// closing report. summaryView keys for runs are 'run|'+runKey so the
+// Back stack can tell them apart from per-step views.
+async function openRunSummary(key, push=true){
+  const r=(lastData?.runs||[]).find(x=>runKey(x)===key);
+  if (!r || r.stage) return;
+  const snap = push ? snapshotModal() : null;
+  if (!closeDetail(false, true)) return;
+  if (snap && !(snap.kind==='summary'&&snap.key==='run|'+key))
+    pushHist(snap);
+  summaryView={key:'run|'+key};
+  if (modalScroll==null) modalScroll=0;
+  const head=`<h3 id="modal-title">Run summary - ${esc(r.run||key)}</h3>`;
+  const link=`<div class="actions"><a class="btn secondary" ` +
+    `target="_blank" href="/api/runs/` +
+    `${encodeURIComponent(base(r.dir))}/summary" title="the same ` +
+    `report as a standalone page - the shareable URL">` +
+    `Open as page ↗</a></div>`;
+  document.getElementById('dbody').innerHTML =
+    (modalHist.length?`<div class="dnav">${backBtnHTML()}</div>`:'') +
+    head + `<div class="notice">Loading summary&hellip;</div>` + link;
+  document.getElementById('backdrop').hidden=false;
+  let frag=null, err=null;
+  try{
+    const res=await fetch('/api/runs/'+encodeURIComponent(base(r.dir))+
+      '/summary?frag=1');
+    if (res.ok) frag=await res.text();
+    else { const o=await res.json().catch(()=>({}));
+           err='Summary unavailable: '+(o.error||('HTTP '+res.status)); }
+  }catch(e){ err='Summary unavailable: '+(e.message||e); }
+  if (!summaryView || summaryView.key!=='run|'+key) return;
+  document.getElementById('dbody').innerHTML =
+    (modalHist.length?`<div class="dnav">${backBtnHTML()}</div>`:'') +
+    head +
+    (r.summarizing?`<div class="notice">A summary session is running - ` +
+      `reopen this view when it finishes; the deterministic roll-up ` +
+      `below is the interim answer.</div>`:'') +
+    (err!=null ? `<div class="notice error">${esc(err)}</div>`
+      : `<div class="sumdoc">${frag}</div>`) + link;
   applyModalScroll();
 }
 function summaryNav(d){
@@ -8391,6 +8855,24 @@ function showRunDetails(key, keepStack){
       (k==='tokens'?tokenHelp:'') + `</div>`).join('') + '</div>' +
     `<div class="actions"><button type="button" class="btn secondary" ` +
     `data-filter-run="${esc(key)}">Show only this run</button>` +
+    (r.stage ? '' : `<button type="button" class="btn secondary" ` +
+      `data-run-summary="${esc(key)}" ` +
+      `title="read this run's summary - the LLM-written executive ` +
+      `report when one was generated, otherwise each step's own ` +
+      `closing report">Run summary</button>` +
+      `<button type="button" class="btn secondary" ` +
+      `data-summarize-run="${esc(base(r.dir))}" ` +
+      `data-rk="${esc(key)}"` +
+      `${(r.summarizing||liveSteps.length)?' disabled':''} ` +
+      `title="${liveSteps.length
+        ? 'disabled while a step is still live'
+        : r.summarizing
+          ? 'a summary session is running - run.summary.md lands ' +
+            'when it finishes'
+          : 'spawn a fresh Devin session to write an executive ' +
+            'summary of this run (run.summary.md)' +
+            (r.has_summary ? ' - replaces the existing file' : '')}">` +
+      `${r.summarizing?'Generating\u2026':'Generate LLM summary'}</button>`) +
     (r.request_id ? `<button type="button" class="btn secondary" ` +
       `data-open-request="${esc(r.request_id)}">View original request / TOML</button>` : '') +
     (r.stage==='generating' && r.request_id
@@ -8862,6 +9344,12 @@ function showRequestForm(rec){
       `worktree merge conflict, spawn a resolve-* session to finish the ` +
       `merge (<code>merge_resolver = true</code>) instead of only ` +
       `parking the worktree for a human</span></label>` +
+    `<label class="check"><input type="checkbox" id="rq-summarize"` +
+      `${rec.summarize?' checked':''}${disabled}><span>When the run ends, ` +
+      `spawn one small session that writes an executive summary ` +
+      `(<code>run.summarize = true</code>) - the run modal's ` +
+      `"Run summary" reads it; without it the per-step closing reports ` +
+      `still roll up</span></label>` +
     `<label class="check"><input type="checkbox" id="rq-ask"` +
       `${rec.ask?' checked':''}${disabled}><span>Ask me questions if ` +
       `needed: when the planner hits a genuine ambiguity while drafting, ` +
@@ -9143,7 +9631,8 @@ function requestFields(){
     ['raw','label','project','model','effort','on_failure',
      'plan_model','plan_effort'].map(k=>
     [k,document.getElementById(`rq-${k}`).value]));
-  for (const k of ['followup','worktrees','merge_resolver','ask']){
+  for (const k of ['followup','worktrees','merge_resolver','summarize',
+                   'ask']){
     const el=document.getElementById(`rq-${k}`);
     if (el) f[k]=el.checked;
   }
@@ -9833,6 +10322,8 @@ document.addEventListener('click', async e=>{
     return; }
   const snavEl = t.closest && t.closest('[data-snav]');
   if (snavEl){ openSummary(snavEl.dataset.snav, false); return; }
+  const rsumEl = t.closest && t.closest('[data-run-summary]');
+  if (rsumEl){ openRunSummary(rsumEl.dataset.runSummary); return; }
   const backEl = t.closest && t.closest('[data-modal-back]');
   if (backEl){ modalBack(); return; }
   const navEl = t.closest && t.closest('[data-nav]');
@@ -10087,6 +10578,22 @@ document.addEventListener('click', async e=>{
                 {confirm:true});
       closeDetail(true); await refresh();
     } catch(err){ alert('Delete failed: '+err.message); t.disabled=false; }
+    return; }
+  if (t.dataset && t.dataset.summarizeRun){
+    const rk = t.dataset.rk;
+    if(!confirm('Spawn a Devin session to write an executive summary ' +
+                'for this run? It reads the steps\u2019 own closing ' +
+                'reports and writes run.summary.md (replacing any ' +
+                'existing one). The run itself is untouched.')) return;
+    t.disabled=true; t.textContent='Generating\u2026';
+    try {
+      await api('POST',
+        `/api/runs/${encodeURIComponent(t.dataset.summarizeRun)}/summarize`,
+        {});
+      await refresh();
+      if (rk) showRunDetails(rk, true);
+    } catch(err){ alert('Summarize failed: '+err.message);
+      t.disabled=false; t.textContent='Generate LLM summary'; }
     return; }
   if (t.dataset && t.dataset.filterRun){
     selectedRun=t.dataset.filterRun;
@@ -10487,6 +10994,25 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                             md, f"{m.group(1)} / {m.group(2)}")
                             .encode("utf-8"),
                             "text/html; charset=utf-8")
+                elif (m := re.fullmatch(r"/api/runs/([^/]+)/summary",
+                                        path)):
+                    # run-level report: the LLM-written run.summary.md
+                    # when a summarizer session produced one, else the
+                    # deterministic roll-up of the steps' own reports
+                    md = run_summary_doc(m.group(1), runs_dir)
+                    q = urllib.parse.parse_qs(
+                        urllib.parse.urlsplit(self.path).query)
+                    if q.get("raw", [""])[0] in ("1", "true"):
+                        self._send(md.encode("utf-8"),
+                                   "text/markdown; charset=utf-8")
+                    elif q.get("frag", [""])[0] in ("1", "true"):
+                        self._send(_summary_body(md).encode("utf-8"),
+                                   "text/html; charset=utf-8")
+                    else:
+                        self._send(summary_html(
+                            md, f"{m.group(1)} / run summary")
+                            .encode("utf-8"),
+                            "text/html; charset=utf-8")
                 elif (m := re.fullmatch(
                         r"/api/runs/([^/]+)/steps/([^/]+)/trajectory",
                         path)):
@@ -10570,6 +11096,11 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/resume", path)):
                     self._json(resume_run(m.group(1), runs_dir,
                                           devin_argv), 202)
+                elif (m := re.fullmatch(r"/api/runs/([^/]+)/summarize",
+                                        path)):
+                    self._json(summarize_run_start(
+                        m.group(1), runs_dir, devin_argv,
+                        model=body.get("model")), 202)
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/merge", path)):
                     only = body.get("steps") if isinstance(
                         body.get("steps"), list) else None
@@ -10723,6 +11254,8 @@ def main(argv: list[str] | None = None) -> int:
             ("sweep", cmd_sweep, "mark orphaned running/queued records lost"),
             ("merge", cmd_merge,
              "land a run's pending (deferred/parked) branches"),
+            ("summarize", cmd_summarize,
+             "write a run's LLM executive summary (run.summary.md)"),
             ("sessions", cmd_sessions,
              "list / clean up conductor-spawned devin sessions"),
             ("demo", cmd_demo, "self-test against a mock devin")):
@@ -10736,12 +11269,14 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--max-parallel", type=int, default=None,
                            help="cap concurrent agents (overrides the "
                                 "manifest's run.max_parallel)")
-        if name in ("plan", "run", "demo", "sessions", "sweep", "merge"):
+        if name in ("plan", "run", "demo", "sessions", "sweep", "merge",
+                    "summarize"):
             p.add_argument("--devin", default=None,
                            help="devin command override (e.g. mock shim). "
                                 "Split with shlex - quote or use forward "
                                 "slashes in Windows paths")
-        if name in ("run", "demo", "serve", "sweep", "sessions", "merge"):
+        if name in ("run", "demo", "serve", "sweep", "sessions", "merge",
+                    "summarize"):
             p.add_argument("--runs-dir", default=None, help=argparse.SUPPRESS)
         if name in ("sessions", "sweep"):
             p.add_argument("--keep-hours", type=float, default=48,
@@ -10766,9 +11301,16 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--steps", nargs="+", default=None,
                            help="merge only these steps (pick one of "
                                 "several parked alternatives)")
+        if name == "summarize":
+            p.add_argument("run_dir")
+            p.add_argument("--model", default=None,
+                           help="model for the summary session "
+                                "(default: the run's recorded "
+                                "summarize_model, else the CLI default)")
     args = ap.parse_args(argv)
     return {"plan": cmd_plan, "run": cmd_run, "status": cmd_status,
             "serve": cmd_serve, "sweep": cmd_sweep, "merge": cmd_merge,
+            "summarize": cmd_summarize,
             "sessions": cmd_sessions, "demo": cmd_demo}[args.cmd](args)
 
 
