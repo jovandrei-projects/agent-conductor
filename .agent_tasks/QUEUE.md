@@ -25,6 +25,47 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (recoverable-trash, wave step of run
+  20261016-013719-workflow-ux-safety): 'Delete run' and proposal 'Discard'
+  are recoverable now - both move their whole bundle to
+  `data/trash/<ts>-<8hex>` (next to data/runs; `data/trash/events.jsonl`
+  is its audit log) instead of rmtree-unlinking. Each entry's `meta.json`
+  persists kind, ref, origin, deleted_at and expires_at (48h retention,
+  `TRASH_RETAIN_S` = 172800, `CONDUCTOR_TRASH_HOURS` boot knob) plus an
+  item list of {slot,payload,dest,name,dir} pairs so restore is a pure
+  file move with no hidden state. Runs keep every prior protection -
+  confirm gate, live steps/summarizer/resume/_MERGE_BUSY, in-watched-dir
+  refusal (destination too: trap 5), matching `devin rm`s after the move;
+  sessions were never deleted anyway and parked branches/worktrees are
+  untouched (the meta note says so). Requests take record + owned manifest
+  + ALL `<id>.*` side files + the parked planner spool (moved inside the
+  entry so a pending flush cannot resurrect the request); when a spool
+  overlay exists it - not the stale on-disk shadow - becomes the record
+  payload; pre-trash 'discarded' tombstones list as `legacy-<id>`, restore
+  to `draft`, and expire off the recorded timestamp. Restore never
+  overwrites: a busy run name lands `-restored`, a busy request record
+  refuses the whole restore (409), a busy manifest lands `<stem>-restored`
+  with `rec.manifest` repointed, occupied side-file/spool destinations
+  keep the newer copy; a run restored under a fresh name gets its
+  state.json self-paths rewritten and a `run_restored` event. Partial
+  failures keep the failed items in the entry for retry; every move is
+  validated direct-child-of-managed-root and every payload direct-child-
+  of-payload/ so a crafted meta cannot escape. `sweep_trash` (folded into
+  sweep_runs, cmd_serve + serve loop) purges ONLY expired entries, capped
+  at TRASH_SWEEP_LIMIT=64/pass, and dry-runs entirely while a live
+  self-hosted worker watches the data tree. Endpoints: `GET
+  /api/state?trash=1` (trash_count/trash_ids always, entries on demand),
+  `POST /api/trash/<id>/restore`, `POST /api/trash/empty`
+  ({confirm:true} - the one permanent delete). UI: `view:` gains an 'N
+  trash' chip, a #trashwrap table between runs and agents shows kind /
+  deleted / purges-in / notes / Restore + a plainly-confirmed Empty
+  trash, and #undobar offers Undo for the entry you just trashed until
+  dismissed or restored elsewhere. 346/346 tests + demo green; 20 new
+  RecoverableTrashTests (metadata+retention round-trips, collision-safe
+  restores incl. repointed state paths, attachment/followup + spool
+  preservation, watched/merge guards, bounded+expired-only sweeps,
+  partial-failure retry, crafted-meta escapes, legacy tombstones, HTTP
+  routes, dashboard hooks).
 - DONE 2026-10-16 (model-choice-lists, wave step of run
   20261016-013719-workflow-ux-safety): the Planner/Step model fields moved
   off the shared native datalist onto a real combobox (role=combobox +

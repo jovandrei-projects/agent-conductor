@@ -96,6 +96,20 @@ try:
 except ValueError:
     ARCHIVE_AFTER_S = 48 * 3600
 
+# Deleting a run record or discarding a proposal is RECOVERABLE: the bundle
+# moves to data/trash/<entry>/ (meta.json + payload/) instead of rmtree and
+# is hidden from normal listings for TRASH_RETAIN_S - the dashboard's Undo
+# action or Trash view restores it. A bounded sweep purges only expired
+# entries; 'Empty trash' is the one irreversible op and is confirmed twice.
+TRASH_DIR = DATA_DIR / "trash"
+try:
+    TRASH_RETAIN_S = float(
+        os.environ.get("CONDUCTOR_TRASH_HOURS") or 48) * 3600
+except ValueError:
+    TRASH_RETAIN_S = 48 * 3600
+TRASH_SWEEP_MAX = 64        # entries purged per sweep pass - bounded work
+TRASH_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+
 PREAMBLE = """\
 This session was spawned unattended by agent-conductor
 (C:\\Projects\\agent-conductor). No human is watching this run. Do NOT use
@@ -3912,6 +3926,8 @@ def sweep_runs(runs_dir: Path, write: bool = True) -> list[str]:
                 break
             save_state(sj.parent, st)
     lines += archive_runs(runs_dir, write=write)
+    lines += sweep_trash(_trash_root(runs_dir), runs_dir.parent / "requests",
+                         runs_dir, write=write)
     return lines
 
 
@@ -3954,13 +3970,17 @@ _ARCHIVE_POLL_S = 1800.0    # /api/state is polled ~2s; scan twice an hour
 def _auto_archive(runs_dir: Path) -> None:
     """serve's startup sweep archives once at boot; a dashboard left up for
     days would never hide runs that finished after boot without this
-    throttled pass (failures just keep the current view)."""
+    throttled pass (failures just keep the current view). The same pass
+    purges expired trash - bounded, expired-only, and self-dry-running
+    while a live worker watches the data tree."""
     global _ARCHIVE_TRIED
     if time.time() - _ARCHIVE_TRIED < _ARCHIVE_POLL_S:
         return
     _ARCHIVE_TRIED = time.time()
     try:
         archive_runs(runs_dir)
+        sweep_trash(_trash_root(runs_dir), runs_dir.parent / "requests",
+                    runs_dir)
     except Exception:
         LOG.exception("auto-archive sweep failed")
 
@@ -6992,18 +7012,245 @@ def set_run_archived(run_name: str, body: dict,
     return {"run": run_name, "archived": archived}
 
 
-def delete_run(run_name: str, body: dict,
-               runs_dir: Path = RUNS_DIR) -> dict:
-    """Dashboard 'Delete run': remove the run's whole on-disk record -
-    state, events, prompts, stdout logs, ATIF exports. Requires
-    {"confirm": true} and is refused while any step is live or a
-    resume/merge is in flight (same gates resume_run/merge_run use).
-    The devin sessions it spawned are NOT deleted - once the state.json
-    naming them is gone they leave the `sessions` whitelist and become
-    manual `devin rm <id>` cleanup, same as trap-13 orphans. Parked
-    worktree branches outlive the record."""
+# ------------------------------------------------------------------- trash
+# 'Delete run' / 'Discard' move their bundle to data/trash/<entry>/
+# (meta.json + payload/) instead of destroying it. The record drops out of
+# every normal listing the moment it moves, stays recoverable for
+# TRASH_RETAIN_S (default 48h), and restores via the dashboard Undo action
+# or the Trash view. Only two paths destroy for real: the bounded sweep of
+# EXPIRED entries, and 'Empty trash' behind an explicit confirm.
+#
+# What moves: for a run, the whole data/runs/<ts>-<name>/ dir; for a
+# request, the <id>.json record, its owned <id>-*.toml proposal, every
+# <id>.* side artifact (gen.log/export/draft/run.log), and the planner
+# spool dir (it must move - a parked overlay would otherwise flush and
+# resurrect the record). What never moves: spawned devin sessions (restore
+# re-whitelists them via the returned state.json), parked worktree
+# branches/checkouts, request image attachments (absolute-path references,
+# possibly shared), and anything outside the managed roots - payload names
+# are minted here and every dest name is re-validated as a direct child of
+# its root on restore, so a hand-edited meta cannot aim the engine at
+# unrelated data.
+
+
+def _trash_root(runs_dir: Path) -> Path:
+    return runs_dir.parent / "trash"
+
+
+def _trash_log(trash_dir: Path, **kv) -> None:
+    """Append-only audit line into the trash's own events.jsonl - a trashed
+    run dir moves wholesale, so its own events.jsonl can't carry the
+    deletion record."""
+    try:
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        kv["ts"] = now_iso()
+        with STATE_LOCK:
+            with open(trash_dir / "events.jsonl", "a",
+                      encoding="utf-8") as f:
+                f.write(json.dumps(kv, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _trash_new(trash_dir: Path, kind: str, name: str, ref: str,
+               note: str = "") -> tuple[Path, dict]:
+    """Mint an entry dir + meta skeleton. meta.json is written LAST, after
+    every payload move - it is the entry's commit point, so a crash mid-
+    move leaves a dir no listing or sweep recognizes as trash."""
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    for _ in range(20):
+        d = trash_dir / f"{stamp}-{secrets.token_hex(3)}"
+        try:
+            (d / "payload").mkdir(parents=True)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise RequestError("Could not create a trash entry", 500)
+    deleted = now_iso()
+    exp = dt.datetime.fromtimestamp(
+        time.time() + TRASH_RETAIN_S).isoformat(timespec="seconds")
+    meta = {"id": d.name, "kind": kind, "name": name, "ref": ref,
+            "deleted_at": deleted, "expires_at": exp, "note": note,
+            "items": []}
+    return d, meta
+
+
+def _trash_take(entry_dir: Path, meta: dict, src: Path, slot: str,
+                dest_kind: str, dest_name: str, is_dir: bool) -> None:
+    """Move `src` into the entry payload and record how it goes back:
+    `dest_kind` names the managed root (runs/requests/manifests/spool) and
+    `dest_name` the direct-child basename it restores under."""
+    payload = entry_dir / "payload" / f"{len(meta['items']):02d}-{slot}"
+    shutil.move(str(src), str(payload))
+    meta["items"].append({"slot": slot, "payload": payload.name,
+                          "dest": dest_kind, "name": dest_name,
+                          "dir": bool(is_dir)})
+
+
+def _trash_store_record(entry_dir: Path, meta: dict, rec: dict,
+                        dest_name: str) -> None:
+    """Persist a request record that exists only as a spool overlay (the
+    <id>.json file never landed) as the entry's record payload."""
+    p = entry_dir / "payload" / f"{len(meta['items']):02d}-record"
+    p.write_text(json.dumps(rec, indent=2, ensure_ascii=False),
+                 encoding="utf-8")
+    meta["items"].append({"slot": "record", "payload": p.name,
+                          "dest": "requests", "name": dest_name,
+                          "dir": False})
+
+
+def _trash_write_meta(entry_dir: Path, meta: dict) -> None:
+    tmp = entry_dir / "meta.json.tmp"
+    tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    tmp.replace(entry_dir / "meta.json")
+
+
+def _trash_entry(trash_dir: Path, entry_id: str) -> tuple[Path, dict]:
+    """Resolve + read a real trash entry (id == dir name == meta id); the
+    regex gate and resolved-parent check keep callers inside trash_dir."""
+    if not TRASH_ID_RE.fullmatch(entry_id or ""):
+        raise RequestError("Invalid trash entry", 404)
+    d = (trash_dir / entry_id).resolve()
+    if d.parent != trash_dir.resolve() or not d.is_dir():
+        raise RequestError("Trash entry not found", 404)
+    try:
+        meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RequestError("Trash entry is not readable", 500) from exc
+    if not isinstance(meta, dict) or meta.get("id") != entry_id:
+        raise RequestError("Trash entry metadata mismatch", 500)
+    return d, meta
+
+
+def _legacy_discards(requests_dir: Path, now: float) -> list[dict]:
+    """Pre-trash 'Discard' tombstones: status=='discarded' records still
+    sitting in requests_dir (their manifest file was already unlinked).
+    Listed as `legacy-<id>` trash entries so they can still be restored -
+    they come back as drafts - or purged; the deletion clock is the
+    record's own updated_at."""
+    out = []
+    try:
+        files = sorted(requests_dir.glob("*.json"))
+    except OSError:
+        return out
+    for rf in files:
+        try:
+            rec = json.loads(rf.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict) or rec.get("status") != "discarded" \
+                or not REQUEST_ID_RE.fullmatch(str(rec.get("id") or "")):
+            continue
+        deleted = rec.get("updated_at") or rec.get("created_at")
+        exp = (_iso_ts(deleted) or now) + TRASH_RETAIN_S
+        out.append({"id": f"legacy-{rec['id']}", "kind": "request",
+                    "name": rec.get("label") or rec["id"], "ref": rec["id"],
+                    "deleted_at": deleted,
+                    "expires_at": dt.datetime.fromtimestamp(exp).isoformat(
+                        timespec="seconds"),
+                    "expires_in_s": max(0.0, exp - now),
+                    "note": "discarded before trash existed - restores as "
+                            "a draft; its proposal file was not kept",
+                    "items": 0, "legacy": True})
+    return out
+
+
+def list_trash(trash_dir: Path, requests_dir: Path,
+               now: float | None = None) -> list[dict]:
+    """Every recoverable entry, newest first: real data/trash/*/ entries
+    plus legacy 'discarded' request tombstones."""
+    now = time.time() if now is None else now
+    out = []
+    try:
+        dirs = sorted(trash_dir.iterdir())
+    except OSError:
+        dirs = []
+    for d in dirs:
+        if not d.is_dir() or not TRASH_ID_RE.fullmatch(d.name):
+            continue
+        try:
+            meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue   # a mid-move entry is not trash yet - leave it alone
+        if not isinstance(meta, dict) or meta.get("id") != d.name:
+            continue
+        out.append({"id": d.name, "kind": meta.get("kind"),
+                    "name": meta.get("name"), "ref": meta.get("ref"),
+                    "deleted_at": meta.get("deleted_at"),
+                    "expires_at": meta.get("expires_at"),
+                    "expires_in_s": max(
+                        0.0, (_iso_ts(meta.get("expires_at")) or now) - now),
+                    "note": meta.get("note"),
+                    "items": len(meta.get("items") or []), "legacy": False})
+    out += _legacy_discards(requests_dir, now)
+    out.sort(key=lambda e: e.get("deleted_at") or "", reverse=True)
+    return out
+
+
+def _trash_dest(item: dict, dirs: dict[str, Path]) -> Path:
+    """The restore destination of one item - always a direct child of its
+    managed root, or the move refuses to follow it."""
+    name = item.get("name")
+    root = dirs.get(item.get("dest"))
+    if not name or Path(str(name)).name != name or root is None:
+        raise RequestError("Corrupt trash entry item", 500)
+    dest = (root / name).resolve()
+    if dest.parent != root.resolve():
+        raise RequestError("Trash item escapes its managed root", 500)
+    return dest
+
+
+def _rewrite_run_paths(run_dir: Path, old_abs: str) -> None:
+    """A run restored under a different dir name gets its state.json's
+    self-references (run_dir + each step's prompt/stdout_log/export, all
+    recorded as absolute paths) retargeted to the new location."""
+    sj = run_dir / "state.json"
+    try:
+        st = json.loads(sj.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    old = os.path.normcase(str(old_abs)).rstrip("\\/")
+    new = str(run_dir)
+
+    def rw(v):
+        if not isinstance(v, str):
+            return v
+        nv = os.path.normcase(v)
+        if nv == old:
+            return new
+        return new + v[len(old):] if nv.startswith(
+            old + os.sep) or nv.startswith(old + "/") else v
+
+    st["run_dir"] = rw(st.get("run_dir"))
+    for r in (st.get("steps") or {}).values():
+        for k in ("prompt", "stdout_log", "export"):
+            r[k] = rw(r.get(k))
+    try:
+        sj.write_text(json.dumps(st, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def delete_run(run_name: str, body: dict, runs_dir: Path = RUNS_DIR,
+               trash_dir: Path | None = None) -> dict:
+    """Dashboard 'Delete run': move the run's whole on-disk record - state,
+    events, prompts, stdout logs, ATIF exports - to recoverable trash
+    (data/trash/<entry>/), NOT rmtree. The row leaves every normal list at
+    once and the entry restores via the in-app Undo action or the Trash
+    view for TRASH_RETAIN_S; after that the bounded sweep purges it, and
+    'Empty trash' is the only immediate permanent delete.
+
+    Same gates resume_run/merge_run use: {"confirm": true}, refused while
+    any step is live, a resume/merge is in flight, or a summarizer session
+    is writing into the dir. The devin sessions it spawned are NOT deleted
+    (they leave the `sessions` whitelist until a restore brings state.json
+    back, same as trap-13 orphans) and parked worktree branches outlive
+    the record - the entry meta names them; trash never touches git."""
     if body.get("confirm") is not True:
         raise RequestError("Confirm delete explicitly")
+    trash_dir = trash_dir or _trash_root(runs_dir)
     d, st = _run_dir_checked(run_name, runs_dir)
     if any(step_live(r, driver_alive(st)) for r in (st.get("steps") or {}).values()):
         raise RequestError("This run still has a live agent - wait for it "
@@ -7015,17 +7262,33 @@ def delete_run(run_name: str, body: dict,
         if run_name in _MERGE_BUSY:
             raise RequestError("A merge is already running for this run",
                                409)
-    _assert_unwatched(runs_dir, d)
+    if _summarizing(d) or pid_alive(_SUM_PIDS.get(run_name)):
+        raise RequestError("A summary session is still writing into this "
+                           "run dir - wait for it or let it die first", 409)
+    _assert_unwatched(runs_dir, d, trash_dir)
+    unmerged = [n for n, r in (st.get("steps") or {}).items()
+                if r.get("branch") and r.get("merged") is not True]
+    entry_dir, meta = _trash_new(
+        trash_dir, "run", st.get("run") or run_name, run_name,
+        note=("spawned devin sessions are not deleted - restoring "
+              "re-whitelists them" +
+              (f"; unmerged branches stay parked: {', '.join(unmerged)}"
+               if unmerged else "")))
+    meta["origin"] = str(d)
     try:
-        shutil.rmtree(d)
+        _trash_take(entry_dir, meta, d, "run", "runs", d.name, is_dir=True)
     except OSError as exc:
-        raise RequestError(f"Could not delete the run dir: {exc}",
+        shutil.rmtree(entry_dir, ignore_errors=True)
+        raise RequestError(f"Could not move the run to trash: {exc}",
                            500) from exc
+    _trash_write_meta(entry_dir, meta)
+    _trash_log(trash_dir, event="trash_add", kind="run", ref=run_name,
+               entry=meta["id"], name=meta["name"])
     # Sentinels in %TEMP% key on the run's resolved path - sweep the
     # path-keyed set (stop/skip/prompt/rnote/timeout) plus the bare
-    # run-level legacy names. Step-level legacy names (stop-<run>-<step>)
-    # can't be told apart from a same-named run's keyed flags - left in
-    # place, they are inert empty files.
+    # run-level legacy names. A restored dir re-keys identically when it
+    # lands under its old name, but deliberately starts flag-clean: an
+    # interrupted skip/stop decision is not something a restore replays.
     for f in _flag_dir().glob(f"*{_flag_key(d)}*"):
         try:
             f.unlink()
@@ -7037,7 +7300,8 @@ def delete_run(run_name: str, body: dict,
                 missing_ok=True)
         except OSError:
             pass
-    return {"deleted": run_name}
+    return {"deleted": run_name, "trashed": True,
+            "trash_id": meta["id"], "expires_at": meta["expires_at"]}
 
 
 def set_step_timeout(run_name: str, step_name: str, body: dict,
@@ -7150,19 +7414,322 @@ def set_step_notes(run_name: str, step_name: str, body: dict,
 def discard_request(request_id: str,
                     requests_dir: Path = REQUESTS_DIR,
                     manifests_dir: Path = MANIFESTS_DIR,
-                    runs_dir: Path = RUNS_DIR) -> dict:
+                    runs_dir: Path = RUNS_DIR,
+                    trash_dir: Path | None = None) -> dict:
+    """Dashboard 'Discard': move the request's proposal bundle to
+    recoverable trash instead of marking it destroyed - the <id>.json
+    record, the owned <id>-*.toml proposal, every <id>.* artifact
+    (gen.log/export/draft/run.log) and the planner spool all keep for
+    TRASH_RETAIN_S. The row leaves every normal list at once; Undo/Restore
+    returns it at the same workflow stage with attachments and the
+    follow-up flag intact. Running/launched proposals still refuse, as do
+    watched destinations (trap 5)."""
+    trash_dir = trash_dir or _trash_root(runs_dir)
     with REQUEST_LOCK:
-        _assert_unwatched(runs_dir, requests_dir, manifests_dir)
-        rec = _read_request(request_id, requests_dir)
+        rec = _read_request(request_id, requests_dir)   # overlay wins
         if _request_status(rec, runs_dir) not in (
                 "draft", "ready", "error", "launch_failed", "questions"):
             raise RequestError("A running or launched proposal cannot be discarded",
                                409)
-        if rec.get("manifest"):
-            _manifest_path(rec, manifests_dir).unlink(missing_ok=True)
-        rec.update(status="discarded", proposed_steps=[], manifest=None)
+        _assert_unwatched(runs_dir, requests_dir, manifests_dir, trash_dir)
+        entry_dir, meta = _trash_new(
+            trash_dir, "request", rec.get("label") or request_id,
+            request_id,
+            note=("image attachments stay in data/attachments (referenced "
+                  "by path, possibly shared); the planner spool moved with "
+                  "the record so a pending flush cannot resurrect it"))
+        try:
+            # the parked overlay decides which copy of the record is
+            # authoritative - decide BEFORE the spool dir moves away
+            overlay = _spool_rec(request_id) is not None
+            spool = _spool_dir(request_id)
+            if spool.is_dir():
+                _trash_take(entry_dir, meta, spool, "spool", "spool",
+                            spool.name, is_dir=True)
+            if rec.get("manifest"):
+                try:
+                    mp = _manifest_path(rec, manifests_dir)
+                except RequestError:
+                    mp = None          # not owned / bad shape - leave it
+                if mp is not None and mp.is_file():
+                    _trash_take(entry_dir, meta, mp, "manifest",
+                                "manifests", mp.name, is_dir=False)
+            recp = _request_path(request_id, requests_dir)
+            for art in sorted(requests_dir.glob(f"{request_id}.*")):
+                if art.is_file() and art.name != recp.name:
+                    _trash_take(entry_dir, meta, art, "artifact",
+                                "requests", art.name, is_dir=False)
+            if recp.is_file() and not overlay:
+                _trash_take(entry_dir, meta, recp, "record", "requests",
+                            recp.name, is_dir=False)
+            else:
+                # A parked spool overlay is what readers see - the on-disk
+                # copy is its shadow. Persist the overlay AS the record;
+                # the shadow is superseded, not payload.
+                recp.unlink(missing_ok=True)
+                _trash_store_record(entry_dir, meta, rec, recp.name)
+        except OSError as exc:
+            shutil.rmtree(entry_dir, ignore_errors=True)
+            raise RequestError(
+                f"Could not move the request to trash: {exc}", 500) from exc
+        _trash_write_meta(entry_dir, meta)
+        _trash_log(trash_dir, event="trash_add", kind="request",
+                   ref=request_id, entry=meta["id"], name=meta["name"])
+        out = dict(rec)
+        out.update(trashed=True, trash_id=meta["id"],
+                   expires_at=meta["expires_at"])
+        return out
+
+
+def _restore_request_entry(entry_dir: Path, meta: dict,
+                           requests_dir: Path, manifests_dir: Path,
+                           runs_dir: Path) -> dict:
+    """Put a request bundle back: artifacts -> requests/, the proposal
+    TOML -> manifests/ (a `-restored` rename when a newer file holds the
+    old name), the parked spool -> PLANNER_SPOOL, and the <id>.json record
+    LAST - an existing record means a same-id request was recreated, which
+    is newer work and is never overwritten (the whole restore refuses).
+    The record comes back byte-identical, so the effective workflow stage
+    is whatever _request_status recomputes for it."""
+    payload = (entry_dir / "payload").resolve()
+    dirs = {"runs": runs_dir, "requests": requests_dir,
+            "manifests": manifests_dir, "spool": Path(PLANNER_SPOOL)}
+    plan: list[tuple[dict, Path, Path | None]] = []
+    rec_item = None
+    for item in meta.get("items") or []:
+        src = (payload / str(item.get("payload") or "")).resolve()
+        if src.parent != payload or not src.exists():
+            raise RequestError(
+                f"Trash payload {item.get('payload')} is missing", 500)
+        dest = _trash_dest(item, dirs)
+        if item.get("slot") == "record":
+            rec_item = (item, src, dest)
+            continue
+        if item.get("slot") == "manifest" and dest.exists():
+            # newer work owns the name - land beside it under a -restored
+            # variant (still <id>-prefixed, so _manifest_path accepts it)
+            rid = str(meta.get("ref") or "")
+            base_name = dest.name[:-5] if dest.name.endswith(".toml") \
+                else dest.name
+            for n in range(1, 20):
+                cand = dest.with_name(
+                    f"{base_name}-restored{'' if n == 1 else '-' + str(n)}"
+                    f".toml")
+                if not cand.exists():
+                    dest = cand
+                    break
+            else:
+                raise RequestError(
+                    "No free manifest name to restore under", 500)
+            if not cand.name.startswith(f"{rid}-"):
+                raise RequestError(
+                    "Restored manifest name would not belong to the "
+                    "request", 500)
+        plan.append((item, src, dest))
+    if rec_item is not None and rec_item[2].exists():
+        raise RequestError(
+            "A request with this id already exists - not overwriting "
+            "newer work", 409)
+    rid = str(meta.get("ref") or "")
+    if rec_item is None:
+        raise RequestError("Trash entry has no request record", 500)
+    manifest_dest = next((d for i, s, d in plan
+                          if i.get("slot") == "manifest"), None)
+    moved: list[tuple[dict, Path]] = []
+    failed: list[str] = []
+    for item, src, dest in plan:
+        if dest.exists():
+            # an occupied side-file/spool dest means newer work owns it -
+            # keep it and drop our copy with the entry
+            moved.append((item, dest))
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+            moved.append((item, dest))
+        except OSError:
+            failed.append(item.get("payload") or "?")
+    if failed:
+        meta["items"] = [rec_item[0]] + [
+            i for i, _s, _d in plan
+            if (i.get("payload") or "?") in failed]
+        _trash_write_meta(entry_dir, meta)
+        raise RequestError(
+            "Restore was partial - failed item(s) stay in trash: "
+            + ", ".join(failed), 500)
+    rec = json.loads(rec_item[1].read_text(encoding="utf-8"))
+    if manifest_dest is not None:
+        rec["manifest"] = str(manifest_dest)   # repoint (rename or moved
+                                               # manifests root)
+    recp = _request_path(rid, requests_dir)
+    tmp = requests_dir / f"{rid}.tmp"
+    tmp.write_text(json.dumps(rec, indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    tmp.replace(recp)                          # atomic, like _save_request
+    return {"restored": rid, "status": rec.get("status") or "draft"}
+
+
+def _restore_run_entry(entry_dir: Path, meta: dict,
+                       runs_dir: Path) -> dict:
+    """Put a run dir back under data/runs. A same-named dir is newer work
+    and is never overwritten - the payload lands as `<name>-restored[-N]`
+    and its internal absolute self-references are rewritten."""
+    payload = (entry_dir / "payload").resolve()
+    item = next((i for i in (meta.get("items") or [])
+                 if i.get("slot") == "run"), None)
+    if item is None:
+        raise RequestError("Trash entry has no run payload", 500)
+    src = (payload / str(item.get("payload") or "")).resolve()
+    if src.parent != payload or not src.is_dir():
+        raise RequestError("Run payload is missing from trash", 500)
+    dest = _trash_dest(item, {"runs": runs_dir})
+    actual = dest
+    if dest.exists():
+        for n in range(1, 20):
+            cand = runs_dir / (f"{item['name']}-restored"
+                               + ("" if n == 1 else f"-{n}"))
+            if not cand.exists():
+                actual = cand
+                break
+        else:
+            raise RequestError(
+                "No free run dir name to restore under", 500)
+    _assert_unwatched(runs_dir, actual)
+    try:
+        shutil.move(str(src), str(actual))
+    except OSError as exc:
+        raise RequestError(f"Could not restore the run dir: {exc}",
+                           500) from exc
+    renamed = actual != dest
+    if renamed:
+        _rewrite_run_paths(actual, str(meta.get("origin") or dest))
+    log_event(actual, event="run_restored", entry=meta.get("id"),
+              restored_as=actual.name)
+    return {"restored": item["name"], "restored_as": actual.name,
+            "renamed": renamed}
+
+
+def _restore_legacy_discard(request_id: str, requests_dir: Path) -> dict:
+    """A pre-trash tombstone never left requests_dir - restoring clears its
+    'discarded' mark back to 'draft' (its proposal file was already gone
+    when the old code discarded it)."""
+    with REQUEST_LOCK:
+        rec = _read_request_file(request_id, requests_dir)
+        if rec.get("status") != "discarded":
+            raise RequestError("Request is not in trash", 409)
+        rec["status"] = "draft"
+        rec["error"] = None
         _save_request(rec, requests_dir)
-        return dict(rec)
+        return {"restored": request_id, "status": "draft",
+                "legacy": True}
+
+
+def restore_trash(entry_id: str, trash_dir: Path = TRASH_DIR,
+                  runs_dir: Path = RUNS_DIR,
+                  requests_dir: Path = REQUESTS_DIR,
+                  manifests_dir: Path = MANIFESTS_DIR) -> dict:
+    """Trash view 'Restore' (and the post-delete Undo): put the entry's
+    payloads back at their recorded destinations, at the workflow state
+    they carried. Never overwrites an occupied destination - run dirs
+    rename to `<name>-restored[-N]` with internal paths rewritten, a
+    proposal manifest lands beside a same-named newer file under a
+    `-restored` variant (rec['manifest'] repointed), side artifacts keep
+    the existing file, and an occupied request record refuses the whole
+    restore. Refused while a destination sits in a live agent's watched
+    workspace (trap 5)."""
+    m = re.fullmatch(r"legacy-(\d{8}-\d{6}-[0-9a-f]{8})", entry_id or "")
+    if m:
+        return _restore_legacy_discard(m.group(1), requests_dir)
+    entry_dir, meta = _trash_entry(trash_dir, entry_id)
+    _assert_unwatched(runs_dir, requests_dir, manifests_dir, trash_dir)
+    if meta.get("kind") == "run":
+        out = _restore_run_entry(entry_dir, meta, runs_dir)
+    elif meta.get("kind") == "request":
+        out = _restore_request_entry(entry_dir, meta, requests_dir,
+                                     manifests_dir, runs_dir)
+    else:
+        raise RequestError("Unknown trash entry kind", 500)
+    shutil.rmtree(entry_dir, ignore_errors=True)
+    _trash_log(trash_dir, event="trash_restore", kind=meta.get("kind"),
+               ref=meta.get("ref"), entry=entry_id)
+    return out
+
+
+def empty_trash(body: dict, trash_dir: Path = TRASH_DIR,
+                requests_dir: Path = REQUESTS_DIR,
+                runs_dir: Path = RUNS_DIR) -> dict:
+    """Trash view 'Empty trash': the ONLY immediate permanent delete -
+    every entry dir plus legacy discard tombstones. The handler requires
+    {"confirm": true} and the UI words the confirm as irreversible; a live
+    agent watching the trash/requests tree refuses it (trap 5)."""
+    if body.get("confirm") is not True:
+        raise RequestError("Confirm emptying trash explicitly")
+    _assert_unwatched(runs_dir, trash_dir, requests_dir)
+    entries = list_trash(trash_dir, requests_dir)
+    gone = 0
+    for e in entries:
+        if e.get("legacy"):
+            try:
+                _request_path(e["ref"], requests_dir).unlink(
+                    missing_ok=True)
+                gone += 1
+            except (OSError, RequestError):
+                pass
+            continue
+        d = (trash_dir / e["id"]).resolve()
+        try:
+            if d.parent == trash_dir.resolve() and d.is_dir():
+                shutil.rmtree(d)
+                gone += 1
+        except OSError:
+            pass
+    _trash_log(trash_dir, event="trash_empty", count=gone)
+    return {"emptied": gone}
+
+
+def sweep_trash(trash_dir: Path, requests_dir: Path,
+                runs_dir: Path | None = None, now: float | None = None,
+                write: bool = True,
+                limit: int = TRASH_SWEEP_MAX) -> list[str]:
+    """Purge ONLY expired trash entries - oldest expiry first, capped at
+    `limit` per pass so the dashboard poll stays bounded. Entries with no
+    readable meta.json are in-flight moves, not trash; they are never
+    touched. Same trap-5 rule as sweep_runs: while a live worker's
+    work_dir contains the trash or requests tree this degrades to a
+    dry-run report."""
+    now = time.time() if now is None else now
+    watched = False
+    if runs_dir is not None:
+        states = _load_run_states(runs_dir)
+        watched = any(
+            _runs_watched(d, states)
+            for d in (trash_dir, requests_dir) if d is not None)
+    lines: list[str] = []
+    doomed = [e for e in list_trash(trash_dir, requests_dir, now)
+              if e["expires_in_s"] <= 0]
+    doomed.sort(key=lambda e: e.get("expires_at") or "")
+    for e in doomed[:max(0, limit)]:
+        lines.append(f"{e['id']}: purged ({e['kind']} "
+                     f"'{e.get('name') or e.get('ref')}', expired "
+                     f"{e.get('expires_at')})")
+        if not write or watched:
+            continue
+        try:
+            if e.get("legacy"):
+                _request_path(e["ref"], requests_dir).unlink(
+                    missing_ok=True)
+            else:
+                d = (trash_dir / e["id"]).resolve()
+                if d.parent == trash_dir.resolve() and d.is_dir():
+                    shutil.rmtree(d)
+        except (OSError, RequestError):
+            continue
+        _trash_log(trash_dir, event="trash_purge", kind=e.get("kind"),
+                   ref=e.get("ref"), entry=e["id"])
+    if lines and write and watched:
+        lines.insert(0, f"DRY-RUN: a live worker watches the trash tree "
+                        f"- not purging (trap 5)")
+    return lines
 
 
 # ---------------------------------------------------------------- dashboard
@@ -7664,12 +8231,16 @@ def _pending_agent(st: dict, sd: dict, key: str, run_dir: str,
 def collect_dashboard(runs_dir: Path,
                       devin_argv: list[str] | None = None,
                       requests_dir: Path | None = None,
-                      include_archived: bool = False) -> dict:
+                      include_archived: bool = False,
+                      include_trash: bool = False) -> dict:
     """Show executed run states alongside saved, not-yet-executed requests.
     A launched request uses state.json for its rows, not its proposal
     preview. Runs stamped state['archived'] (auto-archive, or the modal's
     Archive button) are omitted unless include_archived - they stay on
-    disk either way, and the 'archived_runs' count always reflects them."""
+    disk either way, and the 'archived_runs' count always reflects them.
+    Trashed runs/requests never appear here (their files moved to
+    data/trash); trash_count/trash_ids feed the view chip and the Undo
+    bar's liveness check, and include_trash adds the full entry list."""
     requests_dir = requests_dir or runs_dir.parent / "requests"
     _auto_archive(runs_dir)
     _auto_drain()
@@ -7678,15 +8249,28 @@ def collect_dashboard(runs_dir: Path,
     refresh_prices(runs_dir)
     prices = price_table(runs_dir)
     requests: dict[str, dict] = {}
+    trash_ids: list[str] = []
     for rf in requests_dir.glob("*.json"):
         try:
             rec = json.loads(rf.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if isinstance(rec, dict) and REQUEST_ID_RE.fullmatch(
-                str(rec.get("id") or "")) and rec.get("status") != "discarded":
-            # a parked planner overlay is more current than the file
-            requests[rec["id"]] = _spool_rec(rec["id"]) or rec
+        if not isinstance(rec, dict) or not REQUEST_ID_RE.fullmatch(
+                str(rec.get("id") or "")):
+            continue
+        if rec.get("status") == "discarded":
+            trash_ids.append(f"legacy-{rec['id']}")   # pre-trash tombstone
+            continue
+        # a parked planner overlay is more current than the file
+        requests[rec["id"]] = _spool_rec(rec["id"]) or rec
+    trash_dir = _trash_root(runs_dir)
+    try:
+        for td in trash_dir.iterdir():
+            if td.is_dir() and TRASH_ID_RE.fullmatch(td.name) \
+                    and (td / "meta.json").is_file():
+                trash_ids.append(td.name)
+    except OSError:
+        pass
     launched: set[str] = set()
     emitted_prep: set[str] = set()   # plan_sessions rows emitted once
                                      # per request (dup run dirs share
@@ -8059,6 +8643,9 @@ def collect_dashboard(runs_dir: Path,
             "cpu_count": os.cpu_count(),
             "free_ram_gb": free_ram_gb(), "runs": runs, "agents": agents,
             "archived_runs": archived_runs,
+            "trash_count": len(trash_ids), "trash_ids": trash_ids,
+            "trash": (list_trash(trash_dir, requests_dir)
+                      if include_trash else None),
             "project_options": [{"slug": slug, "cloud_ok": p["cloud_ok"]}
                                 for slug, p in sorted(projects.items())],
             "pricing": {"tier": "self-serve", "models": len(prices),
@@ -8394,8 +8981,10 @@ tr.ctxanchor td { background:#1c3041; }
   </div>
   <div class="sub tb-flow">Save draft &rarr; generate proposal &rarr; review &rarr; start when ready. Generating never runs tasks. Right-click a run or task row for its actions (Shift+F10 from the keyboard; Shift+right-click keeps the browser menu).</div>
   <div class="sub" id="filters"></div>
+  <div class="sub" id="undobar" hidden></div>
 </div>
 <h2>runs</h2><div class="wrapw"><table id="runs"></table></div>
+<div id="trashwrap" hidden></div>
 <h2>agents by project</h2><div id="agents"></div>
 <div id="ctxmenu" role="menu" aria-label="row actions" hidden></div>
 <div id="backdrop" hidden><div id="detail" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button type="button" class="x" id="dx">Close ×</button><div id="dbody"></div></div></div>
@@ -8465,6 +9054,17 @@ let density = store.getItem('ac-density') || 'full';
 // 'archived' view chip: archived runs stay on disk but are hidden from the
 // default listing - the toggle refetches /api/state?archived=1 to list them.
 let showArchived = store.getItem('ac-arch') === '1';
+// 'trash' view chip: recoverable deletions (run records, proposal drafts)
+// list with Restore + a confirmed Empty trash until the 48h sweep purges
+// them; the toggle refetches /api/state?trash=1 for the entry list.
+let showTrash = store.getItem('ac-trash') === '1';
+let lastTrash = null;   // {id,label} of the just-trashed entry - the Undo
+                        // bar rides it until used, dismissed, or the entry
+                        // disappears (restored/emptied/purged elsewhere)
+const stateUrl = () => '/api/state' +
+  ((showArchived||showTrash)
+    ? '?' + [showArchived?'archived=1':'', showTrash?'trash=1':'']
+        .filter(Boolean).join('&') : '');
 function syncTopbar(){
   const tb = document.querySelector && document.querySelector('.topbar');
   if (tb && document.documentElement)
@@ -9429,8 +10029,9 @@ function showRunDetails(key, keepStack){
       `${liveSteps.length?' disabled':''} ` +
       `title="${liveSteps.length
         ? 'disabled while a step is still live - stop the run first'
-        : 'permanently delete this run record - state, logs, prompts, ' +
-          'exports'}">Delete run</button>`) +
+        : 'move this run record - state, logs, prompts, exports - to ' +
+          'Trash; recoverable for 48h, Empty trash deletes it for good'}">` +
+      `Delete run</button>`) +
     '</div>';
   applyModalScroll();
   document.getElementById('backdrop').hidden = false;
@@ -9510,8 +10111,8 @@ function ctxRunItems(r){
       attrs:ctxAttrs({'delete-run':base(r.dir)}),
       title:c.liveSteps.length
         ? 'disabled while a step is still live - stop the run first'
-        : 'permanently delete this run record - state, logs, prompts, ' +
-          'exports'});
+        : 'move this run record to Trash - recoverable for 48h, Empty ' +
+          'trash deletes it for good'});
   }
   return it;
 }
@@ -9620,8 +10221,7 @@ async function api(method,path,body){
   if (!res.ok) throw new Error(out.error||`HTTP ${res.status}`);
   return out;
 }
-async function refresh(){ render(await api('GET','/api/state' +
-  (showArchived?'?archived=1':''))); }
+async function refresh(){ render(await api('GET', stateUrl())); }
 function effortOptionsFor(model){
   const e=(lastData?.model_options||{})[model];
   return (e && e.length ? e : ['min','low','medium','high','max'])
@@ -10214,7 +10814,9 @@ async function requestAction(action){
   const manifestEl=document.getElementById('rq-manifest');
   const editedManifest=!!manifestEl &&
     manifestEl.value!==modalRequest.originalManifest;
-  if (action==='discard' && !confirm('Discard this request, its proposal TOML, and all planned steps?')) return;
+  if (action==='discard' && !confirm('Discard this request, its proposal ' +
+      'TOML, and all planned steps? They move to Trash, recoverable for ' +
+      '48h (Undo right after, or the Trash view).')) return;
   // Regenerate replaces the generated tasks when it succeeds, so it
   // always confirms - and names any unsaved TOML edits it would drop
   if (action==='generate' && rec.manifest && !confirm(
@@ -10260,7 +10862,9 @@ async function requestAction(action){
       if (!rid) return;
       await api('POST',`/api/requests/${rid}/stop`,{});
     } else if (action==='discard'){
-      await api('POST',`/api/requests/${rid}/discard`,{confirm:true});
+      const out=await api('POST',`/api/requests/${rid}/discard`,{confirm:true});
+      if (out && out.trash_id) lastTrash={id:out.trash_id,
+        label:`request ${rec.label||rid}`};
       selectedRun=null;
       closeDetail(true);
       await refresh();
@@ -10355,6 +10959,50 @@ function tickElapsed(now){
     if (td) td.textContent = elapsed(a, now);
   }
 }
+// The Trash view (view: 'N trash' chip). Every row is a recoverable
+// deletion with its purge clock; Restore lands it back where it was
+// (collisions rename, never overwrite) and Empty trash is the one
+// irreversible op, so it confirms plainly and the server confirms again.
+function trashHtml(d){
+  const items = d.trash||[];
+  let h = `<h2>trash</h2><div class="sub">deleted run records and ` +
+    `proposal drafts rest here for 48h, then a sweep purges them - ` +
+    `Restore puts each back exactly where it was. Trashing never removed ` +
+    `spawned sessions, parked branches, or worktrees - and nothing here ` +
+    `runs.</div>`;
+  if (items.length)
+    h += `<div style="margin:0 0 8px"><button type="button" ` +
+      `class="btn danger" data-empty-trash ` +
+      `title="permanently delete every trash entry now - there is no ` +
+      `restore after this">Empty trash</button></div>`;
+  h += `<div class="wrapw"><table>` +
+    `<colgroup><col style="width:23%"><col style="width:10%">` +
+    `<col style="width:12%"><col style="width:14%"><col style="width:30%">` +
+    `<col style="width:11%"></colgroup>` +
+    `<tr><th>name</th><th>kind</th><th>deleted</th><th>purges in</th>` +
+    `<th>notes</th><th></th></tr>`;
+  for (const e of items){
+    const left = e.expires_in_s<=0 ? 'expired - purge pending'
+      : fmtS(e.expires_in_s);
+    h += `<tr><td class="wrap">${esc(e.name||e.ref||'?')}` +
+      `<div class="sub">${esc(e.ref!==e.name?(e.ref||''):'')}` +
+      `${esc(e.id)}</div></td>` +
+      `<td>${e.kind==='run'?'run':'proposal'}` +
+      `${e.legacy?' <span class="stage skipped" title="discarded before ' +
+      `the Trash view existed">legacy</span>`:''}</td>` +
+      `<td>${loc(e.deleted_at)}</td>` +
+      `<td title="purge-eligible at ${esc(e.expires_at||'?')}">${left}</td>` +
+      `<td class="wrap sub">${esc(e.note||((e.items||0)+' item(s)'))}</td>` +
+      `<td><button type="button" class="btn secondary" ` +
+      `data-restore-trash="${esc(e.id)}" ` +
+      `title="put it back where it was - nothing is overwritten; a busy ` +
+      `name lands under a -restored suffix">Restore</button></td></tr>`;
+  }
+  h += `</table></div>`;
+  if (!items.length) h += `<div class="sub">trash is empty.</div>`;
+  return h;
+}
+
 function render(d){
   if (BOOT===null) BOOT = d.serve_boot;
   else if (d.serve_boot !== BOOT){ location.reload(); return; }
@@ -10384,7 +11032,8 @@ function render(d){
   // a Compact|Full flip must re-render even when the payload is identical.
   const sig = JSON.stringify([d.runs, d.agents.map(({tail,...r})=>r),
     selectedRun, [...only].sort(), [...facets].sort(), expanded,
-    runsShown===Infinity?'all':runsShown, density]);
+    runsShown===Infinity?'all':runsShown, density,
+    d.trash, d.trash_ids, showTrash, lastTrash&&lastTrash.id]);
   const tailEl = document.getElementById('dtail');
   if (sig === lastSig){
     tickElapsed(now);
@@ -10427,9 +11076,40 @@ function render(d){
     `title="list archived runs - finished runs are auto-archived after ` +
     `48h (CONDUCTOR_ARCHIVE_HOURS); files stay on disk, Unarchive in the ` +
     `run modal brings one back">${d.archived_runs||0} archived` +
-    `${showArchived?' ×':''}</button></span>` +
+    `${showArchived?' ×':''}</button>` +
+    `<button type="button" class="chip${showTrash?' active':''}" ` +
+    `data-trash aria-pressed="${showTrash}" ` +
+    `title="recoverable trash - deleted runs and proposals rest here for ` +
+    `48h before a sweep purges them; Restore puts one back, Empty trash ` +
+    `removes all of them for good">${d.trash_count||0} trash` +
+    `${showTrash?' ×':''}</button></span>` +
     (only.size||facets.size?` <button type="button" class="chip" ` +
       `data-reset>clear filters</button>`:'');
+
+  // Undo bar: the entry a delete/discard just trashed stays one click
+  // away until dismissed, restored, or purged (trash_ids liveness).
+  const ub = document.getElementById('undobar');
+  if (ub){
+    if (lastTrash && !(d.trash_ids||[]).includes(lastTrash.id))
+      lastTrash = null;
+    ub.hidden = !lastTrash;
+    ub.innerHTML = lastTrash
+      ? `<span class="filter-label">trashed:</span> ` +
+        `${esc(lastTrash.label)} ` +
+        `<button type="button" class="chip" data-undo-trash=` +
+        `"${esc(lastTrash.id)}" title="restore it right now">` +
+        `Undo</button> ` +
+        `<button type="button" class="chip" data-trash-open ` +
+        `title="open the Trash view">open trash</button> ` +
+        `<button type="button" class="chip" data-undo-dismiss ` +
+        `title="leave it in trash - it auto-purges after 48h">` +
+        `dismiss</button>` : '';
+  }
+  const tw = document.getElementById('trashwrap');
+  if (tw){
+    tw.hidden = !showTrash;
+    if (showTrash) tw.innerHTML = trashHtml(d);
+  }
 
   // runs table first - a run can span projects (chips show which)
   let h = '<colgroup><col style="width:13%"><col style="width:19%">' +
@@ -11234,14 +11914,17 @@ document.addEventListener('click', async e=>{
     const unmerged=AGENTS.filter(a=>a.branch && a.merged!==true &&
       (a.run_key||a.run_dir)===(r?runKey(r):'')).length;
     if(!confirm(`Delete run '${r?r.run:dir}'? Its whole record - state, ` +
-      `logs, prompts, session exports - is removed from disk. There is ` +
-      `no undo.` +
+      `logs, prompts, session exports - moves to Trash, recoverable for ` +
+      `48h (Undo right after, or the Trash view). Empty trash is what ` +
+      `deletes it for good.` +
       (unmerged?` ${unmerged} worktree branch(es) are still unmerged - ` +
         `merge them first or they stay parked.`:''))) return;
     t.disabled=true;
     try {
-      await api('POST',`/api/runs/${encodeURIComponent(dir)}/delete`,
+      const out=await api('POST',`/api/runs/${encodeURIComponent(dir)}/delete`,
                 {confirm:true});
+      if (out && out.trash_id) lastTrash={id:out.trash_id,
+        label:`run ${r?r.run:dir}`};
       closeDetail(true); await refresh();
     } catch(err){ alert('Delete failed: '+err.message); t.disabled=false; }
     return; }
@@ -11277,6 +11960,53 @@ document.addEventListener('click', async e=>{
     store.setItem('ac-arch', showArchived?'1':'0');
     await refresh(); return;
   }
+  if (t.dataset && t.dataset.trash!==undefined){   // 'N trash' view chip
+    showTrash=!showTrash;
+    store.setItem('ac-trash', showTrash?'1':'0');
+    await refresh(); return;
+  }
+  if (t.dataset && t.dataset.trashOpen!==undefined){   // Undo bar link
+    showTrash=true; store.setItem('ac-trash','1');
+    await refresh();
+    const tw=document.getElementById('trashwrap');
+    if (tw && tw.scrollIntoView) tw.scrollIntoView();
+    return;
+  }
+  if (t.dataset && t.dataset.undoTrash){   // Undo a delete/discard
+    const id=t.dataset.undoTrash;
+    t.disabled=true;
+    try {
+      const out=await api('POST',
+        `/api/trash/${encodeURIComponent(id)}/restore`,{});
+      lastTrash=null; await refresh();
+      alert(`Restored ${out.restored_as||out.restored||'it'}.`);
+    } catch(err){ alert('Restore failed: '+err.message); t.disabled=false; }
+    return; }
+  if (t.dataset && t.dataset.undoDismiss!==undefined){
+    lastTrash=null; if (lastData) render(lastData); return; }
+  if (t.dataset && t.dataset.restoreTrash){   // Trash view row
+    const id=t.dataset.restoreTrash;
+    t.disabled=true;
+    try {
+      const out=await api('POST',
+        `/api/trash/${encodeURIComponent(id)}/restore`,{});
+      if (lastTrash && lastTrash.id===id) lastTrash=null;
+      await refresh();
+      alert(`Restored ${out.restored_as||out.restored||'it'}.`);
+    } catch(err){ alert('Restore failed: '+err.message); t.disabled=false; }
+    return; }
+  if (t.dataset && t.dataset.emptyTrash!==undefined){
+    const n=(lastData?.trash||[]).length;
+    if(!confirm(`Empty trash? ${n} item(s) are PERMANENTLY deleted now ` +
+      `- run records, logs, prompts and proposal drafts cannot be ` +
+      `recovered after this.`)) return;
+    t.disabled=true;
+    try {
+      await api('POST','/api/trash/empty',{confirm:true});
+      lastTrash=null; await refresh();
+    } catch(err){ alert('Empty trash failed: '+err.message);
+      t.disabled=false; }
+    return; }
   if (t.dataset && t.dataset.st){            // status filter chip: show only
     only.has(t.dataset.st) ? only.delete(t.dataset.st)
                            : only.add(t.dataset.st);
@@ -11605,8 +12335,7 @@ document.addEventListener('mouseover', e=>{
   applyHl();
 });
 async function tick(){
-  try { render(await (await fetch('/api/state' +
-    (showArchived?'?archived=1':''))).json()); }
+  try { render(await (await fetch(stateUrl())).json()); }
   catch(e){} finally { setTimeout(tick, 2000); } }
 setDensity(density);
 if (typeof window!=='undefined' && window.addEventListener)
@@ -11619,9 +12348,11 @@ tick();
 def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                            requests_dir: Path | None = None,
                            manifests_dir: Path = MANIFESTS_DIR,
-                           attachments_dir: Path | None = None):
+                           attachments_dir: Path | None = None,
+                           trash_dir: Path | None = None):
     requests_dir = requests_dir or runs_dir.parent / "requests"
     attachments_dir = attachments_dir or runs_dir.parent / "attachments"
+    trash_dir = trash_dir or runs_dir.parent / "trash"
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def _send(self, body: bytes, ctype: str, status: int = 200) -> None:
@@ -11676,6 +12407,8 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     self._json(collect_dashboard(
                         runs_dir, devin_argv, requests_dir,
                         include_archived=q.get("archived", [""])[0]
+                        in ("1", "true", "yes"),
+                        include_trash=q.get("trash", [""])[0]
                         in ("1", "true", "yes")))
                 elif (m := re.fullmatch(r"/api/requests/([^/]+)", path)):
                     rec = request_details(m[1], requests_dir,
@@ -11798,8 +12531,17 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     else:
                         if body.get("confirm") is not True:
                             raise RequestError("Confirm discard explicitly")
-                        self._json(discard_request(request_id, requests_dir,
-                                                   manifests_dir, runs_dir))
+                        self._json(discard_request(
+                            request_id, requests_dir, manifests_dir,
+                            runs_dir, trash_dir))
+                elif (m := re.fullmatch(
+                        r"/api/trash/([^/]+)/restore", path)):
+                    self._json(restore_trash(m.group(1), trash_dir,
+                                             runs_dir, requests_dir,
+                                             manifests_dir))
+                elif path == "/api/trash/empty":
+                    self._json(empty_trash(body, trash_dir, requests_dir,
+                                           runs_dir))
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/resume", path)):
                     self._json(resume_run(m.group(1), runs_dir,
                                           devin_argv), 202)
@@ -11823,7 +12565,8 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     self._json(set_run_archived(m.group(1), body,
                                                 runs_dir))
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/delete", path)):
-                    self._json(delete_run(m.group(1), body, runs_dir))
+                    self._json(delete_run(m.group(1), body, runs_dir,
+                                          trash_dir))
                 elif (m := re.fullmatch(
                         r"/api/runs/([^/]+)/steps/([^/]+)/interrupt", path)):
                     self._json(interrupt_step(
