@@ -3877,5 +3877,95 @@ prompt = "work"
             self.assertIn(name, html)
 
 
+class StepSummaryTests(unittest.TestCase):
+    """GET /api/runs/<run>/steps/<step>/summary renders a markdown
+    report per step (status/elapsed/tokens/trajectory/commits/stdout
+    tail) and persists <step>.summary.md once the step is not live."""
+
+    def _run(self, td: str, step: dict, **st_extra):
+        runs = Path(td) / "runs"
+        rd = runs / "20261015-000000-sum"
+        rd.mkdir(parents=True)
+        st = {"run": "sum", "steps": {"s1": step}, **st_extra}
+        (rd / "state.json").write_text(json.dumps(st), encoding="utf-8")
+        return runs, rd
+
+    def _export(self, rd: Path) -> Path:
+        exp = rd / "s1.export.json"
+        exp.write_text(json.dumps({"steps": [
+            {"step_id": 1, "timestamp": "2026-10-15T01:00:00",
+             "metrics": {"prompt_tokens": 1000, "completion_tokens": 50,
+                         "cached_tokens": 800}},
+            {"step_id": 2, "timestamp": "2026-10-15T01:02:00",
+             "metrics": {"prompt_tokens": 1500, "completion_tokens": 70,
+                         "cached_tokens": 1200}}]}), encoding="utf-8")
+        return exp
+
+    def test_report_has_core_sections(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run(td, {
+                "status": "done", "started_at": "2026-10-15T00:00:00",
+                "ended_at": "2026-10-15T00:33:52", "elapsed_s": 2032.4,
+                "model": "swe-2", "effort": "max", "mode": "bypass",
+                "session_id": "sess-1", "verify_ok": True,
+                "exit_code": 0, "task": "do the thing",
+                "tokens": {"prompt": 1000, "completion": 50,
+                           "cached": 800, "llm_steps": 2}})
+            md = conductor.step_summary(rd.name, "s1", runs)
+            self.assertIn("# 20261015-000000-sum / s1", md)
+            self.assertIn("**status:** done", md)
+            self.assertIn("**elapsed:** 33m52s", md)
+            self.assertIn("sess-1", md)
+            self.assertIn("billed in 200", md)   # prompt - cached
+            self.assertIn("do the thing", md)
+            # persisted once the step is not live
+            self.assertEqual((rd / "s1.summary.md").read_text(
+                encoding="utf-8"), md)
+
+    def test_trajectory_and_tail_rendered(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run(td, {
+                "status": "done", "elapsed_s": 60,
+                "tokens": {"prompt": 5, "completion": 1,
+                           "cached": 0, "llm_steps": 2}})
+            exp = self._export(rd)
+            st = json.loads((rd / "state.json").read_text())
+            st["steps"]["s1"]["export"] = str(exp)
+            log = rd / "s1.stdout.log"
+            log.write_text("line1\nline2\nSTATUS: done\n")
+            st["steps"]["s1"]["stdout_log"] = str(log)
+            (rd / "state.json").write_text(json.dumps(st))
+            md = conductor.step_summary(rd.name, "s1", runs)
+            self.assertIn("## Trajectory (2 turns", md)
+            self.assertIn("## stdout tail", md)
+            self.assertIn("STATUS: done", md)
+
+    def test_live_step_serves_but_never_writes(self):
+        """trap 5: a file write into data/runs mid-step can kill a
+        self-hosted worker - live steps render fresh, persist nothing."""
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run(td, {
+                "status": "running",
+                "started_at": conductor.now_iso(), "timeout_min": 60})
+            md = conductor.step_summary(rd.name, "s1", runs)
+            self.assertIn("**status:** running", md)
+            self.assertFalse((rd / "s1.summary.md").exists())
+
+    def test_missing_step_and_bad_names_404(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs, _ = self._run(td, {"status": "done"})
+            with self.assertRaises(conductor.RequestError):
+                conductor.step_summary("20261015-000000-sum", "nope", runs)
+            with self.assertRaises(conductor.RequestError):
+                conductor.step_summary("../escape", "s1", runs)
+            with self.assertRaises(conductor.RequestError):
+                conductor.step_summary("20261015-000000-sum",
+                                       "s1/../../x", runs)
+
+    def test_summary_link_in_modal_js(self):
+        self.assertIn("/summary", conductor._DASH_HTML)
+        self.assertIn("Session summary", conductor._DASH_HTML)
+
+
 if __name__ == "__main__":
     unittest.main()
