@@ -162,6 +162,18 @@ NOTE FROM THE OPERATOR (saved on the conductor dashboard for this step):
 {notes}
 """
 
+# Prepended to the task body when the dashboard's 'Interrupt + instruct'
+# respawns a step: the operator asked for a stop, the request folded the
+# new instructions into the notes channel below, and this fresh session
+# continues the same step under both the original task and the add-on.
+INTERRUPT_NOTE = """\
+NOTE FROM THE CONDUCTOR: the operator interrupted this step and resumed \
+it with additional instructions - they are appended under 'NOTE FROM \
+THE OPERATOR' below. The previous session's work is already committed \
+in this repo: inspect the recent git log and .agent_tasks state, then \
+CONTINUE from where it stopped instead of redoing finished work.
+"""
+
 # Closing review step appended when a request's follow-up checkbox is set -
 # the planner is told to write it, and _publish_proposal appends this block
 # itself when the planner forgot, so the checkbox is a guarantee.
@@ -1935,6 +1947,17 @@ def rnote_flag(run_dir: Path, step: str) -> Path:
     return _flag_dir() / f"rnote-{_flag_key(run_dir)}-{_safe_name(step)}"
 
 
+def intrq_flag(run_dir: Path, step: str) -> Path:
+    """Dashboard 'Interrupt + instruct' request: a durable JSON sentinel
+    holding the operator's supplemental instructions + attachment refs.
+    wait_worker polls it like a stop flag - the worker must die before
+    the resume, so submission and the kill land under one name; run_step
+    then folds the request into the rnote channel and respawns the SAME
+    step. Kept by clear_run_flags like rnote, so a pending interrupt
+    survives a driver restart and lands on the next dispatch."""
+    return _flag_dir() / f"intrq-{_flag_key(run_dir)}-{_safe_name(step)}"
+
+
 def gen_stop_flag(request_id: str) -> Path:
     """Dashboard 'Stop proposal' sentinel: polled by the planner's
     wait_worker while a request generates. Request ids are already
@@ -2011,8 +2034,8 @@ def clear_run_flags(run_dir: Path) -> None:
     code must be resumable by new code. Skip sentinels deliberately
     survive: a user's skip stays in force until they Unskip, or a resume
     would silently resurrect a step they removed from the queue. The
-    prompt-edit and resume-notes sentinels survive too - the resume is
-    exactly when run_step reads them."""
+    prompt-edit, resume-notes and interrupt-request sentinels survive
+    too - the resume is exactly when run_step reads them."""
     name = _safe_name(run_dir.name)
     pats = [f"*{_flag_key(run_dir)}*",
             f"stop-{name}*", f"drain-{name}", f"pause-{name}",
@@ -2021,10 +2044,12 @@ def clear_run_flags(run_dir: Path) -> None:
         for pat in pats:
             for f in _flag_dir().glob(pat):
                 # skip- stays in force until Unskip; prompt-/rnote- are
-                # the pending step's edited prompt and resume notes -
-                # both are meant to survive the resume that is about to
-                # read them, so none of the three are halt sentinels.
-                if f.name.startswith(("skip-", "prompt-", "rnote-")):
+                # the pending step's edited prompt and resume notes, and
+                # intrq- is an unsubmitted-in-flight 'Interrupt + instruct'
+                # request - all are meant to survive the resume that is
+                # about to read them, so none are halt sentinels.
+                if f.name.startswith(
+                        ("skip-", "prompt-", "rnote-", "intrq-")):
                     continue
                 try:
                     f.unlink()
@@ -2036,6 +2061,64 @@ def clear_run_flags(run_dir: Path) -> None:
 
 TIMEOUT_MAX_EXT = 3        # a live log auto-extends past timeout_min up to
                            # this many extra floor units: ceiling = 4x
+
+
+def _body_with_notes(base: str | None, notes: str | None) -> str:
+    """The dispatch body: the step's own text, then the operator-notes
+    block appended under it. Kept tiny because run_step recomputes it
+    mid-loop when an interrupt folds fresh text into the notes sentinel."""
+    b = base or ""
+    if notes and notes.strip():
+        b = b.rstrip() + "\n\n" + RESUME_NOTES.format(notes=notes.strip())
+    return b
+
+
+def _intrq_to_notes(run_dir: Path, step: str) -> str | None:
+    """Fold a pending 'Interrupt + instruct' request into the step's
+    resume-notes sentinel - the single durable channel every dispatch
+    already reads, so instructions can be applied exactly once and can
+    never double-land on a retry.
+
+    Returns the rendered notes block, or None when no request is pending
+    (or the notes write failed). The intrq flag is deleted only AFTER the
+    notes write lands: the request's text lives in intrq xor rnote, so a
+    restart can neither lose it nor apply it twice."""
+    flag = intrq_flag(run_dir, step)
+    src = _flag_text(flag)
+    if src is None:
+        return None
+    try:
+        req = json.loads(src)
+        instructions = str(req.get("instructions") or "").strip()
+        attachments = req.get("attachments") or []
+        stamp = str(req.get("submitted_at") or "")
+    except (ValueError, TypeError):
+        # a hand-written or interrupted write left plain text - still
+        # deliver it as instructions rather than dropping the request.
+        req, instructions, attachments, stamp = {}, src.strip(), [], ""
+    lines = [f"INTERRUPT {stamp or now_iso()}: the operator stopped this "
+             "step and added the instructions below - they apply IN "
+             "ADDITION to the original task.",
+             instructions or "(no text - see attachments)"]
+    imgs = [a for a in attachments if isinstance(a, dict)]
+    if imgs:
+        lines.append("IMAGE ATTACHMENTS (absolute paths - Read each one "
+                     "to see the screenshot):")
+        lines += [f"- {a.get('name') or 'image'}: {a.get('path') or ''}"
+                  for a in imgs]
+    block = "\n".join(lines)
+    notes = rnote_flag(run_dir, step)
+    try:
+        existing = notes.read_text(encoding="utf-8") \
+            if notes.is_file() else ""
+        merged = (existing.rstrip() + "\n\n" + block) \
+            if existing.strip() else block
+        _flag_dir().mkdir(exist_ok=True)
+        notes.write_text(merged, encoding="utf-8")
+    except OSError:
+        return None          # keep intrq - the next dispatch retries the fold
+    flag.unlink(missing_ok=True)
+    return block
 
 
 def wait_worker(proc, stdout_log: Path, timeout_s: float,
@@ -2183,6 +2266,18 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     mid-wait -> tree-kill and 'stopped'. A 'Skip step' sentinel lands the
     same 'skipped' but is NOT consumed - it stays in force (even across
     --resume) until the user clicks Unskip.
+
+    An 'Interrupt + instruct' sentinel (intrq-*, a JSON request) polls in
+    the same slot as a stop flag but is NOT a stop: firing alone it kills
+    the worker, folds the operator's instructions into the rnote-*
+    channel, and respawns the SAME step (no attempt spent) under
+    INTERRUPT_NOTE - the killed worker's product is committed first, the
+    worktree/work_dir and accumulated changes are kept. A request that
+    lands after the turn already ended (STATUS printed, verify running,
+    or a real stop flag also firing) never respawns - it banks into the
+    notes channel for the next dispatch instead. The sentinel is only
+    deleted once its content is banked, so a driver restart mid-
+    transition can neither lose the request nor apply it twice.
     """
     halted = _flag_set(stop_flag(run_dir),
                        stop_flag(run_dir, step.name))
@@ -2207,30 +2302,33 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                   phase="before_spawn", user_skip=user_skip)
         return "skipped"
 
-    body_src = step.prompt
-    if body_src is None and step.prompt_file:
+    body_base = step.prompt
+    if body_base is None and step.prompt_file:
         try:
-            body_src = (cfg.path.parent / step.prompt_file).read_text(
+            body_base = (cfg.path.parent / step.prompt_file).read_text(
                 encoding="utf-8")
         except OSError:
-            body_src = step.prompt_file
+            body_base = step.prompt_file
 
-    # Dashboard prompt edits / resume notes are tempdir sentinels (trap-5
-    # safe): an override replaces the task body for every dispatch while
-    # it exists; notes append operator context under it. Both are durable
-    # (clear_run_flags leaves them) so they also apply on resume.
+    # Dashboard prompt edits / resume notes / interrupt requests are
+    # tempdir sentinels (trap-5 safe): an override replaces the task body
+    # for every dispatch while it exists; notes append operator context
+    # under it. All are durable (clear_run_flags leaves them) so they
+    # also apply on resume. A banked 'Interrupt + instruct' request -
+    # driver died mid-transition, or a hard stop landed first - folds
+    # into the notes channel BEFORE they are read, so the instructions
+    # reach this dispatch exactly once.
     prompt_edited = False
     try:
         over = prompt_flag(run_dir, step.name)
         if over.is_file():
-            body_src = over.read_text(encoding="utf-8")
+            body_base = over.read_text(encoding="utf-8")
             prompt_edited = True
     except OSError:
         pass
+    intr_folded = _intrq_to_notes(run_dir, step.name) is not None
     rnotes = _flag_text(rnote_flag(run_dir, step.name))
-    if rnotes and rnotes.strip():
-        body_src = (body_src or "").rstrip() + "\n\n" + \
-            RESUME_NOTES.format(notes=rnotes.strip())
+    body_src = _body_with_notes(body_base, rnotes)
 
     prompt_path = run_dir / "prompts" / f"{step.name}.md"
     prompt_path.parent.mkdir(exist_ok=True)
@@ -2289,25 +2387,56 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     all_sessions: set[str] = set()
     tok_acc: dict[str, int] = {}
     attempt = 0
+    interrupts = 0
+    intr_respawn = False
+    intr_late = False
+    intr_banked = False
     while True:
-        attempt += 1
-        if attempt > 1:
-            # The timed-out attempt's work was committed at the bottom of
-            # this loop; the retry is a fresh session pointed at that state.
-            # Per-attempt files keep every transcript and export.
+        if intr_respawn:
+            # 'Interrupt + instruct': the worker was killed by our own
+            # sentinel and its product committed at the bottom of this
+            # loop - this respawn is the SAME step (not a retry attempt;
+            # it costs no max_attempts) resumed under INTERRUPT_NOTE with
+            # the operator's text folded into the notes channel.
+            intr_respawn = False
+            interrupts += 1
             prompt_path = run_dir / "prompts" / \
-                f"{step.name}.attempt{attempt}.md"
-            stdout_log = run_dir / f"{step.name}.attempt{attempt}.stdout.log"
-            export_path = run_dir / f"{step.name}.attempt{attempt}.export.json"
-            retry_step = dataclasses.replace(
-                step, prompt=RETRY_NOTE.format(
-                    timeout=step.timeout_min, prev=attempt - 1,
-                    total=step.max_attempts) + "\n" + (body_src or ""))
+                f"{step.name}.interrupt{interrupts}.md"
+            stdout_log = run_dir / \
+                f"{step.name}.interrupt{interrupts}.stdout.log"
+            export_path = run_dir / \
+                f"{step.name}.interrupt{interrupts}.export.json"
+            intr_step = dataclasses.replace(
+                step, prompt=INTERRUPT_NOTE + (body_src or ""),
+                prompt_file=None)
             prompt_path.write_text(
-                render_prompt(retry_step, slug, work_dir, cfg.path.parent,
+                render_prompt(intr_step, slug, work_dir, cfg.path.parent,
                               cfg.preamble), encoding="utf-8")
-            log_event(run_dir, event="step_retry", step=step.name,
-                      attempt=attempt)
+            log_event(run_dir, event="step_interrupt_respawn",
+                      step=step.name, interrupt=interrupts)
+        else:
+            attempt += 1
+            if attempt > 1:
+                # The timed-out attempt's work was committed at the bottom
+                # of this loop; the retry is a fresh session pointed at
+                # that state. Per-attempt files keep every transcript.
+                prompt_path = run_dir / "prompts" / \
+                    f"{step.name}.attempt{attempt}.md"
+                stdout_log = \
+                    run_dir / f"{step.name}.attempt{attempt}.stdout.log"
+                export_path = \
+                    run_dir / f"{step.name}.attempt{attempt}.export.json"
+                retry_step = dataclasses.replace(
+                    step, prompt=RETRY_NOTE.format(
+                        timeout=step.timeout_min, prev=attempt - 1,
+                        total=step.max_attempts) + "\n" + (body_src or ""),
+                    prompt_file=None)
+                prompt_path.write_text(
+                    render_prompt(retry_step, slug, work_dir,
+                                  cfg.path.parent, cfg.preamble),
+                    encoding="utf-8")
+                log_event(run_dir, event="step_retry", step=step.name,
+                          attempt=attempt)
 
         before = session_ids(devin_argv, work_dir) or set()
         cmd = devin_cmd(devin_argv, step, prompt_path, export_path)
@@ -2349,7 +2478,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                     rc, timed_out, hung, stopped, ext_s = wait_worker(
                         proc, stdout_log, step.timeout_min * 60,
                         stop_flags=(stop_flag(run_dir),
-                                    stop_flag(run_dir, step.name)),
+                                    stop_flag(run_dir, step.name),
+                                    intrq_flag(run_dir, step.name)),
                         timeout_flag=timeout_flag(run_dir, step.name),
                         stall_s=(step.stall_min * 60
                                  if step.stall_min > 0 else None))
@@ -2358,11 +2488,61 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                     proc.wait()
                     timed_out, ext_s = True, 0.0
                 if stopped:
-                    # consume the per-step sentinel; a run-level stop flag
-                    # stays so later waves see it too
-                    stop_flag(run_dir, step.name).unlink(
-                        missing_ok=True)
-                    break
+                    # The per-step sentinel is consumed either way; a
+                    # run-level stop flag stays so later waves see it too.
+                    # Then split what did the killing: a real stop flag
+                    # (per-step or run-level) ends the step, while an
+                    # 'Interrupt + instruct' request that fired ALONE is
+                    # not a stop - the same step respawns below once the
+                    # request folds into the notes channel.
+                    had_step_stop = \
+                        stop_flag(run_dir, step.name).is_file()
+                    stop_flag(run_dir, step.name).unlink(missing_ok=True)
+                    if intrq_flag(run_dir, step.name).is_file() \
+                            and not had_step_stop \
+                            and not stop_flag(run_dir).is_file():
+                        if tail_status(stdout_log) is None:
+                            # our sentinel did the killing mid-turn: fold
+                            # the request, then respawn. A notes-write
+                            # failure keeps the flag and reports stopped -
+                            # the pending request still applies on resume.
+                            if _intrq_to_notes(run_dir, step.name) \
+                                    is not None:
+                                body_src = _body_with_notes(
+                                    body_base,
+                                    _flag_text(rnote_flag(run_dir,
+                                                          step.name)))
+                                intr_respawn, stopped = True, False
+                                with STATE_LOCK:
+                                    rec["interrupts"] = \
+                                        (rec.get("interrupts") or 0) + 1
+                        else:
+                            # the worker had already ended its turn when
+                            # the request landed - natural completion
+                            # wins, so this is NOT a user stop: the step
+                            # records its real status. Bank the text for
+                            # the next dispatch instead of respawning a
+                            # finished turn; a fold failure keeps the
+                            # flag pending.
+                            intr_late = _intrq_to_notes(
+                                run_dir, step.name) is not None
+                            stopped = False
+                            log_event(run_dir,
+                                      event="step_interrupt_late",
+                                      step=step.name)
+                    elif intrq_flag(run_dir, step.name).is_file():
+                        # a real stop flag AND an interrupt landed
+                        # together: the stop wins the terminal status,
+                        # but the instructions still bank into notes so
+                        # a later resume carries them.
+                        intr_banked = _intrq_to_notes(
+                            run_dir, step.name) is not None
+                    # Only a REAL stop breaks early. A respawn and a late
+                    # arrival both reset `stopped`, so they fall through
+                    # to the post block - which commits the killed (or
+                    # finished) worker's product and reads its STATUS.
+                    if stopped:
+                        break
             except OSError as exc:
                 LOG.error("step %s spawn failed: %s", step.name, exc)
                 log_event(run_dir, event="spawn_error", step=step.name,
@@ -2374,10 +2554,14 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         status_line = tail_status(stdout_log)
         _merge_tokens(tok_acc, tail_metrics(export_path))
         # Commit each attempt's product BEFORE deciding to retry - the next
-        # session resumes from committed state, not the working tree.
+        # session resumes from committed state, not the working tree. The
+        # same commit covers a killed worker's partial work before an
+        # interrupt respawn continues it.
         if post_commit and cfg.checkpoint and is_git_repo(work_dir) \
                 and git_dirty(work_dir):
             git_commit(work_dir, f"conductor: work from {step.name}")
+        if intr_respawn:
+            continue
         if spawn_failed or not timed_out or attempt >= step.max_attempts:
             break
     elapsed = round(time.time() - t0, 1)
@@ -2399,6 +2583,16 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             verify_ok = False
             (run_dir / f"{step.name}.verify.log").write_text(
                 "verify timed out after 600s\n", encoding="utf-8")
+
+    # An interrupt request that landed during verify/teardown can never be
+    # consumed for THIS dispatch - bank it into the notes channel like a
+    # late arrival rather than leaving a kill sentinel to poison the next
+    # dispatch's first flag poll. A fold failure keeps the flag so the
+    # request still lands on the next dispatch.
+    if intrq_flag(run_dir, step.name).is_file():
+        intr_late = _intrq_to_notes(run_dir, step.name) is not None \
+            or intr_late
+        log_event(run_dir, event="step_interrupt_late", step=step.name)
 
     if stopped:
         status = "stopped"
@@ -2451,6 +2645,20 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         if stopped:
             notes.append("stopped by user via dashboard; the run "
                          "proceeds without it, --resume re-runs the step")
+        if interrupts:
+            notes.append(f"operator interrupted and resumed the step with "
+                         f"added instructions ({interrupts}x) - the same "
+                         "step continued, not a retry attempt")
+        if intr_late:
+            notes.append("an operator interrupt request arrived after the "
+                         "worker's turn ended - banked into resume notes "
+                         "for the next dispatch")
+        if intr_banked:
+            notes.append("a stop landed before a pending interrupt - its "
+                         "instructions were banked into resume notes")
+        if intr_folded:
+            notes.append("a banked interrupt request was folded into "
+                         "this dispatch's prompt")
         if prompt_edited:
             notes.append("prompt body was overridden via the dashboard "
                          "edit control before dispatch")
@@ -2658,6 +2866,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         # The driver is now THIS code version: it polls the path-keyed
         # sentinels only, so the dashboard can stop writing legacy names.
         state["flags"] = "v2"
+        # ...and it polls the intrq- sentinel, so the dashboard's
+        # 'Interrupt + instruct' action can accept requests again.
+        state["intrq"] = True
         # A resumed run is in flight again: the stale 'aborted'/'ended_at'
         # from the pause/crash would keep showing the old end-state notice
         # (e.g. 'Paused by user') until the loop re-stamps them.
@@ -2687,7 +2898,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                  "started_at": now_iso(), "devin": " ".join(devin_argv),
                  "devin_argv": devin_argv,
                  "run_dir": str(run_dir), "max_parallel": cap,
-                 "flags": "v2",
+                 "flags": "v2", "intrq": True,
                  "driver_pid": os.getpid(),
                  "driver_started_at": now_iso(),
                  "free_ram_gb": free_ram_gb(), "steps": {}}
@@ -6089,6 +6300,79 @@ def stop_step(run_name: str, step_name: str,
     return {"stopping": step_name}
 
 
+def interrupt_step(run_name: str, step_name: str, body: dict,
+                   runs_dir: Path = RUNS_DIR) -> dict:
+    """Dashboard 'Interrupt + instruct': persist the operator's
+    supplemental instructions (+ image attachment refs) in a durable
+    intrq-* sentinel the running driver polls in the same slot as a stop
+    flag - on sight the worker's process tree dies, the request folds
+    into the step's resume notes, and the SAME step respawns with them.
+
+    Only the sentinel is written here: no state.json touch, no respawn
+    from this handler (the driver owns the transition, so a dead driver
+    never leaves an orphaned replacement - the pending flag simply waits
+    for the next dispatch). A second request while one is pending is
+    refused: instructions must apply exactly once, so there is no
+    'latest wins' queue. A step that already ended is refused too - the
+    natural-completion race resolves on the driver side, and the UI
+    offers resume notes for follow-ups to a finished step."""
+    if not RUN_DIR_RE.fullmatch(step_name):
+        raise RequestError("Invalid step name", 404)
+    d, st = _run_dir_checked(run_name, runs_dir)
+    rec = (st.get("steps") or {}).get(step_name)
+    if rec is None:
+        raise RequestError("Step not in this run", 404)
+    if rec.get("status") != "running":
+        raise RequestError(
+            f"Step is {rec.get('status')}, not running - its turn is "
+            "over, so an interrupt has nothing to stop. Leave resume "
+            "notes instead; they reach the next dispatch.", 409)
+    if not step_live(rec, driver_alive(st)):
+        raise RequestError("This step is already dead (its record is "
+                           "stale - sweep will mark it lost)", 409)
+    if not st.get("intrq"):
+        raise RequestError(
+            "This run's conductor does not poll interrupt requests (it "
+            "predates the feature) - use Stop this step, then resume "
+            "notes + Resume instead", 409)
+    instructions = body.get("instructions")
+    if not isinstance(instructions, str) or not instructions.strip():
+        raise RequestError("instructions must be non-empty text")
+    instructions = instructions.strip()
+    if len(instructions) > 20_000:
+        raise RequestError("instructions must be at most 20,000 "
+                           "characters", 422)
+    attachments = _attachment_fields(body.get("attachments"))
+    if intrq_flag(d, step_name).is_file():
+        raise RequestError(
+            "An interrupt request is already pending for this step - "
+            "wait for the current one to land", 409)
+    payload = {"instructions": instructions, "attachments": attachments,
+               "submitted_at": now_iso()}
+    # atomic land: a crash mid-write must never leave half a JSON body
+    # for the driver to find unparseable (it would stay 'pending'
+    # forever); tmp-then-replace makes the request all-or-nothing.
+    flag = intrq_flag(d, step_name)
+    tmp = flag.with_name(flag.name + ".tmp")
+    try:
+        _flag_dir().mkdir(exist_ok=True)
+        tmp.write_text(json.dumps(payload, ensure_ascii=False),
+                       encoding="utf-8")
+        tmp.replace(flag)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        raise RequestError(
+            f"Could not write the interrupt request: {exc}", 500) from exc
+    # Same courtesy as stop_step: when the pid is visible kill it now
+    # rather than waiting out the flag poll - the driver sees the
+    # sentinel either way and only the pid's own tree dies (never the
+    # run, sibling steps, or the dashboard's process).
+    if rec.get("pid"):
+        _kill_pid(rec["pid"], rec.get("started_at"))
+    # NB no log_event here for the same trap-5 reason as stop_step.
+    return {"interrupting": step_name}
+
+
 def skip_step(run_name: str, step_name: str, body: dict,
               runs_dir: Path = RUNS_DIR) -> dict:
     """Dashboard 'Skip step'/'Unskip step': a persistent per-step sentinel
@@ -7045,6 +7329,12 @@ def collect_dashboard(runs_dir: Path,
                 "resume_notes": _flag_text(
                     rnote_flag(sj.parent, rec.get("name") or name)),
                 "prompt_edited": bool(rec.get("prompt_edited")),
+                # 'Interrupt + instruct': a pending request sentinel on a
+                # live step (the driver may be mid-kill), plus how many
+                # respawns this step has already done.
+                "intr_pending": intrq_flag(
+                    sj.parent, rec.get("name") or name).is_file(),
+                "interrupts": rec.get("interrupts"),
                 "cloud": rec.get("cloud", plan.get("cloud")),
                 "verify_ok": rec.get("verify_ok"),
                 "skipped_by_user": _safe_name(
@@ -7767,6 +8057,12 @@ const qDismissed = new Set();   // request|qids sigs the human closed - the
                               // auto-popup never re-nags for the same set
 const promptDrafts = {};    // key -> unsaved 'Edit prompt' text
 const notesDrafts = {};     // key -> unsaved 'resume notes' text
+// 'Interrupt + instruct' composer, all keyed by agentKey like the draft
+// maps so the 2s rebuild never eats an in-flight draft.
+const intrOpen = {};        // key -> composer section is open
+const intrDrafts = {};      // key -> unsent instructions text
+const intrAttach = {};      // key -> [{name,path}] attachments to send
+const intrSent = {};        // key -> {at: interrupts count when sent}
 // Trajectory expansion: which arc groups/entries are open per agent, and
 // the fetched full text per export file. Both survive the 2s modal
 // rebuild - the rebuild re-renders open entries from cache instead of
@@ -8094,15 +8390,111 @@ function summaryNav(d){
   const b=pos>=0 && sibs[pos+d];
   if (b) openSummary(agentKey(b), false);   // sibling nav keeps the Back stack
 }
+// 'Interrupt + instruct' composer inside the task modal. Opening it only
+// reveals a section - nothing reaches the server until the explicit
+// 'Interrupt + resume' confirm, and a step that ends while it sits open
+// degrades to a tombstone (the draft stays visible so nothing is lost).
+// After sending, the section follows the transition's phases off the
+// agent row's intr_pending flag and interrupts counter.
+function intrComposerHTML(a){
+  const key = agentKey(a);
+  if (!intrOpen[key]) return '';
+  const sent = intrSent[key];
+  const draft = intrDrafts[key];
+  const list = intrAttach[key]||[];
+  const thumbs = editable =>
+    `<div class="attach-strip" aria-live="polite" ` +
+    `aria-label="Attached images"${list.length?'':' hidden'}>` +
+    list.map(x=>
+      `<span class="attach-item"><a href="/api/attachments/` +
+      `${encodeURIComponent(x.name)}" target="_blank" ` +
+      `title="${esc(x.path)}"><img src="/api/attachments/` +
+      `${encodeURIComponent(x.name)}" alt="${esc(x.name)}"></a>` +
+      (editable?`<button type="button" class="attach-x" ` +
+        `data-attach-rm="${esc(x.name)}" ` +
+        `title="Remove this attachment">×</button>`:'') +
+      `</span>`).join('') + `</div>`;
+  if (sent){
+    // post-submit progress: the request sentinel + the record's respawn
+    // counter name the phase the driver is in
+    let msg;
+    if (a.intr_pending)
+      msg='Interrupt requested - the driver kills the worker on its ' +
+        'next flag poll (seconds), commits its work, then resumes this ' +
+        'same step with your instructions.';
+    else if ((a.interrupts||0) > (sent.at||0))
+      msg='Done - the worker was stopped and this step resumed with ' +
+        'your instructions (interrupt '+a.interrupts+').';
+    else if (a.status!=='running')
+      msg='The step ended ('+a.status+') - check its note for whether ' +
+        'the interrupt applied or was banked for the next dispatch.';
+    else
+      msg='Worker stopped - resuming this step with your ' +
+        'instructions…';
+    return `<h3 style="margin-top:14px">Interrupt + instruct</h3>` +
+      `<div class="notice${a.status==='running' ? '' : ' warn'}">` +
+      `${esc(msg)}</div>` + thumbs(false) +
+      `<div class="actions"><button type="button" ` +
+      `class="btn secondary" data-intr-cancel>Close</button></div>`;
+  }
+  if (a.status!=='running'){
+    return `<h3 style="margin-top:14px">Interrupt + instruct</h3>` +
+      `<div class="notice warn">This step finished (${esc(a.status)}) ` +
+      `while the composer was open - nothing was sent and the worker ` +
+      `was never touched.</div>` +
+      (draft!==undefined
+        ? `<textarea disabled style="min-height:70px">${esc(draft)}` +
+          `</textarea>` : '') +
+      `<div class="actions"><button type="button" ` +
+      `class="btn secondary" data-intr-cancel>Close</button></div>`;
+  }
+  return `<h3 style="margin-top:14px">Interrupt + instruct</h3>` +
+    `<div class="notice">Stops this step's worker, then immediately ` +
+    `resumes the SAME step in a fresh session - committed work and the ` +
+    `worktree stay, the run keeps going, and your text lands under ` +
+    `'NOTE FROM THE OPERATOR' on the new prompt. Use Stop this step ` +
+    `instead if the step should just end.</div>` +
+    `<textarea id="d-instr" style="min-height:90px" spellcheck="false" ` +
+    `placeholder="additional instructions for the resumed session…">` +
+    `${esc(draft||'')}</textarea>` + thumbs(true) +
+    `<div class="sub attach-row"><button type="button" ` +
+    `class="attach-btn" data-attach-pick="d-instr-file" ` +
+    `aria-label="Choose image files to attach" ` +
+    `title="Attach screenshots - they reach the resumed session as ` +
+    `image paths">` +
+    `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ` +
+    `stroke="currentColor" stroke-width="2" stroke-linecap="round" ` +
+    `stroke-linejoin="round" aria-hidden="true" focusable="false">` +
+    `<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57` +
+    `A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>` +
+    `</svg></button>` +
+    `<span>Optional screenshots - pick files, drop, or paste. They ` +
+    `upload to data/attachments and reach the resumed session as ` +
+    `paths.</span></div>` +
+    `<input type="file" id="d-instr-file" accept="image/*" multiple ` +
+    `hidden>` +
+    `<div id="d-instr-msg" class="notice" hidden></div>` +
+    `<div class="actions">` +
+    `<button type="button" class="btn" ` +
+    `data-intr-send="${esc(base(a.run_dir))}" ` +
+    `data-step="${esc(a.step)}"${a.intr_pending ? ' disabled' : ''}>` +
+    `${a.intr_pending ? 'Interrupt pending…' : 'Interrupt + resume'}` +
+    `</button>` +
+    `<button type="button" class="btn secondary" data-intr-cancel>` +
+    `Cancel</button>` +
+    `<span class="sub">the click confirms the request - the worker is ` +
+    `killed on the driver's next flag poll and the same step resumes ` +
+    `with these instructions.</span></div>`;
+}
 function showDetail(i, keepStack){
   const a = AGENTS[i]; if(!a || !closeDetail(false, !!keepStack)) return;
   detailIdx = i; detailKey = agentKey(a);
   // The modal is rebuilt on every refresh tick - carry the focused
   // textarea's draft text and caret across the rebuild so typing in
-  // Edit prompt / resume notes isn't eaten.
+  // Edit prompt / resume notes / the interrupt composer isn't eaten.
   const f0 = document.activeElement;
   const fid = f0 && f0.id;
-  const fsel = (fid==='d-prompt'||fid==='d-rnotes')
+  const fsel = (fid==='d-prompt'||fid==='d-rnotes'||fid==='d-instr')
     ? [f0.selectionStart, f0.selectionEnd] : null;
   const pk = detailKey;
   const pd = promptDrafts[pk];   // unsaved edit (undefined = none open)
@@ -8121,6 +8513,9 @@ function showDetail(i, keepStack){
       (a.timeout_ext_s?` (+${fmtS(a.timeout_ext_s)} active past it)`:
       ''):'-'],
     ['attempt',a.attempts!=null?`${a.attempts} of ${a.max_attempts||'?'}`:'-'],
+    ['interrupts',a.interrupts
+      ? a.interrupts+'x (the operator stopped + resumed it with added ' +
+        'instructions)' : '-'],
     ['tokens',tokTitle(a.tokens)||'-'],
     ['est cost',(fmtC(a.cost)!=='-'?fmtC(a.cost)+' - ':'')+costTitle(a.cost)],
     ['session',(a.session_id||'-')+(a.session_gone?' (deleted from sidebar)':'')],
@@ -8177,7 +8572,18 @@ function showDetail(i, keepStack){
             `proceeds to the next step">Stop this step</button>` +
             `<span class="sub" style="margin-left:10px">tree-kills the ` +
             `devin process; committed work stays. The run continues; ` +
-            `Resume re-runs the step.</span></div>` : '') +
+            `Resume re-runs the step.</span></div>` +
+            `<div class="actions"><button type="button" ` +
+            `class="btn secondary" ` +
+            `data-intr-open="${esc(agentKey(a))}" ` +
+            `title="stop the worker, then immediately resume this same ` +
+            `step with added instructions/screenshots - committed work ` +
+            `and the worktree stay; the run keeps going">` +
+            `Interrupt + instruct</button>` +
+            `<span class="sub" style="margin-left:10px">opens a composer ` +
+            `first - the same step resumes with your text; nothing is ` +
+            `skipped and the run does not pause.</span></div>` : '') +
+        intrComposerHTML(a) +
         (((a.status==='queued'||a.status==='waiting') && !a.skipped_by_user)
           ? `<div class="actions"><button type="button" ` +
             `class="btn secondary" ` +
@@ -8528,10 +8934,16 @@ function ctxAgentItems(a){
     it.push({label:'View request / runbook',
       attrs:ctxAttrs({'open-request':a.request_id})});
   const act = [];
-  if (a.status==='running' && a.run_dir)
+  if (a.status==='running' && a.run_dir){
+    act.push({label:'Interrupt + instruct',
+      attrs:ctxAttrs({'intr-open':key}),
+      title:'stop the worker and resume this same step with added ' +
+        'instructions/screenshots - committed work stays; the run ' +
+        'keeps going'});
     act.push({label:'Stop this step', danger:true,
       attrs:ctxAttrs({'stop-agent':base(a.run_dir),'step':a.step}),
       title:'tree-kill this agent now - the run proceeds to the next step'});
+  }
   if ((a.status==='queued'||a.status==='waiting') && !a.skipped_by_user &&
       a.run_dir)
     act.push({label:'Skip step',
@@ -9071,12 +9483,38 @@ function renderAttach(editable){
     `</span>`).join('');
   strip.hidden=!rqAttachments.length;
 }
-// The editable request textarea gates every drop/paste listener - other
-// modals (agent detail, questionnaire) reuse the same backdrop, so a bare
-// document-level bind must bail when rq-raw is absent or disabled.
+// The editable request textarea OR the interrupt composer's textarea
+// gates every drop/paste listener - other modals (agent detail,
+// questionnaire) reuse the same backdrop, so a bare document-level bind
+// must bail when neither is present or both are disabled.
 function attachTarget(){
-  const ta=document.getElementById('rq-raw');
-  return (ta && !ta.disabled && !modalQA) ? ta : null;
+  if (modalQA) return null;
+  const rq=document.getElementById('rq-raw');
+  if (rq && !rq.disabled) return rq;
+  const di=document.getElementById('d-instr');
+  return (di && !di.disabled) ? di : null;
+}
+function renderIntrAttach(){
+  const strip=document.getElementById('d-instr-attach');
+  if(!strip) return;
+  const list=intrAttach[detailKey]||[];
+  strip.innerHTML=list.map(a=>
+    `<span class="attach-item"><a href="/api/attachments/` +
+    `${encodeURIComponent(a.name)}" target="_blank" ` +
+    `title="${esc(a.path)}"><img src="/api/attachments/` +
+    `${encodeURIComponent(a.name)}" alt="${esc(a.name)}"></a>` +
+    `<button type="button" class="attach-x" ` +
+    `data-attach-rm="${esc(a.name)}" title="Remove this attachment">` +
+    `×</button>` +
+    `</span>`).join('');
+  strip.hidden=!list.length;
+}
+function attachErr(msg, intr){
+  // upload errors land in the composer's own notice when the interrupted
+  // step's textarea was the target, else in the request form's
+  const e=intr && document.getElementById('d-instr-msg');
+  if (e){ e.hidden=false; e.className='notice error'; e.textContent=msg; }
+  else formError(msg);
 }
 function insertAtCaret(ta,text){
   // NL via charCode: a backslash-n written into this Python string would
@@ -9093,8 +9531,10 @@ function insertAtCaret(ta,text){
 async function attachFiles(files){
   const ta=attachTarget();
   if(!ta || !files) return;
+  const intr = ta.id==='d-instr';
   const imgs=[...files].filter(f=>(f.type||'').startsWith('image/'));
-  if(!imgs.length){ formError('Only image files can be attached.'); return; }
+  if(!imgs.length){
+    attachErr('Only image files can be attached.', intr); return; }
   for (const f of imgs){
     try {
       const res=await fetch('/api/attachments',{method:'POST',
@@ -9102,13 +9542,21 @@ async function attachFiles(files){
         body:f});
       const out=await res.json().catch(()=>({}));
       if(!res.ok) throw new Error(out.error||('HTTP '+res.status));
-      if(!rqAttachments.some(x=>x.name===out.name)) rqAttachments.push(out);
-      renderAttach(true);
-      insertAtCaret(ta,out.path);
-      if(modalRequest) modalRequest.dirty=true;
-      refreshPending();
+      if (intr){
+        // the composer sends attachments as references in the POST body -
+        // the instructions text stays prose, no caret insertion
+        const b=(intrAttach[detailKey]=intrAttach[detailKey]||[]);
+        if(!b.some(x=>x.name===out.name)) b.push(out);
+        renderIntrAttach();
+      } else {
+        if(!rqAttachments.some(x=>x.name===out.name)) rqAttachments.push(out);
+        renderAttach(true);
+        insertAtCaret(ta,out.path);
+        if(modalRequest) modalRequest.dirty=true;
+        refreshPending();
+      }
       try{ta.dispatchEvent(new Event('input',{bubbles:true}));}catch(e){}
-    } catch(err){ formError('Attach failed: '+err.message); }
+    } catch(err){ attachErr('Attach failed: '+err.message, intr); }
   }
 }
 async function openRequest(id, keepStack){
@@ -9618,7 +10066,15 @@ function render(d){
           `×${a.attempts}</span>` : '') +
         (a.timeout_ext_s ? `<span class="sub" title="stayed active ` +
           `${fmtS(a.timeout_ext_s)} past the timeout floor"> +ext</span>`
-          : '') + `</td>` +
+          : '') +
+        (a.intr_pending && a.status==='running'
+          ? `<span class="sub" title="an 'Interrupt + instruct' request ` +
+            `is pending - the driver stops the worker on its next flag ` +
+            `poll and resumes the same step"> ·interrupting</span>` : '') +
+        (a.interrupts ? `<span class="sub" title="the operator stopped ` +
+          `and resumed this step with added instructions ` +
+          `${a.interrupts}x - same step, not a retry"> ` +
+          `·intr×${a.interrupts}</span>` : '') + `</td>` +
         `<td class="step"><span>${esc(a.step)}</span>${a.wt
           ? ` <button type="button" class="chip" data-facet="wt" ` +
             `style="color:#58a6ff" title="${esc(a.branch||'worktree')}">wt</button>` +
@@ -9779,16 +10235,23 @@ document.addEventListener('click', async e=>{
   const rmAtt = t.closest && t.closest('[data-attach-rm]');
   if (rmAtt){
     e.preventDefault();
-    rqAttachments=rqAttachments.filter(
-      a=>a.name!==rmAtt.dataset.attachRm);
-    renderAttach(true);
-    if (modalRequest) modalRequest.dirty=true;
-    refreshPending();
+    const n = rmAtt.dataset.attachRm;
+    if ((intrAttach[detailKey]||[]).some(a=>a.name===n)){
+      intrAttach[detailKey]=intrAttach[detailKey].filter(
+        a=>a.name!==n);
+      renderIntrAttach();
+    } else {
+      rqAttachments=rqAttachments.filter(a=>a.name!==n);
+      renderAttach(true);
+      if (modalRequest) modalRequest.dirty=true;
+      refreshPending();
+    }
     return; }
   const pickAtt = t.closest && t.closest('[data-attach-pick]');
   if (pickAtt){
     e.preventDefault();
-    const fi=document.getElementById('rq-file');
+    const fi=document.getElementById(
+      pickAtt.dataset.attachPick||'rq-file');
     if (fi && attachTarget()) fi.click();
     return; }
   if (modalQA && t.dataset && t.dataset.qopt!==undefined){
@@ -9971,6 +10434,62 @@ document.addEventListener('click', async e=>{
         `${encodeURIComponent(t.dataset.step)}/stop`,{});
       closeDetail(true); await refresh();
     } catch(err){ alert('Stop failed: '+err.message); t.disabled=false; }
+    return; }
+  const intrOpenEl = t.closest && t.closest('[data-intr-open]');
+  if (intrOpenEl){
+    // opens the composer section on that task's modal - composing is
+    // free; nothing reaches the server until the explicit send
+    const j = AGENTS.findIndex(
+      x=>agentKey(x)===intrOpenEl.dataset.intrOpen);
+    if (j>=0){
+      intrOpen[agentKey(AGENTS[j])]=true;
+      showDetail(j, true);
+      const p = document.getElementById('d-instr');
+      if (p && p.focus) p.focus();
+    }
+    return; }
+  const intrCancel = t.closest && t.closest('[data-intr-cancel]');
+  if (intrCancel){
+    // cancel is a pure view change - the worker is never touched
+    intrOpen[detailKey]=false;
+    delete intrSent[detailKey];
+    const j = AGENTS.findIndex(x=>agentKey(x)===detailKey);
+    if (j>=0) showDetail(j, true);
+    return; }
+  const intrSend = t.closest && t.closest('[data-intr-send]');
+  if (intrSend){
+    const dir = intrSend.dataset.intrSend, step = intrSend.dataset.step;
+    const key = detailKey;
+    const ta = document.getElementById('d-instr');
+    const instructions = (ta ? ta.value : '').trim();
+    const msg = m => { const el=document.getElementById('d-instr-msg');
+      if (el){ el.hidden=false; el.className='notice error';
+               el.textContent=m; } };
+    if (!instructions){
+      msg('Write the instructions first - they are what the resumed ' +
+          'session continues with.'); return; }
+    if(!confirm(`Interrupt '${step}'? Its worker is killed now and the ` +
+                `same step resumes in a fresh session carrying your ` +
+                `instructions (plus ${(intrAttach[key]||[]).length} ` +
+                `attached image(s)). Committed work and the worktree ` +
+                `stay; the run keeps going.`)) return;
+    intrSend.disabled=true;
+    try {
+      await api('POST',
+        `/api/runs/${encodeURIComponent(dir)}/steps/` +
+        `${encodeURIComponent(step)}/interrupt`,
+        {instructions,
+         attachments:(intrAttach[key]||[]).map(
+           a=>({name:a.name,path:a.path}))});
+      const a = AGENTS.find(x=>agentKey(x)===key);
+      intrSent[key] = {at:(a && a.interrupts)||0};
+      delete intrDrafts[key]; intrAttach[key]=[];
+      const j = AGENTS.findIndex(x=>agentKey(x)===key);
+      if (j>=0) showDetail(j, true);
+      await refresh();
+    } catch(err){
+      msg('Interrupt failed: '+err.message);
+      intrSend.disabled=false; }
     return; }
   if (t.dataset && t.dataset.stopGen){
     if(!confirm('Stop preparing this proposal? The planner session is ' +
@@ -10177,11 +10696,14 @@ document.addEventListener('toggle', e=>{
 document.addEventListener('input', e=>{
   // typed questionnaire text survives an option-toggle re-render
   if (modalQA && e.target.id==='q-free') modalQA.free=e.target.value;
-  // unsaved prompt/notes text survives the 2s modal rebuild - keyed by
-  // run_dir|step so a re-sorted row never inherits another step's draft
-  if ((e.target.id==='d-prompt'||e.target.id==='d-rnotes')
+  // unsaved prompt/notes/instructions text survives the 2s modal
+  // rebuild - keyed by run_key|step so a re-sorted row never inherits
+  // another step's draft
+  if ((e.target.id==='d-prompt'||e.target.id==='d-rnotes'||
+       e.target.id==='d-instr')
       && detailKey!=null)
-    (e.target.id==='d-prompt'?promptDrafts:notesDrafts)[detailKey]=
+    (e.target.id==='d-prompt'?promptDrafts:
+      e.target.id==='d-rnotes'?notesDrafts:intrDrafts)[detailKey]=
       e.target.value;
   if (modalRequest && e.target.id?.startsWith('rq-')){
     modalRequest.dirty=true;
@@ -10228,7 +10750,7 @@ document.addEventListener('dragover', e=>{
     e.preventDefault(); ta.classList.add('drop'); }
 });
 document.addEventListener('dragleave', ()=>{
-  const ta=document.getElementById('rq-raw');
+  const ta=attachTarget();
   if(ta) ta.classList.remove('drop');
 });
 document.addEventListener('drop', e=>{
@@ -10250,8 +10772,11 @@ document.addEventListener('paste', e=>{
 // A canceled dialog delivers no files and changes nothing; clearing the
 // value lets picking the same file twice still fire 'change'.
 document.addEventListener('change', e=>{
-  const fi=document.getElementById('rq-file');
-  if(!fi || e.target!==fi) return;
+  // either hidden picker - the request form's or the interrupt
+  // composer's - shares the drop/paste upload path
+  const fi=e.target;
+  if(!fi || (fi!==document.getElementById('rq-file') &&
+             fi!==document.getElementById('d-instr-file'))) return;
   const files=[...(fi.files||[])];
   try{fi.value='';}catch(err){}
   if(files.length) attachFiles(files);
@@ -10586,6 +11111,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                                                 runs_dir))
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/delete", path)):
                     self._json(delete_run(m.group(1), body, runs_dir))
+                elif (m := re.fullmatch(
+                        r"/api/runs/([^/]+)/steps/([^/]+)/interrupt", path)):
+                    self._json(interrupt_step(
+                        m.group(1), m.group(2), body, runs_dir), 202)
                 elif (m := re.fullmatch(
                         r"/api/runs/([^/]+)/steps/([^/]+)/stop", path)):
                     self._json(stop_step(m.group(1), m.group(2), runs_dir),
