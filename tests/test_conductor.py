@@ -1260,14 +1260,14 @@ const row={dataset:{runKey:'/first'}};
 (async()=>{
   await click({dataset:{},closest:selector=>selector==='tr.runrow'?row:null});
   assert.match(elem('filters').innerHTML,/Clear run filter/);
-  assert.match(elem('filters').innerHTML,/first ??/);
+  assert.match(elem('filters').innerHTML,/first ×/);
   assert.match(elem('runs').innerHTML,/runrow selected/);
   assert.doesNotMatch(elem('runs').innerHTML,/A separate run/);
   // the task column is modal-only now - rows are told apart by step name
   assert.match(elem('agents').innerHTML,/>alpha</);
   assert.doesNotMatch(elem('agents').innerHTML,/>beta</);
   await click({dataset:{facet:'merged'}});
-  assert.match(elem('filters').innerHTML,/merged ??/);
+  assert.match(elem('filters').innerHTML,/merged ×/);
   await click({dataset:{clearRun:''}});
   // the 'merged' tag chip still filters both tables: 'second' has no
   // merged step, so its run row hides too.
@@ -1311,7 +1311,7 @@ const d={serve_boot:'b',generated_at:'2026-10-14',agents:req.proposed_steps.map(
   project_options:[{slug:'p',cloud_ok:false}],defaults:{model:'swe-2',effort:'max'}};
 vm.runInContext('render('+JSON.stringify(d)+')',ctx);
 assert.match(elem('runs').innerHTML,/Ready to run/);
-assert.match(elem('runs').innerHTML,/Draft ?? unsent/);
+assert.match(elem('runs').innerHTML,/Draft · unsent/);
 assert.match(elem('agents').innerHTML,/phase-4/);
 (async()=>{
   await vm.runInContext('openRequest('+JSON.stringify(id)+')',ctx);
@@ -4141,11 +4141,11 @@ assert.match(elem('runs').innerHTML,/>1 done</);
 assert.match(elem('runs').innerHTML,/class="dot run"/);
 assert.match(elem('runs').innerHTML,/est \$1\.50/);
 // run row: step-token line names every field under the 'steps:' label
-assert.match(elem('runs').innerHTML,/steps: in 1k ?? out 200 ?? cached 0 ?? 2 turns ?? \$1\.50/);
+assert.match(elem('runs').innerHTML,/steps: in 1k · out 200 · cached 0 · 2 turns · \$1\.50/);
 // agent row: cost cell; tokens render as labeled fields (in/out/cached/
-// turns) - the bare '1k/200 ??2st' compact form is gone.
+// turns) - the bare '1k/200 ·2st' compact form is gone.
 assert.match(elem('agents').innerHTML,/\$0\.12/);
-assert.match(elem('agents').innerHTML,/in 1k ?? out 200 ?? cached 0 ?? 2 turns/);
+assert.match(elem('agents').innerHTML,/in 1k · out 200 · cached 0 · 2 turns/);
 assert.doesNotMatch(elem('agents').innerHTML,/1k\/200/);
 // compact density: bare billed-in/out/cached + turns (in = prompt -
 // cached, the billed part - Desktop's "input" number)
@@ -4225,7 +4225,7 @@ assert.ok(cleanRow && !/stage (live|paused|interrupted|halted)/.test(cleanRow));
 const healedRow=runs.split('runrow').find(r=>r.includes('>healed<'));
 assert.ok(healedRow && !/stage (live|paused|interrupted|halted)/.test(healedRow));
 const agents=elem('agents').innerHTML;
-assert.match(agents,/??2/);
+assert.match(agents,/×2/);
 assert.match(agents,/> \+ext</);
 // a click landing on the <b> INSIDE the name button still opens the
 // modal - e.target.dataset is empty, so the handler must closest() up
@@ -4691,7 +4691,7 @@ assert.doesNotMatch(runs,/sub fresh/);
 const blob='x'.repeat(200)+'tail-end';
 render(mk(blob));
 runs=elem('runs').innerHTML;
-assert.match(runs,/class="genline fresh" title="[^"]*tail-end">???x+tail-end</);
+assert.match(runs,/class="genline fresh" title="[^"]*tail-end">…x+tail-end</);
 // before the first output, the line says the planner is warming up
 // (gen_last flipped to null - that change flashes too)
 render(mk(null));
@@ -4781,8 +4781,8 @@ assert.match(rq,/class="rlabels">[^]*?class="stage generating"[^>]*>Preparing pr
 assert.match(rq,/class="genline"[^>]*>reading the repo</);
 // (b) the token labels carry .toksub, exempt from the compact hide
 const tok=row('tokrun');
-assert.match(tok,/class="toksub"[^>]*>planner: in 4k ?? out 1k ?? cached 6k ?? 2 turns ?? \$0\.02</);
-assert.match(tok,/class="toksub"[^>]*>steps: in 50k ?? out 9k ?? cached 150k ?? 11 turns ?? \$1\.50</);
+assert.match(tok,/class="toksub"[^>]*>planner: in 4k · out 1k · cached 6k · 2 turns · \$0\.02</);
+assert.match(tok,/class="toksub"[^>]*>steps: in 50k · out 9k · cached 150k · 11 turns · \$1\.50</);
 assert.match(tok,/class="toksub"[^>]*>est \$1\.52</);
 assert.doesNotMatch(tok,/class="sub"[^>]*>steps:/);
 // 'not planned' is a label too - same compact exemption
@@ -4793,8 +4793,8 @@ vm.runInContext("setDensity('compact')",ctx);
 render();
 runs=elem('runs').innerHTML;
 const tokc=row('tokrun');
-assert.match(tokc,/class="toksub"[^>]*>planner: 4k\/1k\/6k 2L ?? \$0\.02</);
-assert.match(tokc,/class="toksub"[^>]*>steps: 50k\/9k\/150k 11L ?? \$1\.50</);
+assert.match(tokc,/class="toksub"[^>]*>planner: 4k\/1k\/6k 2L · \$0\.02</);
+assert.match(tokc,/class="toksub"[^>]*>steps: 50k\/9k\/150k 11L · \$1\.50</);
 assert.match(tokc,/class="toksub"[^>]*>est \$1\.52</);
 const spc=row('stale-paused');
 assert.match(spc,/class="rlabels">[^]*?class="stage paused"[^>]*>paused - resume ready</);
@@ -4802,7 +4802,7 @@ assert.match(spc,/class="stage error"[^>]*>Needs review</);
 // back to full: the long labeled form returns, markup unchanged
 vm.runInContext("setDensity('full')",ctx);
 render();
-assert.match(row('tokrun'),/steps: in 50k ?? out 9k ?? cached 150k ?? 11 turns/);
+assert.match(row('tokrun'),/steps: in 50k · out 9k · cached 150k · 11 turns/);
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
                            capture_output=True, text=True, encoding="utf-8",
@@ -5449,7 +5449,7 @@ const el=(sel,dataset)=>({dataset:{},
   // the run-name button applies the run filter by its stable key
   await click(el('[data-filter-run]',{filterRun:'request:q1'}));
   assert.equal(vm.runInContext('selectedRun',ctx),'request:q1');
-  assert.match(elem('filters').innerHTML,/runA ??/);
+  assert.match(elem('filters').innerHTML,/runA ×/);
   assert.match(agents(),/>one</);
   assert.doesNotMatch(agents(),/>three</);
   assert.doesNotMatch(elem('runs').innerHTML,/>runB</);
@@ -5463,7 +5463,7 @@ const el=(sel,dataset)=>({dataset:{},
   await click(inner);
   assert.equal(vm.runInContext('selectedRun',ctx),'/rB');
   assert.equal(elem('backdrop').hidden,true);   // never a modal
-  assert.match(elem('filters').innerHTML,/runB ??/);
+  assert.match(elem('filters').innerHTML,/runB ×/);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
@@ -6236,7 +6236,7 @@ class LifecycleDisplayTests(unittest.TestCase):
             with mock.patch.object(conductor, "refresh_prices"):
                 d = conductor.collect_dashboard(runs, ["no-such-devin"])
             a = d["agents"][0]
-            self.assertTrue(a["tail_last"].startswith("???"))
+            self.assertTrue(a["tail_last"].startswith("…"))
             self.assertIn("working on it", a["tail_last"])
             self.assertNotIn("I'll start", a["tail_last"])
             self.assertEqual(a["task_full"], "the task")
@@ -6513,7 +6513,7 @@ const open=k=>vm.runInContext(
   assert.match(body,/LINE1\nLINE2   spaced/);
   assert.match(body,/&lt;b&gt;html&lt;\/b&gt;/);
   assert.match(body,/data-arc-copy="4"/);
-  assert.match(body,/tool call 1 ?? edit/);
+  assert.match(body,/tool call 1 · edit/);
   // second fetch? no - cached by export@mtime
   assert.equal(fetches.length,1);
   // collapse-all returns to the compact closed state
@@ -10549,7 +10549,7 @@ const runs=elem('runs').innerHTML;
 const r1row=runs.split('<tr').find(x=>x.includes('>r1<'));
 assert.match(r1row,/runrow[^"]*unreviewed/);
 assert.match(r1row,/class="stage unreviewed"[^>]*>unreviewed</);
-assert.match(r1row,/aria-label="Filter to run r1 ?? unreviewed"/);
+assert.match(r1row,/aria-label="Filter to run r1 · unreviewed"/);
 const r2row=runs.split('<tr').find(x=>x.includes('>r2<'));
 assert.doesNotMatch(r2row,/unreviewed/);
 const rqrow=runs.split('<tr').find(x=>x.includes('>rq<'));
@@ -10560,7 +10560,7 @@ const agents=elem('agents').innerHTML;
 const s2row=agents.split('<tr').find(x=>x.includes('>s2<'));
 assert.match(s2row,/unreviewed/);
 assert.match(s2row,/>failed/);
-assert.match(s2row,/aria-label="task s2 ?? unreviewed"/);
+assert.match(s2row,/aria-label="task s2 · unreviewed"/);
 const s3row=agents.split('<tr').find(x=>x.includes('>s3<'));
 assert.doesNotMatch(s3row,/unreviewed/);
 const s4row=agents.split('<tr').find(x=>x.includes('>plan-proposal<'));
