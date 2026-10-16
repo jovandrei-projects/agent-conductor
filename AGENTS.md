@@ -199,9 +199,22 @@ and `plan_gen_id` marks the attempt that produced the current manifest.
 task list - after publish, after launch (same `request:<id>` run_key) and
 after reload, with real status + session/log links but never a `run_dir`
 or a `counts` share, so nothing about them is runnable. Saving or generating NEVER
-launches implementation: only the separate Start run button does. Editing
-request/model after generation marks the plan stale; regenerate or edit+save
-TOML before launching. The form's follow-up checkbox asks the planner for a
+launches implementation: only the separate Start run button does.
+Staleness is a *computed* diff (`_pending_actions`), not a latched flag:
+generation inputs (`raw`/`project`/`attachments` - `GEN_INPUT_FIELDS`)
+are compared to the `gen_inputs` snapshot `_publish_proposal` stamps at
+publish, and option fields (`OPTION_FIELDS`) to what the TOML itself
+encodes (`_manifest_options`). A diverging generation input needs
+Regenerate tasks (Apply refuses with 409 - step prompts can't be patched
+deterministically); diverging options need Apply or Regenerate - both
+pending means Regenerate first since it writes the options too. Reverting
+a field to its baseline clears the mark; launch refuses while either
+bucket is pending; a failed generation/apply keeps the pending state; a
+hand-edited TOML moves the option baseline (the form then shows drift
+until reconciled). Records published before baselines existed keep the
+old `stale` flag as an opaque `fields` gen marker until a publish
+re-baselines them; `ask`/`plan_model`/`plan_effort`/`label` never stale.
+The form's follow-up checkbox asks the planner for a
 closing `follow-up-plan` step that drafts `<run>-followup.toml` into
 `manifests/` for review; if the planner omits it, `_publish_proposal`
 appends the step itself. `On step failure` and `Attempts/step` map to
