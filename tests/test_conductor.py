@@ -10324,5 +10324,654 @@ prompt = "the manifest was already written; say done"
         self.assertEqual(st["followup"]["status"], "registered")
 
 
+class DeviceOwnershipTests(unittest.TestCase):
+    """The `device` step key leases ONE adb serial machine-wide for a
+    step's whole life: explicit serial assignment, cross-run ownership,
+    queuing on a shared device, stale-owner recovery, AVD boot where
+    tooling allows, and cleanup that only ever stops what we booted."""
+
+    def _patches(self, devdir, devices, avds=None, poll=0.02):
+        if callable(devices):
+            adb_fn = devices
+        else:
+            adb_fn = (lambda: None if devices is None else list(devices))
+        if callable(avds):
+            avd_fn = avds
+        else:
+            avd_fn = (lambda: None if avds is None else list(avds))
+        return (mock.patch.object(conductor, "adb_devices", adb_fn),
+                mock.patch.object(conductor, "emulator_avds", avd_fn),
+                mock.patch.object(conductor, "_device_dir",
+                                  lambda: devdir),
+                mock.patch.object(conductor, "DEVICE_POLL_S", poll),
+                mock.patch.object(conductor, "DEVICE_WAIT_SAVE_S", 0.0))
+
+    def _write_lease(self, devdir: Path, serial: str, **over):
+        devdir.mkdir(exist_ok=True)
+        info = {"serial": serial, "token": "foreign-token", "spec": "any",
+                "run_dir": "C:/other-run/artifacts", "run_key": "other-00",
+                "step": "foreign-step", "owner_pid": os.getpid(),
+                # None skips the creation-window check in pid_alive -
+                # os.getpid() predates the stamp by more than its window
+                "owner_started_at": None,
+                "worker_pid": None, "worker_started_at": None,
+                "leased_at": conductor.now_iso(), "booted": None}
+        info.update(over)
+        (devdir / (conductor._safe_name(serial) + ".json")).write_text(
+            json.dumps(info), encoding="utf-8")
+
+    def _dead_pid(self) -> int:
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        return p.pid
+
+    def _rec(self, runs: Path, step="mob") -> dict:
+        st = json.loads((next(runs.iterdir()) / "state.json").read_text(
+            encoding="utf-8"))
+        return st["steps"][step]
+
+    def _run_dir(self, runs: Path) -> Path:
+        return next(runs.iterdir())
+
+    def test_any_assigns_serial_and_propagates_env(self):
+        """A `device` step gets an explicit serial before spawn: the lease
+        is recorded on the step rec, ANDROID_SERIAL +
+        CONDUCTOR_DEVICE_SERIAL reach the worker env, and the prompt
+        carries the device note."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            devdir = base / "devleases"
+            patches = self._patches(
+                devdir, [("emulator-5554", "device"),
+                         ("RFGL11NN0QV", "device")])
+            for p in patches:
+                p.start()
+            try:
+                m = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "do mobile things"
+device = "any"
+''')
+                self.assertEqual(run_manifest(m, runs), 0)
+            finally:
+                for p in patches:
+                    p.stop()
+            rec = self._rec(runs)
+            self.assertEqual(rec["status"], "done")
+            # sorted() pick: 'RFGL11NN0QV' precedes 'emulator-5554'
+            self.assertEqual(rec["device"], "RFGL11NN0QV")
+            self.assertEqual(rec["device_spec"], "any")
+            sess = json.loads(
+                (proj / ".mock_sessions.json").read_text(encoding="utf-8"))
+            self.assertEqual(sess[0]["android_serial"], "RFGL11NN0QV")
+            self.assertEqual(sess[0]["device_serial"], "RFGL11NN0QV")
+            prompt = (self._run_dir(runs) / "prompts/mob.md").read_text(
+                encoding="utf-8")
+            self.assertIn("owns Android device `RFGL11NN0QV`", prompt)
+            self.assertEqual(list(devdir.glob("*.json")), [])
+            evs = (self._run_dir(runs) / "events.jsonl").read_text(
+                encoding="utf-8")
+            self.assertIn('"device_acquired"', evs)
+            self.assertIn('"device_released"', evs)
+
+    def test_explicit_serial_targets_named_device(self):
+        """`device = "emulator-5554"` takes exactly that serial even when
+        another device sorts first."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            devdir = base / "devleases"
+            patches = self._patches(
+                devdir, [("emulator-5554", "device"),
+                         ("RFGL11NN0QV", "device")])
+            for p in patches:
+                p.start()
+            try:
+                m = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "on the emulator"
+device = "emulator-5554"
+''')
+                self.assertEqual(run_manifest(m, runs), 0)
+            finally:
+                for p in patches:
+                    p.stop()
+            self.assertEqual(self._rec(runs)["device"], "emulator-5554")
+
+    def test_competing_projects_queue_on_shared_device(self):
+        """Two wave-1 steps on different projects, one attached device:
+        the loser queues (device_wait recorded) until the winner releases,
+        then takes the SAME serial - serialized, never concurrent."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            p1 = make_project(base, "p1")
+            p2 = make_project(base, "p2")
+            runs = base / "runs"
+            devdir = base / "devleases"
+            patches = self._patches(
+                devdir, [("emulator-5554", "device")], avds=[])
+            for p in patches:
+                p.start()
+            try:
+                m = write_manifest(base, f'''
+[[step]]
+name = "hold"
+project = "{p1.as_posix()}"
+prompt = "sleep=2 slow device work"
+wave = 1
+device = "any"
+
+[[step]]
+name = "waiter"
+project = "{p2.as_posix()}"
+prompt = "quick device work"
+wave = 1
+device = "any"
+''')
+                self.assertEqual(run_manifest(m, runs), 0)
+            finally:
+                for p in patches:
+                    p.stop()
+            run_dir = self._run_dir(runs)
+            st = json.loads((run_dir / "state.json").read_text(
+                encoding="utf-8"))
+            recs = st["steps"]
+            self.assertEqual(recs["hold"]["device"], "emulator-5554")
+            self.assertEqual(recs["waiter"]["device"], "emulator-5554")
+            self.assertEqual(recs["hold"]["status"], "done")
+            self.assertEqual(recs["waiter"]["status"], "done")
+            waiter = next(r for r in recs.values() if r.get("device_wait"))
+            holder = next(r for r in recs.values()
+                          if not r.get("device_wait"))
+            # Serialization invariant: the waiter's lease acquisition
+            # event is never earlier than the holder's release event.
+            # (ended_at lags release by seconds of merge/save work, so the
+            # event stream is the honest clock.)
+            evs = [json.loads(l) for l in (run_dir / "events.jsonl")
+                   .read_text(encoding="utf-8").splitlines() if l.strip()]
+            acq = next(e for e in evs
+                       if e.get("event") == "device_acquired"
+                       and e.get("step") == waiter["name"])
+            rel = next(e for e in evs
+                       if e.get("event") == "device_released"
+                       and e.get("step") == holder["name"])
+            self.assertGreaterEqual(
+                conductor._iso_ts(acq["ts"]), conductor._iso_ts(rel["ts"]))
+            self.assertIn('"device_wait"',
+                          (run_dir / "events.jsonl").read_text(
+                              encoding="utf-8"))
+
+    def test_unavailable_device_blocks(self):
+        """A device class that never appears ends 'blocked' after
+        device_wait_s - it does not silently fall back to an unrelated
+        device, and no session is ever spawned."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            devdir = base / "devleases"
+            patches = self._patches(
+                devdir, [("emulator-5554", "device")], avds=[])
+            for p in patches:
+                p.start()
+            try:
+                m = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "needs a real phone"
+device = "physical"
+device_wait_s = 0.3
+''')
+                self.assertEqual(run_manifest(m, runs), 1)
+            finally:
+                for p in patches:
+                    p.stop()
+            rec = self._rec(runs)
+            self.assertEqual(rec["status"], "blocked")
+            self.assertIn("physical", rec["note"])
+            self.assertIn("no Android device", rec["note"])
+            self.assertFalse((proj / ".mock_sessions.json").exists())
+            evs = (self._run_dir(runs) / "events.jsonl").read_text(
+                encoding="utf-8")
+            self.assertIn('"device_wait"', evs)
+            self.assertIn('"device_blocked"', evs)
+
+    def test_adb_down_blocks_without_fallback(self):
+        """adb unreachable (devices=None) is 'unknown', not 'none
+        attached': the step waits then blocks, never spawning."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            devdir = base / "devleases"
+            patches = self._patches(devdir, None, avds=None)
+            for p in patches:
+                p.start()
+            try:
+                m = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "needs adb"
+device = "any"
+device_wait_s = 0.3
+''')
+                self.assertEqual(run_manifest(m, runs), 1)
+            finally:
+                for p in patches:
+                    p.stop()
+            rec = self._rec(runs)
+            self.assertEqual(rec["status"], "blocked")
+            self.assertIn("no Android device matching 'any'",
+                          rec["note"])
+
+    def test_stale_owner_broken_then_leased(self):
+        """A lease whose owner+worker pids are both dead is broken once
+        and the serial is re-leased - a crashed run can't wedge a device
+        for later runs."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            devdir = base / "devleases"
+            dead = self._dead_pid()
+            self._write_lease(devdir, "emulator-5554", owner_pid=dead)
+            patches = self._patches(
+                devdir, [("emulator-5554", "device")], avds=[])
+            for p in patches:
+                p.start()
+            try:
+                m = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "on the emu"
+device = "any"
+''')
+                self.assertEqual(run_manifest(m, runs), 0)
+            finally:
+                for p in patches:
+                    p.stop()
+            self.assertEqual(self._rec(runs)["device"], "emulator-5554")
+            self.assertEqual(list(devdir.glob("*.json")), [])
+
+    def test_live_owner_queues_until_release(self):
+        """Cross-run ownership: a lease written by ANOTHER live process
+        (same shape a second conductor would write) blocks our step in
+        'queued' until the file is released - no stealing, no collision."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            devdir = base / "devleases"
+            self._write_lease(devdir, "emulator-5554",
+                              owner_pid=os.getpid())
+            patches = self._patches(
+                devdir, [("emulator-5554", "device")], avds=[])
+            for p in patches:
+                p.start()
+            try:
+                m = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "waits politely"
+device = "any"
+''')
+                box = {}
+                th = threading.Thread(
+                    target=lambda: box.setdefault(
+                        "rc", run_manifest(m, runs)), daemon=True)
+                th.start()
+                deadline = time.time() + 15
+                rec = None
+                while time.time() < deadline:
+                    dirs = list(runs.glob("*/state.json"))
+                    if dirs:
+                        rec = json.loads(dirs[0].read_text(
+                            encoding="utf-8"))["steps"].get("mob") or {}
+                        if rec.get("device_wait"):
+                            break
+                    time.sleep(0.05)
+                self.assertTrue(rec and rec.get("device_wait"),
+                                f"step never queued for device: {rec}")
+                self.assertEqual(rec["status"], "queued")
+                self.assertFalse((proj / ".mock_sessions.json").exists())
+                lease = devdir / (conductor._safe_name("emulator-5554")
+                                  + ".json")
+                lease.unlink()          # foreign owner released
+                th.join(timeout=30)
+                self.assertEqual(box.get("rc"), 0)
+            finally:
+                for p in patches:
+                    p.stop()
+                th.join(timeout=30)
+            self.assertEqual(self._rec(runs)["device"], "emulator-5554")
+
+    def test_stop_during_device_wait_skips(self):
+        """A Stop raised while a step queues on a device ends it
+        'skipped' - it never spawns a worker and never takes a serial."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            devdir = base / "devleases"
+            self._write_lease(devdir, "emulator-5554",
+                              owner_pid=os.getpid())
+            patches = self._patches(
+                devdir, [("emulator-5554", "device")], avds=[])
+            for p in patches:
+                p.start()
+            try:
+                m = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "never runs"
+device = "any"
+''')
+                box = {}
+                th = threading.Thread(
+                    target=lambda: box.setdefault(
+                        "rc", run_manifest(m, runs)), daemon=True)
+                th.start()
+                run_dir = None
+                deadline = time.time() + 15
+                while time.time() < deadline:
+                    dirs = list(runs.glob("*/state.json"))
+                    if dirs:
+                        rec = json.loads(dirs[0].read_text(
+                            encoding="utf-8"))["steps"].get("mob") or {}
+                        if rec.get("device_wait"):
+                            run_dir = dirs[0].parent
+                            break
+                    time.sleep(0.05)
+                self.assertIsNotNone(run_dir)
+                conductor._flag_raise(conductor.stop_flag(run_dir).name)
+                th.join(timeout=30)
+                self.assertEqual(box.get("rc"), 1)
+            finally:
+                for p in patches:
+                    p.stop()
+                th.join(timeout=30)
+                if run_dir:
+                    conductor.stop_flag(run_dir).unlink(missing_ok=True)
+                (devdir / (conductor._safe_name("emulator-5554")
+                           + ".json")).unlink(missing_ok=True)
+            rec = self._rec(runs)
+            self.assertEqual(rec["status"], "skipped")
+            self.assertIn("while waiting for a device",
+                          rec.get("note") or "")
+            self.assertFalse((proj / ".mock_sessions.json").exists())
+            self.assertIsNone(rec.get("device"))
+
+    def test_emulator_boot_and_release_kills_only_ours(self):
+        """`device = "emulator"` boots a free AVD on a free console port
+        when nothing is attached, leases the new serial, and kills exactly
+        that instance on release - never a device it didn't create."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            devdir = base / "devleases"
+
+            class FakeEmu:
+                pid = 43210
+
+                def poll(self):
+                    return None
+
+            spawned = []
+            kills = []
+            patches = self._patches(devdir, [], avds=["AvdA", "AvdB"]) \
+                + (mock.patch.object(
+                    conductor, "_spawn_emulator",
+                    lambda avd, port, log: spawned.append(
+                        (avd, port)) or FakeEmu()),
+                   mock.patch.object(conductor, "_wait_emu_boot",
+                                     lambda s, p, timeout=180: True),
+                   mock.patch.object(
+                       conductor, "_device_kill_emu",
+                       lambda s, p, rd: kills.append((s, p))))
+            for p in patches:
+                p.start()
+            try:
+                m = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "on a fresh emu"
+device = "emulator"
+''')
+                self.assertEqual(run_manifest(m, runs), 0)
+            finally:
+                for p in patches:
+                    p.stop()
+            self.assertEqual(spawned, [("AvdA", 5554)])
+            rec = self._rec(runs)
+            self.assertEqual(rec["device"], "emulator-5554")
+            self.assertEqual(rec["device_booted"], "AvdA")
+            # the release killed exactly the instance we booted, and every
+            # lease file (serial + avd slot) is gone
+            self.assertEqual(kills, [("emulator-5554", 43210)])
+            self.assertEqual(list(devdir.glob("*.json")), [])
+            evs = (self._run_dir(runs) / "events.jsonl").read_text(
+                encoding="utf-8")
+            self.assertIn('"device_booted"', evs)
+
+    def test_stale_booted_emu_reaped_with_image_guard(self):
+        """Stale-lease cleanup only kills a pid that still looks like an
+        emulator - a recycled pid running something else is left alone."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            devdir = base / "devleases"
+            sleeper = subprocess.Popen(
+                [sys.executable, "-c", "import time;time.sleep(60)"])
+            self.addCleanup(lambda: sleeper.kill())
+            kills = []
+            patches = self._patches(
+                devdir, [("emulator-5554", "device")], avds=[]) \
+                + (mock.patch.object(conductor, "_proc_image_name",
+                                     lambda pid: "python.exe"),
+                   mock.patch.object(
+                       conductor, "_device_kill_emu",
+                       lambda s, p, rd: kills.append((s, p))))
+            for p in patches:
+                p.start()
+            try:
+                self._write_lease(
+                    devdir, "emulator-5554", owner_pid=self._dead_pid(),
+                    booted={"avd": "Old", "port": 5554,
+                            "emu_pid": sleeper.pid})
+                m = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "on the emu"
+device = "any"
+''')
+                self.assertEqual(run_manifest(m, runs), 0)
+            finally:
+                for p in patches:
+                    p.stop()
+            # 'python.exe' is NOT an emulator image - the stale pid was
+            # deliberately spared even though the lease claimed we booted it
+            self.assertEqual(kills, [])
+            self.assertIsNone(sleeper.poll())
+            self.assertEqual(self._rec(runs)["device"], "emulator-5554")
+
+    def test_stale_booted_emu_reaped_when_image_matches(self):
+        """...and when the recorded pid IS an emulator image, breaking the
+        stale lease kills that one orphaned instance (by serial + pid,
+        never a blanket kill)."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            devdir = base / "devleases"
+            kills = []
+            patches = self._patches(
+                devdir, [("emulator-5554", "device")], avds=[]) \
+                + (mock.patch.object(conductor, "_proc_image_name",
+                                     lambda pid: "qemu-system-x86_64"),
+                   mock.patch.object(
+                       conductor, "_device_kill_emu",
+                       lambda s, p, rd: kills.append((s, p))))
+            for p in patches:
+                p.start()
+            try:
+                dead = self._dead_pid()
+                self._write_lease(
+                    devdir, "emulator-5554", owner_pid=dead,
+                    booted={"avd": "Old", "port": 5554, "emu_pid": 55555})
+                with mock.patch.object(conductor, "pid_alive",
+                                       lambda pid, since=None:
+                                           pid == 55555):
+                    m = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "on the emu"
+device = "any"
+''')
+                    self.assertEqual(run_manifest(m, runs), 0)
+            finally:
+                for p in patches:
+                    p.stop()
+            self.assertEqual(kills, [("emulator-5554", 55555)])
+            self.assertEqual(self._rec(runs)["device"], "emulator-5554")
+
+    def test_verify_gate_inherits_serial(self):
+        """The verify command runs inside the lease too - a device-side
+        gate sees ANDROID_SERIAL just like the worker."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            devdir = base / "devleases"
+            patches = self._patches(
+                devdir, [("emulator-5554", "device")], avds=[])
+            for p in patches:
+                p.start()
+            try:
+                m = write_manifest(
+                    base,
+                    '[[step]]\nname = "mob"\n'
+                    f'project = "{proj.as_posix()}"\n'
+                    'prompt = "v"\n'
+                    'device = "any"\n'
+                    'verify = "python -c \\"import os;'
+                    'assert os.environ.get(\'ANDROID_SERIAL\')'
+                    '==\'emulator-5554\'\\""\n')
+                self.assertEqual(run_manifest(m, runs), 0)
+            finally:
+                for p in patches:
+                    p.stop()
+            self.assertTrue(self._rec(runs)["verify_ok"])
+
+    def test_device_manifest_validation(self):
+        """device+cloud is a hard manifest error (a cloud worker can't see
+        local adb), bad serials are rejected, and the project registry can
+        carry a slug-level `device` default like `verify`."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            bad = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "x"
+cloud = true
+device = "any"
+''')
+            with self.assertRaises(conductor.ManifestError):
+                conductor.load_manifest(bad)
+            bad2 = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "x"
+device = "not a serial!"
+''')
+            with self.assertRaises(conductor.ManifestError):
+                conductor.load_manifest(bad2)
+            ok = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "x"
+device = true
+''')
+            self.assertEqual(
+                conductor.load_manifest(ok).steps[0].device, "any")
+            pf = base / "projects.toml"
+            pf.write_text(
+                f'[project.mob]\npath = "{proj.as_posix()}"\n'
+                'cloud_ok = false\ndevice = "emulator"\n'
+                'device_wait_s = 5\n', encoding="utf-8")
+            with mock.patch.object(conductor, "PROJECTS_FILE", pf):
+                inh = write_manifest(base, '''
+[[step]]
+name = "mob"
+project = "mob"
+prompt = "x"
+''')
+                st = conductor.load_manifest(inh).steps[0]
+                self.assertEqual(st.device, "emulator")
+                self.assertEqual(st.device_wait_s, 5)
+                # a cloud step does not inherit (local serials are
+                # meaningless on the VM) - but doesn't error either
+                inh_cloud = write_manifest(base, '''
+[[step]]
+name = "mob"
+project = "mob"
+prompt = "x"
+cloud = true
+''')
+                st = conductor.load_manifest(inh_cloud).steps[0]
+                self.assertIsNone(st.device)
+
+    def test_no_device_step_unaffected(self):
+        """A step without `device` spawns as before: no serial env, no
+        lease files, device fields stay null."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            devdir = base / "devleases"
+            patches = self._patches(
+                devdir, [("emulator-5554", "device")])
+            for p in patches:
+                p.start()
+            try:
+                m = write_manifest(base, f'''
+[[step]]
+name = "mob"
+project = "{proj.as_posix()}"
+prompt = "plain step"
+''')
+                self.assertEqual(run_manifest(m, runs), 0)
+            finally:
+                for p in patches:
+                    p.stop()
+            rec = self._rec(runs)
+            self.assertIsNone(rec.get("device"))
+            sess = json.loads(
+                (proj / ".mock_sessions.json").read_text(encoding="utf-8"))
+            self.assertIsNone(sess[0]["android_serial"])
+            self.assertFalse(devdir.exists()
+                             and list(devdir.glob("*.json")))
+
+
 if __name__ == "__main__":
     unittest.main()

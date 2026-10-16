@@ -149,6 +149,9 @@ def main() -> int:
     sessions.append({"id": sid, "short_id": sid,
                      "working_directory": str(cwd),
                      "last_activity_at": int(time.time()),
+                     "android_serial": os.environ.get("ANDROID_SERIAL"),
+                     "device_serial":
+                     os.environ.get("CONDUCTOR_DEVICE_SERIAL"),
                      "title": (body.splitlines() or ["mock"])[0][:60]})
     _save_registry(cwd, sessions)
     if slow_after:
@@ -214,6 +217,9 @@ def resolve_merge(cwd: Path, sid: str, export: str | None) -> int:
     sessions.append({"id": sid, "short_id": sid,
                      "working_directory": str(cwd),
                      "last_activity_at": int(time.time()),
+                     "android_serial": os.environ.get("ANDROID_SERIAL"),
+                     "device_serial":
+                     os.environ.get("CONDUCTOR_DEVICE_SERIAL"),
                      "title": "resolve-merge"})
     _save_registry(cwd, sessions)
     if export:

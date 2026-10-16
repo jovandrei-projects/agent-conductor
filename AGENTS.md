@@ -106,6 +106,36 @@ state). Default is conservative: ~1 agent per 4 logical cores, max 4 -
 each agent is a full Devin session with tool subprocesses, not a thread.
 The run records the effective cap + free RAM in `state.json`.
 
+Android devices: parallel STEPS are not parallel DEVICES - adb serials are
+shared machine state, and without `device` a mobile worker picks its own
+target (two workers will happily race `emulator-5554`; one step's cleanup
+`emu kill` has already killed a shared emulator in a real run). A
+`[[step]] device = ...` (`"any"`, `"emulator"`, `"physical"`, or an exact
+adb serial; also `true` = any; `[defaults]` and the project's
+`projects.toml` entry can carry it like `verify`) leases ONE serial
+machine-wide in `%TEMP%/agent-conductor-devices/` for the step's whole
+life - every attempt, interrupt respawn and the verify gate get
+`ANDROID_SERIAL` + `CONDUCTOR_DEVICE_SERIAL`, the prompt gets a device
+note, and `state.json` records `device`/`device_spec`/`device_booted`.
+A busy-but-attached device queues the step (`queued` + `device_wait`,
+uncapped - it frees when the owner's step ends or its pids die); a device
+that never attaches blocks the step after `device_wait_s` (default 600,
+0 = wait forever). Leases are O_EXCL files with owner+worker pids - a
+dead driver doesn't free a device its orphaned worker still uses, and a
+fully-dead lease is broken once (a recorded `booted` emulator it left
+behind is reaped by serial+pid, never a blanket kill). `device =
+"emulator"` may BOOT a free AVD on a free even console port when nothing
+matching is attached (skipped: `device_boot = false`; `"any"` boots only
+with `device_boot = true`; AVD + port + `emu_pid` are recorded so release
+stops exactly that instance via `emu kill` → pid-verified taskkill - a
+user's emulator or phone is never stopped). `device` + `cloud` is a
+manifest error - a cloud worker can't see local adb. adb/emulator binaries
+are discovered via `CONDUCTOR_ADB`/`CONDUCTOR_EMULATOR`, PATH, or the SDK
+dirs (`ANDROID_HOME`, `ANDROID_SDK_ROOT`, `%LOCALAPPDATA%\Android\Sdk`).
+Known gap: leases own the SERIAL, not the shared adb server - workers
+still mustn't reuse fixed host ports (`adb forward tcp:9222`) across
+concurrent steps; pick a free port per session.
+
 Tracking: `state.json` is the agent registry (status, pid, started/ended,
 elapsed, session id, work dir, paths to prompt/stdout/export, `merged` +
 `merged_at` for worktree branches, `outcome` - the step's newest
@@ -200,7 +230,10 @@ UI-generated `<YYYYMMDD-HHMMSS>-<random>-<run>.toml`, flat; see its README);
 `examples/` is reference-only. `projects.toml` registers slug -> path +
 `cloud_ok` + optional `verify` (the project's known gate command, e.g.
 `python run_tests.py` - steps on the slug inherit it unless they set
-their own; `verify = ""` opts out; cloud steps never inherit). Relative
+their own; `verify = ""` opts out; cloud steps never inherit) + optional
+`device`/`device_wait_s`/`device_boot` (a mobile slug's adb serial class;
+steps on it inherit unless they set their own - cloud steps never do).
+Relative
 `path`s resolve against the repo root, so a git
 worktree checkout needs the untracked `projects.local.toml` next to it
 (absolute paths) - it merges over the tracked entries. `--devin "..."` or `CONDUCTOR_DEVIN` overrides the spawned binary
