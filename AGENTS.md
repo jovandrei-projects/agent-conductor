@@ -159,7 +159,21 @@ spooled draft, extract a finished manifest from `gen.log`, wait out a
 still-writing orphan, or land the interruption as `error` with artifacts
 preserved under `data/requests/`. A draft is published only while its
 `draft_started_at` matches the current generation - a superseded draft is
-kept (`<id>.draft.toml`) but never auto-published. Saving or generating NEVER
+kept (`<id>.draft.toml`) but never auto-published, and the publish gate
+(`_disk_untouched`) compares the request file's mtime + stop stamp, not just
+its second-granularity `updated_at`. `stop_generation` also deletes the
+stopped attempt's overlay, so the restored draft/ready state is what
+readers see at once instead of a stale 'generating' overlay.
+Every finished attempt (published, questions-parked, stopped or failed)
+is banked on the request as a `plan_sessions` record - gen_id, captured
+session id (`devin list` diff in the planner tempdir, then export
+`session_id`/`session` + `tail_session_ref` fallbacks), status, tokens -
+and `plan_gen_id` marks the attempt that produced the current manifest.
+`collect_dashboard` re-emits them as `plan-proposal` (the producer;
+`plan-proposal-N` for other attempts) 'step 0' history rows on the plan's
+task list - after publish, after launch (same `request:<id>` run_key) and
+after reload, with real status + session/log links but never a `run_dir`
+or a `counts` share, so nothing about them is runnable. Saving or generating NEVER
 launches implementation: only the separate Start run button does. Editing
 request/model after generation marks the plan stale; regenerate or edit+save
 TOML before launching. The form's follow-up checkbox asks the planner for a

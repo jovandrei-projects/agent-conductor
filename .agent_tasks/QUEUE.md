@@ -19,6 +19,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 6 | Task prompt editing: pre-dispatch Edit prompt, resume notes for ran steps, full prompt text in modal | done | task-prompt-editing/ | 172/172 mock tests + demo green; prompt-/rnote- sentinels survive resume |
 | 7 | Planner 'ask me questions' checkbox: questionnaire modal before manifest, answers feed a refine pass | done | planner-questions/ | 193/193 mock tests + demo green; live planner not dispatched |
 | 8 | Stop proposal during preparation: stopgen sentinel + _GEN_PROCS kill + per-attempt gen_id scoping, restores draft/ready | done | stop-proposal-preparation/ | 216/216 mock tests + demo + real-proc smoke green |
+| 9 | Retain the create-proposal session as step-0 preparation history on the plan's task list | done | retain-proposal-session/ | 221/221 mock tests + demo green; plan_sessions + plan_gen_id persisted per attempt |
 
 ## Not yet filed as tasks
 
