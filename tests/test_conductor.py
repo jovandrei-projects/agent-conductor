@@ -2545,10 +2545,11 @@ assert.match(elem('runs').innerHTML,/steps: in 1k · out 200 · cached 0 · 2 tu
 assert.match(elem('agents').innerHTML,/\$0\.12/);
 assert.match(elem('agents').innerHTML,/in 1k · out 200 · cached 0 · 2 turns/);
 assert.doesNotMatch(elem('agents').innerHTML,/1k\/200/);
-// compact density uses the bare in/out/cached + turns form instead
+// compact density: bare billed-in/out/cached + turns (in = prompt -
+// cached, the billed part - Desktop's "input" number)
 assert.strictEqual(vm.runInContext(
   "fmtTc({prompt:10000,completion:1000,cached:6000,llm_steps:2})",ctx),
-  '10k/1k/6k 2L');
+  '4k/1k/6k 2L');
 const click=async(t)=>handlers.click({target:t,preventDefault:()=>{}});
 (async()=>{
   // clicking 'running' shows ONLY running agents and ONLY their run
