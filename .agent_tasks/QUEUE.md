@@ -24,6 +24,28 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (model-choice-lists, wave step of run
+  20261016-013719-workflow-ux-safety): the Planner/Step model fields moved
+  off the shared native datalist onto a real combobox (role=combobox +
+  listbox popup per field). Typing filters a Recommendations group
+  (substring hits, prefix first) that sits above a separated, scrollable
+  .mall 'All models' group - both read modelCatalog(), the same
+  `devin models list` parse (+adaptive, +2-slug fallback while logged
+  out). The full list always renders, even at zero matches ('no matches'
+  note); free text is untouched (the input keeps any catalogless value).
+  A model in BOTH groups is two options with distinct ids
+  (-opt-r<i>/-opt-a<i>) sharing one flat items order, so
+  aria-activedescendant/Arrow nav is unambiguous across the seam;
+  aria-selected marks both twins. Esc closes only the popup (modal stays),
+  Enter picks the active option (or just closes when none - free text
+  survives), ArrowDown opens+activates from closed, click on the focused
+  input re-opens, outside click/focusout dismiss, mousedown inside the
+  popup is preventDefaulted so the input never blurs mid-pick, hover
+  tracks active. Picks dispatch a synthetic input event so dirty/syncEffort
+  /pending-diff stay the single typing path; popup flips .up near the
+  modal's bottom edge. 297/297 mock tests + demo green; new
+  ModelComboboxTests (markup + node-harness interactions) and a 35-check
+  Playwright probe against real Chromium + the live 54-family catalog.
 - DONE 2026-10-16 (request-image-picker, wave step of run
   20261016-013719-workflow-ux-safety): the request form's "Attach images"
   hint gains a paperclip button - an icon-sized .btn.secondary look

@@ -7514,6 +7514,30 @@ td :is(a,button):focus-visible { outline-offset:-2px; }
 #detail textarea.toml { min-height:270px; font:12px/1.5 ui-monospace,Consolas,monospace; }
 #detail input:disabled, #detail textarea:disabled, #detail select:disabled { opacity:.65; }
 #detail .field-row { display:grid; grid-template-columns:2fr 1fr 1fr; gap:10px; }
+/* model comboboxes: the input stays free text; its popup pairs a typed-
+   filter Recommendations group with a separated, scrollable All models
+   group (.mall). Anchored under the field, flips .up near the modal's
+   bottom edge so it never stretches the dialog's scroll area */
+#detail .mcombo { position:relative; }
+#detail .mpop { position:absolute; top:100%; left:0; right:0; z-index:8;
+  display:flex; flex-direction:column; margin-top:4px; padding:4px;
+  background:#1c2128; border:1px solid #30363d; border-radius:8px;
+  box-shadow:0 8px 24px rgba(0,0,0,.55); max-height:300px; }
+#detail .mpop.up { top:auto; bottom:100%; margin:0 0 4px; }
+#detail .mpop .mgrp { display:flex; flex-direction:column; min-height:0; }
+#detail .mpop .mgrp-all { flex:1; }
+#detail .mpop .mgrp + .mgrp { border-top:1px solid #30363d; margin-top:2px; }
+#detail .mpop .msec { color:#6e7681; font-size:10px; letter-spacing:.04em;
+  text-transform:uppercase; padding:5px 8px 3px; flex:none; }
+#detail .mpop .mall { overflow-y:auto; min-height:0; }
+#detail .mpop .mopt { padding:5px 10px; border-radius:5px; font-size:12px;
+  color:#e6edf3; cursor:pointer; white-space:nowrap; overflow:hidden;
+  text-overflow:ellipsis; }
+#detail .mpop .mopt.on { background:#1f6feb; color:#fff; }
+#detail .mpop .mopt[aria-selected="true"] { color:#79c0ff; }
+#detail .mpop .mopt.on[aria-selected="true"] { color:#fff; }
+#detail .mpop .mnone { color:#6e7681; font-size:11px; font-style:italic;
+  padding:4px 10px; }
 #detail .actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:16px 0 0; }
 #detail .notice { color:#8b949e; background:#0d1117; border-left:3px solid #30363d; padding:8px 10px; margin:10px 0; }
 #detail .notice.warn { border-color:#d29922; color:#e6edf3; }
@@ -8614,6 +8638,108 @@ function syncEffort(modelInp, inputId, listId){
   if (dl) dl.innerHTML=effortOptionsFor(model);
   if (inp.value && opts.length && !opts.includes(inp.value)) inp.value='';
 }
+// --- model comboboxes ---------------------------------------------------
+// The Planner/Step model fields keep free text (a value need not be in
+// the catalog - an older model id stays valid) while the popup offers a
+// filtered Recommendations group on top of a separated, scrollable All
+// models group. Both read modelCatalog() - the same `devin models list`
+// parse that fed the old datalist, so provider families stay distinct.
+const MODEL_FIELDS=['rq-plan_model','rq-model'];
+const MCOMBO={};   // input id -> {items:[{id,value}], active} - the flat
+                   // option order across BOTH groups, so an item present
+                   // in recs AND the full list is two reachable entries
+function modelCatalog(){
+  const mo=(lastData&&lastData.model_options)||{};
+  const list=Object.keys(mo).length?Object.keys(mo):['swe-2','gpt-6-luna'];
+  if(!list.includes('adaptive'))list.push('adaptive');
+  return list;
+}
+function mcombo(inp){return MCOMBO[inp.id]||(MCOMBO[inp.id]={items:[],active:-1});}
+function mpopRender(inp){
+  const pop=document.getElementById(inp.id+'-pop');
+  if(!pop)return;
+  const st=mcombo(inp), all=modelCatalog();
+  const cur=(inp.value||'').trim(), q=cur.toLowerCase();
+  // recommendations: substring hits, exact-prefix first - an empty query
+  // skips the group entirely (all list alone carries the popup then)
+  const recs=q?all.filter(m=>m.toLowerCase().includes(q))
+    .sort((a,b)=>(b.toLowerCase().startsWith(q)?1:0)-
+                (a.toLowerCase().startsWith(q)?1:0)):[];
+  st.items=[];
+  const opt=(m,sec)=>{
+    const i=st.items.length, it={id:`${inp.id}-opt-${sec}${i}`,value:m};
+    st.items.push(it);
+    return `<div class="mopt" role="option" id="${it.id}" ` +
+      `data-mfor="${inp.id}" data-mi="${i}" ` +
+      `aria-selected="${m===cur?'true':'false'}">${esc(m)}</div>`;
+  };
+  pop.innerHTML=
+    (q?`<div class="mgrp" role="group" aria-label="Recommendations">` +
+       `<div class="msec">Recommendations</div>` +
+       (recs.length?recs.map(m=>opt(m,'r')).join('')
+        :`<div class="mnone">no matches - the full list is below</div>`) +
+       `</div>`:'') +
+    `<div class="mgrp mgrp-all" role="group" aria-label="All models">` +
+    `<div class="msec">${q?'All models':'Supported models'}</div>` +
+    `<div class="mall">${all.map(m=>opt(m,'a')).join('')}</div></div>`;
+  // the current value's row is the landing spot - its recommendations
+  // occurrence wins (top of the list); a free-text value has none
+  st.active=st.items.findIndex(i=>i.value===cur);
+}
+function mpopOpen(inp){
+  const pop=document.getElementById(inp.id+'-pop');
+  if(!pop||inp.disabled)return;
+  mpopRender(inp);
+  pop.hidden=false;
+  inp.setAttribute('aria-expanded','true');
+  // near the modal's bottom edge the popup grows upward instead of
+  // stretching the dialog's scroll area out of view
+  const d=document.getElementById('detail'),
+        dr=d&&d.getBoundingClientRect&&d.getBoundingClientRect(),
+        ir=inp.getBoundingClientRect&&inp.getBoundingClientRect();
+  if(pop.classList)pop.classList.toggle('up',
+    !!(dr&&ir&&ir.bottom+280>dr.bottom&&ir.top-dr.top>280));
+  const st=mcombo(inp);
+  if(st.active>=0)mpopActivate(inp,st.active);
+}
+function mpopClose(inp){
+  const pop=document.getElementById(inp.id+'-pop');
+  if(!pop||pop.hidden)return;
+  pop.hidden=true;
+  inp.setAttribute('aria-expanded','false');
+  inp.removeAttribute('aria-activedescendant');
+  mcombo(inp).active=-1;
+}
+function mpopActivate(inp,idx,scroll){
+  const st=mcombo(inp);
+  if(idx<0||!st.items.length){
+    st.active=-1;
+    inp.removeAttribute('aria-activedescendant');return;
+  }
+  st.active=(idx+st.items.length)%st.items.length;
+  const it=st.items[st.active];
+  inp.setAttribute('aria-activedescendant',it.id);
+  const pop=document.getElementById(inp.id+'-pop'),
+        prev=pop&&pop.querySelector?pop.querySelector('.mopt.on'):null;
+  if(prev&&prev.classList)prev.classList.remove('on');
+  const el=document.getElementById(it.id);
+  if(el){
+    if(el.classList)el.classList.add('on');
+    if(scroll!==false&&el.scrollIntoView)
+      el.scrollIntoView({block:'nearest'});
+  }
+}
+function mpopPick(inp,idx){
+  const st=mcombo(inp), it=st&&st.items[idx];
+  if(!it)return;
+  inp.value=it.value;
+  // a synthetic input event routes the pick through the SAME delegated
+  // handler typing uses - dirty flag, effort sync, pending re-diff -
+  // then the popup closes (the handler re-renders it open first)
+  if(inp.dispatchEvent)
+    inp.dispatchEvent(new Event('input',{bubbles:true}));
+  mpopClose(inp);
+}
 function openNew(){
   if (!closeDetail()) return;
   const defaults=lastData?.defaults||{model:'swe-2',effort:'max'};
@@ -8628,11 +8754,17 @@ function showRequestForm(rec){
   const projectOptions=`<option value="">Infer from request</option>` +
     choices.map(p=>`<option value="${esc(p.slug)}"${p.slug===rec.project?' selected':''}>` +
       `${esc(p.slug)}${p.cloud_ok?'':' (local only)'}</option>`).join('');
-  const modelList=(lastData?.model_options &&
-    Object.keys(lastData.model_options).length)
-    ? Object.keys(lastData.model_options) : ['swe-2','gpt-6-luna'];
-  if (!modelList.includes('adaptive')) modelList.push('adaptive');
-  const modelOptions=modelList.map(m=>`<option value="${esc(m)}">`).join('');
+  // model fields are free-text comboboxes: typing filters a
+  // recommendations group that sits on top of a separated, scrollable
+  // 'All models' group - both fed by the live modelCatalog()
+  const modelField=(id,label,value)=>
+    `<div><label for="${id}">${label}</label>` +
+    `<div class="mcombo"><input id="${id}" class="mcombo-in" ` +
+    `role="combobox" aria-expanded="false" aria-autocomplete="list" ` +
+    `aria-controls="${id}-pop" autocomplete="off" spellcheck="false" ` +
+    `value="${esc(value||'')}"${disabled}>` +
+    `<div class="mpop" id="${id}-pop" role="listbox" ` +
+    `aria-label="${esc(label)} - model choices" hidden></div></div></div>`;
   const steps=rec.proposed_steps||[];
   const canEdit=editable && stage!=='new';
   document.getElementById('dbody').innerHTML =
@@ -8670,19 +8802,16 @@ function showRequestForm(rec){
     `<input id="rq-label" maxlength="80" value="${esc(rec.label||'')}"${disabled}>` +
     `<div class="field-row"><div><label for="rq-project">Project</label>` +
     `<select id="rq-project"${disabled}>${projectOptions}</select></div>` +
-    `<div><label for="rq-plan_model">Planner model</label>` +
-    `<input id="rq-plan_model" list="rq-models" ` +
-    `value="${esc(rec.plan_model||rec.model||'')}"${disabled}></div>` +
+    modelField('rq-plan_model','Planner model',
+               rec.plan_model||rec.model) +
     `<div><label for="rq-plan_effort">Planner effort</label>` +
     `<input id="rq-plan_effort" list="rq-plan_efforts" ` +
     `value="${esc(rec.plan_effort||rec.effort||'')}"${disabled}>` +
     `<datalist id="rq-plan_efforts">` +
     `${effortOptionsFor(rec.plan_model||rec.model)}</datalist>` +
     `</div></div>` +
-    `<div class="field-row"><div><label for="rq-model">Step model</label>` +
-    `<input id="rq-model" list="rq-models" ` +
-    `value="${esc(rec.model||'')}"${disabled}>` +
-    `<datalist id="rq-models">${modelOptions}</datalist></div>` +
+    `<div class="field-row">` +
+    modelField('rq-model','Step model',rec.model) +
     `<div><label for="rq-effort">Step effort</label>` +
     `<input id="rq-effort" list="rq-efforts" ` +
     `value="${esc(rec.effort||'')}"${disabled}>` +
@@ -9609,6 +9738,28 @@ document.addEventListener('click', async e=>{
     hideCtxMenu();
     if (!inCtx) return;
   }
+  // a model-combobox option picks by flat index - data-mi disambiguates
+  // a model that shows in both Recommendations and the full list
+  const mopt = t.closest && t.closest('.mopt');
+  if (mopt && mopt.dataset && mopt.dataset.mi!==undefined){
+    e.preventDefault();
+    const inp=document.getElementById(mopt.dataset.mfor);
+    if (inp) mpopPick(inp, +mopt.dataset.mi);
+    return;
+  }
+  // any other click outside an open model popup dismisses it - and like
+  // a native datalist, clicking the input itself re-opens it (a focused
+  // field gets no second focusin, so this is the only reopen gesture)
+  for (const id of MODEL_FIELDS){
+    const pop=document.getElementById(id+'-pop');
+    if (t.id===id){ if (t.classList && t.classList.contains('mcombo-in'))
+      mpopOpen(t); continue; }
+    if (pop && !pop.hidden &&
+        !(t.closest && t.closest('#'+id+'-pop'))){
+      const inp=document.getElementById(id);
+      if (inp) mpopClose(inp);
+    }
+  }
   if (t.id==='dx' || t.id==='backdrop'){
     closeDetail(); return; }
   if (t.id==='new-request'){
@@ -10038,15 +10189,35 @@ document.addEventListener('input', e=>{
     if (msg) msg.hidden=true;
     // syncEffort may rewrite the effort input when its model changed -
     // run it first so the pending diff sees the settled value
-    if (e.target.id==='rq-model' || e.target.id==='rq-plan_model')
+    if (e.target.id==='rq-model' || e.target.id==='rq-plan_model'){
       syncEffort(e.target,
                  e.target.id==='rq-model'?'rq-effort':'rq-plan_effort',
                  e.target.id==='rq-model'?'rq-efforts':'rq-plan_efforts');
+      // every keystroke re-filters Recommendations; the All models group
+      // below them always lists the full catalog regardless of matches
+      mpopOpen(e.target);
+    }
     // stale state is a live diff against the publish baselines - edit
     // and revert both re-evaluate, so returning a field to its baseline
     // clears its mark without a save
     refreshPending();
   }
+});
+// model combobox focus = the native-datalist gesture: the popup opens on
+// focus and closes when the field loses it (a pick keeps focus on the
+// input, so the popup closing on its own click never looks like a blur)
+document.addEventListener('focusin', e=>{
+  if (e.target && e.target.classList &&
+      e.target.classList.contains('mcombo-in')) mpopOpen(e.target);
+});
+document.addEventListener('focusout', e=>{
+  if (e.target && e.target.classList &&
+      e.target.classList.contains('mcombo-in')) mpopClose(e.target);
+});
+// a mousedown inside an open model popup (option or scrollbar) must not
+// blur the input first - the option click itself does the picking
+document.addEventListener('mousedown', e=>{
+  if (e.target.closest && e.target.closest('.mpop')) e.preventDefault();
 });
 // attachment drop/paste: bound once at document level (the modal's
 // innerHTML is rebuilt per open, element listeners would stack or die);
@@ -10109,6 +10280,39 @@ document.addEventListener('keydown', e=>{
     if ((e.key==='Enter'||e.key===' ') &&
         e.target.closest && !e.target.closest('#ctxmenu')){
       e.preventDefault(); hideCtxMenu(); return; }
+  }
+  // model combobox: while its popup is open the field owns arrows/Home/
+  // End/Enter/Esc - Esc closes only the popup (the modal stays up), and
+  // the flat item order spans Recommendations + All models so a model
+  // listed in both is two distinct, separately reachable options
+  if (e.target && e.target.classList &&
+      e.target.classList.contains('mcombo-in')){
+    const inp=e.target,
+          pop=document.getElementById(inp.id+'-pop'),
+          open=!!(pop&&!pop.hidden);
+    if (e.key==='ArrowDown'||e.key==='ArrowUp'){
+      e.preventDefault();
+      if(!open)mpopOpen(inp);      // closed: the arrow opens AND moves
+      const st=mcombo(inp); if(!st.items.length)return;
+      const i=st.active<0 ? (e.key==='ArrowDown'?0:st.items.length-1)
+        : (st.active+(e.key==='ArrowDown'?1:-1)+st.items.length)
+          %st.items.length;
+      mpopActivate(inp,i);return;
+    }
+    if (open && (e.key==='Home'||e.key==='End')){
+      e.preventDefault();
+      const st=mcombo(inp); if(!st.items.length)return;
+      mpopActivate(inp,e.key==='Home'?0:st.items.length-1);return;
+    }
+    if (e.key==='Enter'&&open){
+      const st=mcombo(inp);
+      if(st.active>=0){e.preventDefault();mpopPick(inp,st.active);}
+      else mpopClose(inp);
+      return;
+    }
+    if (e.key==='Escape'&&open){
+      e.preventDefault();mpopClose(inp);return;
+    }
   }
   // keyboard equivalent of right-click: the Menu key or Shift+F10 on a
   // focused run/task row opens the same menu anchored to the row (not while
@@ -10175,6 +10379,13 @@ function applyHl(){
       !!hoverRun && x.dataset.runKey===hoverRun));
 }
 document.addEventListener('mouseover', e=>{
+  // hovering a model option tracks it as the active descendant - the
+  // mouse and Arrow keys then agree on what Enter would pick
+  const mo = e.target.closest && e.target.closest('.mopt');
+  if (mo && mo.dataset && mo.dataset.mi!==undefined){
+    const inp=document.getElementById(mo.dataset.mfor);
+    if (inp) mpopActivate(inp,+mo.dataset.mi,false);
+  }
   const tr = e.target.closest && e.target.closest('tr[data-run-key]');
   hoverRun = tr && tr.dataset.runKey || null;
   applyHl();

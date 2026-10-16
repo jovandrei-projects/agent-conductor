@@ -231,9 +231,13 @@ when the planner ignores them (edit the TOML directly to override).
 `Step model/effort` feed `[defaults]` (the workers); `Planner
 model/effort` feed only the `--model` of the planning session itself, so
 an expensive planner can write a runbook cheap workers execute. The model
-fields autocomplete from `devin models list` (cached 10min, parsed into
-per-family effort suffixes - an empty effort picks the family's bare
-variant); the fixed fallback list is all you get while logged out.
+fields are free-text comboboxes fed by `devin models list` (cached 10min,
+parsed into per-family effort suffixes - an empty effort picks the
+family's bare variant): typing filters a Recommendations group over a
+separated, scrollable All-models group (`.mall`), a catalogless value
+stays valid, and a model present in both groups is two distinct options
+so `aria-activedescendant` never aliases. The fixed fallback list is all
+you get while logged out.
 Discard removes only an unrun, app-owned proposal and its planned rows.
 The `worktrees`/`merge resolver` checkboxes reach the planner prompt and
 are guaranteed into the TOML at publish (`_guarantee_isolation` - never
