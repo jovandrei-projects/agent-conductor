@@ -22,6 +22,26 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (follow-up-plan, closing step of run
+  20261016-013703-proposal-ui-fixes): reviewed the run - 1/2 worker steps
+  landed. `fix-regenerate-label` done + merged (e1eaa7c): 'Needs review'
+  chip + modal nag now suppress while stage is generating/questions.
+  `compact-live-output` work is COMPLETE but parked unmerged (branch
+  conductor/20261016-013703-proposal-ui-fixes/compact-live-output,
+  fd86225 + a7a3da9, 211/211 green in-worktree) - it recorded `failed`
+  only because the post-step verify gate hit a flaky sentinel test:
+  `test_queued_step_flag_skips_without_spawning` (test_worktrees.py:884,
+  rc 0 != 1 at ~306s; green standalone). New issue: SECOND flake in the
+  `_flag_soon` wall-clock family (same class as the ux-controls
+  stop-flag flake) - possibly a real race where a flag landing between
+  the pre-spawn check and subprocess spawn is dropped. Drafted
+  manifests/proposal-ui-fixes-followup.toml (validated by `plan`): merge
+  the parked branch (main checkout, union-merge bookkeeping), harden the
+  flag-timing test family + close the pre-spawn flag window, live-smoke
+  both UI fixes, closing follow-up-plan step. NOT launched - human
+  review. Overlap note inside the file: supersedes the still-unlaunched
+  ux-controls-followup flake step; its merge/verify-timeout/ask-smoke
+  steps are deliberately not duplicated here.
 - DONE 2026-10-16 (fix-regenerate-label): clicking Regenerate on a stale
   proposal showed 'Preparing proposal...' AND 'Needs review' at once -
   `stale` is only cleared by `_publish_proposal` on success, so it
