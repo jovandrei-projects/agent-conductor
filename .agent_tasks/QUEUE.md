@@ -835,3 +835,25 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   10 new ManualMergeGuardTests + 1 node render test; 434-test suite:
   2 unrelated _wait_run_dir timing flakes (10s deadline under full-suite
   load, both pass standalone).
+- DONE 2026-10-16 (integration-verification, step of run
+  20261016-100852-run-review-ux): all nine feature branches now live in
+  ONE combined state - the three parked ones (review-workflow,
+  cumulative-elapsed-time, manual-merge-guard) were merged into the
+  integration worktree over the four already-landed steps, conflicts
+  resolved as union (sentinel exemptions, resume path gets both the
+  merge claim + interval seeding, terminal writes get iv-close +
+  completion bump, payloads carry review+elapsed+executing fields, run
+  table row gets revChip + isoChip + unreviewed class, task row keeps
+  the step-name button AND the pill). Verified combined:
+  457/457 python run_tests.py (one real defect found: a splice of
+  CumulativeElapsedTests read git-show output through a PowerShell pipe
+  so non-cp1252 bytes became '?' - rebuilt the file cleanly; all 8
+  resulting fails then passed), demo green producing a real run dir,
+  serve smoke on it (review POSTs 200, needs_review flips, elapsed/
+  executing in /api/state), direct set_*_review calls exercised
+  ack-fold/stale-seq-409/tombstone/re-completion-reflag, run_executing
+  live-driver/live-step/dead verified, plan green, STATUS/NEXT beside
+  OUTCOME on real records. finding: suite is now ~783s > the 600s
+  run_step verify cap - this step's own verify times out on green.
+  Manual-check remainder: a real-browser pass on the combined dashboard
+  (node harnesses cover behavior, not painted pixels).
