@@ -119,7 +119,16 @@ the request as `plan_tokens` (across regenerations and the malformed-TOML
 retry) - the runs table shows them as `planner:`/`steps:` token lines
 when present, each field labeled (`in / out / cached / turns` - cached
 is a share of `in`, never additive; turns = LLM steps, not manifest
-steps).
+steps). A run row also carries a compact `wt` chip from `iso` - the
+run's CONFIGURED worktree coverage `{wt,local,cloud}` computed by
+`_run_isolation`: the parsed manifest is authoritative (parse already
+folds `merge='deferred'` into worktree and rejects worktree+cloud),
+falling back to the request's `proposed_steps` snapshot, then the
+per-record `wt`/`cloud` stamped on every step record at queue/dispatch -
+never branch names or liveness, so an undispatched run still labels and
+a stray branch on a legacy record invents nothing. Partial coverage
+spells it out on the chip (`wt 2/3`); cloud-only or worktree-free runs
+get none.
 `serve`
 renders it as a live page at `http://127.0.0.1:8773` (loopback only,
 auto-refreshes, shows elapsed time ticking for running agents). The same
@@ -529,6 +538,12 @@ Append as they are hit.
      cwd is `data/worktrees/<run>/<step>` - `data/runs` writes are outside
      every worker's watch dir. Cross-project runs write outside the
      worker's cwd too. The poisoned case was only non-worktree self-runs.
+     The mirror guard for OUR writes is `_assert_unwatched` (`_watchers_of`
+     collects every live step whose work_dir contains a destination); its
+     409 names the owner - `<run-dir>:<step>` plus slug + short session id
+     via `_watcher_identity`, sorted, capped at 3 + "+N more" - and the
+     same label feeds the launch project-overlap guard and
+     `_any_live_step_in`'s deferred-merge block.
 6. **`rc 0` proves nothing.** A `devin -p` worker can exit 0 before the ACP
    turn starts (see trap 5) or print `STATUS` only at the end of a real
    turn. `run_step` now marks `rc==0` + missing `STATUS` as `failed`,

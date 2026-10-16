@@ -10324,5 +10324,322 @@ prompt = "the manifest was already written; say done"
         self.assertEqual(st["followup"]["status"], "registered")
 
 
+class ExecutionContextLabelTests(unittest.TestCase):
+    """Runs-table 'wt' chip (configured worktree isolation) + the
+    workspace-watcher 409 naming its owning agent.
+
+    run['iso'] is {wt,local,cloud} counts over the run's CONFIGURED steps -
+    the parsed manifest is authoritative (load_manifest folds
+    merge='deferred' into worktree and rejects worktree+cloud), the
+    request's proposed_steps snapshot and per-record 'wt' (stamped at
+    queue/dispatch) are fallbacks. Branch names and liveness never feed
+    it, so a run whose steps haven't spawned still reports its scheduled
+    isolation and a stray branch on a legacy run invents nothing.
+
+    _assert_unwatched still guards every request/manifest/trash write; the
+    refusal now names each watching step as '<run-dir>:<step>' plus slug
+    and a short session id when recorded, lists up to three and counts
+    the rest."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.proj = make_project(self.base)
+        self.runs = self.base / "runs"
+        self.requests = self.base / "requests"
+        self.requests.mkdir()
+        patch = mock.patch.object(conductor, "load_projects", return_value={
+            "proj": {"path": self.proj, "cloud_ok": False}})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def manifest(self, steps: str, name="cfg") -> Path:
+        m = self.base / f"{name}.toml"
+        m.write_text(f'[run]\nname = "{name}"\n{steps}', encoding="utf-8")
+        return m
+
+    def write_run(self, dirname, manifest=None, steps=None, **extra):
+        d = self.runs / dirname
+        d.mkdir(parents=True, exist_ok=True)
+        st = {"run": dirname, "steps": steps or {}}
+        if manifest is not None:
+            st["manifest"] = str(manifest)
+        st.update(extra)
+        (d / "state.json").write_text(json.dumps(st), encoding="utf-8")
+        return d
+
+    def live_step(self, work_dir: Path, **rec) -> dict:
+        # no pid + fresh started_at = the no-pid live shape (a self-hosted
+        # record mid-run): step_live stays true without probing a process
+        return {"status": "running", "work_dir": str(work_dir),
+                "started_at": conductor.now_iso(), "timeout_min": 120,
+                **rec}
+
+    def dash(self):
+        return conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                           self.requests)
+
+    # ------------------------------------------------------------- iso
+
+    def test_iso_from_manifest_before_any_dispatch(self):
+        """Nothing has run (no step records at all) and the label still
+        reports the scheduled isolation - config, not liveness."""
+        m = self.manifest('''
+[[step]]
+name = "a"
+project = "proj"
+prompt = "x"
+worktree = true
+
+[[step]]
+name = "b"
+project = "proj"
+prompt = "y"
+worktree = true
+''')
+        self.write_run("20261016-120000-allwt", manifest=m)
+        self.assertEqual(self.dash()["runs"][0]["iso"],
+                         {"wt": 2, "local": 2, "cloud": 0})
+
+    def test_iso_mixed_and_deferred_counted(self):
+        m = self.manifest('''
+[[step]]
+name = "a"
+project = "proj"
+prompt = "x"
+worktree = true
+
+[[step]]
+name = "b"
+project = "proj"
+prompt = "y"
+merge = "deferred"
+
+[[step]]
+name = "c"
+project = "proj"
+prompt = "z"
+''')
+        self.write_run("20261016-120100-mixed", manifest=m)
+        # merge='deferred' implies worktree at parse time -> wt=2 of 3
+        self.assertEqual(self.dash()["runs"][0]["iso"],
+                         {"wt": 2, "local": 3, "cloud": 0})
+
+    def test_iso_absent_for_plain_and_cloud_only_runs(self):
+        m = self.manifest('''
+[[step]]
+name = "a"
+project = "proj"
+prompt = "x"
+
+[[step]]
+name = "b"
+project = "proj"
+prompt = "y"
+cloud = true
+''')
+        self.write_run("20261016-120200-plain", manifest=m)
+        self.assertIsNone(self.dash()["runs"][0]["iso"])
+
+    def test_iso_falls_back_to_proposed_steps_then_records(self):
+        gone = self.base / "gone.toml"          # recorded path, file deleted
+        # request-launched run: the proposal snapshot carries the config
+        rid = "20261016-121212-abcd1234"
+        (self.requests / f"{rid}.json").write_text(json.dumps({
+            "id": rid, "status": "launched", "run": "snap",
+            "proposed_steps": [
+                {"step": "a", "slug": "proj", "wt": True, "cloud": False},
+                {"step": "b", "slug": "proj", "wt": False,
+                 "cloud": False}]}), encoding="utf-8")
+        self.write_run("20261016-120300-snap", manifest=gone,
+                       request_id=rid,
+                       steps={"a": {"status": "done",
+                                    "ended_at": "2026-10-16T12:30:00"}})
+        # CLI run, new-code records carry 'wt' even without the file
+        self.write_run("20261016-120400-recrec", manifest=gone,
+                       steps={"a": {"status": "done", "wt": True,
+                                    "ended_at": "2026-10-16T12:30:00"}})
+        iso = {r["run"]: r["iso"] for r in self.dash()["runs"]}
+        self.assertEqual(iso["20261016-120300-snap"],
+                         {"wt": 1, "local": 2, "cloud": 0})
+        self.assertEqual(iso["20261016-120400-recrec"],
+                         {"wt": 1, "local": 1, "cloud": 0})
+
+    def test_iso_never_reads_branch_names(self):
+        """Legacy records have no 'wt' key - a parked conductor branch is
+        evidence a worktree EXISTED, not that the config scheduled one,
+        so the run stays unlabeled rather than guessing."""
+        self.write_run(
+            "20261016-120500-legacy", manifest=self.base / "gone.toml",
+            steps={"a": {"status": "done",
+                         "branch": "conductor/legacy/a",
+                         "ended_at": "2026-10-16T12:30:00"}})
+        self.assertIsNone(self.dash()["runs"][0]["iso"])
+
+    def test_iso_on_unlaunched_request_row(self):
+        rid = "20261016-122222-feedbeef"
+        m = self.manifest('''
+[[step]]
+name = "a"
+project = "proj"
+prompt = "x"
+worktree = true
+''', name="plan")
+        (self.requests / f"{rid}.json").write_text(json.dumps({
+            "id": rid, "status": "ready", "run": "plan",
+            "manifest": str(m),
+            "proposed_steps": [
+                {"step": "a", "slug": "proj", "wt": True,
+                 "cloud": False}]}), encoding="utf-8")
+        self.assertEqual(self.dash()["runs"][0]["iso"],
+                         {"wt": 1, "local": 1, "cloud": 0})
+
+    def test_dispatch_records_wt_config(self):
+        m = self.manifest(f'''
+[[step]]
+name = "iso"
+project = "{self.proj.as_posix()}"
+prompt = "work"
+worktree = true
+
+[[step]]
+name = "plain"
+project = "{self.proj.as_posix()}"
+prompt = "work"
+''')
+        self.assertEqual(run_manifest(m, self.runs), 0)
+        st = json.loads((next(self.runs.iterdir()) /
+                         "state.json").read_text())
+        self.assertIs(st["steps"]["iso"]["wt"], True)
+        self.assertIs(st["steps"]["plain"]["wt"], False)
+
+    # ------------------------------------------------------ wt chip (js)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_run_row_wt_chip_render(self):
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map();
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],addEventListener:()=>{},
+  body:{classList:{toggle:()=>{},contains:()=>false}},
+  documentElement:{style:{setProperty:(k,v)=>{}}}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',agents:[],
+runs:[
+ {run:'allwt',dir:'/a',counts:{done:2},ended_at:'2026-10-16T01:00:00',
+  iso:{wt:2,local:2,cloud:0}},
+ {run:'mixed',dir:'/m',counts:{done:3},ended_at:'2026-10-16T01:00:00',
+  iso:{wt:1,local:2,cloud:1}},
+ {run:'plain',dir:'/p',counts:{done:1},ended_at:'2026-10-16T01:00:00'},
+ {run:'req',key:'request:r1',request_id:'r1',stage:'ready',
+  dir:'/m.toml',counts:{planned:1},iso:{wt:1,local:1,cloud:0}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const row=name=>elem('runs').innerHTML.split('runrow')
+  .find(r=>r.includes('>'+name+'<'));
+// all-local-worktree run: compact 'wt' inside .rlabels, explanatory title
+const a=row('allwt');
+assert.match(a,/class="rlabels">[^]*?class="stage wt"[^>]*>wt</);
+assert.match(a,/title="worktree isolation: all 2 local step\(s\) run in git worktrees"/);
+// mixed isolation: the count is IN the label, not tooltip-only
+const m=row('mixed');
+assert.match(m,/class="stage wt"[^>]*>wt 1\/2</);
+assert.match(m,/1 of 2 local steps run in git worktrees/);
+assert.match(m,/the rest write in the project checkout/);
+assert.match(m,/1 step\(s\) run in the cloud/);
+// no configured worktrees: no chip at all
+assert.doesNotMatch(row('plain'),/stage wt/);
+// unlaunched proposal rows carry the label too - it is config, not runtime
+assert.match(row('req'),/class="stage wt"[^>]*>wt</);
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    # -------------------------------------------------- watcher warning
+
+    def test_watcher_warning_reachable_and_names_owner(self):
+        """The guard is still reachable: every managed dir lives under
+        ROOT, so a live main-checkout step watches them all. The 409 now
+        names run:step, slug and the short session id from state.json -
+        the authoritative ownership record."""
+        watched = self.base / "repo"          # the agent's checkout
+        watched.mkdir()
+        self.write_run("20261016-130000-selfhost", steps={
+            "fix-parser": self.live_step(
+                watched, slug="repo",
+                session_id="abcdef0123456789")})
+        dest = watched / "data" / "requests"
+        with self.assertRaises(conductor.RequestError) as cm:
+            conductor._assert_unwatched(self.runs, dest)
+        exc = cm.exception
+        self.assertEqual(exc.status, 409)
+        msg = str(exc)
+        self.assertIn("live agent is watching this workspace", msg)
+        self.assertIn("20261016-130000-selfhost:fix-parser", msg)
+        self.assertIn("repo", msg)
+        self.assertIn("session abcdef01", msg)
+
+    def test_watcher_warning_surfaces_through_create_request(self):
+        watched = self.base / "repo"
+        watched.mkdir()
+        req_dir = watched / "data" / "requests"
+        self.write_run("20261016-130100-own", steps={
+            "hold": self.live_step(watched)})
+        with self.assertRaises(conductor.RequestError) as cm:
+            conductor.create_request({"raw": "anything"},
+                                     req_dir, self.runs)
+        self.assertEqual(cm.exception.status, 409)
+        self.assertIn("20261016-130100-own:hold", str(cm.exception))
+        self.assertFalse(req_dir.exists())   # nothing was written
+
+    def test_watcher_warning_lists_multiple_and_caps(self):
+        watched = self.base / "repo"
+        watched.mkdir()
+        for i in range(5):
+            self.write_run(f"20261016-130{i}00-w{i}", steps={
+                f"s{i}": self.live_step(
+                    watched, session_id=f"{i:016x}")})
+        with self.assertRaises(conductor.RequestError) as cm:
+            conductor._assert_unwatched(self.runs, watched / "manifests")
+        msg = str(cm.exception)
+        self.assertIn(":s0", msg)
+        self.assertIn(":s2", msg)
+        self.assertIn("+2 more", msg)
+        self.assertNotIn(":s4", msg)         # past the cap
+
+    def test_watcher_warning_missing_identity_degrades(self):
+        """Old records may lack slug/session_id - the label still carries
+        run-dir:step and never prints placeholder 'None'/'session'."""
+        watched = self.base / "repo"
+        watched.mkdir()
+        self.write_run("20261016-131000-bare", steps={
+            "only": self.live_step(watched)})
+        with self.assertRaises(conductor.RequestError) as cm:
+            conductor._assert_unwatched(self.runs, watched / "manifests")
+        msg = str(cm.exception)
+        self.assertIn("20261016-131000-bare:only", msg)
+        self.assertNotIn("None", msg)
+        self.assertNotIn("session", msg)
+
+    def test_watcher_warning_ignores_dead_and_foreign(self):
+        watched = self.base / "repo"
+        watched.mkdir()
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        self.write_run("20261016-131100-done", steps={
+            "fin": {"status": "done", "work_dir": str(watched),
+                    "ended_at": "2026-10-16T13:20:00"},
+            "other": self.live_step(elsewhere)})
+        conductor._assert_unwatched(
+            self.runs, watched / "manifests")     # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

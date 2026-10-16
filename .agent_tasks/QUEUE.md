@@ -658,3 +658,27 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   cell. 2 new TaskTableNavTests (click targets, keyboard, filtering,
   nav, highlight lifecycle) + test_modal_edit_form_locks updated for
   the new entry point; 322/322 + demo green.
+- DONE 2026-10-16 (execution-context-labels, wave step of run
+  20261016-100852-run-review-ux): two label truths. (a) Run rows now
+  carry a compact 'wt' chip from `iso` {wt,local,cloud} - the run's
+  CONFIGURED worktree coverage computed by `_run_isolation`: parsed
+  manifest first (merge='deferred' already reads as worktree, cloud
+  steps never count), then the request's proposed_steps snapshot, then
+  the `wt`/`cloud` fields now stamped on every step record at
+  queue/dispatch/pre-spawn-terminal - branch names and liveness never
+  consulted, so undispatched runs label correctly and a parked branch
+  on a legacy record invents nothing. Partial coverage spells it out on
+  the chip itself ('wt 1/2' + title explaining the rest run in the
+  checkout). (b) The trap-5 'A live agent is watching this workspace'
+  409 is still reachable (data/ sits under ROOT - a main-checkout or
+  resolve-* step watches every managed dir) and now names its owner:
+  `_watchers_of` collects ALL live steps whose work_dir contains a
+  destination (sorted, dedup-stable), `_watcher_identity` renders
+  '<run-dir>:<step> (slug, session <id8>)' with missing fields dropped
+  rather than 'None', capped at 3 + '+N more'. The same identity now
+  feeds the sweep/archive/trash-purge DRY-RUN lines (via
+  `_runs_watched` returning the identity list), `_any_live_step_in`'s
+  deferred-merge refusal, and the launch-time project-overlap 409.
+  Identifiers only - task text never enters an error string. 13 new
+  tests (iso derivation matrix + watcher identity/multi/fallback +
+  node chip render).
