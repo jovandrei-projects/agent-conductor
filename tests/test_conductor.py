@@ -10412,6 +10412,9 @@ device = "any"
             prompt = (self._run_dir(runs) / "prompts/mob.md").read_text(
                 encoding="utf-8")
             self.assertIn("owns Android device `RFGL11NN0QV`", prompt)
+            # the note also points at the shipped relaunch/dialog helper
+            self.assertIn("mobile_device.py", prompt)
+            self.assertIn("Confirm Navigation", prompt)
             self.assertEqual(list(devdir.glob("*.json")), [])
             evs = (self._run_dir(runs) / "events.jsonl").read_text(
                 encoding="utf-8")

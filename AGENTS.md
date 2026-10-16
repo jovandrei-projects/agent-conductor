@@ -136,6 +136,31 @@ Known gap: leases own the SERIAL, not the shared adb server - workers
 still mustn't reuse fixed host ports (`adb forward tcp:9222`) across
 concurrent steps; pick a free port per session.
 
+Intentional app restarts: a worker that reloads or restarts a WebView
+app can hit the app's unsaved-changes guard - the WebView shows a NATIVE
+'Confirm Navigation' dialog (Leave this Page / Stay on this Page) that
+no CDP/JS channel can answer, so the navigation never completes and
+automation behind it waits forever (burned 20261014-235630-
+apartment-play-edit's mobile-parity-validation: its harness ran
+`location.reload()` on a page dirty with its own test edits; the
+emulator sat on the dialog while the step clock ran out). The shipped
+`mobile_device.py` (next to conductor.py, stdlib-only) is the supported
+path and the device note hands it to every leased step:
+`relaunch <pkg>` = process restart the dialog cannot block (settles
+first so completed saves flush; in-memory unsaved state is lost - use
+only when disposable), `confirm-navigation --pkg <pkg> [--leave|--stay]`
+= bounded poll for the known dialog after an in-page reload, tapping
+only when the caller asserts the dirty state is disposable/saved
+(`--leave`) or aborts it (`--stay`); no decision flag = refuse,
+unexpected dialogs = uiautomator+screencap diag + actionable failure,
+never an auto-accept, every call `-s <leased serial>` (a foreign
+`--serial` under a lease is refused). App-side follow-ups recorded
+(apartment-3d, not edited here): its `location.reload()`-based harnesses
+should either save/flush before reload or call the helper, and an
+automation-authorized guard bypass (intent extra / `__save.flushNow()`
+await hook) would remove the dialog round-trip entirely - today only
+uiautomator can answer it.
+
 Tracking: `state.json` is the agent registry (status, pid, started/ended,
 elapsed, session id, work dir, paths to prompt/stdout/export, `merged` +
 `merged_at` for worktree branches, `outcome` - the step's newest
