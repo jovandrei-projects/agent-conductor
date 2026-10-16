@@ -7462,6 +7462,12 @@ td :is(a,button):focus-visible { outline-offset:-2px; }
 .attach-item img { width:100%; height:100%; object-fit:cover; display:block; }
 .attach-x { position:absolute; top:2px; right:2px; width:20px; height:20px; border-radius:50%; border:1px solid #30363d; background:rgba(13,17,23,.9); color:#ffb2aa; cursor:pointer; font-size:14px; line-height:1; padding:0; }
 .attach-x:hover { border-color:#9f3535; }
+/* the paperclip control opens the OS image picker into the same upload
+   path - styled as an icon-sized .btn.secondary, fed by a hidden
+   input[type=file] */
+.attach-row { display:flex; align-items:flex-start; gap:8px; }
+.attach-btn { flex:none; display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px; margin-top:1px; padding:0; border:1px solid #30363d; border-radius:6px; background:#21262d; color:#8b949e; cursor:pointer; }
+.attach-btn:hover { color:#e6edf3; border-color:#8b949e; }
 #detail textarea.drop { border-color:#58a6ff; }
 #detail label.check { display:flex; align-items:flex-start; gap:8px; margin:12px 0 4px; font-size:13px; cursor:pointer; }
 #detail label.check input[type=checkbox] { width:auto; margin-top:2px; }
@@ -8649,12 +8655,25 @@ function showRequestForm(rec){
       `value="${esc(rec.max_attempts??3)}"${disabled}></div><div></div></div>` +
     `<label for="rq-raw">Your request</label><textarea id="rq-raw"${disabled} ` +
     `placeholder="Describe the work in your own words…">${esc(rec.raw||'')}</textarea>` +
-    `<div id="rq-attach" class="attach-strip" hidden></div>` +
-    (editable?`<div class="sub">Attach images by dropping image files ` +
-      `anywhere on this dialog or pasting a screenshot - each is saved ` +
-      `under data/attachments and its path is inserted into the request. ` +
-      `Remove one with its &times; any time before generating or ` +
-      `starting.</div>`:'') +
+    `<div id="rq-attach" class="attach-strip" aria-live="polite" ` +
+      `aria-label="Attached images" hidden></div>` +
+    (editable?`<div class="sub attach-row"><button type="button" ` +
+      `class="attach-btn" data-attach-pick ` +
+      `aria-label="Choose image files to attach" ` +
+      `title="Attach images - pick files from this device">` +
+      `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" ` +
+      `stroke="currentColor" stroke-width="2" stroke-linecap="round" ` +
+      `stroke-linejoin="round" aria-hidden="true" focusable="false">` +
+      `<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57` +
+      `A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>` +
+      `</svg></button>` +
+      `<span>Attach images - click the paperclip to pick files from ` +
+      `this device, drop image files anywhere on this dialog, or paste ` +
+      `a screenshot. Each is saved under data/attachments and its path ` +
+      `is inserted into the request; remove one with its &times; any ` +
+      `time before generating or starting.</span></div>` +
+      `<input type="file" id="rq-file" accept="image/*" multiple ` +
+      `hidden>`:'') +
     `<label class="check"><input type="checkbox" id="rq-followup"` +
       `${rec.followup?' checked':''}${disabled}><span>End the run with a ` +
       `planning step that drafts a follow-up manifest into manifests/ ` +
@@ -9561,6 +9580,12 @@ document.addEventListener('click', async e=>{
     if (modalRequest) modalRequest.dirty=true;
     refreshPending();
     return; }
+  const pickAtt = t.closest && t.closest('[data-attach-pick]');
+  if (pickAtt){
+    e.preventDefault();
+    const fi=document.getElementById('rq-file');
+    if (fi && attachTarget()) fi.click();
+    return; }
   if (modalQA && t.dataset && t.dataset.qopt!==undefined){
     // toggle a suggested option - single-select replaces, multi toggles;
     // re-clicking the sole pick deselects it
@@ -9995,6 +10020,16 @@ document.addEventListener('paste', e=>{
     .filter(i=>i.kind==='file'&&(i.type||'').startsWith('image/'))
     .map(i=>i.getAsFile()).filter(Boolean);
   if(files.length){ e.preventDefault(); attachFiles(files); }
+});
+// the paperclip's hidden file input shares the drop/paste upload path.
+// A canceled dialog delivers no files and changes nothing; clearing the
+// value lets picking the same file twice still fire 'change'.
+document.addEventListener('change', e=>{
+  const fi=document.getElementById('rq-file');
+  if(!fi || e.target!==fi) return;
+  const files=[...(fi.files||[])];
+  try{fi.value='';}catch(err){}
+  if(files.length) attachFiles(files);
 });
 document.addEventListener('keydown', e=>{
   // the open row menu owns the keyboard: Esc dismisses (focus returns to
