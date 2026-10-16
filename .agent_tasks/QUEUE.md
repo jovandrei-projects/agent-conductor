@@ -24,6 +24,28 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (deferred-merge-engine, wave step of run
+  20261016-013719-workflow-ux-safety): `merge = "deferred"` (run-level
+  or per-step; implies worktree) separates worktree isolation from
+  merging - branches, worktrees, commits and verify results stay pending
+  in `state.json`'s `pending_merges` until a human runs
+  `conductor.py merge <run_dir>` (new CLI verb; `--steps` picks a
+  subset) or clicks Merge pending branches. Sequential deferred steps
+  on one project branch off a per-run integration baseline
+  (`conductor/<run>/baseline-<slug>`) that FFs only over verified tips
+  and absorbs target movement via merge-tree plumbing; same-wave
+  same-project members stay `alternative`s, never auto-combined. The
+  explicit merge stages verified entries in an isolated `stage-<hash>`
+  worktree, re-runs their verify gates on the combination, resolves
+  conflicts via merge_resolver IN the stage, and lands the recorded
+  target atomically (ff-only merge when checked out, expected-value
+  update-ref otherwise) - a red combined verify or busy repo keeps
+  everything pending; retained work is never deleted. Bonus fix: ALL
+  merge paths (post-wave, resume-finalize, merge_run, deferred staging)
+  now serialize on `.git/conductor-merge.lock` + `abort_own_merge`
+  refuses while a live lock-holder exists - the cross-run merge-kill
+  recorded by isolate-proposal-planning. 250/250 tests + demo green;
+  13 new DeferredMergeTests.
 - DONE 2026-10-16 (follow-up-plan, closing step of run
   20261016-013711-proposal-flow-fixes): reviewed the run against the
   human's three requests - ALL THREE DELIVERED on master (stop at
