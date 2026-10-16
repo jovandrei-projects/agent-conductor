@@ -3568,5 +3568,181 @@ const row=i=>({dataset:{},closest:sel=>sel==='tr.agen'?{dataset:{i:String(i)}}:n
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class RunLifecycleCleanupTests(unittest.TestCase):
+    """Auto-archive: a run whose ended_at is older than ARCHIVE_AFTER_S is
+    stamped state['archived'] and drops out of the default dashboard view
+    (kept on disk; ?archived=1 / Unarchive brings it back). 'Delete run'
+    removes the whole record, gated on {confirm:true} and no live work."""
+
+    def _ended_run(self, runs: Path, name: str, hours_ago: float,
+                   **extra) -> Path:
+        rd = runs / name
+        rd.mkdir(parents=True, exist_ok=True)
+        t = (conductor.dt.datetime.now()
+             - conductor.dt.timedelta(hours=hours_ago)).isoformat(
+                 timespec="seconds")
+        st = {"run": name, "started_at": t, "ended_at": t,
+              "steps": {"a": {"status": "done", "started_at": t,
+                              "ended_at": t}},
+              **extra}
+        (rd / "state.json").write_text(json.dumps(st), encoding="utf-8")
+        (rd / "events.jsonl").write_text("{}\n", encoding="utf-8")
+        return rd
+
+    def test_archive_marks_only_old_finished_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            old = self._ended_run(runs, "20260101-000000-old", 49)
+            new = self._ended_run(runs, "20260102-000000-new", 1)
+            live = self._ended_run(runs, "20260103-000000-unf", 99)
+            st = json.loads((live / "state.json").read_text())
+            del st["ended_at"]           # interrupted/unfinished: untouched
+            (live / "state.json").write_text(json.dumps(st))
+            lines = conductor.archive_runs(runs)
+            self.assertTrue(any("old" in l for l in lines))
+            self.assertTrue(json.loads((old / "state.json").read_text())
+                            .get("archived"))
+            for d in (new, live):
+                self.assertNotIn("archived",
+                                 json.loads((d / "state.json").read_text()))
+
+    def test_archive_threshold_and_disable(self):
+        """ARCHIVE_AFTER_S is the knob (CONDUCTOR_ARCHIVE_HOURS at boot);
+        0 disables the pass entirely."""
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            mid = self._ended_run(runs, "20260101-000000-mid", 2)
+            with mock.patch.object(conductor, "ARCHIVE_AFTER_S", 0):
+                self.assertEqual(conductor.archive_runs(runs), [])
+            self.assertNotIn("archived",
+                             json.loads((mid / "state.json").read_text()))
+            with mock.patch.object(conductor, "ARCHIVE_AFTER_S", 3600):
+                conductor.archive_runs(runs)
+            self.assertTrue(json.loads((mid / "state.json").read_text())
+                            .get("archived"))
+
+    def test_archived_runs_hidden_then_listed(self):
+        """Default /api/state omits archived runs and their agents but
+        still counts them; include_archived lists them stamped."""
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            self._ended_run(runs, "20260101-000000-old", 49,
+                            archived=conductor.now_iso())
+            self._ended_run(runs, "20260102-000000-new", 1)
+            d = conductor.collect_dashboard(runs)
+            self.assertEqual({r["run"] for r in d["runs"]},
+                             {"20260102-000000-new"})
+            self.assertEqual(d["archived_runs"], 1)
+            self.assertEqual(len(d["agents"]), 1)
+            d = conductor.collect_dashboard(runs, include_archived=True)
+            self.assertEqual(len(d["runs"]), 2)
+            self.assertEqual(len(d["agents"]), 2)
+            old = next(r for r in d["runs"]
+                       if r["run"] == "20260101-000000-old")
+            self.assertTrue(old["archived"])
+            self.assertEqual(d["archived_runs"], 1)
+
+    def test_set_run_archived_toggle(self):
+        """Manual Archive/Unarchive on a finished run flips the stamp; a
+        live step refuses to be hidden."""
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            rd = self._ended_run(runs, "20260101-000000-t", 1)
+            out = conductor.set_run_archived(rd.name, {}, runs)
+            self.assertTrue(out["archived"])
+            self.assertTrue(json.loads((rd / "state.json").read_text())
+                            ["archived"])
+            out = conductor.set_run_archived(rd.name, {"archived": False},
+                                             runs)
+            self.assertFalse(out["archived"])
+            self.assertNotIn("archived",
+                             json.loads((rd / "state.json").read_text()))
+            # live step -> 409
+            p = subprocess.Popen([sys.executable, "-c",
+                                  "import time;time.sleep(30)"])
+            try:
+                st = json.loads((rd / "state.json").read_text())
+                st["steps"]["a"] = {"status": "running", "pid": p.pid,
+                                    "started_at": conductor.now_iso()}
+                (rd / "state.json").write_text(json.dumps(st))
+                with self.assertRaises(conductor.RequestError) as e:
+                    conductor.set_run_archived(rd.name, {}, runs)
+                self.assertEqual(e.exception.status, 409)
+            finally:
+                p.terminate()
+                p.wait()
+
+    def test_delete_run_removes_the_record(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            rd = self._ended_run(runs, "20260101-000000-t", 1)
+            (rd / "prompts").mkdir()
+            (rd / "prompts" / "a.md").write_text("p", encoding="utf-8")
+            with self.assertRaises(conductor.RequestError):
+                conductor.delete_run(rd.name, {}, runs)      # unconfirmed
+            self.assertTrue((rd / "state.json").is_file())
+            out = conductor.delete_run(rd.name, {"confirm": True}, runs)
+            self.assertEqual(out["deleted"], rd.name)
+            self.assertFalse(rd.exists())
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.delete_run(rd.name, {"confirm": True}, runs)
+            self.assertEqual(e.exception.status, 404)
+
+    def test_delete_run_refuses_a_live_step(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "data" / "runs"
+            rd = self._ended_run(runs, "20260101-000000-t", 1)
+            p = subprocess.Popen([sys.executable, "-c",
+                                  "import time;time.sleep(30)"])
+            try:
+                st = json.loads((rd / "state.json").read_text())
+                st["steps"]["a"] = {"status": "running", "pid": p.pid,
+                                    "started_at": conductor.now_iso()}
+                (rd / "state.json").write_text(json.dumps(st))
+                with self.assertRaises(conductor.RequestError) as e:
+                    conductor.delete_run(rd.name, {"confirm": True}, runs)
+                self.assertEqual(e.exception.status, 409)
+                self.assertTrue(rd.exists())
+            finally:
+                p.terminate()
+                p.wait()
+
+    def test_sweep_also_archives_and_resume_unarchives(self):
+        """sweep folds the archive pass in (so serve startup gets it), and
+        --resume drops the stamp - a re-entered run is visible again."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "work"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            rd = next(runs.iterdir())
+            st = json.loads((rd / "state.json").read_text())
+            old = (conductor.dt.datetime.now()
+                   - conductor.dt.timedelta(hours=49)).isoformat(
+                       timespec="seconds")
+            st["ended_at"] = old
+            (rd / "state.json").write_text(json.dumps(st))
+            lines = conductor.sweep_runs(runs)
+            self.assertTrue(any("archived" in l for l in lines))
+            st = json.loads((rd / "state.json").read_text())
+            self.assertTrue(st.get("archived"))
+            self.assertEqual(run_manifest(m, runs, resume=str(rd)), 0)
+            st = json.loads((rd / "state.json").read_text())
+            self.assertNotIn("archived", st)
+
+    def test_control_names_in_dashboard_html(self):
+        html = conductor._DASH_HTML
+        for name in ("Archive run", "Unarchive", "Delete run",
+                     "archived"):
+            self.assertIn(name, html)
+
+
 if __name__ == "__main__":
     unittest.main()
