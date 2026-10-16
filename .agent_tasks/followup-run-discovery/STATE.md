@@ -65,8 +65,9 @@ already-written files.
 ## Where it stopped
 
 All phases done. Full suite re-run clean after the owner-dir scoping fix;
-15/15 FollowupDiscoveryTests green. Commits land on this worktree's
-branch; the parent run's merge step picks it up.
+15/15 FollowupDiscoveryTests green. Branch merged to master via
+resolve-followup-run-discovery (merge 9794ec5; both-append on
+efficiency_stats.md only; 366/366 post-merge suite green).
 
 ## Deferred or blocked
 
