@@ -1294,6 +1294,9 @@ def summary_html(md: str, title: str) -> str:
             "padding:10px 12px;font-size:12px;overflow:auto;"
             "white-space:pre-wrap}strong{color:#e6edf3}</style></head>"
             f"<body>{''.join(body)}</body></html>")
+
+
+def _merge_tokens(acc: dict[str, int], tok: dict | None) -> dict:
     for k, v in (tok or {}).items():
         if isinstance(v, (int, float)):
             acc[k] = acc.get(k, 0) + int(v)
