@@ -755,3 +755,31 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   Identifiers only - task text never enters an error string. 13 new
   tests (iso derivation matrix + watcher identity/multi/fallback +
   node chip render).
+- DONE 2026-10-16 (follow-up-plan, closing step of run
+  20261016-100852-run-review-ux): reviewed the run against every item of
+  the human request - 4 of 9 steps merged mid-run + verified
+  (task-outcome-summary d57e9c2, task-table-navigation 12fbe2b,
+  modal-refresh-stability 8cb3988, execution-context-labels 6b1418c);
+  the other five recorded `failed` yet all carry COMPLETED work parked
+  on unmerged branches: inspect-and-design (59b3c18, design docs; gate
+  hit 1 publish-race test flake), review-workflow (8888cb7 - the whole
+  review-mark feature; its 290/290 gate was GREEN, recorded failed only
+  because the worker exited 0 without a STATUS: line),
+  cumulative-elapsed-time (6f1af6f, 369/369 in-worktree),
+  manual-merge-guard (e81d03b, run_executing + merge-<runkey> claim),
+  integration-verification (31ee57f - already union-merges the other
+  four, verified combined 457/457 ~783s in-worktree + live serve smoke).
+  The last three gates all read "verify timed out after 600s": the
+  suite outgrew the hard-coded cap - now a GUARANTEED false-fail for
+  `python run_tests.py` gates (driver-side, so it affects any run until
+  new code ships). Drafted manifests/run-review-ux-followup.toml
+  (validated by `plan`, also dropped as the intake artifact in the main
+  checkout's manifests/): land-run-review-ux-branches (main-checkout
+  merge of the union branch + merge-verb record stamping; preflight
+  refuses while the still-live workflow-ux-safety run drives this
+  repo), verify-timeout-config, verify-gate-flake-hardening,
+  review-ux-live-smoke (trap-5 scratch-copy serve + committed browser
+  probe), closing follow-up-plan. NOT launched - human review. Overlap
+  notes inside the file: verify-timeout duplicates the still-unlaunched
+  ux-controls-followup item; the flake step is scoped to this run's two
+  observed failures vs proposal-ui-fixes-followup's _flag_soon family.
