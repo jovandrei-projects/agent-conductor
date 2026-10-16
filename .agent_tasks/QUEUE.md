@@ -549,3 +549,23 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   summary-md bullets, cmd_status, and the follow-up plan's review
   sources. mock_devin prints it (outcome=/nooutcome/status= keywords);
   12 new tests, 307/307 + demo green.
+- DONE 2026-10-16 (task-table-navigation, wave step of run
+  20261016-100852-run-review-ux): the agents table got real click targets
+  - the step name is a `linkbtn step-name` button (`data-agent-detail`,
+  agentKey-keyed) that opens the task modal, and the run name a
+  `linkbtn run-link` (`data-filter-run`, run_key before run_dir) that
+  applies the existing run filter; the bare `tr.agen` click->modal
+  catch-all is gone, so misclicks and text selection can't pop a dialog
+  (the row stays focusable for Shift+F10 + Enter/Space = details, and
+  dropped `cursor:pointer` since it no longer acts). `data-filter-run`
+  dispatch moved to `closest()` like the other attrs. New `.dsel` mark
+  (same palette as run `.selected`, hover-proof) highlights the row
+  whose modal is open - `selKeys()`/`applySel()` key it by
+  agentKey/runKey via a new `data-akey` on `tr.agen` (never row index),
+  so re-sorts/filters/refreshes can't paint the wrong row; task nav +
+  ArrowLeft/Right move the mark, closeDetail clears it, and run
+  details/request/questionnaire/summary views mark their run row the
+  same way. A task with no run association renders a plain-text run
+  cell. 2 new TaskTableNavTests (click targets, keyboard, filtering,
+  nav, highlight lifecycle) + test_modal_edit_form_locks updated for
+  the new entry point; 322/322 + demo green.

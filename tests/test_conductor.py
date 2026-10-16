@@ -5274,6 +5274,217 @@ const key=(k,t,o)=>{let pd=0;handlers.keydown(
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class TaskTableNavTests(unittest.TestCase):
+    """Task-table click targets: the step name opens the task modal
+    (data-agent-detail, keyed by agentKey), the run name applies the run
+    filter (data-filter-run, run_key before run_dir), and a bare click on
+    any other part of a task row does nothing. While a modal is open its
+    row keeps a .dsel mark keyed by agentKey/runKey - moved by sibling
+    nav, re-applied on refresh, cleared on close."""
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_task_row_click_targets(self):
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',scrollTop:0}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},fetch:async()=>({ok:true,json:async()=>({})}),
+  confirm:()=>true,alert:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'x',agents:[
+  {step:'one',run:'runA',run_dir:'/rA',run_key:'request:q1',slug:'p',
+   status:'done',task:'t1',seq:0,request_id:'q1'},
+  {step:'two',run:'runA',run_dir:'/rA',run_key:'request:q1',slug:'p',
+   status:'done',task:'t2',seq:1,request_id:'q1'},
+  {step:'three',run:'runB',run_dir:'/rB',run_key:'/rB',slug:'p',
+   status:'done',task:'t3',seq:0},
+  {step:'orphan',run:null,run_dir:null,run_key:'',slug:'p',
+   status:'skipped',task:'t4'}],
+ runs:[{run:'runA',dir:'/rA',key:'request:q1',request_id:'q1',
+        counts:{done:2}},
+       {run:'runB',dir:'/rB',key:'/rB',counts:{done:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const agents=()=>elem('agents').innerHTML;
+// the step name is a real button keyed by agentKey (stable across
+// re-sorts); the run name is a filter button keyed by the stable run_key
+// (request:q1), NOT the dir path
+assert.match(agents(),
+  /<button type="button" class="linkbtn step-name"[^>]*data-agent-detail="request:q1\|one"[^>]*>one<\/button>/);
+assert.match(agents(),
+  /<button type="button" class="linkbtn run-link"[^>]*data-filter-run="request:q1"[^>]*>runA<\/button>/);
+// a task with no run association keeps a plain-text run cell - there is
+// no filter target to apply
+const orphanRow=agents().split('<tr ').find(r=>r.includes('>orphan<'));
+assert.ok(orphanRow);
+assert.doesNotMatch(orphanRow,/run-link/);
+assert.match(orphanRow,/<td>-<\/td>/);
+// the row still advertises its context menu and stays focusable
+assert.match(agents(),/<tr class="agen"[^>]*tabindex="0"[^>]*aria-haspopup="menu"/);
+const click=async t=>handlers.click({target:t,preventDefault:()=>{}});
+const el=(sel,dataset)=>({dataset:{},
+  closest:s=>s===sel?{dataset}:null});
+(async()=>{
+  // a bare click anywhere else on the task row (e.g. the result cell, or
+  // while selecting text) must NOT open the modal - the row catch-all is
+  // gone
+  await click({dataset:{},
+    closest:s=>s==='tr.agen'?{dataset:{i:'0'}}:null});
+  assert.equal(elem('backdrop').hidden,true);
+  // the step-name button opens this task's modal
+  await click(el('[data-agent-detail]',{agentDetail:'request:q1|one'}));
+  assert.equal(elem('backdrop').hidden,false);
+  assert.match(elem('dbody').innerHTML,/p \/ one/);
+  await click({id:'dx',dataset:{},closest:()=>null});
+  assert.equal(elem('backdrop').hidden,true);
+  // the run-name button applies the run filter by its stable key
+  await click(el('[data-filter-run]',{filterRun:'request:q1'}));
+  assert.equal(vm.runInContext('selectedRun',ctx),'request:q1');
+  assert.match(elem('filters').innerHTML,/runA ×/);
+  assert.match(agents(),/>one</);
+  assert.doesNotMatch(agents(),/>three</);
+  assert.doesNotMatch(elem('runs').innerHTML,/>runB</);
+  // a click on inner markup of the run-name button (closest() dispatch)
+  // reaches the same handler instead of falling to the row
+  await click({id:'',dataset:{clearRun:''},closest:()=>null});
+  const inner={dataset:{},closest:s=>{
+    if(s==='[data-filter-run]')return {dataset:{filterRun:'/rB'}};
+    if(s==='tr.agen')return {dataset:{i:'2'}};
+    return null;}};
+  await click(inner);
+  assert.equal(vm.runInContext('selectedRun',ctx),'/rB');
+  assert.equal(elem('backdrop').hidden,true);   // never a modal
+  assert.match(elem('filters').innerHTML,/runB ×/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_task_row_selection_highlight_lifecycle(self):
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',scrollTop:0}); return nodes.get(id); };
+// model the row DOM honestly: every render() rewrites the table HTML, so
+// re-parse fresh row objects ONLY when the markup changed - classList
+// toggles then persist exactly like real nodes between renders and are
+// recreated clean (no dsel baked into markup) on each rebuild.
+let parsed={html:null,rows:[]};
+function domRows(){
+  const html=(elem('runs').innerHTML||'')+'\n'+(elem('agents').innerHTML||'');
+  if (html===parsed.html) return parsed.rows;
+  const rows=[...html.matchAll(/<tr [^>]*>/g)].map(m=>{
+    const tag=m[0];
+    const attr=n=>{const a=tag.match(new RegExp(n+'="([^"]*)"'));
+      return a?a[1]:'';};
+    const set=new Set(attr('class').split(/\s+/).filter(Boolean));
+    const row={dataset:{runKey:attr('data-run-key'),akey:attr('data-akey'),
+      i:attr('data-i')},_set:set,
+      classList:{contains:c=>set.has(c),
+        toggle:(c,on)=>{on?set.add(c):set.delete(c)},
+        add:c=>set.add(c),remove:c=>set.delete(c)}};
+    row.has=c=>set.has(c);
+    return row;
+  }).filter(r=>r._set.has('runrow')||r._set.has('agen'));
+  parsed={html,rows};
+  return rows;
+}
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:sel=>
+    /data-run-key|data-akey|runrow|agen/.test(sel)?domRows():[],
+  activeElement:null,addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},fetch:async()=>({ok:true,json:async()=>({}),
+    text:async()=>''}),confirm:()=>true,alert:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'x',agents:[
+  {step:'s1',run:'rA',run_dir:'/rA',run_key:'/rA',slug:'p',status:'done',
+   task:'t1',seq:0},
+  {step:'s2',run:'rA',run_dir:'/rA',run_key:'/rA',slug:'p',status:'done',
+   task:'t2',seq:1},
+  {step:'x1',run:'rB',run_dir:'/rB',run_key:'/rB',slug:'p',status:'done',
+   task:'t3',seq:0}],
+ runs:[{run:'rA',dir:'/rA',key:'/rA',counts:{done:2}},
+       {run:'rB',dir:'/rB',key:'/rB',counts:{done:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const dsel=()=>domRows().filter(r=>r._set.has('dsel'))
+  .map(r=>r.dataset.akey||r.dataset.runKey).sort();
+const click=async t=>handlers.click({target:t,preventDefault:()=>{}});
+const el=(sel,dataset)=>({dataset:{},
+  closest:s=>s===sel?{dataset}:null});
+const key=k=>handlers.keydown({key:k,
+  target:{closest:()=>null,matches:()=>false},preventDefault:()=>{}});
+(async()=>{
+  assert.deepEqual(dsel(),[]);
+  // open a task modal via its step-name button - that row alone marks
+  await click(el('[data-agent-detail]',{agentDetail:'/rA|s1'}));
+  assert.equal(elem('backdrop').hidden,false);
+  assert.deepEqual(dsel(),['/rA|s1']);
+  // sibling nav moves the mark to the task now displayed
+  await click(el('[data-nav]',{nav:'/rA|s2'}));
+  assert.match(elem('dbody').innerHTML,/p \/ s2/);
+  assert.deepEqual(dsel(),['/rA|s2']);
+  // ArrowRight walks back the other way; ArrowLeft from s1 stops at end
+  key('ArrowLeft');
+  assert.match(elem('dbody').innerHTML,/p \/ s1/);
+  assert.deepEqual(dsel(),['/rA|s1']);
+  key('ArrowLeft');
+  assert.deepEqual(dsel(),['/rA|s1']);          // first task - no move
+  // a re-sorted refresh cannot paint the wrong row: keys, not indexes
+  const d2=JSON.parse(JSON.stringify(data)); d2.agents.reverse();
+  vm.runInContext('render('+JSON.stringify(d2)+')',ctx);
+  assert.deepEqual(dsel(),['/rA|s1']);
+  // filtering the task's run out leaves no visible row marked; the modal
+  // stays open and unfiltering brings its mark back
+  vm.runInContext('selectedRun="/rB"; render(lastData)',ctx);
+  assert.deepEqual(dsel(),[]);
+  assert.equal(elem('backdrop').hidden,false);
+  vm.runInContext('selectedRun=null; render(lastData)',ctx);
+  assert.deepEqual(dsel(),['/rA|s1']);
+  // the filter's own .hl/.selected marks never impersonate the modal mark
+  vm.runInContext('selectedRun="/rA"; render(lastData)',ctx);
+  const selRow=domRows().find(r=>r.dataset.runKey==='/rA'&&r._set.has('runrow'));
+  assert.ok(selRow._set.has('selected'));
+  assert.ok(domRows().every(r=>r._set.has('dsel')===
+    (r.dataset.akey==='/rA|s1')));
+  vm.runInContext('selectedRun=null; render(lastData)',ctx);
+  // closing the dialog clears the mark
+  key('Escape');
+  assert.equal(elem('backdrop').hidden,true);
+  assert.deepEqual(dsel(),[]);
+  // run details get the equivalent mark on their run row
+  vm.runInContext('showRunDetails("/rA")',ctx);
+  assert.deepEqual(dsel(),['/rA']);
+  vm.runInContext('closeDetail(true)',ctx);
+  assert.deepEqual(dsel(),[]);
+  // Enter on a focused task row still opens details (deliberate keyboard
+  // activation - not the removed arbitrary-CLICK path)
+  handlers.keydown({key:'Enter',target:{matches:s=>s==='tr.agen',
+    dataset:{i:'1'}},preventDefault:()=>{}});
+  assert.equal(elem('backdrop').hidden,false);
+  assert.deepEqual(dsel(),['/rA|s2']);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
 class ApplyRequestTests(unittest.TestCase):
     """The deterministic 'Apply options to TOML' path: option fields patch
     the proposal in place; request text and project still need a planner."""
@@ -7471,7 +7682,10 @@ const data={serve_boot:'b',generated_at:'t',agents:[
    prompt_editable:false,notes_enabled:true,resume_notes:'old note'}],
   runs:[{run:'r',dir:'/r',counts:{waiting:1,stopped:1}}]};
 vm.runInContext('render('+JSON.stringify(data)+')',ctx);
-const row=i=>({dataset:{},closest:sel=>sel==='tr.agen'?{dataset:{i:String(i)}}:null,preventDefault:()=>{}});
+// task rows no longer open the modal on a bare click - the step-name
+// button (data-agent-detail, keyed by agentKey) is the way in
+const row=i=>({dataset:{},closest:sel=>sel==='[data-agent-detail]'
+  ?{dataset:{agentDetail:'/r|s'+String(i+1)}}:null,preventDefault:()=>{}});
 (async()=>{
   // pending step: full prompt text, editable form, labels disambiguated
   await handlers.click({target:row(0)});
