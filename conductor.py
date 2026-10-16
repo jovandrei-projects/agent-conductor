@@ -924,6 +924,26 @@ def effective_statuses(state: dict) -> dict[str, str]:
     return out
 
 
+def run_executing(st: dict) -> str | None:
+    """Why this run still counts as executing, else None.
+
+    The driver pid is authoritative for runs this code drives: a live
+    conductor means the run is mid-flight even at instants when no step
+    record reads 'running' - between waves, queued-but-unspawned under
+    the cap, the post-exit verify/merge window, or a stop/pause shutdown
+    still in progress (a raised halt sentinel is a REQUEST; the run has
+    not stopped until the driver is gone). Run records that predate
+    driver_pid fall back to live step rows - the pre-2026-10-15 shape.
+    """
+    if driver_alive(st):
+        return "its conductor process is still running"
+    live = sorted(n for n, r in (st.get("steps") or {}).items()
+                  if step_live(r))
+    if live:
+        return f"agent(s) still live: {', '.join(live[:3])}"
+    return None
+
+
 def free_ram_gb() -> float | None:
     """Free physical memory via GlobalMemoryStatusEx (informational)."""
     try:
@@ -2488,6 +2508,18 @@ def gen_stop_flag(request_id: str) -> Path:
     return _flag_dir() / f"stopgen-{request_id}"
 
 
+def merge_claim_flag(run_dir: Path) -> Path:
+    """The run's merge-ownership claim: while this sentinel exists, a
+    manual merge of the run's pending branches (or a resume's startup
+    stamp) owns the run's merge surface and the other side must stay
+    out. Same flag-dir home as the halt sentinels - machine-global,
+    path-keyed to the run's resolved dir, and never inside a watched
+    tree (trap 5). clear_run_flags must leave it alone: resume clearing
+    its own halt sentinels must not silently drop a merge's live claim.
+    The file's JSON payload says who holds it ('by': merge|resume)."""
+    return _flag_dir() / f"merge-{_flag_key(run_dir)}"
+
+
 def _flag_text(flag: Path) -> str | None:
     try:
         return flag.read_text(encoding="utf-8") if flag.is_file() else None
@@ -2582,14 +2614,15 @@ def _flag_raise(name: str) -> None:
 
 
 def clear_run_flags(run_dir: Path) -> None:
-    """Remove all HALT sentinels for a run - called on resume/merge so a
+    """Remove all HALT sentinels for a run - called on resume so a
     previously stopped run can actually start work again. Clears both
     path-keyed names and legacy bare-name ones: a run paused under old
     code must be resumable by new code. Skip sentinels deliberately
     survive: a user's skip stays in force until they Unskip, or a resume
     would silently resurrect a step they removed from the queue. The
-    prompt-edit, resume-notes and interrupt-request sentinels survive
-    too - the resume is exactly when run_step reads them."""
+    prompt-edit, resume-notes, interrupt-request and merge-claim
+    sentinels survive too - the resume is exactly when run_step reads
+    them, and a merge in flight keeps its claim."""
     name = _safe_name(run_dir.name)
     pats = [f"*{_flag_key(run_dir)}*",
             f"stop-{name}*", f"drain-{name}", f"pause-{name}",
@@ -2603,7 +2636,8 @@ def clear_run_flags(run_dir: Path) -> None:
                 # request - all are meant to survive the resume that is
                 # about to read them, so none are halt sentinels.
                 if f.name.startswith(
-                        ("skip-", "prompt-", "rnote-", "intrq-")):
+                        ("skip-", "prompt-", "rnote-", "intrq-",
+                         "merge-")):
                     continue
                 try:
                     f.unlink()
@@ -4053,34 +4087,56 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if args.resume is not None:
         run_dir = find_resume_dir(cfg, runs_dir, args.resume or "latest")
-        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
-        # The driver is now THIS code version: it polls the path-keyed
-        # sentinels only, so the dashboard can stop writing legacy names.
-        state["flags"] = "v2"
-        # ...and it polls the intrq- sentinel, so the dashboard's
-        # 'Interrupt + instruct' action can accept requests again.
-        state["intrq"] = True
-        # A resumed run is in flight again: the stale 'aborted'/'ended_at'
-        # from the pause/crash would keep showing the old end-state notice
-        # (e.g. 'Paused by user') until the loop re-stamps them.
-        state.pop("aborted", None)
-        state.pop("ended_at", None)
-        # A re-entered run is in flight again - drop the auto-archive
-        # stamp so it resurfaces on the default dashboard view.
-        state.pop("archived", None)
-        # The driver is THIS process now - restamp so driver_alive()
-        # tracks the resumed conductor, not the dead original.
-        state["driver_pid"] = os.getpid()
-        state["driver_started_at"] = now_iso()
-        # The current manifest's policy applies to steps prepared from now
-        # on; already-recorded recs keep their own `deferred` flags.
-        state["merge_policy"] = cfg.merge_policy
-        state["summarize_model"] = cfg.summarize
-        save_state(run_dir, state)
-        print(f"[resume] {run_dir.name}")
-        # Resume must be able to start work again: drop any stop/drain
-        # sentinels left by a dashboard Stop click.
-        clear_run_flags(run_dir)
+        # Serialize the startup stamp against a manual pending-branch
+        # merge: merge_run holds the run's merge claim for its whole
+        # operation and re-reads state under it, so stamping driver_pid
+        # while WE hold the same claim is what makes a just-started resume
+        # visible to a merge that already passed its first check - the
+        # two can never overlap.
+        try:
+            resume_claim = _claim_run_merge(run_dir, "resume")
+        except RequestError as exc:
+            print(f"--resume: {exc} - retry once it finishes")
+            return 2
+        try:
+            state = json.loads(
+                (run_dir / "state.json").read_text(encoding="utf-8"))
+            if driver_alive(state):
+                print(f"--resume: {run_dir.name} still has a live "
+                      "conductor - let it end first")
+                return 2
+            # The driver is now THIS code version: it polls the path-keyed
+            # sentinels only, so the dashboard can stop writing legacy
+            # names.
+            state["flags"] = "v2"
+            # ...and it polls the intrq- sentinel, so the dashboard's
+            # 'Interrupt + instruct' action can accept requests again.
+            state["intrq"] = True
+            # A resumed run is in flight again: the stale
+            # 'aborted'/'ended_at' from the pause/crash would keep showing
+            # the old end-state notice (e.g. 'Paused by user') until the
+            # loop re-stamps them.
+            state.pop("aborted", None)
+            state.pop("ended_at", None)
+            # A re-entered run is in flight again - drop the auto-archive
+            # stamp so it resurfaces on the default dashboard view.
+            state.pop("archived", None)
+            # The driver is THIS process now - restamp so driver_alive()
+            # tracks the resumed conductor, not the dead original.
+            state["driver_pid"] = os.getpid()
+            state["driver_started_at"] = now_iso()
+            # The current manifest's policy applies to steps prepared from
+            # now on; already-recorded recs keep their own `deferred`
+            # flags.
+            state["merge_policy"] = cfg.merge_policy
+            state["summarize_model"] = cfg.summarize
+            save_state(run_dir, state)
+            print(f"[resume] {run_dir.name}")
+            # Resume must be able to start work again: drop any stop/drain
+            # sentinels left by a dashboard Stop click.
+            clear_run_flags(run_dir)
+        finally:
+            resume_claim.unlink(missing_ok=True)
     else:
         run_dir = new_run_dir(cfg, runs_dir)
         state = {"run": cfg.name, "description": cfg.description,
@@ -4644,9 +4700,11 @@ def sweep_runs(runs_dir: Path, write: bool = True) -> list[str]:
     watched = _runs_watched(runs_dir, states)
     lines: list[str] = []
     for sj, st in states:
-        if driver_alive(st):
+        if driver_alive(st) or _merge_claim_held(sj.parent):
             # The run's conductor is alive (possibly mid-verify/merge with
-            # a dead worker pid). Orphan-marking is for dead drivers.
+            # a dead worker pid), or a manual merge is mid-flight on it -
+            # either way the run's records are being actively written.
+            # Orphan-marking is for abandoned runs.
             continue
         eff = effective_statuses(st)
         steps = st.get("steps") or {}
@@ -4702,7 +4760,8 @@ def archive_runs(runs_dir: Path, write: bool = True,
         if st.get("archived"):
             continue
         ended = _iso_ts(st.get("ended_at"))
-        if ended is None or now - ended < ARCHIVE_AFTER_S:
+        if ended is None or now - ended < ARCHIVE_AFTER_S \
+                or _merge_claim_held(sj.parent):
             continue
         lines.append(f"{sj.parent.name}: archived (ended {st['ended_at']}, "
                      f"over {ARCHIVE_AFTER_S / 3600:g}h old)")
@@ -7677,12 +7736,23 @@ def resume_run(name: str, runs_dir: Path = RUNS_DIR,
         st = json.loads((d / "state.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise RequestError("Cannot read run state", 500) from exc
+    if driver_alive(st):
+        raise RequestError("This run's conductor is still running - "
+                           "resume once it has stopped", 409)
     if any(step_live(r, driver_alive(st)) for r in (st.get("steps") or {}).values()):
         raise RequestError("This run still has a live agent - wait for it "
                            "or let it die first", 409)
     pid = _RESUME_PIDS.get(name)
     if pid and pid_alive(pid):
         raise RequestError("A resume is already starting for this run", 409)
+    # A manual merge holds the run's merge claim for its whole operation;
+    # resume must not launch a driver over it (the spawned cmd_run would
+    # refuse on the claim anyway - checking here keeps the answer clean).
+    holder = _merge_claim_held(d)
+    if holder:
+        raise RequestError(
+            f"A {holder.get('by') or 'merge'} is in flight for this run "
+            "- resume once it finishes", 409)
     manifest = st.get("manifest")
     if not manifest or not Path(manifest).is_file():
         raise RequestError("Run's manifest is gone; resume from the CLI: "
@@ -7710,6 +7780,79 @@ def _git_dir(repo_dir: Path) -> Path | None:
         return None
     p = Path(r.stdout.strip())
     return p if p.is_absolute() else (repo_dir / p).resolve()
+
+
+def _merge_claim_held(run_dir: Path) -> dict | None:
+    """The live claim on this run's merge surface, else None. The payload's
+    'by' names the owner ('merge' = a merge_run in flight, 'resume' = a
+    driver mid-stamp) so refusals can say who is operating. A claim whose
+    owner pid is dead is stale and broken by the next acquirer; a fresh
+    but unreadable one counts as held for a short grace - an O_EXCL
+    winner is mid-write between create and payload, and breaking the file
+    under it would orphan a real claim (same race the device lease
+    covers)."""
+    p = merge_claim_flag(run_dir)
+    try:
+        info = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+        if not isinstance(info, dict):
+            info = None
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        info = None
+    if info and pid_alive(info.get("pid")):
+        return info
+    if info is None:
+        try:
+            if time.time() - p.stat().st_mtime < 10:
+                return {"by": "operation", "pid": None}
+        except OSError:
+            pass
+    return None
+
+
+def _claim_run_merge(run_dir: Path, by: str) -> Path:
+    """Take the run's merge claim or raise 409 naming the live owner.
+
+    Same O_EXCL + pid shape as _RepoMergeLock, but per RUN and machine-
+    global (the flag dir), because the parties live in different
+    processes: a dashboard merge_run, a CLI merge, and a `run --resume`
+    driver stamping itself into state.json. Whoever holds the claim owns
+    the run's merge surface; merge_run holds it for the whole operation
+    and re-reads state under it, so a resume that already passed its own
+    checks is caught by the recheck instead of overlapping the merge.
+    Returns the claim path - the caller unlinks it on release."""
+    p = merge_claim_flag(run_dir)
+    try:
+        p.parent.mkdir(exist_ok=True)
+    except OSError:
+        pass
+    for _attempt in (0, 1):
+        try:
+            fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            holder = _merge_claim_held(run_dir)
+            if holder:
+                who = holder.get("by") or "merge"
+                pidbit = (f" (pid {holder['pid']})"
+                          if holder.get("pid") else "")
+                raise RequestError(
+                    f"a {who} is already operating on this run{pidbit}",
+                    409)
+            try:
+                p.unlink(missing_ok=True)  # dead owner: break once
+            except OSError:
+                # lost the break race or the file is still being written -
+                # treat as held rather than force it
+                raise RequestError(
+                    "another operation is already claiming this run", 409)
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(
+                {"pid": os.getpid(), "at": now_iso(), "by": by}))
+        return p
+    raise RequestError("the run's merge claim is held but its owner "
+                       "cannot be read", 409)
 
 
 class _RepoMergeLock:
@@ -8048,8 +8191,10 @@ def merge_run(name: str, runs_dir: Path = RUNS_DIR,
     unverified work is never included and retained work is never deleted.
 
     `only` restricts the operation to the named steps (for landing one
-    alternative instead of combining them all). Refused while the run has
-    a live step, an in-flight resume, or another merge already running."""
+    alternative instead of combining them all). Refused while the run is
+    still executing (live driver - including the verify/merge and
+    stop-shutdown windows - or a live step), while a resume is in flight
+    or starting, or while another merge already holds the run's claim."""
     with _MERGE_LOCK:
         if name in _MERGE_BUSY:
             raise RequestError("A merge is already running for this run",
@@ -8060,6 +8205,20 @@ def merge_run(name: str, runs_dir: Path = RUNS_DIR,
     finally:
         with _MERGE_LOCK:
             _MERGE_BUSY.discard(name)
+
+
+def _merge_refuse_executing(why: str | None) -> None:
+    """A manual merge runs only once the run has ACTUALLY stopped or
+    finished: a live driver means still executing even when no step
+    record reads 'running' at this instant - between waves, queued under
+    the cap, the verify/merge window after a worker exits, or a stop/
+    pause shutdown that has not finished (a raised sentinel is a request,
+    not a completed stop)."""
+    if why:
+        raise RequestError(f"Merge pending branches is unavailable while "
+                           f"the run is still executing ({why}) - it "
+                           "unlocks once the run has stopped or "
+                           "finished", 409)
 
 
 def _merge_run(name: str, runs_dir: Path,
@@ -8074,13 +8233,37 @@ def _merge_run(name: str, runs_dir: Path,
         st = json.loads((d / "state.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise RequestError("Cannot read run state", 500) from exc
-    steps = st.get("steps") or {}
-    if any(step_live(r, driver_alive(st)) for r in steps.values()):
-        raise RequestError("This run still has a live agent - wait for it "
-                           "or let it die first", 409)
+    _merge_refuse_executing(run_executing(st))
     pid = _RESUME_PIDS.get(name)
     if pid and pid_alive(pid):
         raise RequestError("A resume is already running for this run", 409)
+    # Claim the run's merge surface for the whole operation, then recheck
+    # under it: a resume holds the same claim while it stamps driver_pid,
+    # so a driver that was mid-startup when we first read state is caught
+    # by the second check - the two operations can never overlap. The
+    # claim is also what serializes a dashboard merge against a CLI
+    # `conductor.py merge` (the in-process _MERGE_BUSY set cannot).
+    claim = _claim_run_merge(d, "merge")
+    try:
+        try:
+            st = json.loads(
+                (d / "state.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RequestError("Cannot read run state", 500) from exc
+        _merge_refuse_executing(run_executing(st))
+        pid = _RESUME_PIDS.get(name)
+        if pid and pid_alive(pid):
+            raise RequestError("A resume is already running for this run",
+                               409)
+        return _merge_run_body(d, name, st, runs_dir, devin_argv, only)
+    finally:
+        claim.unlink(missing_ok=True)
+
+
+def _merge_run_body(d: Path, name: str, st: dict, runs_dir: Path,
+                    devin_argv: list[str] | None,
+                    only: list[str] | None = None) -> dict:
+    steps = st.get("steps") or {}
     onlyset = set(only) if only else None
     pending = {n for n, r in steps.items()
                if r.get("branch") and r.get("merged") is not True
@@ -8759,6 +8942,9 @@ def delete_run(run_name: str, body: dict, runs_dir: Path = RUNS_DIR,
         raise RequestError("Confirm delete explicitly")
     trash_dir = trash_dir or _trash_root(runs_dir)
     d, st = _run_dir_checked(run_name, runs_dir)
+    if driver_alive(st):
+        raise RequestError("This run's conductor is still running - "
+                           "delete it once the run has stopped", 409)
     if any(step_live(r, driver_alive(st)) for r in (st.get("steps") or {}).values()):
         raise RequestError("This run still has a live agent - wait for it "
                            "or let it die first", 409)
@@ -8769,6 +8955,11 @@ def delete_run(run_name: str, body: dict, runs_dir: Path = RUNS_DIR,
         if run_name in _MERGE_BUSY:
             raise RequestError("A merge is already running for this run",
                                409)
+    holder = _merge_claim_held(d)
+    if holder:
+        raise RequestError(
+            f"A {holder.get('by') or 'merge'} is in flight for this run "
+            "- delete once it finishes", 409)
     if _summarizing(d) or pid_alive(_SUM_PIDS.get(run_name)):
         raise RequestError("A summary session is still writing into this "
                            "run dir - wait for it or let it die first", 409)
@@ -9849,6 +10040,15 @@ def collect_dashboard(runs_dir: Path,
         proposed = {s["step"]: s for s in request.get("proposed_steps", [])} \
             if request else {}
         eff = effective_statuses(st)
+        # 'executing' is the honest "the run is mid-flight" signal the
+        # merge guard applies: a live driver (covers the between-wave /
+        # verify / shutdown windows where no step reads 'running') or a
+        # step record still backed by something alive, plus the brief
+        # in-process resume-launch window.
+        drv = driver_alive(st)
+        executing = drv or pid_alive(_RESUME_PIDS.get(sj.parent.name)) \
+            or any(step_live(r, drv)
+                   for r in (st.get("steps") or {}).values())
         flagged = _skip_flagged(sj.parent)     # 'Skip step' marks in place
         mbodies = _manifest_bodies(st)         # full text per step name
         # Pipeline order for the task modal's prev/next: the manifest's
@@ -9926,7 +10126,7 @@ def collect_dashboard(runs_dir: Path,
                 "status": status, "started_at": rec.get("started_at"),
                 "ended_at": rec.get("ended_at"),
                 "elapsed_s": rec.get("elapsed_s"),
-                "alive": step_live(rec, driver_alive(st)),
+                "alive": step_live(rec, drv),
                 "pid": rec.get("pid"), "session_id": rec.get("session_id"),
                 "model": model,
                 "model_actual": rec.get("model_actual"),
@@ -10047,6 +10247,7 @@ def collect_dashboard(runs_dir: Path,
                      "key": key, "request_id": st.get("request_id"),
                      "archived": st.get("archived"),
                      "followup": st.get("followup"),
+                     "executing": executing,
                      "iso": _run_isolation(cfg, st, request),
                      "description": st.get("description") or
                      (request or {}).get("description"),
@@ -11661,13 +11862,20 @@ function runCtl(r){
   const liveSteps = AGENTS.filter(a=>(a.run_key||a.run_dir)===key &&
     ['running','queued'].includes(a.status));
   const cks = Object.keys(r.counts||{});
-  return {key, liveSteps,
+  // 'executing' comes from the server (live driver pid or a live step
+  // record) and stays true through the windows where no step currently
+  // reads 'running' - between waves, queued under the cap, the
+  // verify/merge window, and a still-finishing stop/pause. It gates
+  // actions that are unsafe mid-run (manual merge); the POST re-checks
+  // server-side so a stale page cannot slip through.
+  const executing = !!r.executing || !!liveSteps.length;
+  return {key, liveSteps, executing,
     canResume: !!(cks.length &&
       !cks.some(s=>['running','queued'].includes(s)) &&
       cks.some(s=>s!=='done')),
     // worktree branches that never landed (conflict parked the worktree, or
     // the conductor died between the wave and the merge) - mergeable once
-    // nothing in the run is live
+    // the run has actually stopped or finished
     pendingMerge: AGENTS.some(a=>a.branch && a.merged!==true &&
       (a.run_key||a.run_dir)===key &&
       !['running','queued'].includes(a.status)),
@@ -11706,6 +11914,7 @@ function showRunDetails(key, keepStack){
   const pendingMerge = ctl.pendingMerge;
   const liveSteps = ctl.liveSteps;
   const interrupted = ctl.interrupted;
+  const executing = ctl.executing;
   const notice = (r.aborted==='paused' && canResume)
     ? `<div class="notice warn">Paused - in-flight steps finished and ` +
       `nothing new launched. Resume continues where it left off ` +
@@ -11751,7 +11960,14 @@ function showRunDetails(key, keepStack){
         `and any previous proposal is kept">Stop proposal</button>` : '') +
     (pendingMerge ? `<button type="button" class="btn" ` +
       `data-merge-run="${esc(base(r.dir))}" ` +
-      `data-rk="${esc(key)}">Merge pending branches</button>` : '') +
+      `data-rk="${esc(key)}"${executing ? ' disabled' : ''} ` +
+      `title="${executing
+        ? 'unavailable while the run is still executing - it unlocks ' +
+          'once the run has actually stopped or finished (a stop ' +
+          'request needs a moment to land)'
+        : 'merge this run\u2019s parked or deferred worktree branches ' +
+          'into their project checkouts now'}">` +
+      `Merge pending branches</button>` : '') +
     (liveSteps.length ? `<button type="button" class="btn" ` +
       `data-pause-run="${esc(base(r.dir))}" ` +
       `title="let in-flight steps finish, then hold the run - nothing ` +
@@ -11851,8 +12067,13 @@ function ctxRunItems(r){
         attrs:ctxAttrs({'resume-run':base(r.dir)}),
         title:'re-run every non-done step in a fresh session'});
     if (c.pendingMerge)
-      act.push({label:'Merge pending branches',
-        attrs:ctxAttrs({'merge-run':base(r.dir),'rk':key})});
+      act.push({label:'Merge pending branches', dis:c.executing,
+        attrs:ctxAttrs({'merge-run':base(r.dir),'rk':key}),
+        title: c.executing
+          ? 'unavailable while the run is still executing - it unlocks ' +
+            'once the run has actually stopped or finished'
+          : 'merge this run\u2019s parked worktree branches into their ' +
+            'project checkouts'});
     if (act.length) it.push({sep:1}, ...act);
     it.push({sep:1});
     it.push({label:r.archived?'Unarchive run':'Archive run',
