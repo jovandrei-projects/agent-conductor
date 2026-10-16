@@ -5789,7 +5789,7 @@ function render(d){
             `title="${esc(a.tail_last||'')}">${esc(a.tail_last||'')}` +
             `<span class="dots"><span>.</span><span>.</span><span>.</span>` +
             `</span></td>`
-          : `<td class="wrap">${esc(a.note||a.next||'')}</td>`) + `</tr>`;
+          : `<td class="wrap">${esc(a.note||'-')}</td>`) + `</tr>`;
     }
     if (rows.length > SHOW_N)
       h += `<tr><td colspan="13"><a href="#" data-slug="${esc(slug)}">` +
