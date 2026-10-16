@@ -394,10 +394,17 @@ prompt = "third"
             self.assertEqual(len((proj / "WORK.txt").read_text().splitlines()), 1)
             branches = git(proj, "branch", "--list", "conductor/*").stdout
             self.assertEqual(branches.strip(), "")   # merged branches deleted
-            state = json.loads(
-                (next(runs.iterdir()) / "state.json").read_text())
+            run_dir = next(runs.iterdir())
+            state = json.loads((run_dir / "state.json").read_text())
             self.assertTrue(state["steps"]["p1"]["merged"])
             self.assertTrue(state["steps"]["p2"]["merged"])
+            self.assertTrue(state["steps"]["p1"]["merged_at"])
+            evs = [json.loads(l) for l in
+                   (run_dir / "events.jsonl").read_text().splitlines()]
+            merged = [e for e in evs if e["event"] == "step_merged"]
+            self.assertEqual(
+                {(e["step"], e["how"], e["was"]) for e in merged},
+                {("p1", "wave", "done"), ("p2", "wave", "done")})
 
     def test_wave_merge_conflict_keeps_worktree(self):
         """Two worktree steps editing the SAME file in parallel: the first
@@ -432,6 +439,13 @@ worktree = true
             self.assertEqual(p2["status"], "failed")
             self.assertFalse(p2["merged"])
             self.assertIn("merge conflict", p2["note"])
+            evs = [json.loads(l) for l in
+                   (run_dir / "events.jsonl").read_text().splitlines()]
+            conflicts = [e for e in evs
+                         if e["event"] == "step_merge_conflict"]
+            self.assertEqual([(e["step"], e["how"], e["was"])
+                              for e in conflicts],
+                             [("p2", "wave", "done")])
             wt = Path(p2["work_dir"])               # kept for manual merge
             self.assertTrue(wt.is_dir())
             # aborted merge: main checkout has only p1's line, not p2's
@@ -499,7 +513,15 @@ worktree = true
             self.assertEqual(rc, 0)
             self.assertTrue((proj / "LATE.txt").is_file())  # merged late
             state = json.loads((run_dir / "state.json").read_text())
-            self.assertTrue(state["steps"]["wtstep"]["merged"])
+            rec = state["steps"]["wtstep"]
+            self.assertTrue(rec["merged"])
+            self.assertTrue(rec["merged_at"])
+            evs = [json.loads(l) for l in
+                   (run_dir / "events.jsonl").read_text().splitlines()]
+            merged = [e for e in evs if e["event"] == "step_merged"]
+            self.assertEqual([(e["step"], e["how"], e["was"])
+                              for e in merged],
+                             [("wtstep", "resume", "done")])
 
     def test_auth_lost_midrun_blocks_remaining(self):
         """Token dying mid-run: the NEXT group's pre-spawn probe fails ->
@@ -668,6 +690,11 @@ verify = "exit 1"
             self.assertIn("unmerged work", rec["note"])
             self.assertTrue(git(proj, "branch", "--list",
                                 "conductor/*").stdout.strip())
+            evs = [json.loads(l) for l in
+                   (run_dir / "events.jsonl").read_text().splitlines()]
+            kept = [e for e in evs if e["event"] == "step_merge_kept"]
+            self.assertEqual([(e["step"], e["was"]) for e in kept],
+                             [("one", "failed")])
 
     def test_dead_spawn_worktree_removed_as_debris(self):
         """A step that fails before spawning (bad devin cmd) leaves a

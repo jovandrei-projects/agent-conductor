@@ -101,7 +101,8 @@ each agent is a full Devin session with tool subprocesses, not a thread.
 The run records the effective cap + free RAM in `state.json`.
 
 Tracking: `state.json` is the agent registry (status, pid, started/ended,
-elapsed, session id, work dir, paths to prompt/stdout/export, and per-step
+elapsed, session id, work dir, paths to prompt/stdout/export, `merged` +
+`merged_at` for worktree branches, and per-step
 `tokens` - prompt/completion/cached sums plus LLM step count, read out of
 the ATIF export's `final_metrics` at step end; they roll up per run on the
 dashboard). The planner session also exports and its metrics accumulate on
@@ -132,7 +133,14 @@ aborts a stale `conductor/*` merge-in-progress first - a human's merge is
 never touched. All merges - post-wave, resume-finalize, dashboard,
 deferred staging - serialize on a per-repo `.git/conductor-merge.lock`
 (pid + timestamp, broken when the holder pid is dead) since two drivers
-have raced merges and stale-aborts on the same checkout before.
+have raced merges and stale-aborts on the same checkout before. Every
+merge outcome lands in `events.jsonl`: `step_merged` /
+`step_merge_conflict` per step (`how` = wave/resume/manual, `was` = the
+status it replaces, `resolver` when a resolve-* session saved it),
+`step_merge_kept` when a failed step's branch is parked unmerged,
+`worktree_removed` for no-product debris, the `merge_*` family for the
+deferred pipeline, and `merged_at` on the step record for when the branch
+landed.
 
 `merge = "deferred"` (per-step or `[run]` default; implies
 `worktree = true`, incompatible with `cloud`) separates isolation from

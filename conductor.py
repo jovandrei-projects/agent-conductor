@@ -2808,6 +2808,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     run_dir.name) / step.name
                 if _git(project_dir, "rev-parse", "-q", "--verify",
                         prior["branch"]).returncode == 0:
+                    via_resolver = False
                     try:
                         with _RepoMergeLock(project_dir):
                             abort_own_merge(project_dir)
@@ -2818,19 +2819,28 @@ def cmd_run(args: argparse.Namespace) -> int:
                                     step, slug, project_dir, wt,
                                     prior["branch"], cfg, run_dir,
                                     devin_argv, state)
+                                via_resolver = ok
                     except RequestError:
                         ok = False
+                    was = prior.get('status')
                     if ok:
-                        was = prior.get('status')
-                        prior.update(status="done", merged=True)
+                        prior.update(status="done", merged=True,
+                                     merged_at=now_iso())
                         _append_note(prior, f"merged on resume (was {was})")
                         save_state(run_dir, state)
+                        log_event(run_dir, event="step_merged",
+                                  step=step.name, how="resume", was=was,
+                                  branch=prior["branch"],
+                                  resolver=via_resolver)
                         print(f"[merged] {step.name} (merge on resume)")
-                    elif prior.get("status") == "done":
+                    elif was == "done":
                         prior.update(status="failed", merged=False)
                         _append_note(prior, "merge conflict on resume; "
                                             f"worktree kept at {wt}")
                         save_state(run_dir, state)
+                        log_event(run_dir, event="step_merge_conflict",
+                                  step=step.name, how="resume", was=was,
+                                  branch=prior["branch"])
                         print(f"[ failed] {step.name} (merge conflict "
                               "on resume)")
                         if cfg.on_failure == "stop":
@@ -2844,6 +2854,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                                             "- re-running the same branch "
                                             "cannot fix a conflict")
                         save_state(run_dir, state)
+                        log_event(run_dir, event="step_merge_conflict",
+                                  step=step.name, how="resume", was=was,
+                                  branch=prior["branch"])
                         print(f"[conflict] {step.name} still unmerged")
                     continue
             if args.resume is not None and prior.get("status") == "done":
@@ -2998,6 +3011,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             if branch:
                 rec = state["steps"].get(step.name, {})
                 if status in ("done", "partial", "blocked"):
+                    via_resolver = False
                     try:
                         with _RepoMergeLock(repo_dir):
                             ok = worktree_merge(repo_dir, work_dir, branch)
@@ -3006,6 +3020,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                                     step, slug, repo_dir, work_dir, branch,
                                     cfg, run_dir, devin_argv, state)
                                 if ok:
+                                    via_resolver = True
                                     _append_note(
                                         rec, "merge conflict resolved by "
                                              f"resolve-{step.name}")
@@ -3016,10 +3031,17 @@ def cmd_run(args: argparse.Namespace) -> int:
                                           f"{work_dir}")
                     if ok:
                         rec["merged"] = True
+                        rec["merged_at"] = now_iso()
+                        log_event(run_dir, event="step_merged",
+                                  step=step.name, how="wave", was=status,
+                                  branch=branch, resolver=via_resolver)
                     else:
                         rec.update(status="failed", merged=False)
                         _append_note(rec, "merge conflict; worktree kept "
                                           f"at {work_dir}")
+                        log_event(run_dir, event="step_merge_conflict",
+                                  step=step.name, how="wave", was=status,
+                                  branch=branch)
                         status = "failed"
                         statuses[step.name] = "failed"
                     save_state(run_dir, state)
@@ -3032,11 +3054,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                     _append_note(rec, "worktree removed: step failed "
                                       "with no work product")
                     save_state(run_dir, state)
+                    log_event(run_dir, event="worktree_removed",
+                              step=step.name, branch=branch)
                 else:
                     rec = state["steps"].get(step.name, {})
                     _append_note(rec, f"worktree kept at {work_dir} - "
                                       "branch has unmerged work")
                     save_state(run_dir, state)
+                    log_event(run_dir, event="step_merge_kept",
+                              step=step.name, was=status, branch=branch)
         # Once every member merged or was removed, the per-run worktree
         # dir is an empty husk - drop it (kept worktrees keep it alive).
         try:
@@ -5604,6 +5630,7 @@ def _merge_deferred_group(d: Path, st: dict, grp: dict, names: list[str],
             return
         for n, rec in staged:
             rec["merged"] = True
+            rec["merged_at"] = now_iso()
             _append_note(rec, f"deferred merge landed on {target} via "
                               "staged+verified merge")
             wt = Path(rec["work_dir"]) if rec.get("work_dir") else None
@@ -5714,6 +5741,7 @@ def _merge_run(name: str, runs_dir: Path,
         # ours; a human's merge in progress makes worktree_merge refuse.
         # The repo merge lock serializes us against other conductors'
         # in-flight merges on the same repo.
+        via_resolver = False
         try:
             with _RepoMergeLock(repo_dir):
                 if abort_own_merge(repo_dir):
@@ -5727,22 +5755,27 @@ def _merge_run(name: str, runs_dir: Path,
                           or devin_argv or ["devin"])
                     ok = resolve_merge_conflict(step, slug, repo_dir, wt,
                                                 branch, cfg, d, dv, st)
+                    via_resolver = ok
         except RequestError as exc:
             rec["note"] = f"merge deferred: {exc}"
             results["busy"].append(step.name)
             continue
+        was = rec.get("status")
         if ok:
-            rec.update(status="done" if rec.get("status") == "failed"
-                       else rec.get("status"),
-                       merged=True,
-                       note="merged via dashboard "
-                            f"(was {rec.get('status')})")
+            rec.update(status="done" if was == "failed" else was,
+                       merged=True, merged_at=now_iso(),
+                       note=f"merged via dashboard (was {was})")
             results["merged"].append(step.name)
+            log_event(d, event="step_merged", step=step.name,
+                      how="manual", was=was, branch=branch,
+                      resolver=via_resolver)
         else:
             rec.update(merged=False,
                        note="merge still conflicts; the worktree is kept "
                             f"at {wt} for manual resolution")
             results["conflicted"].append(step.name)
+            log_event(d, event="step_merge_conflict", step=step.name,
+                      how="manual", was=was, branch=branch)
     pending -= set(results["merged"])
     for n in pending - set(results["conflicted"]) - set(results["skipped"]):
         # recorded branch belongs to a step the manifest no longer names
@@ -6821,7 +6854,9 @@ def collect_dashboard(runs_dir: Path,
                 "note": rec.get("note"), "next": rec.get("next"),
                 "session_gone": session_gone,
                 "exit_code": rec.get("exit_code"),
+                "status_line": rec.get("status_line"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
+                "merged_at": rec.get("merged_at"),
                 "timeout_min": timeout_min,
                 "timeout_ext_s": rec.get("timeout_extended_s"),
                 "attempts": rec.get("attempts"),
@@ -6892,6 +6927,10 @@ def collect_dashboard(runs_dir: Path,
                      "started_at": st.get("started_at"),
                      "ended_at": st.get("ended_at"), "counts": counts,
                      "aborted": st.get("aborted"),
+                     "resume_log": (str(sj.parent / "resume.launch.log")
+                                    if (sj.parent /
+                                        "resume.launch.log").is_file()
+                                    else None),
                      "tokens": tok_run or None,
                      "cost": ({"usd": round(run_cost, 4) if run_priced
                                else None, "unpriced": run_unpriced}
@@ -7839,7 +7878,9 @@ function showDetail(i, keepStack){
   const pd = promptDrafts[pk];   // unsaved edit (undefined = none open)
   const nd = notesDrafts[pk];
   const kv = [['step',a.step],['run',a.run],['project',a.slug],
-    ['status',a.status],['task prompt',a.task_full||a.task],
+    ['status',a.status+(a.status==='failed'&&a.exit_code===0&&
+      a.status_line==null?' - ended without the STATUS: line':'')],
+    ['task prompt',a.task_full||a.task],
     ['result',a.next],['note',a.note],['log tail',a.tail_last],
     ['model',(a.model||'-')+(a.effort?' (effort '+a.effort+')':'')+
       (a.model_actual?' → '+a.model_actual:'')],
@@ -7855,7 +7896,9 @@ function showDetail(i, keepStack){
     ['session',(a.session_id||'-')+(a.session_gone?' (deleted from sidebar)':'')],
     ['verify',a.verify_ok==null?'-':(a.verify_ok?'pass':'FAIL')],
     ['exit',a.exit_code],['work dir',a.work_dir],
-    ['branch',a.branch],['merged',a.merged],
+    ['branch',a.branch],
+    ['merged',a.merged===true?'yes'+(a.merged_at?' @ '+a.merged_at:'')
+      :a.merged],
     ['prompt file',a.prompt],['stdout',a.stdout_log],['export',a.export],
     ['state file',a.state_md]];
   // A conductor-internal step (resolve-*) names its machine purpose - the
@@ -8091,6 +8134,7 @@ function showRunDetails(key, keepStack){
       (r.cost&&r.cost.unpriced?` (+${r.cost.unpriced} step(s) unpriced)`:'')+
       ` (self-serve rates, plan + steps)`:'-'],
     ['manifest / dir',r.dir],
+    ['resume log',r.resume_log],
     ['sessions', AGENTS.filter(a=>(a.run_key||a.run_dir)===key &&
       a.session_id).map(a=>`${a.step}: ${a.session_id}`).join(' \u00b7 ')
       ||'-']];
@@ -9071,6 +9115,14 @@ function render(d){
         `<td><span class="dot${pulse}" style="background:${c}" ` +
         `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>` +
         `${a.status}` +
+        (a.status==='failed'&&a.exit_code===0&&a.status_line==null
+          ? `<span class="sub" title="${a.tokens&&a.tokens.llm_steps
+            ?'exited cleanly but never printed the STATUS: report line - '+
+             'the turn ended mid-report; tokens show real work ran, so '+
+             'committed work may sit on the branch (Resume finalizes the '+
+             'merge without re-running)'
+            :'exited cleanly before the turn produced anything and '+
+             'recorded no tokens - a no-op run'}"> ·no STATUS</span>`:'') +
         (a.attempts>1 ? `<span class="sub" title="ran ` +
           `${a.attempts} session attempts (timeout retries)"> ` +
           `×${a.attempts}</span>` : '') +
@@ -9082,7 +9134,9 @@ function render(d){
             `style="color:#58a6ff" title="${esc(a.branch||'worktree')}">wt</button>` +
             (a.merged===true
              ? ` <button type="button" class="chip" data-facet="merged" ` +
-               `style="color:#3fb950">merged</button>`
+               `style="color:#3fb950" title="${a.merged_at
+                 ?esc('landed '+a.merged_at)
+                 :'merged into the main checkout'}">merged</button>`
              : a.merged===false
              ? ` <button type="button" class="chip" data-facet="unmerged" ` +
                `style="color:#f0883e">unmerged</button>`
