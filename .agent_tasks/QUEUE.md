@@ -24,6 +24,33 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (follow-up-plan, closing step of run
+  20261016-013711-proposal-flow-fixes): reviewed the run against the
+  human's three requests - ALL THREE DELIVERED on master (stop at
+  a91fa43; retain + compact-labels landed transitively via the verify
+  branch, merge 00722cc; verify fixed 4 real integration regressions,
+  232/232 + demo + live Playwright probe green). Residuals only, none
+  blocking: (a) retained planner history is half-navigable - attempts
+  share `<id>.gen.log`/`.export.json` so non-newest rows lose file
+  links, and the in-flight row shows '...' as session id until attempt
+  end (both were the retain step's own deferred items); (b) run-record
+  truthfulness bug found by this review - state.json still marks the
+  two transitively-merged steps `failed`/`merged:false` though their
+  commits are on master, which also falsely offers them as
+  merge-pending (merged flag only set on directly-merged branches);
+  (c) the whole flow is mock-verified only - no real planner has been
+  stopped/reprepared/retained live. Drafted
+  manifests/proposal-flow-fixes-followup.toml (validated by `plan`):
+  plan-history-completeness (per-attempt spool artifacts + live sid
+  probe), merged-record-accuracy (ancestor-check backfill + cleanup of
+  this run's two merged parked worktrees), proposal-flow-live-smoke
+  (tempdir-copy serve - trap-5-safe), closing follow-up-plan. NOT
+  launched - human review. Deliberately excluded: concurrent-run
+  merge/checkout protection (owned by the still-live
+  workflow-ux-safety run's own follow-up; its parked
+  isolate-worktree-services branch is not this manifest's business)
+  and anything already drafted in ux-controls-followup.toml /
+  proposal-ui-fixes-followup.toml.
 - DONE 2026-10-16 (fix-compact-labels, wave step of run
   20261016-013711-proposal-flow-fixes): "the labels under the run table,
   sometimes are not visible in the 'compact' view" - two losses, both
