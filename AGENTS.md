@@ -143,9 +143,23 @@ worktree checkout needs the untracked `projects.local.toml` next to it
 (shlex-split; use forward slashes or quotes - posix shlex eats unquoted
 backslashes). The :8773 dashboard's New request saves raw drafts in ignored
 `data/requests/`, generates/validates a reviewable TOML with a planning-only
-Devin CLI session, and shows its steps as `planned`. The planner's own stdout
-streams to `data/requests/<id>.gen.log` (outside its tempdir cwd, so trap-5
-safe) and appears live as a `plan-proposal` agent row while generating. Saving or generating NEVER
+Devin CLI session, and shows its steps as `planned`. Generation is isolated
+from repo traffic: the planner runs in a tempdir in its own process group
+(a merge or a serve Ctrl+C cannot reach it - trap 15), and everything it
+produces spools under `%TEMP%/agent-conductor-planner/<id>/` (`gen.log`,
+`gen.export.json`, `draft.toml`, a `request.json` overlay, `job.json`) -
+never a watched workspace. The overlay is the live request record until the
+short publish lands; `_read_request`/`_request_status`/the dashboard consult
+it, so generation may run while a `resolve-*` session or an open merge owns
+the checkout - only the final publish waits on `_wait_writable`
+(`_assert_unwatched` also treats MERGE_HEAD in a non-ignored destination's
+repo as blocking). `drain_planner_spool` at `serve` startup (plus a throttled
+pass in `collect_dashboard`) replays what a restart orphaned: publish a
+spooled draft, extract a finished manifest from `gen.log`, wait out a
+still-writing orphan, or land the interruption as `error` with artifacts
+preserved under `data/requests/`. A draft is published only while its
+`draft_started_at` matches the current generation - a superseded draft is
+kept (`<id>.draft.toml`) but never auto-published. Saving or generating NEVER
 launches implementation: only the separate Start run button does. Editing
 request/model after generation marks the plan stale; regenerate or edit+save
 TOML before launching. The form's follow-up checkbox asks the planner for a

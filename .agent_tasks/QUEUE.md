@@ -21,6 +21,18 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (isolate-proposal-planning, wave step of run
+  20261016-013719-workflow-ux-safety): proposal generation no longer
+  fights repo traffic. The planner writes everything to a per-request
+  spool at %TEMP%/agent-conductor-planner/<id>/ (gen.log, export,
+  draft.toml, request.json overlay, job.json) - never a watched cwd - so
+  a live resolve-* session or open merge can't block or be interrupted
+  by generation; only the short publish waits on _wait_writable, which
+  now also treats an open MERGE_HEAD as blocking for non-ignored dests.
+  Planner runs in its own process group; drain_planner_spool replays
+  spooled state at serve startup and on a throttled poll (publish draft,
+  extract from a finished log, or error with artifacts preserved).
+  215/215 mock tests + demo green.
 - DONE 2026-10-15 (follow-up-plan, closing step of run
   20261015-182057-ux-controls): reviewed the run - 6/8 steps merged
   clean; `image-attachments` + `task-modal-navigation` were done work
