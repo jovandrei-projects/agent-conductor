@@ -5792,13 +5792,23 @@ button.chip:focus-visible, button:focus-visible, tr.runrow:focus-visible { outli
 @keyframes pulse { 50% { opacity:.35; } }
 .wrapw { }  /* overflow here would create a scroll container and break
    the sticky th - tables are width:100% fixed, nothing overflows */
-/* compact density: one line per row - wrap cells ellipsize, sub-lines
-   (dir path, plan tokens) hide */
+/* compact density: wrap cells ellipsize to fewer lines, sub-lines
+   (dir path, planner output, other second-line detail) hide */
 body.compact td { padding-top:2px; padding-bottom:2px; }
 body.compact td.wrap, body.compact td.res {
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 body.compact td .sub { display:none; }
 body.compact td br { display:none; }
+/* .toksub looks like .sub but survives compact: the labeled
+   planner:/steps:/est token lines in a run's steps cell are meant to
+   render there (fmtTc is their compact form). The <br> that stacks
+   them at full density hides in compact, so block gives each label
+   its own line. .rlabels needs no rules - it is a plain block box
+   keeping the run row's chips on their own line under the name in
+   both densities (a <br> would disappear in compact and let them
+   clip inline after the name). */
+.toksub { color:#8b949e; font-size:12px; }
+body.compact td .toksub { display:block; }
 /* .genline: a proposal row's compact live-output line - display:none at
    full density (the .sub line under the stage chip shows the same
    gen_last there), inline on the row's one line under compact, ellipsized
@@ -5854,6 +5864,11 @@ details.arcgrp[open] > summary::before { content:'▾'; }
 .arc-commit { color:#3fb950; }
 
 .stage { display:inline-block; border-radius:9px; padding:1px 7px; font-size:11px; border:1px solid #30363d; white-space:nowrap; }
+/* a pill wider than its column clipped invisibly at the td edge
+   (narrow viewports) - ellipsize inside the pill instead, and keep its
+   baseline even with overflow:hidden so siblings still line up */
+td .stage { max-width:100%; overflow:hidden; text-overflow:ellipsis;
+  vertical-align:top; }
 .stage.draft { color:#e3b341; border-color:#6b5a1f; background:#2a2317; }
 .stage.ready { color:#bc8cff; border-color:#614b84; background:#251d35; }
 .stage.generating { color:#58a6ff; background:#172638;
@@ -6881,9 +6896,11 @@ function render(d){
   // Only rebuild the tables when the payload actually changes - rebuilding
   // innerHTML every 2s resets animations/hover and looks like a reload.
   // `tail` is excluded: live log growth streams into the open modal instead.
+  // density is in the sig: fmtT/fmtTc token text differs per density, so
+  // a Compact|Full flip must re-render even when the payload is identical.
   const sig = JSON.stringify([d.runs, d.agents.map(({tail,...r})=>r),
     selectedRun, [...only].sort(), [...facets].sort(), expanded,
-    runsShown===Infinity?'all':runsShown]);
+    runsShown===Infinity?'all':runsShown, density]);
   const tailEl = document.getElementById('dtail');
   if (sig === lastSig){
     tickElapsed(now);
@@ -7003,6 +7020,12 @@ function render(d){
       r.stage==='questions' && (r.questions||[]).length
         ? `planner waits on ${r.questions.length} answer(s)`
         : glast || (r.stage==='generating' ? 'planner warming up' : '');
+    // stale survives until _publish_proposal clears it, so mid-planning
+    // stages would double-label the row ('Preparing proposal' + 'Needs
+    // review'); the flag only means something once planning has stopped
+    const staleChip = r.stale &&
+      r.stage!=='generating' && r.stage!=='questions'
+        ? ` <span class="stage error">Needs review</span>`:'';
     h += `<tr class="runrow${runKey(r)===selectedRun?' selected':''}" ` +
       `data-run-key="${esc(runKey(r))}" tabindex="0" ` +
       `aria-label="Filter to run ${esc(r.run)}"><td class="wrap">` +
@@ -7019,12 +7042,21 @@ function render(d){
           `<b>${esc(r.run)}</b></button>`
         : `<button type="button" class="linkbtn run-name" ` +
           `data-run-details="${esc(runKey(r))}" title="run details">` +
-          `<b>${esc(r.run)}</b></button>`) + `<br>` +
-      (r.stage ? `<span class="stage ${esc(r.stage)}">` +
+          `<b>${esc(r.run)}</b></button>`) +
+      // Compact hides td <br> and squeezes td.wrap to one ellipsized
+      // line, so these labels used to collapse INLINE after the run
+      // name and clip away depending on name length / column width -
+      // the "labels under the run table sometimes not visible" report.
+      // .rlabels is a plain block box: the chips + genline keep their
+      // own line under the name in BOTH densities (it replaces the <br>
+      // that broke after the name at full density).
+      `<div class="rlabels">` +
+      (r.stage ? `<span class="stage ${esc(r.stage)}" ` +
+        `title="${esc(STAGES[r.stage]||r.stage)}">` +
         `${esc(STAGES[r.stage]||r.stage)}` +
         (r.stage==='generating'
           ? `<span class="dots"><span>.</span><span>.</span><span>.</span></span>`
-          : '') + `</span>` +
+          : '') + `</span>` + staleChip +
         (cgen ? ` <span class="genline${gfresh?' fresh':''}" ` +
           `title="${esc(cgen)}">${esc(cgen)}</span>` : '') +
         (r.stage==='questions' && (r.questions||[]).length
@@ -7039,30 +7071,29 @@ function render(d){
         (r.archived ? `<span class="stage archived" ` +
           `title="auto-archived run - hidden from the default view; ` +
           `files stay on disk">archived</span>` : '') +
-        runStateChip(r) + `<br>` +
+        runStateChip(r) + staleChip + `<br>` +
         `<span class="sub">${esc(base(r.dir))}</span>`) +
-      // stale survives until _publish_proposal clears it, so mid-planning
-      // stages would double-label the row ('Preparing proposal' + 'Needs
-      // review'); the flag only means something once planning has stopped
-      (r.stale && r.stage!=='generating' && r.stage!=='questions'
-        ? ` <span class="stage error">Needs review</span>`:'') +
-      `</td>` +
+      `</div></td>` +
       `<td class="wrap">${r.description?esc(r.description):
         r.stage?'<span class="sub">Awaiting proposal</span>':'-'}</td>` +
       `<td>${(r.projects||[]).map(p=>`<span class="chip">${esc(p)}</span>`).join('')}</td>` +
       `<td>${loc(r.started_at)}</td>` +
       `<td>${r.ended_at?loc(r.ended_at):(r.started_at?'<b>running</b>':'-')}</td>` +
       `<td class="counts">` +
-      `${counts||'<span class="sub">not planned</span>'}` +
-      (r.plan_tokens ? `<br><span class="sub" ` +
+      `${counts||'<span class="toksub">not planned</span>'}` +
+      // .toksub, not .sub: these labeled lines are meant to render in
+      // compact too (fmtTc is the compact form) - the blanket td .sub
+      // hide made the compact branch unreachable
+      (r.plan_tokens ? `<br><span class="toksub" ` +
         `title="${esc(tokTitle(r.plan_tokens))}">planner: ` +
         `${density==='compact' ? fmtTc(r.plan_tokens) : fmtT(r.plan_tokens)}` +
         (r.plan_cost?` · ${fmtC(r.plan_cost)}`:'') + `</span>` : '') +
-      (r.tokens ? `<br><span class="sub" ` +
+      (r.tokens ? `<br><span class="toksub" ` +
         `title="${esc(tokTitle(r.tokens))}">steps: ` +
         `${density==='compact' ? fmtTc(r.tokens) : fmtT(r.tokens)}` +
         (r.cost?` · ${fmtC(r.cost)}`:'') + `</span>` : '') +
-      (runUsd!=null ? `<br><span class="sub" title="estimated self-serve ` +
+      (runUsd!=null ? `<br><span class="toksub" ` +
+        `title="estimated self-serve ` +
         `cost, plan + steps${r.cost&&r.cost.unpriced
           ?`; ${r.cost.unpriced} step(s) have no rate`:''}">` +
         `est ${fmtC({usd:runUsd})}</span>` : '') +
