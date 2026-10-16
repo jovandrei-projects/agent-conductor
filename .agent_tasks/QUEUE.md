@@ -25,6 +25,27 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (modal-refresh-stability, wave step of run
+  20261016-100852-run-review-ux): the task modal no longer loses its
+  place during the 2s background repaint. Measured root cause (the
+  display:none suspicion was disproven live): the wholesale dbody
+  innerHTML swap leaves nothing to scroll-anchor, so a shorter repaint
+  clamps #detail.scrollTop permanently and growth above the viewport
+  pushes the text being read off-screen. showDetail now repaints in
+  place while detailKey is unchanged (no closeDetail hide/show), a
+  byte-identical repaint skips the DOM write entirely, and real changes
+  restore a landmark scroll anchor (first viewport-visible id/data-asid/
+  data-ag/.k/h3 element + occurrence index, pixel dy preserved, #dtail's
+  own inner scroll carried), restore focus via a stable data-*
+  signature + textarea caret + unsaved #d-timeout value (server value
+  wins on conflict). Deliberate task switches land at the top as an
+  explicit policy (row opens previously inherited the old offset since
+  hidden round-trips don't reset scrollTop); Back keeps its own
+  modalScroll snapshot; /api/state responses are seq-guarded so an
+  older body landing last can't repaint a stale view. Reproduced and
+  verified in real Chromium (probe_scroll.py: RESET pre-fix, STABLE
+  post-fix); 331/331 tests + demo green; 3 new
+  ModalScrollStabilityTests node-harness tests.
 - DONE 2026-10-16 (model-choice-lists, wave step of run
   20261016-013719-workflow-ux-safety): the Planner/Step model fields moved
   off the shared native datalist onto a real combobox (role=combobox +
