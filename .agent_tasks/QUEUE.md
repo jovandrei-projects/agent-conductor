@@ -24,6 +24,24 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (modal-detail-navigation, wave step of run
+  20261016-013719-workflow-ux-safety): the task modal's 'Session summary'
+  no longer opens a separate browser window - it renders the report inside
+  the shared `#detail` modal via a new `?frag=1` branch on the existing
+  `/summary` route (server-side `_summary_body` fragment, same escaping;
+  `?raw=1` markdown and the standalone page are unchanged, so direct URLs
+  stay usable). The in-modal view gets the same `.dnav` chrome as the task
+  nav - sibling-named arrows + `task N of M`, disabled at the pipeline
+  ends, ArrowLeft/Right shared - and an 'Open as page ↗' escape hatch.
+  New `modalHist` Back stack: task -> request/runbook and request -> run
+  details push the view they leave ({kind,key|id,scroll}); Back restores
+  the exact task/request/run incl. scroll offset, skipping entries whose
+  rows vanished, while sibling walks and the refresh re-render preserve
+  the stack instead of clearing it. The 'View request / runbook' link in
+  a task modal now returns to THAT task on Back instead of dropping the
+  modal state. Escape/dx/backdrop still tear the whole dialog down.
+  264/264 mock tests + demo green; 2 new ModalDetailNavTests (HTTP-level
+  frag/raw/404 + node-harness prev/next/Back/missing/switch-runs).
 - DONE 2026-10-16 (summary-purpose-parsing, wave step of run
   20261016-013719-workflow-ux-safety): the reported
   `/summary` page for resolve-task-modal-navigation rendered the raw
