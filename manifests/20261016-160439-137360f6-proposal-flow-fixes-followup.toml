@@ -1,0 +1,178 @@
+# Follow-up proposal drafted by the proposal-flow-fixes run's closing
+# follow-up-plan step (run dir: data/runs/20261016-013711-proposal-flow-fixes,
+# request 20261016-012459-3c28a5c1). Reviewed but NOT launched - a human
+# reviews this file, then `python conductor.py run` or dashboard Start run.
+#
+# Reviewed evidence: run state.json + events.jsonl, all four step
+# stdout/verify logs, each step's .agent_tasks/<step>/STATE.md, and the merged
+# git state (master @ 00722cc merge of the verify branch + 009ab81 checkpoint).
+#
+# Run outcome vs the human's three requests - ALL THREE DELIVERED:
+#   stop-proposal-preparation   done + merged (a91fa43). POST
+#                               /api/requests/<id>/stop -> stop_generation:
+#                               stopgen-<id> sentinel polled by the planner's
+#                               own wait_worker + _GEN_PROCS tree-kill +
+#                               per-attempt gen_id scoping; restores
+#                               draft/ready, inputs preserved; repeated/idle
+#                               stops 409.
+#   retain-proposal-session     work done, conductor-recorded `failed` at the
+#                               merge gate (merge_resolver refused on a dirty
+#                               main checkout) - landed transitively via
+#                               1c1f1d5 into the verify branch -> 00722cc to
+#                               master. plan_sessions + plan_gen_id per
+#                               attempt; plan-proposal[-N] step-0 history rows
+#                               never join counts and are never runnable.
+#   fix-compact-labels          work done, conductor-recorded `failed` on 2
+#                               pre-existing StopProposalTests (stash-verified
+#                               at its base) - landed transitively via c3e19b4
+#                               -> 00722cc. .rlabels label line + .toksub token
+#                               labels + in-pill ellipsis + density-aware
+#                               render().
+#   verify-proposal-flow        done + merged (00722cc). Fixed 4 REAL
+#                               integration regressions the merge exposed:
+#                               same-second stop/publish race
+#                               (_disk_untouched now compares
+#                               generation_stopped_at + st_mtime_ns), stale
+#                               generating overlay masking the restore
+#                               (deleted on stop), drain-recovered generations
+#                               missing plan_sessions entries, and a second
+#                               .stage chip still clipping at the td edge in
+#                               compact (.rlabels wraps now). +3
+#                               ProposalFlowIntegrationTests covering the full
+#                               acceptance sequence incl. frozen-time
+#                               same-second race. 232/232 suite + demo + live
+#                               Playwright probe (1400/900/700px, both
+#                               densities) green on the merged tree.
+#
+# What remains (the only scope below):
+#   1. Retained-history completeness gaps the retain step deferred itself:
+#      every attempt shares <id>.gen.log / <id>.gen.export.json, so a newer
+#      attempt overwrites the older one's files and non-newest
+#      plan-proposal-N rows have session id + status + times but no working
+#      file links; and the in-flight row shows '...' as session id until the
+#      attempt ends (capture is post-wait only).
+#   2. state.json truthfulness: this run's record still marks
+#      retain-proposal-session + fix-compact-labels `failed`/`merged:false`
+#      although their commits ARE on master - the post-wave merge loop only
+#      sets `merged` on the branch it merges itself, so work landing
+#      transitively through a sibling branch stays mislabeled and keeps
+#      showing as merge-pending (the "Merge pending branches" button keys on
+#      the same flag). Small fix, plus cleanup of this run's two merged but
+#      parked worktrees/branches.
+#   3. No live exercise ever happened: everything above is mock/fixture/node-
+#      harness verified - no real Devin planner has been stopped mid-flight,
+#      reprepared, published, retained and launched. One bounded live smoke
+#      closes that gap.
+#
+# Deliberately NOT proposed:
+#   - Concurrent-run merge/checkout protection (the dirty main checkout that
+#     made this run's merge_resolver refuse, plus the cross-run
+#     abort_own_merge/checkpoint interference seen 2026-10-16). It belongs to
+#     the still-running 20261016-013719-workflow-ux-safety run - its
+#     isolate-worktree-services step is parked and project-merge-targets is
+#     live at draft time, so that run's own follow-up owns the finding.
+#     Proposing it here would double-scope it.
+#   - conductor/20261016-013719-workflow-ux-safety/isolate-worktree-services:
+#     parked unmerged branch of the OTHER live run. Its own driver/follow-up
+#     finalizes it; do not touch it from this manifest.
+#   - Items already drafted in manifests/ux-controls-followup.toml and
+#     manifests/proposal-ui-fixes-followup.toml (verify timeout cap, flag-test
+#     hardening, earlier UI live smokes) - those files are still awaiting
+#     human review; reconcile before launching any of them together.
+#
+#   python conductor.py plan manifests\proposal-flow-fixes-followup.toml
+#   python conductor.py run  manifests\proposal-flow-fixes-followup.toml
+
+[run]
+name = "proposal-flow-fixes-followup"
+description = "Residuals from the proposal-flow-fixes run: complete retained planner-attempt history (per-attempt artifacts + live session id), fix transitively-merged steps staying marked failed/unmerged, and one bounded live smoke of the stop/reprepare/retain/launch flow."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 60
+max_attempts = 3
+verify = 'python run_tests.py'
+
+# ---------------------------------------------------------------------------
+
+[[step]]
+worktree = true
+name = "plan-history-completeness"
+project = "agent-conductor"
+prompt = '''
+Finish the retained proposal-history feature from run 20261016-013711-proposal-flow-fixes (retain-proposal-session STATE.md lists both items under "Deferred or blocked" - they are the only scope here).
+
+Context: each generation attempt currently shares `<request_id>.gen.log` and `<request_id>.gen.export.json` in the planner spool dir (%TEMP%/agent-conductor-planner/<id>/), so a regenerated attempt overwrites the previous one's artifacts - older `plan-proposal-N` history rows render session id + status + times but dead/absent file links. Separately, the in-flight `plan-proposal` row shows '...' as its session id until the attempt ends because the `devin list` capture runs only after `_planner_response` returns.
+
+Two changes:
+
+1. Per-attempt artifacts: name spool outputs per attempt (e.g. `gen-<gen_id>.log` / `gen-<gen_id>.export.json` or an attempt index - pick whatever fits the existing spool naming) and wire `plan_attempt_agents`/`_plan_attempt_entry` so EVERY retained history row links its own log/export/tail/arc files, not just the newest. Keep `<id>.gen.*` compatibility for in-flight readers if anything still reads the generic names (check gen_last/genline + drain paths), and make `drain_planner_spool`/`_publish_from_spool` preserve the per-attempt mapping. Do not break the live-output tailing the dashboard reads during generation.
+
+2. Live session-id attribution while `generating`: reuse the existing `_capture_session_id` pattern (the `devin list` diff probe already used for run steps - it is read-only and trap-5-safe inside the planner tempdir) so the running plan-proposal row can show the real session id once the planner session registers, instead of '...' until attempt end. The post-wait fallbacks (export session_id/session + tail_session_ref) stay as the authoritative final value - reconcile rather than double-record if they disagree.
+
+Tests: extend the existing RetainProposalSessionTests/StopProposalTests style - assert a stopped-then-regenerated request yields two history rows EACH with working file paths, and the generating-state row carries a session id once the probe sees it. `python run_tests.py` must stay green (233+ expected). Update .agent_tasks (tick the deferred items in retain-proposal-session/STATE.md) and commit in logical groups.
+'''
+
+# ---------------------------------------------------------------------------
+
+[[step]]
+worktree = true
+name = "merged-record-accuracy"
+project = "agent-conductor"
+timeout_min = 45
+prompt = '''
+Fix a run-record truthfulness bug this run exposed, then do its housekeeping.
+
+Bug: in run 20261016-013711-proposal-flow-fixes, steps retain-proposal-session and fix-compact-labels recorded `status="failed"` + `merged=false` when their merge gates failed - but their work IS on master today, because the later verify-proposal-flow step merged both branches into its own worktree branch (1c1f1d5, c3e19b4) and the conductor then merged that branch (00722cc). The post-wave merge loop in conductor.py (~line 2370: `if worktree_merge(...): rec["merged"] = True`) only ever marks the branch it merges directly, so transitively-landed work stays marked failed/unmerged forever - and `merged is not True` is also what feeds the "Merge pending branches" affordance, so these branches are wrongly offered as pending.
+
+Change: after ANY successful merge of a run's branch (post-wave loop, `merge_run`, and the `--resume` finalize path - find every place `merged` is set), sweep the SAME run's other step records: for each step with a recorded `branch` and `merged is not True`, check `git merge-base --is-ancestor <branch> HEAD` in the target repo; if the branch tip is reachable, set `merged=True` and append a note like "branch content reached master transitively via <merge commit/sibling step>". Do NOT rewrite `status` (a step that verify-failed stays failed - the record was honest at the time; only the merge flag is corrected). Regression-test it in the existing mock style: a fake two-branch run where branch B merges branch A's commits into itself, then the run merges B - A's record must end `merged=True` without being offered as pending.
+
+Then housekeeping for the parent run's debris - all in the shared repo, safe from inside your own worktree: `git merge-base --is-ancestor conductor/20261016-013711-proposal-flow-fixes/retain-proposal-session master` and the same for .../fix-compact-labels; if (and only if) both are ancestors, `git worktree remove --force data/worktrees/20261016-013711-proposal-flow-fixes/retain-proposal-session` + `.../fix-compact-labels` and `git branch -d` both branches. If ancestry fails, stop, report which branch is not merged, and do NOT force-remove anything. NEVER touch the 20261016-013719-workflow-ux-safety worktrees/branches (a different, live run) or your own follow-up-plan worktree.
+
+`python run_tests.py` green at the end. Update .agent_tasks and commit the code change separately from bookkeeping.
+'''
+
+# ---------------------------------------------------------------------------
+
+[[step]]
+worktree = true
+name = "proposal-flow-live-smoke"
+project = "agent-conductor"
+verify = ""
+prompt = '''
+Live-smoke the three proposal-flow fixes from run 20261016-013711-proposal-flow-fixes - they are only mock/Playwright-stub verified; no real Devin planner has ever been through the sequence. Verify, don't fix: if something is broken live, record it precisely in .agent_tasks and finish partial rather than patching in this step.
+
+TRAP-5 WARNING that shapes the setup: `DATA_DIR`/`RUNS_DIR`/`REQUESTS_DIR` are anchored to `Path(conductor.py).parent`, so `python conductor.py serve` writes under `<script dir>/data/` regardless of cwd. Writes inside a watched cwd can kill a live Devin session's edit-awareness (trap 5) - and YOUR OWN worktree is watched by your own session, while the main checkout may be watched by a sibling run's resolve/merge session (check `git worktree list` + other runs' state.json for live drivers first). SAFE SETUP: copy the repo to a scratch dir nobody watches, e.g. `robocopy /MIR` (or xcopy) C:\Projects\agent-conductor -> %TEMP%\ac-smoke-<ts> EXCLUDING .git, data, worktrees and node caches; run `python examples/make_demo_projects.py` there so data/demo1 exists as a seed repo; then `python conductor.py serve --port <free 87xx>` FROM THE COPY. All request/run writes then land under the copy's data/ - nothing watched. (Fallback if the copy approach fails: serve from this worktree exactly like verify-proposal-flow did - it survived - but expect the risk.)
+
+Against the scratch serve:
+
+1. POST /api/requests a trivial request for project demo1 (e.g. "add a one-line readme note"), POST .../generate - a REAL planner session spawns.
+2. Mid-generation: GET /api/state - the plan-proposal row appears with live gen_last; in a headless browser if available, confirm the compact row shows the planning chip + genline + labels (Playwright has been used by past sessions here).
+3. POST /api/requests/<id>/stop - the REAL planner proc dies, stage restores draft (or ready if a prior proposal existed), inputs still editable. This stop of a live planner is the single most valuable observation - report exactly what happened.
+4. Edit raw, POST .../generate again, let it publish to ready: the plan-proposal row keeps its real session id after the attempt ends AND after a serve restart (reload persistence). The stopped attempt shows as its own plan-proposal-N stopped row.
+5. Launch the published plan (the request-run endpoint the Start run button uses). The nested run executes the manifest's real step 1 inside data/demo1 - watch its state.json: exactly the manifest steps appear, NO plan-proposal step, no planner respawn. Once step 1 is visibly running (or done), Stop the run via the run-stop endpoint so it doesn't burn a full session; a trivial prompt should finish fast either way.
+6. Compact+full density check on the runs table (browser or DOM inspection): run-row chips + planner:/steps: labels stay visible - the merged .rlabels/.toksub markup.
+
+Cleanup: stop the launched run, discard the throwaway request, delete the generated manifest inside the copy, then kill the serve process and the %TEMP% copy. Kill EVERY spawned process BEFORE printing STATUS - a live child keeps this session from exiting (trap 12). If devin auth is missing or the planner stalls >15 min, finish `partial` with exactly what was observed. Update .agent_tasks; commit bookkeeping only - no code changes belong in this step.
+'''
+
+# ---------------------------------------------------------------------------
+
+[[step]]
+worktree = true
+name = "follow-up-plan"
+project = "agent-conductor"
+timeout_min = 30
+verify = ""
+prompt = '''
+Review what this run accomplished against the residuals it targeted: per-attempt planner artifacts + live session-id attribution (retain-history completeness), merged-flag backfill for transitively-merged step records + parked-worktree cleanup, and the bounded live smoke of the stop/reprepare/retain/launch proposal flow.
+
+Per-step logs, STATUS/NEXT lines and notes are under C:/Projects/agent-conductor/data/runs in the newest dir ending in 'proposal-flow-fixes-followup', alongside the project's .agent_tasks files. Read them to judge what is done, what failed or was skipped, and what new issues were discovered. Check whether the sibling manifests still awaiting review (ux-controls-followup.toml, proposal-ui-fixes-followup.toml, or a follow-up from the 20261016-013719-workflow-ux-safety run once it ends) were launched in the meantime so overlapping items are not proposed twice.
+
+Then write a NEW conductor TOML manifest proposing only the still-unfinished or newly discovered work, saved as 'C:/Projects/agent-conductor/manifests/proposal-flow-fixes-followup-2.toml' using forward slashes. Follow the same manifest conventions as this run (registered project slugs, worktree = true per local step, verify commands, a follow-up-plan closing step). Do NOT launch or implement the follow-up - a human reviews it. If nothing remains, make that explicit in the manifest's header comment without inventing work.
+'''

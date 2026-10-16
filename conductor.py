@@ -3395,7 +3395,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         with STATE_LOCK:
             state["steps"].setdefault(step.name, {}).update(
                 name=step.name, slug=slug, status="skipped",
-                ended_at=now_iso(),
+                wt=step.worktree, cloud=step.cloud, ended_at=now_iso(),
                 note=note + " before the session spawned")
             save_state(run_dir, state)
         log_event(run_dir, event="step_stopped", step=step.name,
@@ -3478,6 +3478,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         rec = state["steps"].setdefault(step.name, {})
         rec.update(name=step.name, slug=slug, project=str(work_dir),
                    work_dir=str(work_dir), branch=branch,
+                   wt=step.worktree,
                    status="running", started_at=now_iso(), ended_at=None,
                    model=step.model, mode=step.mode, cloud=step.cloud,
                    effort=step.effort, timeout_min=step.timeout_min,
@@ -4113,6 +4114,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                         why = "run drained"
                     state["steps"].setdefault(s_.name, {}).update(
                         name=s_.name, status="skipped",
+                        wt=s_.worktree, cloud=s_.cloud,
                         note=why + " before this step ran")
             state["aborted"] = ("paused" if paused else
                                 "stopped" if halted else "drained")
@@ -4154,6 +4156,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                                 "status") != "done":
                             state["steps"].setdefault(s_.name, {}).update(
                                 name=s_.name, status="blocked",
+                                wt=s_.worktree, cloud=s_.cloud,
                                 note="auth lost mid-run; --resume after "
                                      "devin auth login")
                 state["aborted"] = "auth_midrun"
@@ -4292,6 +4295,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                         with STATE_LOCK:
                             state["steps"].setdefault(step.name, {}).update(
                                 name=step.name, slug=slug, status="failed",
+                                wt=step.worktree, cloud=step.cloud,
                                 note="deferred merge needs a branch "
                                      "checked out in the project "
                                      "(detached/unborn HEAD)")
@@ -4305,6 +4309,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     with STATE_LOCK:
                         state["steps"].setdefault(step.name, {}).update(
                             name=step.name, slug=slug,
+                            wt=step.worktree, cloud=step.cloud,
                             status="failed", note="worktree add failed")
                         save_state(run_dir, state)
                     print(f"[  failed] {step.name} (worktree add)")
@@ -4338,7 +4343,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         with STATE_LOCK:
             for step, _s, _w, _r, _b, _n, _g in prepared:
                 state["steps"].setdefault(step.name, {}).update(
-                    status="queued", name=step.name)
+                    status="queued", name=step.name, wt=step.worktree,
+                    cloud=step.cloud)
             save_state(run_dir, state)
 
         if len(prepared) == 1:
@@ -4585,21 +4591,12 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 # ---------------------------------------------------------------- hygiene
 
-def _runs_watched(runs_dir: Path, states: list[tuple[Path, dict]]) -> bool:
-    """Trap-5 write guard: True when a live step's work_dir contains
-    runs_dir - a self-hosted run is in flight and ANY write under runs_dir
-    lands in the worker's watched tree (an external edit ends its session)."""
-    for _sj, st in states:
-        for rec in (st.get("steps") or {}).values():
-            if step_live(rec, driver_alive(st)):
-                wd = rec.get("work_dir") or rec.get("project")
-                try:
-                    if wd and runs_dir.resolve().is_relative_to(
-                            Path(wd).resolve()):
-                        return True
-                except OSError:
-                    pass
-    return False
+def _runs_watched(tree: Path, states: list[tuple[Path, dict]]) -> list[str]:
+    """Trap-5 write guard: identities of the live steps whose work_dir
+    contains `tree` - a self-hosted run in flight means ANY write under it
+    lands in the worker's watched tree (an external edit ends its
+    session). Empty = unwatched."""
+    return _watchers_of(tree, (tree,), states=states)
 
 
 def _load_run_states(runs_dir: Path) -> list[tuple[Path, dict]]:
@@ -4653,8 +4650,9 @@ def sweep_runs(runs_dir: Path, write: bool = True) -> list[str]:
                 dirty = True
         if dirty:
             if watched:
-                lines.insert(0, f"DRY-RUN: a live worker watches {runs_dir} "
-                                f"(self-hosted run) - not writing (trap 5)")
+                lines.insert(0, f"DRY-RUN: live agent(s) watch {runs_dir} "
+                                f"({_watcher_summary(watched)}) - not "
+                                "writing (trap 5)")
                 break
             save_state(sj.parent, st)
     lines += archive_runs(runs_dir, write=write)
@@ -4690,8 +4688,9 @@ def archive_runs(runs_dir: Path, write: bool = True,
             st["archived"] = now_iso()
             save_state(sj.parent, st)
     if lines and write and watched:
-        lines.insert(0, f"DRY-RUN: a live worker watches {runs_dir} "
-                        f"(self-hosted run) - not writing (trap 5)")
+        lines.insert(0, f"DRY-RUN: live agent(s) watch {runs_dir} "
+                        f"({_watcher_summary(watched)}) - not writing "
+                        "(trap 5)")
     return lines
 
 
@@ -5208,20 +5207,75 @@ def _merge_open_for(path: Path) -> bool:
     return merge_in_progress(repo)
 
 
-def _assert_unwatched(runs_dir: Path, *destinations: Path) -> None:
-    for sj in runs_dir.glob("*/state.json"):
-        try:
-            st = json.loads(sj.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        for step in (st.get("steps") or {}).values():
+def _watcher_identity(run_dir_name: str, step_name: str,
+                      rec: dict) -> str:
+    """One-line owner of a live-watched workspace, for guard errors:
+    '<run-dir>:<step>' plus the project slug and a short session id when
+    the record carries them. state.json is the authoritative registry of
+    who runs where; every field degrades when missing (older records may
+    lack slug/session_id). Only identifiers are surfaced - the task body
+    never enters an error string."""
+    label = f"{run_dir_name}:{step_name or rec.get('name') or '?'}"
+    extras = [str(rec["slug"])] if rec.get("slug") else []
+    sid = str(rec.get("session_id") or "").strip()
+    if sid:
+        extras.append(f"session {sid[:8]}")
+    return label + (f" ({', '.join(extras)})" if extras else "")
+
+
+def _watchers_of(runs_dir: Path, destinations: tuple[Path, ...],
+                 states: list[tuple[Path, dict]] | None = None
+                 ) -> list[str]:
+    """Identities of every live step whose watched work_dir contains one
+    of `destinations` - the runs' own state.json records are the
+    authoritative ownership source. All matches are collected (not just
+    the first) so the refusal can name them. `states` lets a caller that
+    already loaded the run states (the sweep/archive passes) skip the
+    re-read."""
+    if states is None:
+        states = []
+        for sj in runs_dir.glob("*/state.json"):
+            try:
+                states.append((sj, json.loads(
+                    sj.read_text(encoding="utf-8"))))
+            except (OSError, ValueError):
+                continue
+    watchers: list[str] = []
+    for sj, st in states:
+        drv = driver_alive(st)
+        for name, step in (st.get("steps") or {}).items():
             wd = step.get("work_dir") or step.get("project")
-            if wd and step_live(step, driver_alive(st)) and any(
-                    p.resolve().is_relative_to(Path(wd).resolve())
-                    for p in destinations):
-                raise RequestError("A live agent is watching this workspace; "
-                                   "wait until it finishes before changing "
-                                   "requests or manifests", 409)
+            if not wd or not step_live(step, drv):
+                continue
+            try:
+                wd = Path(wd).resolve()
+            except OSError:
+                continue
+            if any(p.resolve().is_relative_to(wd) for p in destinations):
+                watchers.append(
+                    _watcher_identity(sj.parent.name, name, step))
+    # Sorted for a stable message: the run-dir prefix is timestamped, so
+    # the order is also chronological and identical across callers/tests.
+    watchers.sort()
+    return watchers
+
+
+def _watcher_summary(watchers: list[str]) -> str:
+    """The parenthesized owner list in a watcher refusal - at most three
+    identities spelled out, the rest counted."""
+    shown = "; ".join(watchers[:3])
+    if len(watchers) > 3:
+        shown += f"; +{len(watchers) - 3} more"
+    return shown
+
+
+def _assert_unwatched(runs_dir: Path, *destinations: Path) -> None:
+    watchers = _watchers_of(runs_dir, destinations)
+    if watchers:
+        raise RequestError(
+            "A live agent is watching this workspace "
+            f"({_watcher_summary(watchers)}); wait until it finishes "
+            "before changing requests or manifests", 409)
     for p in destinations:
         if _merge_open_for(p):
             raise RequestError("A merge is in progress in this checkout; "
@@ -7549,11 +7603,22 @@ def launch_request(request_id: str,
                 st = json.loads(sj.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if any(not step.get("branch") and step_live(step, driver_alive(st)) and
-                   Path(step.get("work_dir") or step.get("project") or "").resolve()
-                   in targets for step in (st.get("steps") or {}).values()):
-                raise RequestError("A live agent already works in this project; "
-                                   "wait or isolate work in a worktree", 409)
+            drv = driver_alive(st)
+            for sname, srec in (st.get("steps") or {}).items():
+                # Worktree steps write under their own dir - only a
+                # non-worktree (branch-less) record can own a project dir.
+                if srec.get("branch") or not step_live(srec, drv):
+                    continue
+                try:
+                    wp = Path(srec.get("work_dir") or
+                              srec.get("project") or "").resolve()
+                except OSError:
+                    continue
+                if wp in targets:
+                    raise RequestError(
+                        "A live agent already works in this project (" +
+                        _watcher_identity(sj.parent.name, sname, srec) +
+                        "); wait or isolate work in a worktree", 409)
         if ROOT.resolve() in targets and any(
                 _request_status(r, runs_dir) == "generating" for f in
                 requests_dir.glob("*.json") for r in [json.loads(
@@ -7719,7 +7784,7 @@ def _any_live_step_in(repo_dir: Path, runs_dir: Path,
             except OSError:
                 continue
             if wdp == want or want.startswith(wdp + os.sep):
-                return f"{sj.parent.name}:{n}"
+                return _watcher_identity(sj.parent.name, n, rec)
     return None
 
 
@@ -9123,12 +9188,12 @@ def sweep_trash(trash_dir: Path, requests_dir: Path,
     work_dir contains the trash or requests tree this degrades to a
     dry-run report."""
     now = time.time() if now is None else now
-    watched = False
+    watched: list[str] = []
     if runs_dir is not None:
         states = _load_run_states(runs_dir)
-        watched = any(
-            _runs_watched(d, states)
-            for d in (trash_dir, requests_dir) if d is not None)
+        watched = sorted({w for d in (trash_dir, requests_dir)
+                          if d is not None
+                          for w in _runs_watched(d, states)})
     lines: list[str] = []
     doomed = [e for e in list_trash(trash_dir, requests_dir, now)
               if e["expires_in_s"] <= 0]
@@ -9152,8 +9217,9 @@ def sweep_trash(trash_dir: Path, requests_dir: Path,
         _trash_log(trash_dir, event="trash_purge", kind=e.get("kind"),
                    ref=e.get("ref"), entry=e["id"])
     if lines and write and watched:
-        lines.insert(0, f"DRY-RUN: a live worker watches the trash tree "
-                        f"- not purging (trap 5)")
+        lines.insert(0, "DRY-RUN: live agent(s) watch the trash tree "
+                        f"({_watcher_summary(watched)}) - not purging "
+                        "(trap 5)")
     return lines
 
 
@@ -9610,6 +9676,41 @@ def _manifest_pending(st: dict, projects: dict) -> list[dict]:
     return out
 
 
+def _run_isolation(cfg: "Manifest | None", st: dict,
+                   request: dict | None) -> dict | None:
+    """The run's effective worktree isolation as configured, before any
+    step has run: {'wt','local','cloud'} counts over its steps, or None
+    when no local step schedules a worktree (or no configuration can be
+    recovered - the dashboard then shows no label at all).
+
+    The parsed manifest is authoritative - load_manifest already folds
+    merge='deferred' into worktree=true and rejects worktree+cloud, so a
+    step's worktree flag is what it WILL run under, not what it happened
+    to spawn. Fallbacks for a gone/unparsable manifest: the request's
+    proposed_steps snapshot (written from the same parse at publish/apply)
+    then per-step 'wt' recorded at queue/dispatch. Branch names are never
+    consulted - they only exist after dispatch and prove nothing about
+    the rest of the pipeline."""
+    items: list[tuple[bool, bool]] | None = None
+    if cfg is not None:
+        items = [(s.worktree, s.cloud) for s in cfg.steps]
+    elif request and request.get("proposed_steps"):
+        items = [(bool(s.get("wt")), bool(s.get("cloud")))
+                 for s in request["proposed_steps"]]
+    else:
+        recs = list((st.get("steps") or {}).values())
+        if recs and all("wt" in r for r in recs):
+            items = [(bool(r["wt"]), bool(r.get("cloud")))
+                     for r in recs]
+    if not items:
+        return None
+    cloud = sum(1 for _w, c in items if c)
+    wt = sum(1 for w, c in items if w and not c)
+    if not wt:
+        return None
+    return {"wt": wt, "local": len(items) - cloud, "cloud": cloud}
+
+
 def _manifest_bodies(st: dict) -> dict[str, str]:
     """Full task bodies from the run's manifest, keyed by step name.
 
@@ -9859,7 +9960,11 @@ def collect_dashboard(runs_dir: Path,
                 "attempts": rec.get("attempts"),
                 "max_attempts": rec.get("max_attempts"),
                 "tokens": rec.get("tokens"), "cost": cost,
-                "wt": bool(rec.get("branch") or plan.get("wt")),
+                # wt = configured isolation, not just a dispatched branch:
+                # rec['wt'] is stamped at queue/dispatch time, so a
+                # worktree step shows 'wt' before its session spawns.
+                "wt": bool(rec.get("wt") or rec.get("branch")
+                           or plan.get("wt")),
                 "stdout_log": rec.get("stdout_log"),
                 "tail": stdout_tail(rec.get("stdout_log")),
                 "export": rec.get("export"), "prompt": rec.get("prompt"),
@@ -9920,6 +10025,7 @@ def collect_dashboard(runs_dir: Path,
                      "key": key, "request_id": st.get("request_id"),
                      "archived": st.get("archived"),
                      "followup": st.get("followup"),
+                     "iso": _run_isolation(cfg, st, request),
                      "description": st.get("description") or
                      (request or {}).get("description"),
                      "started_at": st.get("started_at"),
@@ -9963,6 +10069,12 @@ def collect_dashboard(runs_dir: Path,
                          if ln.strip()), None)
         runs.append({"run": rec.get("run") or rec.get("label"),
                      "key": key, "request_id": rid,
+                     # The owned TOML (when published) is the config of
+                     # record - it reflects hand edits; proposed_steps is
+                     # its publish-time snapshot fallback.
+                     "iso": _run_isolation(
+                         _manifest_cached(rec.get("manifest") or ""),
+                         {}, rec),
                      "description": rec.get("description"),
                      "followup_src": ({"run": rec.get("source_run"),
                                       "key": rec.get("source_run_key") or
@@ -10310,6 +10422,7 @@ td .stage { max-width:100%; overflow:hidden; text-overflow:ellipsis;
 .stage.empty { color:#8b949e; border-color:#30363d; }
 .stage.missing { color:#f0883e; border-color:#7a3d12; background:#2d1f14; }
 .stage.followup { color:#8b949e; }
+.stage.wt { color:#58a6ff; }
 .stage.halted { color:#8b949e; }
 .stage.archived { color:#8b949e; border-color:#21262d; }
 .linkbtn { background:none; border:0; color:#58a6ff; cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
@@ -12789,6 +12902,26 @@ function render(d){
       ` - resumable</span>`;
     return '';
   };
+  // 'wt' chip: the run's CONFIGURED worktree isolation, not runtime
+  // artifacts - the server derives r.iso from the manifest/proposal
+  // (parse already folds merge=deferred into worktree and never counts
+  // cloud), so a still-queued worktree step counts and a stray branch
+  // name never invents one. iso={wt,local,cloud}; partial coverage is
+  // spelled out on the chip itself ('wt 2/3') - a tooltip alone is not
+  // an accessible distinction.
+  const isoChip = r => {
+    const i = r.iso;
+    if (!i || !i.wt) return '';
+    const full = i.wt >= i.local;
+    const cl = i.cloud ? `; ${i.cloud} step(s) run in the cloud` : '';
+    const tip = full
+      ? `worktree isolation: all ${i.local} local step(s) run in git ` +
+        `worktrees${cl}`
+      : `worktree isolation: ${i.wt} of ${i.local} local steps run in ` +
+        `git worktrees - the rest write in the project checkout${cl}`;
+    return ` <span class="stage wt" title="${esc(tip)}">` +
+      `wt${full ? '' : ` ${i.wt}/${i.local}`}</span>`;
+  };
   // What a run's closing follow-up-plan step left behind: a link into the
   // imported proposal row when one exists (it IS a request record -
   // opening it is the same modal), a muted word when nothing produced.
@@ -12886,7 +13019,7 @@ function render(d){
         `${esc(STAGES[r.stage]||r.stage)}` +
         (r.stage==='generating'
           ? `<span class="dots"><span>.</span><span>.</span><span>.</span></span>`
-          : '') + `</span>` + staleChip +
+          : '') + `</span>` + staleChip + isoChip(r) +
         (r.followup_src
           ? (r.followup_src.run
             ? ` <button type="button" class="linkbtn" ` +
@@ -12914,7 +13047,7 @@ function render(d){
         (r.archived ? `<span class="stage archived" ` +
           `title="auto-archived run - hidden from the default view; ` +
           `files stay on disk">archived</span>` : '') +
-        runStateChip(r) + staleChip +
+        runStateChip(r) + staleChip + isoChip(r) +
         (r.followup ? fuChip(r.followup) : '') + `<br>` +
         `<span class="sub">${esc(base(r.dir))}</span>`) +
       `</div></td>` +
