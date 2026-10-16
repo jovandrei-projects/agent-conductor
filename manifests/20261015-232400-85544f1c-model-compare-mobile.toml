@@ -1,0 +1,82 @@
+[run]
+merge_resolver = true
+name = "model-compare-mobile"
+description = "Build an Expo + React Native mobile app inside model-compare that mirrors the webapp with phone-friendly charts, tables, and filters."
+on_failure = "continue"
+checkpoint = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 120
+max_attempts = 3
+
+[[step]]
+worktree = true
+name = "audit-and-scaffold"
+project = "model-compare"
+prompt = """
+Work in the model-compare repository. First, audit the existing webapp: inventory its screens/routes, data sources and API calls, charts, tables, filters, and settings/specs so later steps can mirror them. Write that inventory into a short notes file at mobile/NOTES.md.
+
+Then scaffold a new Expo + React Native (TypeScript) app in a mobile/ subdirectory of the repo using create-expo-app with the Expo Router template. Configure app.json (name, slug, scheme) and install the core dependencies the mirror will need: Expo Router, a data-fetching/cache layer matching what the webapp uses (e.g. @tanstack/react-query if the webapp uses it), a React Native charting library suitable for small screens (e.g. react-native-gifted-charts or victory-native), a fast list (FlashList or FlatList), and safe-area / screen utilities.
+
+Reuse the webapp's existing config/env files in the repo for API base URLs and any keys — read them from the project files, never hardcode or copy credential values into new tracked files; add a mobile/.env.example documenting required vars. The step is done when dependencies install cleanly and `npx expo start` boots the default router screen.
+"""
+
+[[step]]
+worktree = true
+name = "data-and-core-screens"
+project = "model-compare"
+prompt = """
+Work in the model-compare repository, inside the mobile/ Expo app scaffolded previously (see mobile/NOTES.md for the webapp inventory).
+
+Implement the app's data layer and core screens, mirroring the webapp's functionality for a phone:
+
+- Recreate the webapp's data fetching against the same endpoints/config (read endpoints and any auth details from the repo's existing env/config files; do not hardcode secrets).
+- Build the primary screens the webapp has — e.g. model browse/list, model detail, and comparison views — using Expo Router file-based navigation (tabs and/or stack as fits the content).
+- Adapt information density for a phone: fewer columns, larger touch targets, sensible defaults for filters/specs rather than exposing every desktop control at once.
+- Every screen needs loading, empty, and error states.
+
+Keep charts/tables minimal in this step — placeholders are fine where the next step will build dedicated mobile visualizations. The step is done when the app navigates through the mirrored flows with real data wired in.
+"""
+
+[[step]]
+worktree = true
+name = "mobile-visualizations-and-filters"
+project = "model-compare"
+prompt = """
+Work in the model-compare repository, inside the mobile/ Expo app (see mobile/NOTES.md).
+
+Replace the placeholder visualizations with phone-friendly equivalents of the webapp's tables, graphs, and widgets:
+
+- Wide multi-column tables become card lists, stacked key-value rows, or swipeable/expandable rows — never a shrunken desktop table.
+- Charts must be sized and simplified for small screens: legible axis/label font sizes (no tiny letters), reduced series density, touch-friendly tooltips or tap-to-inspect instead of hover.
+- Recreate the webapp's filters and spec controls as mobile-native UI: chip rows, bottom sheets/modal pickers, sensible presets.
+- Beautify the whole app toward a polished consumer feel (inspiration: Monarch and similar finance/analytics apps — clean cards, generous spacing, consistent theme tokens, dark/light support if the webapp has one, subtle gamified touches where they fit like progress or score highlights).
+
+The step is done when every webapp view has a mobile-adapted equivalent with readable text and no horizontal overflow on a ~390px-wide phone viewport.
+"""
+
+[[step]]
+worktree = true
+name = "verify-and-polish"
+project = "model-compare"
+prompt = """
+Work in the model-compare repository, inside the mobile/ Expo app.
+
+Final verification and polish pass:
+
+- Run the project's checks: TypeScript typecheck, lint, and any tests present (add a minimal smoke test setup if the repo has none).
+- Boot the app with `npx expo start` (or `npx expo export` for web) and smoke-test each screen: navigation works, data loads, charts render legibly, no console errors or layout overflow.
+- Fix any issues found, including small-text graphs, cramped tables, or broken filters.
+- Update mobile/README.md with setup/run instructions, which webapp features were mirrored, any env vars required (point to the repo's existing config files — do not write credential values), and anything intentionally not ported.
+"""
+
+
+[[step]]
+worktree = true
+name = "follow-up-plan"
+project = "model-compare"
+timeout_min = 30
+prompt = 'This run just ended. Review what it accomplished against the request it ran from: per-step logs, STATUS/NEXT lines and notes are under C:/Projects/agent-conductor/data/runs (the newest dir ending in -model-compare-mobile), and progress files live under this project .agent_tasks/. Then write a NEW conductor TOML manifest proposing ONLY the still-unfinished or newly discovered work, saved as C:/Projects/agent-conductor/manifests/model-compare-mobile-followup.toml. Do not implement or launch that manifest - a human reviews it first.'

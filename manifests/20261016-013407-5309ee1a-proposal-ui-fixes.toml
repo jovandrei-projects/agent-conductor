@@ -1,0 +1,54 @@
+[run]
+name = "proposal-ui-fixes"
+description = "Fix the incorrect 'needs review' label shown during proposal regeneration and surface live proposal output in the compact view."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 60
+max_attempts = 3
+verify = 'python run_tests.py'
+
+[[step]]
+name = "fix-regenerate-label"
+project = "agent-conductor"
+worktree = true
+timeout_min = 45
+prompt = '''
+In the agent-conductor planner UI, when a user drafts a request and clicks 'regenerate proposal', the run/proposal gets labeled 'needs review' even though the system is actively planning the proposal itself. That status is incorrect: while regeneration is running it should show an in-progress planning state (e.g. 'planning' / 'planning proposal'), and only transition to 'needs review' once the proposal has actually been produced and is awaiting human review.
+
+Trace the flow: find where the 'regenerate proposal' action sets state, and where the 'needs review' label is computed/rendered. A screenshot of the incorrect label is attached at C:/Projects/agent-conductor/data/attachments/20261016-013323-b3b6d7e5.png - read it to confirm the exact UI location and wording before changing anything.
+
+Fix the status transition so clicking 'regenerate proposal' immediately reflects that planning is underway rather than 'needs review'. Keep the status vocabulary consistent with the rest of the codebase and update any tests covering this state machine. Run the project's verify command when done.
+'''
+
+[[step]]
+name = "compact-live-output"
+project = "agent-conductor"
+worktree = true
+timeout_min = 60
+prompt = '''
+In the agent-conductor planner UI, the 'proposal live output' is only visible in the 'full view'. When the user is in the compact view there is no indication that a proposal is being generated.
+
+Add a compact live-output indicator to the compact view: a small column or single line per proposal showing the most recent output - the last sentence or last line is fine, truncated to fit. It must visibly highlight/flash briefly as new output values stream in, so activity is obvious at a glance without switching to full view.
+
+Find where the 'proposal live output' panel is rendered for the full view and where the compact view rows/cards are defined. Reuse the existing output stream/state so both views stay in sync rather than adding a parallel data path. Keep the indicator lightweight (no large buffers rendered per row). Run the project's verify command when done.
+'''
+
+[[step]]
+name = "follow-up-plan"
+project = "agent-conductor"
+worktree = true
+timeout_min = 30
+verify = ''
+prompt = '''
+Review what this run accomplished against the original human request: (1) the 'needs review' label incorrectly shown while 'regenerate proposal' is still planning, and (2) making 'proposal live output' visible in the compact view as a compact, updating indicator.
+
+Per-step logs, STATUS/NEXT lines and notes are under C:/Projects/agent-conductor/data/runs in the newest dir ending in 'proposal-ui-fixes', alongside each project's .agent_tasks files. Read them to judge what is done, what failed or was skipped, and what new issues were discovered.
+
+Then write a NEW conductor TOML manifest proposing only the still-unfinished or newly discovered work, saved as 'C:/Projects/agent-conductor/manifests/proposal-ui-fixes-followup.toml' using forward slashes. Follow the same manifest conventions as this run (registered project slugs, worktree = true per step, verify commands, a follow-up-plan closing step named appropriately). Do NOT launch or implement the follow-up - a human reviews it.
+'''

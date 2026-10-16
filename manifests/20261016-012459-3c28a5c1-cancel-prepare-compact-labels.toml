@@ -1,0 +1,79 @@
+[run]
+name = "proposal-flow-fixes"
+description = "Make proposal preparation stoppable, retain proposal-creation sessions in related tasks, and keep labels beneath the run table visible in compact view."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 60
+max_attempts = 3
+verify = "python run_tests.py"
+
+[[step]]
+name = "stop-proposal-preparation"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Trace the existing Prepare proposal lifecycle and reproduce the inability to stop while the UI shows Preparing proposal. Implement a visible Stop proposal action during preparation that returns the user to the previous editable state without waiting for generation to finish. Preserve existing draft inputs, selections, and any previous valid proposal so the user can add information and prepare again.
+
+Cancel the underlying preparation using the project's existing session/process mechanisms, extending them only as necessary; do not merely hide the progress display. Scope cancellation to that preparation attempt without stopping unrelated tasks or runs. Prevent late progress, completion callbacks, or partial output from overwriting restored state or a subsequent preparation attempt. Handle repeated stop requests and cancellation racing with completion consistently, without deleting session history.
+
+Use the existing test infrastructure to add regression coverage for state restoration, cancellation, late results, and immediate edit-and-reprepare. Run the registered verification command and record actual outcomes and remaining issues with STATUS/NEXT lines in the project's existing .agent_tasks notes.
+'''
+
+[[step]]
+name = "retain-proposal-session"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Investigate why the task/session visible during proposal generation disappears when the resulting plan becomes planned. Retain the actual create-proposal session and its association with the resulting plan so it remains visible in that plan's related-task list after preparation completes and after the UI reloads. Determine whether lifecycle handling, association, filtering, or another existing mechanism causes the disappearance rather than assuming it is archived.
+
+Present the session as preparation history, conceptually a step 0, with its real status and existing session/log navigation. Do not create a synthetic replacement or insert preparation as an executable step in the generated plan. Starting the planned run must execute its actual step 1 without invoking proposal generation again. Preserve execution-step ordering and ensure retry/resume logic cannot accidentally select preparation history as runnable work.
+
+Keep this behavior compatible with stopping preparation and preparing again, without misattributing an earlier session to a later attempt. Add regression coverage for retained visibility, persistence of the association, and execution excluding the proposal session. Run verification and record results and unfinished work with STATUS/NEXT lines in existing .agent_tasks notes.
+'''
+
+[[step]]
+name = "fix-compact-labels"
+project = "agent-conductor"
+worktree = true
+timeout_min = 30
+prompt = '''
+Identify the labels beneath the run table mentioned in the request and reproduce their intermittent disappearance in compact view. Inspect the actual rendering and layout conditions before changing code; do not assume a particular component, framework, or CSS cause.
+
+Fix the cause so the intended labels remain visible and readable in compact view, including when switching between compact and normal views, changing viewport width, and updating table contents. Preserve existing normal-view behavior and compact density without an unrelated redesign.
+
+Add targeted regression coverage using the project's existing UI test facilities where available. Perform feasible visual checks and explicitly record any checks that could not be performed. Run the registered verification command and summarize evidence and remaining issues with STATUS/NEXT lines in existing .agent_tasks notes.
+'''
+
+[[step]]
+name = "verify-proposal-flow"
+project = "agent-conductor"
+worktree = true
+timeout_min = 30
+prompt = '''
+Verify the three requested changes together in the merged project state, first reviewing earlier step outcomes so parked or failed work is not mistaken for delivered functionality.
+
+Exercise this sequence using existing tests and isolated fixtures: prepare a proposal, stop while preparing, confirm the previous inputs are editable, add information, prepare again, confirm the completed create-proposal session remains in the resulting plan's related list, and start the plan with its real step 1 rather than replaying proposal generation. Check late completion from the stopped attempt, reload persistence, and label visibility beneath the run table in both compact and normal views.
+
+Use mocks or isolated fixtures for generation, cancellation, and execution where needed; do not launch real unattended agent runs merely to verify behavior. Add missing integration regression coverage and fix only integration regressions within these requested changes. Run python run_tests.py and any relevant existing checks. Record passed, failed, and unverified acceptance criteria with STATUS/NEXT lines in existing .agent_tasks notes.
+'''
+
+[[step]]
+name = "follow-up-plan"
+project = "agent-conductor"
+worktree = true
+timeout_min = 15
+prompt = '''
+Review what this run actually accomplished against the human's three requests: stopping proposal preparation and restoring the previous state, keeping labels beneath the run table visible in compact view, and retaining the create-proposal session in the plan's related list without executing it again.
+
+Read per-step logs, STATUS/NEXT lines, and notes under C:/Projects/agent-conductor/data/runs in the newest directory ending in proposal-flow-fixes, alongside the project's .agent_tasks files. Compare that evidence with the merged project state and verification results; do not count failed or parked worktree changes as delivered.
+
+Write a NEW conductor TOML manifest to C:/Projects/agent-conductor/manifests/proposal-flow-fixes-followup.toml proposing only still-unfinished requirements or newly discovered work related to this request. Do not repeat completed work or invent additional scope. Use a distinct safe run name, registered project slugs, sequential steps, the required run/default settings from this proposal, worktree isolation for every local step, and python run_tests.py verification for agent-conductor. Keep credentials and private data out of the manifest; refer to existing project files when necessary. If no actionable work remains, make that explicit in the saved proposal without inventing implementation tasks.
+
+This step is review and planning only: do not implement the follow-up, launch the generated manifest, or start another run. Leave the new manifest for human review and record its location and review outcome in the existing task notes.
+'''

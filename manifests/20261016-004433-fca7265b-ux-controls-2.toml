@@ -1,0 +1,287 @@
+[run]
+name = "workflow-ux-safety"
+description = "Improve agent-conductor navigation, proposal editing, recovery, merge isolation, and mobile execution reliability."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 60
+max_attempts = 3
+verify = "python run_tests.py"
+
+[[step]]
+name = "isolate-proposal-planning"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Investigate why generating a proposal can be interrupted or blocked while another worktree merges into agent-conductor. Reproduce the interaction with isolated test instances and temporary repositories, not by disrupting active user sessions.
+
+Allow proposal generation to run in an isolated checkout or independent working area, with its output held safely outside files undergoing a merge. Scope repository locks and process cleanup to their actual owners: a merge must not terminate an unrelated planner, and planning must not interrupt a merge. If final publication requires a lock, defer only that short operation rather than blocking or killing generation. Preserve generated output through cancellation, retry, and server restart.
+
+Add concurrency regression coverage proving that a proposal can finish while a merge is pending or active. Do not restart the live conductor to test this change.
+'''
+
+[[step]]
+name = "isolate-worktree-services"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Inspect how worktree workers receive checkout paths, launch development servers, select ports, and clean up processes. Ensure each worker uses its actual isolated checkout and a distinct available local service port rather than modifying or deploying over the main workspace.
+
+Propagate the correct checkout, service address, and ownership information through existing worker context and launch mechanisms. Handle concurrent port allocation safely, retain service information needed for review, and clean up only processes owned by that worker. Do not kill the main workspace server or another run's services.
+
+Add tests for concurrent worktrees, port contention, retry, cancellation, and cleanup. Preserve existing non-worktree behavior and avoid introducing production deployments.
+'''
+
+[[step]]
+name = "project-merge-targets"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Add project-aware merge-target branch selection through the existing proposal controls, manifest handling, persisted run state, worktree creation, and merge execution.
+
+Populate the branch selector from eligible branches in the selected project's actual repository. Preserve the current main default for existing configurations. When the project is inferred from the request, offer an editable main default and validate it once the project is known. If the target does not exist, show an actionable error rather than silently choosing another branch or creating one. Support different targets for different projects in a multi-project run.
+
+Create work from the intended target baseline and persist the selected target so retries, conflict resolution, and later manual merges cannot silently fall back to main. Validate branch input through safe Git interfaces. Test non-main targets, changed project selection, missing branches, backward compatibility, and multi-project routing. Do not push branches or alter repository protections.
+'''
+
+[[step]]
+name = "deferred-merge-engine"
+project = "agent-conductor"
+worktree = true
+timeout_min = 120
+prompt = '''
+Separate worktree isolation from automatic merging. Introduce an explicit opt-in policy for retaining changes until a human requests a merge, while keeping merge-after-step as the backward-compatible default. Do not change this active run's existing merge policy.
+
+In deferred mode, retain branches, worktrees, commits, verification results, and pending-merge metadata across completion and restart. Sequential dependent steps must see their verified predecessors' changes through an isolated per-run/per-project integration baseline; they must not each restart from unchanged main. Keep independent experimental alternatives identifiable rather than automatically combining them.
+
+Implement the backend operation for explicitly merging pending verified work into its recorded target. Prepare and verify the combined result in isolation before updating that target. Recheck target movement, serialize conflicting merge operations, honor merge_resolver for authorized merges, and preserve recoverable state on conflicts or verification failures. Never include failed verification output automatically or delete retained work during ordinary cleanup.
+
+Test sequential continuity, independent alternatives, retries, restart recovery, non-main targets, failed verification, and the unchanged automatic mode.
+'''
+
+[[step]]
+name = "deferred-merge-controls"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Expose worktree isolation and merge timing as separate proposal options, using the deferred-merge backend if it is available. Explain the distinction between merging after each step and retaining isolated changes for a manual merge at the end. Persist the choices through draft editing, TOML generation, reopening, and run creation.
+
+In run details, show pending changes by project and step, their target branches, verification status, and retained alternatives. Provide an explicit confirmed action to merge the selected pending work after the relevant workers have stopped. Show progress, conflict-resolution state, failures, and per-project partial completion accurately. Do not silently combine alternative implementations or launch another run.
+
+Use the existing backend validation and merge operations rather than duplicating Git logic in the UI. Test disabled states, repeated clicks, refresh during a merge, failure recovery, and target changes. If the backend prerequisite did not land, report that blocker instead of exposing nonfunctional controls.
+'''
+
+[[step]]
+name = "summary-purpose-parsing"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Investigate the navigation summary reported at http://127.0.0.1:8773/api/runs/20261015-182057-ux-controls/steps/resolve-task-modal-navigation/summary, where Task contains <!-- conductor-purpose: resolve-merge -->. Use the existing endpoint if available or its recorded artifacts and a regression fixture; do not assume that the opening HTML-comment token is itself the root cause.
+
+Trace purpose extraction, task-description selection, and rendering. Preserve machine-readable resolver metadata while presenting meaningful human-facing task content or a clear resolver-purpose label when no ordinary task body exists. Do not indiscriminately strip comments from code examples or weaken HTML sanitization.
+
+Add focused tests for the reported marker, surrounding whitespace and ordinary task text, marker-only resolver tasks, literal comments in code, and safe rendering. Keep summary API behavior compatible.
+'''
+
+[[step]]
+name = "modal-detail-navigation"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Replace the application's external-window navigation-summary flow with an in-app detail modal. Give the summary modal previous/next controls using the same task ordering as the surrounding navigation, with clear current-item identification and sensible end-of-list states.
+
+When View request/runbook is opened from a task modal, provide an obvious Back action returning to that exact task and preserving relevant navigation, scroll, and filter state. Maintain a coherent modal history rather than losing the originating task or opening unrelated browser windows. Preserve existing run-name and task-row click behavior and keep direct summary URLs usable.
+
+Follow the existing UI architecture and accessibility patterns for focus, Escape, close behavior, and keyboard navigation. Test previous/next, nested request/runbook views, Back, close, missing items, and switching runs.
+'''
+
+[[step]]
+name = "full-trajectory-view"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Make trajectory details fully readable without removing the compact default. Add individual entry expansion and an expand-all/collapse-all or equivalent full-view control.
+
+Ensure expanded entries expose the complete available step text, including long lines such as a detailed step 4, rather than merely removing a CSS ellipsis from already truncated data. Trace the data path and retrieve stored full content where necessary. Wrap long lines, preserve meaningful whitespace, allow text selection and copying, and handle large trajectories without freezing the UI. If historical full text was never retained, explain its absence rather than fabricating it.
+
+Test long multiline content, collapsed and expanded transitions, complete copied text, run switching, and safe rendering.
+'''
+
+[[step]]
+name = "row-context-menus"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Add useful context menus to run and task items while preserving their existing left-click detail behavior. Include Open details and Filter by this item, plus state-appropriate existing controls such as pause or resume. Reuse established action handlers and server-side state validation; do not create a second execution-control implementation.
+
+Keep text selectable and copy/paste usable. Preserve the native context menu for selected text and editable fields, provide a deliberate native-menu escape route, and offer a discoverable keyboard-accessible equivalent to right-click. Avoid accidental row navigation while opening or using the menu.
+
+Test run and task menus, filtering, changing execution states, unavailable actions, keyboard operation, outside-click dismissal, and native copying.
+'''
+
+[[step]]
+name = "proposal-action-state"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Correct proposal-draft action recommendations using actual semantic differences rather than sticky change flags. Track task-generation inputs separately from options applied to TOML and from ordinary draft-save state. Reverting a checkbox or another field to its relevant baseline must remove the corresponding stale indication.
+
+Explain which changes require Regenerate tasks, which require Apply options to TOML, and when both are needed in a particular order. Disable or clearly neutralize Apply options when there is nothing to apply. Reset baselines only after the corresponding operation succeeds, and retain meaningful pending state after failures. Do not silently discard manual TOML edits or start a run with ignored pending changes.
+
+Style Regenerate tasks as a neutral secondary action, distinct from the primary Start run action, and require confirmation before replacing generated tasks. Do not rely on color alone to communicate staleness.
+
+Test change-and-revert, independently stale task/options state, both actions required, save/reopen, failed operations, confirmation cancellation, and manual TOML preservation.
+'''
+
+[[step]]
+name = "request-image-picker"
+project = "agent-conductor"
+worktree = true
+timeout_min = 45
+prompt = '''
+Add a recognizable paperclip-style attachment control next to Attach images below Your request in the proposal composer. Use the existing icon and UI conventions, not an emoji, and make clicking it open the native local image-file picker.
+
+Reuse the existing attachment storage and validation flow. Preserve any existing paste/drop behavior and provide accessible labeling, selection feedback, preview/removal, and clear validation errors. Canceling the picker must leave the request unchanged. Keep attachment contents out of tracked manifests; use the application's supported artifact references.
+
+Add tests for selecting images, canceling, removing an image, invalid files, duplicate handling consistent with existing behavior, and saving/reopening a draft with attachments.
+'''
+
+[[step]]
+name = "model-choice-lists"
+project = "agent-conductor"
+worktree = true
+timeout_min = 45
+prompt = '''
+Update both Planner model and Step model selectors so typing still provides filtered recommendations at the top, followed by a clearly separated, scrollable full list of configured supported models.
+
+Use the existing model catalog rather than inventing or hardcoding model names. Keep the full list available even when the query has no matches. Preserve the selected value, current free-text behavior if supported, and provider/model distinctions. Ensure keyboard navigation and accessible active-option tracking remain correct when an item appears in both recommendations and the full list.
+
+Test empty input, partial matches, no matches, full-list selection, keyboard interaction, and persistence of planner and step selections.
+'''
+
+[[step]]
+name = "interrupt-with-instructions"
+project = "agent-conductor"
+worktree = true
+timeout_min = 120
+prompt = '''
+Add one coherent running-step action for interrupting work and resuming it with additional instructions and optional screenshots. Open a composer first, reusing proposal attachment capabilities where practical; merely opening or canceling it must not stop the worker.
+
+On confirmed submission, persist the supplemental instructions and attachment references, request a stop of only that step's owned session, await confirmed termination, then resume the same logical step with its existing context and the new instructions. Preserve its worktree and accumulated changes. Prevent overlapping workers, double submission, and duplicate instruction application across retries or server restart. Handle a step that finishes while the composer is open and expose recoverable errors if stopping or resuming fails.
+
+Show clear progress through the stop/resume transition and retain the separate existing controls. Store notes and images through appropriate task artifacts rather than embedding private content in tracked manifests. Add the new action to task details and applicable context menus.
+
+Test cancellation, attachments, natural completion races, delayed stop, restart recovery, duplicate submission, and successful single-flow continuation.
+'''
+
+[[step]]
+name = "recoverable-trash"
+project = "agent-conductor"
+worktree = true
+timeout_min = 120
+prompt = '''
+Replace immediate permanent deletion of runs and proposal drafts with recoverable in-app trash. Retain their recoverable artifacts and necessary metadata for 48 hours from deletion, remove them from normal lists, and provide an immediate Undo action plus a Trash view with Restore and clearly confirmed Empty trash.
+
+Persist deletion timestamps and recovery information across restart. Display expiry, restore entries to the correct workflow state, handle name/path collisions without overwriting newer work, and preserve attachment and follow-up relationships. Respect active-run and worktree ownership safeguards; deleting a list entry must not destroy active sessions or unrelated Git work.
+
+Implement bounded cleanup of expired trash only, and require explicit confirmation for irreversible manual emptying. Validate paths and avoid following references outside managed trash into unrelated data. Test expiry using a controllable clock, partial failures, restart, restore, collisions, and empty-trash confirmation.
+
+Use temporary fixtures exclusively for deletion and cleanup tests. Do not move, purge, or permanently delete real user runs or drafts during implementation.
+'''
+
+[[step]]
+name = "followup-run-discovery"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Make a successfully produced follow-up manifest discoverable as an actual persisted Ready to run entry in the Runs section, without scheduling or starting execution. Inspect the existing follow-up-plan output flow and the reported example C:/Projects/agent-conductor/manifests/ux-controls-followup.toml.
+
+Use the supported proposal/run import path, extending it if necessary. Validate the TOML, registered project references, and execution options before registration. Link the new proposal to its originating run and retain access to the source manifest. Make completion handling idempotent across retries, repeated notifications, refresh, and restart, including when the producer used a worktree. Provide an explicit import/recovery path for already-written follow-up files.
+
+Expose invalid or missing outputs as actionable status instead of silently losing them. Empty follow-ups must clearly indicate that no work remains rather than creating misleading runnable jobs. Do not execute a manifest merely because a file appears.
+
+Test valid registration, durable listing, duplicate prevention, malformed files, missing files, worktree-produced artifacts, and the guarantee that registration launches no workers.
+'''
+
+[[step]]
+name = "emulator-resource-ownership"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Determine how concurrent mobile-related steps actually allocate and target Android devices. Inspect existing orchestration and relevant run artifacts, including apartment-play-edit under C:/Projects/agent-conductor/data/runs. Report with evidence whether projects currently share a device, get separate emulators, or serialize; do not assume automatic isolation.
+
+If concurrent workers can target the same device unsafely, implement the minimum reliable coordination: explicit device serial assignment, cross-run ownership, and queuing when only a shared device is available. Use separate local emulator instances only where existing tooling supports them. Propagate the chosen device to lifecycle and automation commands, and ensure cleanup cannot stop another worker's emulator or a user's unrelated device.
+
+Test competing projects, explicit device targeting, cancellation, safe stale-owner recovery, and unavailable devices with controlled fixtures. Record the resulting concurrency guarantees and any remaining limitations in step notes. Do not provision cloud devices or interfere with active phones/emulators.
+'''
+
+[[step]]
+name = "mobile-relaunch-handling"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Read C:/Projects/agent-conductor/data/attachments/20261016-005550-bdf92e96.png and inspect the mobile-parity-validation step of apartment-play-edit under C:/Projects/agent-conductor/data/runs. Trace the reported stall on Confirm navigation / Leave this page / Stay on this page during an intended app restart or reload. Establish which lifecycle tooling or worker instructions are responsible instead of assuming an app framework.
+
+Fix conductor-owned automation or reusable worker guidance so an intentional, authorized restart cannot wait indefinitely on this known confirmation. Scope handling to the assigned device and expected restart operation. Preserve genuine unsaved user work; use controlled test data or saved state before accepting Leave this page. Do not globally auto-accept dialogs or disable app protections.
+
+Use existing automation capabilities for expected-dialog handling or a supported app lifecycle operation, with bounded waits, diagnostic capture, and an actionable failure for unexpected dialogs. Add regression coverage for the known confirmation, no-dialog success, unexpected dialogs, timeouts, and device ownership. Record app-side follow-up requirements without editing another project.
+'''
+
+[[step]]
+name = "apartment-mobile-relaunch"
+project = "apartment-3d"
+worktree = true
+timeout_min = 90
+prompt = '''
+Check the recorded project attribution for apartment-play-edit / mobile-parity-validation under C:/Projects/agent-conductor/data/runs before editing this project. Read C:/Projects/agent-conductor/data/attachments/20261016-005550-bdf92e96.png. If the affected app belongs to a different registered project, report that attribution and the precise remaining work rather than modifying unrelated code.
+
+For the app owned here, reproduce the intended restart/reload workflow using its actual framework, existing test tooling, an isolated local device, and disposable test data. Validate the conductor-side expected-dialog handling and fix any demonstrated app-side lifecycle or automation issue that still causes the navigation confirmation to stall progress. Retain protections for genuine unsaved edits and never blindly dismiss arbitrary prompts.
+
+Add focused regression coverage and exercise repeated relaunches where local tooling permits. Run the project's registered verification and distinguish real-device/emulator observations from mocked checks. If a required device or prerequisite fix is unavailable, record the blocker promptly rather than waiting indefinitely or claiming successful mobile validation.
+'''
+
+[[step]]
+name = "integration-regressions"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Verify the landed conductor changes together using existing test infrastructure, isolated application instances, synthetic runs/drafts, and temporary repositories. Fix integration regressions within this project, not unrelated new features.
+
+Cover summary metadata and modal previous/next, task-to-request/runbook Back, complete trajectory text, context-menu copy/paste, reversible proposal dirty state, regeneration confirmation, local image selection, full model lists, interruption with instructions/images, trash restore/expiry, and follow-up registration without execution.
+
+Also exercise proposal generation during a merge, selected non-main targets, default automatic versus deferred merging, sequential deferred-worktree continuity, manual merge verification/conflict recovery, service-port isolation, and explicit mobile-device ownership. Review the apartment mobile step's evidence without treating unavailable runtime checks as passed.
+
+Run python run_tests.py and applicable existing targeted/UI checks. Do not launch real user runs, stop active sessions, purge real trash, or merge test changes into real target branches. Record verified outcomes, remaining failures, coverage limitations, and actionable STATUS/NEXT notes for the closing review.
+'''
+
+[[step]]
+name = "follow-up-plan"
+project = "agent-conductor"
+worktree = true
+timeout_min = 25
+prompt = '''
+Review what this run actually accomplished against the human request and this run's manifest. Read per-step logs, STATUS/NEXT lines, and notes under C:/Projects/agent-conductor/data/runs, selecting the newest directory whose name ends in workflow-ux-safety, together with each participating project's .agent_tasks files. Check completion claims against changes and verification evidence.
+
+Account for navigation summaries and modal history, full trajectories, context menus, draft action state and colors, image/model controls, interruption with supplemental instructions, recoverable trash, ready-to-run follow-ups, planning during merges, branch selection, deferred worktree merging, isolated services, emulator concurrency, and the navigation-confirmation stall.
+
+Write a NEW conductor TOML manifest proposing only still-unfinished requested work or newly discovered work necessary to complete it. Save it as C:/Projects/agent-conductor/manifests/workflow-ux-safety-followup.toml using forward slashes. Use registered project slugs, worktree isolation, appropriate verification commands, max_attempts = 3, and the requested run/default settings. Do not repeat completed work, invent repository details, embed credentials/private data, or propose cloud execution without explicit authorization.
+
+For a nonempty valid proposal, use the supported registration/import flow to list it under Runs as Ready to run, linked to this run, without launching it. If registration remains unavailable, record that blocker explicitly. If no actionable work remains, record that outcome in the TOML without fabricating steps or queuing an empty run.
+
+Do not implement any follow-up work or start the follow-up. A human will review it.
+'''
