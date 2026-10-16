@@ -1155,6 +1155,7 @@ def now_iso() -> str:
 
 
 def save_state(run_dir: Path, state: dict) -> None:
+    _fold_review_flags(run_dir, state)
     with STATE_LOCK:
         tmp = run_dir / "state.json.tmp"
         tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -1951,6 +1952,95 @@ def _flag_text(flag: Path) -> str | None:
         return None
 
 
+def review_flag(run_dir: Path, step: str | None = None) -> Path:
+    """Dashboard review marks ('Mark as reviewed' / 'Mark as needing
+    review'): one JSON sentinel per run and per step -
+    {"reviewed": bool, "seq": int|null, "at": iso}. `seq` records which
+    completion_seq the mark covers, so an ack for an older completion
+    can never hide a newer one. Durable like skip-: clear_run_flags
+    leaves it, save_state folds it into state.json, and the dashboard
+    overlays it live the way prompt-/rnote-/skip- flags are read."""
+    n = "review-" + _flag_key(run_dir)
+    return _flag_dir() / (n + f"-{_safe_name(step)}" if step else n)
+
+
+def _review_flag_body(run_dir: Path, step: str | None = None) -> dict | None:
+    """The review sentinel's parsed body, or None when absent/malformed."""
+    try:
+        body = json.loads(review_flag(run_dir, step).read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return body if isinstance(body, dict) and "reviewed" in body else None
+
+
+def _review_mark(run_dir: Path, stored,
+                 step: str | None = None) -> dict | None:
+    """The newest review mark for a run or step: the live sentinel body
+    when present, else the mark already folded into state.json. The two
+    compare on `at` (ISO text sorts chronologically) so a stale sentinel
+    can't resurrect an older mark over a newer folded one."""
+    flag = _review_flag_body(run_dir, step)
+    if flag is None:
+        return stored if isinstance(stored, dict) else None
+    s_at = str((stored or {}).get("at") or "") \
+        if isinstance(stored, dict) else ""
+    return flag if str(flag.get("at") or "") >= s_at else stored
+
+
+def _needs_review(seq, mark: dict | None) -> bool:
+    """Does this completion still need a human look?
+
+    True on an explicit 'needs review' tombstone (mark.reviewed is
+    False), or when a completion_seq exists that the newest mark does
+    not cover - an ack binds the seq it saw, so a re-completion after
+    resume/retry flags again while repeated saves of the same outcome
+    keep the ack. A seq-less legacy record is never flagged on its own.
+    """
+    if isinstance(mark, dict) and mark.get("reviewed") is False:
+        return True
+    return seq is not None and (not isinstance(mark, dict)
+                                or mark.get("seq") != seq)
+
+
+def _fold_review_flags(run_dir: Path, state: dict) -> None:
+    """Fold this run's review-* sentinels into the state dict - called
+    from save_state so every driver save carries the newest human marks
+    into the durable record (a sentinel wins on `at` ties since the flag
+    channel is where endpoints always write first). A mark for a step
+    with no record yet stays flag-only until the rec exists."""
+    prefix = f"review-{_flag_key(run_dir)}"
+    try:
+        flags = list(_flag_dir().glob(prefix + "*"))
+    except OSError:
+        return
+    steps = state.get("steps") or {}
+    for f in flags:
+        try:
+            body = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(body, dict) or "reviewed" not in body:
+            continue
+        suffix = f.name[len(prefix):]
+        if not suffix:
+            target = state                    # run-level mark
+        else:
+            step_safe = suffix[1:]            # '-<safe step name>'
+            name = next((n for n in steps
+                         if _safe_name(n) == step_safe), None)
+            if name is None:
+                continue                      # pending/renamed step: no rec
+            target = steps[name]
+        old = target.get("review")
+        old_at = str(old.get("at") or "") \
+            if isinstance(old, dict) else ""
+        if str(body.get("at") or "") >= old_at:
+            target["review"] = {"reviewed": body.get("reviewed"),
+                                "seq": body.get("seq"),
+                                "at": body.get("at")}
+
+
 # Runs launched by an older conductor poll BARE-name sentinels
 # (stop-<run>, drain-<run>, timeout-<run>-<step>) - the path-keyed names
 # above only exist in new code. state["flags"]="v2" marks a run whose
@@ -1994,6 +2084,15 @@ def _append_note(rec: dict, text: str) -> None:
     rec["note"] = (rec["note"] + "; " + text) if rec.get("note") else text
 
 
+def _bump_completion(rec: dict) -> None:
+    """Advance completion_seq on a step rec or run state - the review
+    workflow's 'a new outcome exists to look at' counter. Bumped once at
+    each terminal-outcome write (step end, merge flip, sweep's
+    lost-mark, run ended_at); re-saves of the same outcome leave it
+    alone so a recorded ack still covers them."""
+    rec["completion_seq"] = int(rec.get("completion_seq") or 0) + 1
+
+
 def _flag_raise(name: str) -> None:
     """Write a stop/drain sentinel. Best-effort: a mkdir/write failure only
     delays the stop by one poll, so callers don't crash on it."""
@@ -2024,7 +2123,12 @@ def clear_run_flags(run_dir: Path) -> None:
                 # the pending step's edited prompt and resume notes -
                 # both are meant to survive the resume that is about to
                 # read them, so none of the three are halt sentinels.
-                if f.name.startswith(("skip-", "prompt-", "rnote-")):
+                # review- marks are durable too: a resume re-completion
+                # bumps completion_seq so an old ack simply stops
+                # matching - wiping the mark would fabricate 'never
+                # reviewed' instead.
+                if f.name.startswith(
+                        ("skip-", "prompt-", "rnote-", "review-")):
                     continue
                 try:
                     f.unlink()
@@ -2273,6 +2377,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             with STATE_LOCK:
                 rec.update(status="failed",
                            note="not a git repo root; checkpoint required")
+                _bump_completion(rec)
                 save_state(run_dir, state)
             return "failed"
         git_commit(work_dir, f"conductor: checkpoint before {step.name}",
@@ -2467,6 +2572,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                    prompt_edited=prompt_edited or None,
                    prompt=str(prompt_path), stdout_log=str(stdout_log),
                    export=str(export_path))
+        _bump_completion(rec)
         save_state(run_dir, state)
     log_event(run_dir, event="step_end", step=step.name, status=status,
               exit_code=rc, elapsed_s=elapsed, session=rec.get("session_id"),
@@ -2702,6 +2808,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             print("devin is not logged in. Run `devin auth login` first.")
             state["ended_at"] = now_iso()
             state["aborted"] = "auth"
+            _bump_completion(state)
             save_state(run_dir, state)
             log_event(run_dir, event="run_abort", reason="auth")
             hub_update(tid, state, final=True, final_status="dropped")
@@ -2736,6 +2843,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             state["aborted"] = ("paused" if paused else
                                 "stopped" if halted else "drained")
             state["ended_at"] = now_iso()
+            _bump_completion(state)
             save_state(run_dir, state)
 
     for gi, members in enumerate(groups):
@@ -2777,6 +2885,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                                      "devin auth login")
                 state["aborted"] = "auth_midrun"
                 state["ended_at"] = now_iso()
+                _bump_completion(state)
                 save_state(run_dir, state)
             hub_update(tid, state, final=True, final_status="dropped")
             return 2
@@ -2824,12 +2933,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                         was = prior.get('status')
                         prior.update(status="done", merged=True)
                         _append_note(prior, f"merged on resume (was {was})")
+                        _bump_completion(prior)
                         save_state(run_dir, state)
                         print(f"[merged] {step.name} (merge on resume)")
                     elif prior.get("status") == "done":
                         prior.update(status="failed", merged=False)
                         _append_note(prior, "merge conflict on resume; "
                                             f"worktree kept at {wt}")
+                        _bump_completion(prior)
                         save_state(run_dir, state)
                         print(f"[ failed] {step.name} (merge conflict "
                               "on resume)")
@@ -2843,6 +2954,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                                             "hand or enable merge_resolver "
                                             "- re-running the same branch "
                                             "cannot fix a conflict")
+                        _bump_completion(prior)
                         save_state(run_dir, state)
                         print(f"[conflict] {step.name} still unmerged")
                     continue
@@ -3022,6 +3134,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                                           f"at {work_dir}")
                         status = "failed"
                         statuses[step.name] = "failed"
+                    _bump_completion(rec)
                     save_state(run_dir, state)
                 elif worktree_debris(repo_dir, work_dir, branch):
                     # step died before doing work and the branch carries
@@ -3066,6 +3179,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         halt_remaining(len(groups))
 
     state["ended_at"] = now_iso()
+    _bump_completion(state)
     save_state(run_dir, state)
     log_event(run_dir, event="run_end")
     hub_update(tid, state, final=True)
@@ -3198,6 +3312,7 @@ def sweep_runs(runs_dir: Path, write: bool = True) -> list[str]:
                     rec.setdefault(
                         "note", "marked lost by sweep: nothing alive behind "
                                 "the record (conductor or worker died?)")
+                    _bump_completion(rec)
                     dirty = True
         if steps and not st.get("ended_at") and not any(
                 r.get("status") in ("running", "queued")
@@ -3205,6 +3320,7 @@ def sweep_runs(runs_dir: Path, write: bool = True) -> list[str]:
             lines.append(f"{sj.parent.name}: run closed (no live steps)")
             if write:
                 st["ended_at"] = now_iso()
+                _bump_completion(st)
                 dirty = True
         if dirty:
             if watched:
@@ -5606,6 +5722,7 @@ def _merge_deferred_group(d: Path, st: dict, grp: dict, names: list[str],
             rec["merged"] = True
             _append_note(rec, f"deferred merge landed on {target} via "
                               "staged+verified merge")
+            _bump_completion(rec)
             wt = Path(rec["work_dir"]) if rec.get("work_dir") else None
             if wt and wt != stage_wt:
                 worktree_remove(repo_dir, wt, rec["branch"])
@@ -5737,11 +5854,13 @@ def _merge_run(name: str, runs_dir: Path,
                        merged=True,
                        note="merged via dashboard "
                             f"(was {rec.get('status')})")
+            _bump_completion(rec)
             results["merged"].append(step.name)
         else:
             rec.update(merged=False,
                        note="merge still conflicts; the worktree is kept "
                             f"at {wt} for manual resolution")
+            _bump_completion(rec)
             results["conflicted"].append(step.name)
     pending -= set(results["merged"])
     for n in pending - set(results["conflicted"]) - set(results["skipped"]):
@@ -6139,6 +6258,83 @@ def set_step_notes(run_name: str, step_name: str, body: dict,
         raise RequestError(f"Could not write the notes flag: {exc}",
                            500) from exc
     return {"resume_notes": body["notes"]}
+
+
+def set_run_review(run_name: str, body: dict,
+                   runs_dir: Path = RUNS_DIR) -> dict:
+    """Dashboard 'Mark as reviewed'/'Mark as needing review' for the RUN
+    as a whole - the run's own mark, never folded into its tasks."""
+    return _set_review(run_name, None, body, runs_dir)
+
+
+def set_step_review(run_name: str, step_name: str, body: dict,
+                    runs_dir: Path = RUNS_DIR) -> dict:
+    """The same marks for one TASK - never touches the run's own mark."""
+    if not RUN_DIR_RE.fullmatch(step_name):
+        raise RequestError("Invalid step name", 404)
+    return _set_review(run_name, step_name, body, runs_dir)
+
+
+def _set_review(run_name: str, step_name: str | None, body: dict,
+                runs_dir: Path) -> dict:
+    """A review mark is written to a review-* sentinel first - the only
+    write that is always safe under trap 5 - then folded into state.json
+    by the driver's next save_state, or immediately when nothing in the
+    run is live. An ack binds the completion_seq it covered: a resume/
+    retry re-completion bumps seq so the stale ack stops matching, while
+    repeated saves of the same outcome never resurrect the indicator.
+    An explicit {'seq': n} body guards the ack against a race - when a
+    newer completion already landed than the view the click was made
+    from, the POST is refused and the human sees the new state first."""
+    reviewed = body.get("reviewed")
+    if not isinstance(reviewed, bool):
+        raise RequestError("'reviewed' must be true or false", 422)
+    d, st = _run_dir_checked(run_name, runs_dir)
+    if step_name is None:
+        target, seq = st, st.get("completion_seq")
+    else:
+        target = (st.get("steps") or {}).get(step_name)
+        if target is None:
+            if step_name not in _manifest_step_names(st):
+                raise RequestError("Step not in this run", 404)
+            target, seq = {}, None
+        else:
+            seq = target.get("completion_seq")
+    seen = body.get("seq", "__unset__")
+    if reviewed and seen != "__unset__" and seen != seq:
+        raise RequestError("A newer completion landed since this view "
+                           "loaded - reload and review it", 409)
+    mark = _review_mark(d, target.get("review"), step_name)
+    if reviewed and seq is None and not (
+            isinstance(mark, dict) and mark.get("reviewed") is False):
+        raise RequestError(
+            "Nothing to review yet - this "
+            + ("run" if step_name is None else "step")
+            + " has no recorded completion", 409)
+    out = {"reviewed": reviewed, "seq": seq, "at": now_iso()}
+    try:
+        _flag_dir().mkdir(exist_ok=True)
+        review_flag(d, step_name).write_text(
+            json.dumps(out), encoding="utf-8")
+    except OSError as exc:
+        raise RequestError(f"Could not write the review flag: {exc}",
+                           500) from exc
+    # Nothing of this run's live -> fold the marks into state.json now
+    # (same shape the driver's own save performs next). Two cases keep
+    # the mark flag-only until a later save lands it: a driver still up
+    # would clobber the fold with its in-memory state anyway (and its
+    # next save re-folds the flag), and a watched runs_dir makes ANY
+    # state write a trap-5 violation.
+    if not driver_alive(st) and not any(
+            step_live(r, False) for r in (st.get("steps") or {}).values()):
+        try:
+            _assert_unwatched(runs_dir, d)
+        except RequestError:
+            pass
+        else:
+            save_state(d, st)
+    return {"run": run_name, "step": step_name, "review": out,
+            "needs_review": _needs_review(seq, out)}
 
 
 def discard_request(request_id: str,
@@ -6775,6 +6971,15 @@ def collect_dashboard(runs_dir: Path,
                                if tf.is_file() else rec.get("timeout_min"))
             except (OSError, ValueError):
                 timeout_min = rec.get("timeout_min")
+            # Review mark: live sentinel overlay when present (newer `at`
+            # wins), else the mark folded into state.json. A LIVE step
+            # suppresses the flag rather than dropping the seq: a
+            # re-dispatch supersedes the old completion until the next
+            # terminal write stamps a new seq, and popping would let an
+            # old ack collide with the recycled value.
+            rmark = _review_mark(sj.parent, rec.get("review"),
+                                 rec.get("name") or name)
+            alive = step_live(rec, driver_alive(st))
             agents.append({
                 "run": st.get("run"), "run_dir": st.get("run_dir") or str(sj.parent),
                 "run_key": key, "request_id": st.get("request_id"),
@@ -6785,7 +6990,7 @@ def collect_dashboard(runs_dir: Path,
                 "status": status, "started_at": rec.get("started_at"),
                 "ended_at": rec.get("ended_at"),
                 "elapsed_s": rec.get("elapsed_s"),
-                "alive": step_live(rec, driver_alive(st)),
+                "alive": alive,
                 "pid": rec.get("pid"), "session_id": rec.get("session_id"),
                 "model": model,
                 "model_actual": rec.get("model_actual"),
@@ -6819,6 +7024,10 @@ def collect_dashboard(runs_dir: Path,
                 "skipped_by_user": _safe_name(
                     rec.get("name") or name) in flagged,
                 "note": rec.get("note"), "next": rec.get("next"),
+                "completion_seq": rec.get("completion_seq"),
+                "review": rmark,
+                "needs_review": (not alive) and _needs_review(
+                    rec.get("completion_seq"), rmark),
                 "session_gone": session_gone,
                 "exit_code": rec.get("exit_code"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
@@ -6884,6 +7093,17 @@ def collect_dashboard(runs_dir: Path,
                 request, key, generating=False,
                 log_path=requests_dir / f"{request['id']}.gen.log",
                 prices=prices))
+        # Run-level review mark, same sentinel/folded layering as the
+        # steps'. A tombstone shows at once; a seq mismatch only reads as
+        # 'new completion to review' once the run actually ended (a
+        # resumed run keeps its old seq but pops ended_at - flagging it
+        # mid-run would resurrect an ack the in-flight work superseded).
+        run_mark = _review_mark(sj.parent, st.get("review"))
+        run_needs = bool(
+            (isinstance(run_mark, dict)
+             and run_mark.get("reviewed") is False)
+            or (st.get("ended_at")
+                and _needs_review(st.get("completion_seq"), run_mark)))
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
                      "key": key, "request_id": st.get("request_id"),
                      "archived": st.get("archived"),
@@ -6892,6 +7112,8 @@ def collect_dashboard(runs_dir: Path,
                      "started_at": st.get("started_at"),
                      "ended_at": st.get("ended_at"), "counts": counts,
                      "aborted": st.get("aborted"),
+                     "completion_seq": st.get("completion_seq"),
+                     "review": run_mark, "needs_review": run_needs,
                      "tokens": tok_run or None,
                      "cost": ({"usd": round(run_cost, 4) if run_priced
                                else None, "unpriced": run_unpriced}
@@ -7242,6 +7464,16 @@ td .stage { max-width:100%; overflow:hidden; text-overflow:ellipsis;
 .stage.questions { color:#ffa657; border-color:#7a3d12; background:#2d1f14; }
 .stage.halted { color:#8b949e; }
 .stage.archived { color:#8b949e; border-color:#21262d; }
+/* 'unreviewed' = a completion nobody has marked reviewed yet. Cyan is a
+   free hue in this palette (green reads as success onto failures,
+   orange is timed_out/questions) - and the pill's own TEXT is the
+   carrier per WCAG 1.4.1, with the row's left inset + bolded name as
+   the non-color marks, so the flag never relies on hue alone. */
+.stage.unreviewed { color:#39c5cf; border-color:#1e6e77; background:#122e33; }
+/* the left-edge inset mirrors .selected's filter mark - unreviewed wins
+   the slot when both classes land on one row (this rule is later) */
+tr.unreviewed td:first-child { box-shadow:inset 3px 0 #39c5cf; }
+tr.agen.unreviewed td.step > span { font-weight:700; }
 .linkbtn { background:none; border:0; color:#58a6ff; cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
 .run-name { color:#58a6ff; text-decoration:underline; text-align:left; }
 .run-name:hover { color:#79c0ff; }
@@ -7386,6 +7618,22 @@ const costTitle = c => !c ? 'no token data yet' :
   (c.label ? `${c.label} (${c.uid||''})` : (c.uid||'')) +
   (c.usd==null ? ' - no self-serve rate for this model'
               : ' - est. self-serve cost');
+// Review workflow: 'unreviewed' = a completion a human hasn't marked
+// reviewed. role=status so a live refresh announces it; the pill text is
+// the carrier - color is never the only signal. Independent of the
+// outcome's own status chips/dots, so a failed result stays red AND
+// carries this flag until someone looks.
+const unreviewedPill = what =>
+  `<span class="stage unreviewed" role="status" ` +
+  `title="${esc(what)} finished and has not been marked reviewed - ` +
+  `open details for the review controls">unreviewed</span>`;
+// kv-row text for the review field: an ack names the mark's stamp, a
+// seq-less legacy record says so outright instead of implying work.
+const reviewLine = e => e.needs_review ? 'needs review'
+  : (e.review && e.review.reviewed === true
+    ? `reviewed ${e.review.at || ''}`
+    : (e.completion_seq != null ? 'no review recorded'
+                               : 'no completion recorded'));
 // row density + sticky-topbar height (test harness stubs `document`
 // only - guard every browser global)
 const store = (typeof localStorage!=='undefined') ? localStorage :
@@ -7839,7 +8087,8 @@ function showDetail(i, keepStack){
   const pd = promptDrafts[pk];   // unsaved edit (undefined = none open)
   const nd = notesDrafts[pk];
   const kv = [['step',a.step],['run',a.run],['project',a.slug],
-    ['status',a.status],['task prompt',a.task_full||a.task],
+    ['status',a.status],['review',reviewLine(a)],
+    ['task prompt',a.task_full||a.task],
     ['result',a.next],['note',a.note],['log tail',a.tail_last],
     ['model',(a.model||'-')+(a.effort?' (effort '+a.effort+')':'')+
       (a.model_actual?' → '+a.model_actual:'')],
@@ -7896,6 +8145,18 @@ function showDetail(i, keepStack){
         `Session summary</a><span class="sub" style="margin-left:10px">` +
         `status, elapsed, tokens, trajectory, commits, stdout tail - ` +
         `readable markdown instead of a raw log.</span></div>` +
+        `<div class="actions"><button type="button" ` +
+        `class="btn${a.needs_review?'':' secondary'}" ` +
+        `data-review-step="${esc(base(a.run_dir))}" ` +
+        `data-step="${esc(a.step)}" ` +
+        `data-review-set="${a.needs_review?1:0}" ` +
+        `data-review-seq="${a.completion_seq??''}" ` +
+        `title="a private 'you looked at this' flag - it changes nothing ` +
+        `about the outcome and never marks the run itself">` +
+        `${a.needs_review?'Mark as reviewed':'Mark as needing review'}` +
+        `</button><span class="sub" style="margin-left:10px">` +
+        `a personal review mark for this task only - the run keeps its ` +
+        `own mark, and a re-run completion flags it again.</span></div>` +
         (a.status==='running'
           ? `<div class="actions"><button type="button" class="btn danger" ` +
             `data-stop-agent="${esc(base(a.run_dir))}" ` +
@@ -8084,6 +8345,9 @@ function showRunDetails(key, keepStack){
     ? (r.cost&&r.cost.usd||0)+(r.plan_cost&&r.plan_cost.usd||0) : null;
   const kv = [['description',r.description||'-'],['projects',(r.projects||[]).join(', ')],
     ['started',r.started_at],['ended',r.ended_at],
+    // review marks live on run records only - a proposal/planner row is
+    // preparation history, never a completion to ack
+    ...(r.stage?[]:[['review',reviewLine(r)]]),
     ['steps',(total?`${total} total · `:'')+
       Object.entries(r.counts||{}).map(([s,n])=>`${n} ${s}`).join(', ')],
     ['tokens',tokTitle(r.tokens)||'-'],
@@ -8119,6 +8383,15 @@ function showRunDetails(key, keepStack){
     `data-filter-run="${esc(key)}">Show only this run</button>` +
     (r.request_id ? `<button type="button" class="btn secondary" ` +
       `data-open-request="${esc(r.request_id)}">View original request / TOML</button>` : '') +
+    (r.stage ? '' : `<button type="button" ` +
+      `class="btn${r.needs_review?'':' secondary'}" ` +
+      `data-review-run="${esc(base(r.dir))}" ` +
+      `data-review-set="${r.needs_review?1:0}" ` +
+      `data-review-seq="${r.completion_seq??''}" ` +
+      `title="a private 'you looked at this' flag for the run as a whole ` +
+      `- its tasks keep their own marks">` +
+      `${r.needs_review?'Mark as reviewed':'Mark as needing review'}` +
+      `</button>`) +
     (r.stage==='generating' && r.request_id
       ? `<button type="button" class="btn danger" ` +
         `data-stop-gen="${esc(r.request_id)}" ` +
@@ -8228,6 +8501,11 @@ function ctxRunItems(r){
         attrs:ctxAttrs({'merge-run':base(r.dir),'rk':key})});
     if (act.length) it.push({sep:1}, ...act);
     it.push({sep:1});
+    it.push({label:r.needs_review?'Mark as reviewed':'Mark as needing review',
+      attrs:ctxAttrs({'review-run':base(r.dir),'review-set':r.needs_review?1:0,
+                      'review-seq':r.completion_seq??''}),
+      title:'personal review mark for the RUN as a whole - its tasks ' +
+            'keep their own'});
     it.push({label:r.archived?'Unarchive run':'Archive run',
       attrs:ctxAttrs({'arch-run':base(r.dir),'arch-set':r.archived?0:1})});
     it.push({label:'Delete run', danger:true, dis:!!c.liveSteps.length,
@@ -8270,6 +8548,12 @@ function ctxAgentItems(a){
   if (a.step==='plan-proposal' && a.status==='running' && a.request_id)
     act.push({label:'Stop proposal', danger:true,
       attrs:ctxAttrs({'stop-gen':a.request_id})});
+  if (a.run_dir)
+    act.push({label:a.needs_review?'Mark as reviewed':'Mark as needing review',
+      attrs:ctxAttrs({'review-step':base(a.run_dir),'step':a.step,
+                      'review-set':a.needs_review?1:0,
+                      'review-seq':a.completion_seq??''}),
+      title:'personal review mark for THIS task - the run keeps its own'});
   if (a.prompt_editable && a.run_dir)
     act.push({label:'Edit prompt', attrs:ctxAttrs({'edit-prompt':key}),
       title:'open the task and jump to the prompt editor'});
@@ -8937,10 +9221,16 @@ function render(d){
     const staleChip = r.stale &&
       r.stage!=='generating' && r.stage!=='questions'
         ? ` <span class="stage error">Needs review</span>`:'';
-    h += `<tr class="runrow${runKey(r)===selectedRun?' selected':''}" ` +
+    // 'unreviewed' marks a finished completion nobody acked - distinct
+    // from the stale-proposal 'Needs review' chip above (that one means
+    // the manifest drifted from its request, not a review ack).
+    const revChip = r.needs_review ? ` ${unreviewedPill('this run')}` : '';
+    h += `<tr class="runrow${runKey(r)===selectedRun?' selected':''}` +
+      `${r.needs_review?' unreviewed':''}" ` +
       `data-run-key="${esc(runKey(r))}" tabindex="0" ` +
       `aria-haspopup="menu" ` +
-      `aria-label="Filter to run ${esc(r.run)}"><td class="wrap">` +
+      `aria-label="Filter to run ${esc(r.run)}` +
+      `${r.needs_review?' · unreviewed':''}"><td class="wrap">` +
       (r.counts&&r.counts.running
         ? `<span class="dot run" style="background:#58a6ff" ` +
           `title="a step in this run is running"></span>` : '') +
@@ -8983,7 +9273,7 @@ function render(d){
         (r.archived ? `<span class="stage archived" ` +
           `title="auto-archived run - hidden from the default view; ` +
           `files stay on disk">archived</span>` : '') +
-        runStateChip(r) + staleChip + `<br>` +
+        runStateChip(r) + staleChip + revChip + `<br>` +
         `<span class="sub">${esc(base(r.dir))}</span>`) +
       `</div></td>` +
       `<td class="wrap">${r.description?esc(r.description):
@@ -9065,9 +9355,11 @@ function render(d){
           `title="live session (inferred - recorded at step end)">` +
           `${esc(sess)}…</td>`
         : `<td class="hide-s"${sess==='…'?' title="recorded when the step ends"':''}>${esc(sess)}</td>`;
-      h += `<tr class="agen" data-i="${a._i}" ` +
+      h += `<tr class="agen${a.needs_review?' unreviewed':''}" ` +
+        `data-i="${a._i}" ` +
         `data-run-key="${esc(a.run_key||a.run_dir||'')}" tabindex="0" ` +
-        `aria-haspopup="menu" aria-label="task ${esc(a.step)}">` +
+        `aria-haspopup="menu" aria-label="task ${esc(a.step)}` +
+        `${a.needs_review?' · unreviewed':''}">` +
         `<td><span class="dot${pulse}" style="background:${c}" ` +
         `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>` +
         `${a.status}` +
@@ -9076,7 +9368,8 @@ function render(d){
           `×${a.attempts}</span>` : '') +
         (a.timeout_ext_s ? `<span class="sub" title="stayed active ` +
           `${fmtS(a.timeout_ext_s)} past the timeout floor"> +ext</span>`
-          : '') + `</td>` +
+          : '') +
+        (a.needs_review ? ` ${unreviewedPill('this task')}` : '') + `</td>` +
         `<td class="step"><span>${esc(a.step)}</span>${a.wt
           ? ` <button type="button" class="chip" data-facet="wt" ` +
             `style="color:#58a6ff" title="${esc(a.branch||'worktree')}">wt</button>` +
@@ -9497,6 +9790,28 @@ document.addEventListener('click', async e=>{
       closeDetail(true); await refresh();
     } catch(err){ alert((on?'Archive':'Unarchive')+' failed: ' +
       err.message); t.disabled=false; }
+    return; }
+  // Review marks: run-level (data-review-run) and task-level
+  // (data-review-step + data-step). No confirm - the mark is a private,
+  // reversible 'you looked at this' flag, and the modal stays open so
+  // the pill + kv line flip in place on the refresh. data-review-seq
+  // rides the POST so an ack on a view older than the newest completion
+  // is refused instead of silently covering it.
+  if (t.dataset && (t.dataset.reviewRun || t.dataset.reviewStep)){
+    const dir=t.dataset.reviewRun||t.dataset.reviewStep;
+    const reviewed=t.dataset.reviewSet==='1';
+    const rawSeq=t.dataset.reviewSeq;
+    t.disabled=true;
+    try {
+      await api('POST',
+        `/api/runs/${encodeURIComponent(dir)}` +
+        (t.dataset.reviewStep
+          ? `/steps/${encodeURIComponent(t.dataset.step)}` : '') +
+        `/review`,
+        {reviewed, seq: (rawSeq===''||rawSeq==null) ? null : +rawSeq});
+      await refresh();
+    } catch(err){ alert('Review update failed: '+err.message);
+      t.disabled=false; }
     return; }
   if (t.dataset && t.dataset.deleteRun){
     const dir=t.dataset.deleteRun;
@@ -9943,6 +10258,12 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                                                 runs_dir))
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/delete", path)):
                     self._json(delete_run(m.group(1), body, runs_dir))
+                elif (m := re.fullmatch(r"/api/runs/([^/]+)/review", path)):
+                    self._json(set_run_review(m.group(1), body, runs_dir))
+                elif (m := re.fullmatch(
+                        r"/api/runs/([^/]+)/steps/([^/]+)/review", path)):
+                    self._json(set_step_review(m.group(1), m.group(2), body,
+                                               runs_dir))
                 elif (m := re.fullmatch(
                         r"/api/runs/([^/]+)/steps/([^/]+)/stop", path)):
                     self._json(stop_step(m.group(1), m.group(2), runs_dir),

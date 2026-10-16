@@ -7108,5 +7108,547 @@ const body=()=>elem('dbody').innerHTML;
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class ReviewWorkflowTests(_RunControlBase):
+    """Review acknowledgment for finalized runs + tasks: completion_seq
+    bumps once per terminal-outcome write; review-* sentinels carry the
+    human's mark (trap-5 safe) and fold into state.json on the next
+    save; an ack binds the seq it saw so a re-completion re-flags while
+    repeated saves of the same outcome never do. Run and task marks are
+    independent, and 'unreviewed' never masquerades as success."""
+
+    @staticmethod
+    def _state(run_dir: Path) -> dict:
+        return json.loads((run_dir / "state.json").read_text(
+            encoding="utf-8"))
+
+    def _collect(self, runs: Path) -> dict:
+        with mock.patch.object(conductor, "refresh_prices"):
+            return conductor.collect_dashboard(
+                runs, ["no-such-devin"],
+                requests_dir=runs.parent / "requests")
+
+    @staticmethod
+    def _dead_driver(run_dir: Path):
+        """The run ended, so its conductor pid is dead. Mock runs execute
+        in-process (driver_pid = this test process, still alive) - stamp a
+        dead pid so the immediate state.json fold can run like it would
+        after a real run's driver exits."""
+        sj = run_dir / "state.json"
+        st = json.loads(sj.read_text(encoding="utf-8"))
+        st["driver_pid"] = 999_999_999
+        sj.write_text(json.dumps(st), encoding="utf-8")
+
+    def _finish_run(self, base: Path, prompt: str = "first",
+                    want_rc: int = 0):
+        """A one-step mock run to completion; returns manifest, runs dir,
+        and the run dir it created."""
+        proj = make_project(base)
+        runs = base / "runs"
+        m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "{prompt}"
+''')
+        self.assertEqual(run_manifest(m, runs), want_rc)
+        run_dir = next(runs.glob("*/state.json")).parent
+        self._dead_driver(run_dir)
+        self.addCleanup(lambda: [
+            conductor.review_flag(run_dir, s).unlink(missing_ok=True)
+            for s in (None, "s1", "s2")])
+        return m, runs, run_dir
+
+    def test_completion_seq_stamped_on_terminal_writes(self):
+        with tempfile.TemporaryDirectory() as td:
+            _m, runs, run_dir = self._finish_run(Path(td))
+            st = self._state(run_dir)
+            self.assertEqual(st["steps"]["s1"]["completion_seq"], 1)
+            self.assertEqual(st["completion_seq"], 1)
+            # ...and the dashboard reports both as needing review,
+            # with status untouched.
+            d = self._collect(runs)
+            a = next(x for x in d["agents"] if x["step"] == "s1")
+            r = d["runs"][0]
+            self.assertEqual(a["status"], "done")
+            self.assertTrue(a["needs_review"])
+            self.assertEqual(a["completion_seq"], 1)
+            self.assertTrue(r["needs_review"])
+
+    def test_failed_outcome_still_needs_review(self):
+        """'unreviewed' is never a success badge: a failed step keeps its
+        red status AND the review flag."""
+        with tempfile.TemporaryDirectory() as td:
+            _m, runs, run_dir = self._finish_run(Path(td), "mockfail", 1)
+            st = self._state(run_dir)
+            self.assertEqual(st["steps"]["s1"]["status"], "failed")
+            self.assertTrue(st["steps"]["s1"]["completion_seq"])
+            a = next(x for x in self._collect(runs)["agents"]
+                     if x["step"] == "s1")
+            self.assertEqual(a["status"], "failed")
+            self.assertTrue(a["needs_review"])
+
+    def test_ack_reflag_and_persistence(self):
+        """ack clears the indicator; a tombstone restores it; the mark
+        folds into state.json and survives a fresh read (restart)."""
+        with tempfile.TemporaryDirectory() as td:
+            _m, runs, run_dir = self._finish_run(Path(td))
+            out = conductor.set_step_review(
+                run_dir.name, "s1", {"reviewed": True}, runs)
+            self.assertFalse(out["needs_review"])
+            self.assertEqual(out["review"]["seq"], 1)
+            # folded into state.json right away (nothing live)
+            rec = self._state(run_dir)["steps"]["s1"]
+            self.assertEqual(rec["review"]["reviewed"], True)
+            self.assertEqual(rec["review"]["seq"], 1)
+            self.assertTrue(conductor.review_flag(run_dir, "s1").is_file())
+            a = next(x for x in self._collect(runs)["agents"]
+                     if x["step"] == "s1")
+            self.assertFalse(a["needs_review"])
+            # tombstone re-arms it; a second ack clears it again
+            out = conductor.set_step_review(
+                run_dir.name, "s1", {"reviewed": False}, runs)
+            self.assertTrue(out["needs_review"])
+            self.assertTrue(self._state(run_dir)["steps"]["s1"]
+                            ["review"]["reviewed"] is False)
+            conductor.set_step_review(
+                run_dir.name, "s1", {"reviewed": True}, runs)
+            a = next(x for x in self._collect(runs)["agents"]
+                     if x["step"] == "s1")
+            self.assertFalse(a["needs_review"])
+
+    def test_same_completion_updates_never_reset_ack(self):
+        """Repeated saves of the same outcome and unrelated metadata
+        edits keep the ack - the seq never moves on them."""
+        with tempfile.TemporaryDirectory() as td:
+            _m, runs, run_dir = self._finish_run(Path(td))
+            conductor.set_step_review(
+                run_dir.name, "s1", {"reviewed": True}, runs)
+            conductor.set_run_review(
+                run_dir.name, {"reviewed": True}, runs)
+            st = self._state(run_dir)
+            # metadata-only churn: a note edit plus repeated saves
+            rec = st["steps"]["s1"]
+            rec["note"] = "operator note edit after the fact"
+            conductor.save_state(run_dir, st)
+            st = self._state(run_dir)
+            conductor.save_state(run_dir, st)       # plain re-save
+            st = self._state(run_dir)
+            self.assertEqual(st["steps"]["s1"]["completion_seq"], 1)
+            self.assertEqual(st["completion_seq"], 1)
+            a = next(x for x in self._collect(runs)["agents"]
+                     if x["step"] == "s1")
+            self.assertFalse(a["needs_review"])
+            self.assertFalse(self._collect(runs)["runs"][0]["needs_review"])
+
+    def test_run_and_step_marks_are_independent(self):
+        with tempfile.TemporaryDirectory() as td:
+            _m, runs, run_dir = self._finish_run(Path(td))
+            # ack the run only -> the task stays unreviewed
+            conductor.set_run_review(
+                run_dir.name, {"reviewed": True}, runs)
+            d = self._collect(runs)
+            self.assertFalse(d["runs"][0]["needs_review"])
+            a = next(x for x in d["agents"] if x["step"] == "s1")
+            self.assertTrue(a["needs_review"])
+            # ack the task only -> the run stays unreviewed
+            conductor.set_run_review(
+                run_dir.name, {"reviewed": False}, runs)
+            conductor.set_step_review(
+                run_dir.name, "s1", {"reviewed": True}, runs)
+            d = self._collect(runs)
+            self.assertTrue(d["runs"][0]["needs_review"])
+            a = next(x for x in d["agents"] if x["step"] == "s1")
+            self.assertFalse(a["needs_review"])
+
+    def test_legacy_records_never_autoflag_but_take_marks(self):
+        """A seq-less historical record is not presented as freshly
+        completed - though a human can still mark it both ways."""
+        with tempfile.TemporaryDirectory() as td:
+            _m, runs, run_dir = self._finish_run(Path(td))
+            st = self._state(run_dir)
+            st["steps"]["s1"].pop("completion_seq", None)
+            st.pop("completion_seq", None)
+            (run_dir / "state.json").write_text(
+                json.dumps(st), encoding="utf-8")
+            d = self._collect(runs)
+            a = next(x for x in d["agents"] if x["step"] == "s1")
+            self.assertFalse(a["needs_review"])
+            self.assertFalse(d["runs"][0]["needs_review"])
+            # 'mark reviewed' on a seq-less record with no tombstone:
+            # nothing to review -> refused
+            with self.assertRaises(conductor.RequestError) as ctx:
+                conductor.set_step_review(
+                    run_dir.name, "s1", {"reviewed": True}, runs)
+            self.assertEqual(ctx.exception.status, 409)
+            # tombstone, then clear it by hand - both are allowed
+            conductor.set_step_review(
+                run_dir.name, "s1", {"reviewed": False}, runs)
+            a = next(x for x in self._collect(runs)["agents"]
+                     if x["step"] == "s1")
+            self.assertTrue(a["needs_review"])
+            conductor.set_step_review(
+                run_dir.name, "s1", {"reviewed": True}, runs)
+            a = next(x for x in self._collect(runs)["agents"]
+                     if x["step"] == "s1")
+            self.assertFalse(a["needs_review"])
+
+    def test_older_ack_never_hides_a_newer_completion(self):
+        with tempfile.TemporaryDirectory() as td:
+            _m, runs, run_dir = self._finish_run(Path(td))
+            # simulate a mark bound to an older seq than the record's
+            rec = self._state(run_dir)["steps"]["s1"]
+            self.assertTrue(
+                conductor._needs_review(
+                    2, {"reviewed": True, "seq": 1,
+                        "at": conductor.now_iso()}))
+            self.assertTrue(
+                conductor._needs_review(rec["completion_seq"], None))
+            self.assertFalse(
+                conductor._needs_review(
+                    1, {"reviewed": True, "seq": 1,
+                        "at": conductor.now_iso()}))
+            # tombstone always shows, seq or not
+            self.assertTrue(
+                conductor._needs_review(
+                    None, {"reviewed": False, "seq": None,
+                           "at": conductor.now_iso()}))
+            # and the endpoint's seq guard: an ack made against a stale
+            # view is refused instead of masking the newer completion
+            with self.assertRaises(conductor.RequestError) as ctx:
+                conductor.set_step_review(
+                    run_dir.name, "s1",
+                    {"reviewed": True, "seq": 99}, runs)
+            self.assertEqual(ctx.exception.status, 409)
+
+    def test_flag_overlay_reads_live_and_folds_on_save(self):
+        """A sentinel written 'while the driver is up' is honored by
+        collect_dashboard before any save, then lands in state.json on
+        the next save_state - restart-proof."""
+        with tempfile.TemporaryDirectory() as td:
+            _m, runs, run_dir = self._finish_run(Path(td))
+            flag = conductor.review_flag(run_dir, "s1")
+            flag.parent.mkdir(exist_ok=True)
+            flag.write_text(json.dumps(
+                {"reviewed": True, "seq": 1, "at": conductor.now_iso()}),
+                encoding="utf-8")
+            # live overlay: no fold yet - state.json still has no mark
+            self.assertNotIn("review", self._state(run_dir)["steps"]["s1"])
+            a = next(x for x in self._collect(runs)["agents"]
+                     if x["step"] == "s1")
+            self.assertFalse(a["needs_review"])
+            # next driver save folds the mark into the durable record
+            conductor.save_state(run_dir, self._state(run_dir))
+            rec = self._state(run_dir)["steps"]["s1"]
+            self.assertEqual(rec["review"]["seq"], 1)
+            # a stale flag never masks a newer folded mark
+            flag.write_text(json.dumps(
+                {"reviewed": False, "seq": 1,
+                 "at": "2001-01-01T00:00:00"}), encoding="utf-8")
+            a = next(x for x in self._collect(runs)["agents"]
+                     if x["step"] == "s1")
+            self.assertFalse(a["needs_review"])
+
+    def test_clear_run_flags_preserves_review(self):
+        with tempfile.TemporaryDirectory() as td:
+            _m, runs, run_dir = self._finish_run(Path(td))
+            conductor.set_step_review(
+                run_dir.name, "s1", {"reviewed": True}, runs)
+            conductor._flag_raise(conductor.stop_flag(run_dir).name)
+            conductor._flag_raise(
+                conductor.review_flag(run_dir, "s2").name)
+            conductor.clear_run_flags(run_dir)
+            self.assertFalse(conductor.stop_flag(run_dir).is_file())
+            self.assertTrue(
+                conductor.review_flag(run_dir, "s1").is_file())
+            self.assertTrue(
+                conductor.review_flag(run_dir, "s2").is_file())
+
+    def test_sweep_lost_mark_bumps_seq(self):
+        """A stale 'running' record swept to 'lost' is a new outcome -
+        it gets its own completion_seq and flags for review."""
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            rd = runs / "20260101-000000-t"
+            rd.mkdir(parents=True)
+            (rd / "state.json").write_text(json.dumps({
+                "run": "t", "started_at": "2026-01-01T00:00:00",
+                "driver_pid": 999_999_999,
+                "steps": {"s1": {"name": "s1", "status": "running",
+                                 "started_at": "2026-01-01T00:00:00",
+                                 "ended_at": "2026-01-01T00:10:00",
+                                 "stdout_log": "gone.log"}}}),
+                encoding="utf-8")
+            lines = conductor.sweep_runs(runs)
+            self.assertTrue(any("lost" in ln for ln in lines))
+            st = self._state(rd)
+            self.assertEqual(st["steps"]["s1"]["status"], "lost")
+            self.assertEqual(st["steps"]["s1"]["completion_seq"], 1)
+            self.assertEqual(st["completion_seq"], 1)   # run closed too
+
+    def test_resume_recompletion_requires_review_again(self):
+        """Stop mid-run -> stop marks seq 1 -> ack -> resume re-runs the
+        step -> seq 2; the old ack no longer covers it."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "sleep=3 then work"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "second"
+''')
+            t, _rc = self._start_run(m, runs)
+            run_dir = self._wait_run_dir(runs, "s1")
+            self.addCleanup(lambda: [
+                conductor.review_flag(run_dir, s).unlink(missing_ok=True)
+                for s in (None, "s1", "s2")])
+            conductor.stop_run(run_dir.name, {}, runs)
+            t.join(timeout=30)
+            self._dead_driver(run_dir)
+            st = self._state(run_dir)
+            self.assertEqual(st["steps"]["s1"]["status"], "stopped")
+            self.assertEqual(st["steps"]["s1"]["completion_seq"], 1)
+            # human acks the stopped outcome - flag survives resume
+            conductor.set_step_review(
+                run_dir.name, "s1", {"reviewed": True}, runs)
+            self.assertEqual(
+                self._state(run_dir)["steps"]["s1"]["review"]["seq"], 1)
+            rc = run_manifest(m, runs, resume=str(run_dir))
+            self.assertEqual(rc, 0)
+            st = self._state(run_dir)
+            rec = st["steps"]["s1"]
+            self.assertEqual(rec["status"], "done")
+            self.assertEqual(rec["completion_seq"], 2)
+            self.assertEqual(rec["review"]["seq"], 1)   # folded, kept
+            self.assertTrue(
+                conductor.review_flag(run_dir, "s1").is_file())
+            d = self._collect(runs)
+            a = next(x for x in d["agents"] if x["step"] == "s1")
+            self.assertTrue(a["needs_review"])
+            self.assertTrue(d["runs"][0]["needs_review"])
+
+    def test_review_endpoints_over_http(self):
+        """POST /api/runs/<d>/review and .../steps/<s>/review carry the
+        marks; unknown runs/steps 404, a stale-seq ack 409s, a non-bool
+        'reviewed' 422s, and 'mark reviewed' with nothing to review 409s."""
+        with tempfile.TemporaryDirectory() as td:
+            _m, runs, run_dir = self._finish_run(Path(td))
+            reqs = Path(td) / "reqs"
+            handler = conductor.make_dashboard_handler(
+                runs, ["no-such-devin"], reqs, Path(td) / "manifests")
+            server = conductor.http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0), handler)
+            threading.Thread(target=server.serve_forever,
+                             daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            port = server.server_port
+
+            def call(method, path, data=None):
+                conn = http.client.HTTPConnection("127.0.0.1", port,
+                                                  timeout=5)
+                conn.request(
+                    method, path,
+                    json.dumps(data).encode("utf-8") if data is not None
+                    else None,
+                    {"Content-Type": "application/json",
+                     "Origin": f"http://127.0.0.1:{port}"})
+                res = conn.getresponse()
+                payload = json.loads(res.read().decode("utf-8"))
+                conn.close()
+                return res.status, payload
+
+            status, out = call("POST",
+                               f"/api/runs/{run_dir.name}/review",
+                               {"reviewed": True})
+            self.assertEqual(status, 200)
+            self.assertFalse(out["needs_review"])
+            self.assertEqual(out["review"]["seq"], 1)
+            status, out = call(
+                "POST",
+                f"/api/runs/{run_dir.name}/steps/s1/review",
+                {"reviewed": False})
+            self.assertEqual(status, 200)
+            self.assertTrue(out["needs_review"])
+            # the run mark above never covered the task
+            status, _ = call("POST", "/api/runs/nope/review",
+                             {"reviewed": True})
+            self.assertEqual(status, 404)
+            status, _ = call(
+                "POST", f"/api/runs/{run_dir.name}/steps/nope/review",
+                {"reviewed": True})
+            self.assertEqual(status, 404)
+            status, _ = call("POST", f"/api/runs/{run_dir.name}/review",
+                             {"reviewed": "yes"})
+            self.assertEqual(status, 422)
+            status, _ = call("POST", f"/api/runs/{run_dir.name}/review",
+                             {"reviewed": True, "seq": 42})
+            self.assertEqual(status, 409)
+
+    def test_nothing_to_review_is_refused(self):
+        """A run with no completion yet can't be 'marked reviewed' -
+        only a tombstone (explicit 'needs review') is legal there."""
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            rd = runs / "20260101-000000-t"
+            rd.mkdir(parents=True)
+            (rd / "state.json").write_text(json.dumps({
+                "run": "t", "started_at": "2026-01-01T00:00:00",
+                "driver_pid": 999_999_999,
+                "steps": {"s1": {"name": "s1", "status": "failed",
+                                 "ended_at": "2026-01-01T00:10:00"}}}),
+                encoding="utf-8")
+            self.addCleanup(lambda: [
+                conductor.review_flag(rd, s).unlink(missing_ok=True)
+                for s in (None, "s1")])
+            with self.assertRaises(conductor.RequestError) as ctx:
+                conductor.set_run_review(
+                    rd.name, {"reviewed": True}, runs)
+            self.assertEqual(ctx.exception.status, 409)
+            # tombstone IS legal (flag a run for attention)
+            out = conductor.set_run_review(
+                rd.name, {"reviewed": False}, runs)
+            self.assertTrue(out["needs_review"])
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_js_review_badges_modal_and_ctx(self):
+        """Table pills, row accents + a11y text, the modal's review kv
+        and buttons, ctx-menu parity, and the delegated POST dispatch -
+        including that a failed row keeps its status text next to the
+        pill."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,
+  {innerHTML:'',hidden:true,textContent:'',scrollTop:0});
+  return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const posts=[], calls=[];
+const fetch=async(url,opt)=>{
+  calls.push([url,opt&&opt.body?JSON.parse(opt.body):null]);
+  if (url.startsWith('/api/state'))
+    return {ok:true,status:200,json:async()=>data};
+  posts.push([url,opt&&opt.body?JSON.parse(opt.body):null]);
+  return {ok:true,status:200,json:async()=>({needs_review:false})};
+};
+const ctx=vm.createContext({document,fetch,confirm:()=>true,alert:()=>{},
+  location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-14T00:00:00',agents:[
+  {step:'s1',run:'r1',run_dir:'/r1',run_key:'k1',slug:'p',status:'done',
+   task:'t1',completion_seq:1,needs_review:true},
+  {step:'s2',run:'r1',run_dir:'/r1',run_key:'k1',slug:'p',status:'failed',
+   task:'t2',completion_seq:3,needs_review:true,
+   review:{reviewed:true,seq:1,at:'2026-10-14T00:30:00'}},
+  {step:'s3',run:'r2',run_dir:'/r2',run_key:'k2',slug:'p',status:'done',
+   task:'t3',completion_seq:1,needs_review:false,
+   review:{reviewed:true,seq:1,at:'2026-10-14T01:00:00'}},
+  {step:'plan-proposal',run:'rq',run_dir:null,run_key:'request:q1',
+   slug:'p',status:'done',task:'planner',needs_review:false}],runs:[
+  {run:'r1',dir:'/r1',counts:{done:1,failed:1},
+   ended_at:'2026-10-14T01:00:00',
+   completion_seq:2,needs_review:true},
+  {run:'r2',dir:'/r2',counts:{done:1},ended_at:'2026-10-14T02:00:00',
+   completion_seq:1,needs_review:false,
+   review:{reviewed:true,seq:1,at:'2026-10-14T02:00:00'}},
+  {run:'rq',dir:'/q.toml',key:'request:q1',request_id:'q1',stage:'ready',
+   counts:{planned:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const runs=elem('runs').innerHTML;
+// run row: unreviewed class + pill text + aria mention; a reviewed run
+// carries none of them; a proposal/stage row never flags
+const r1row=runs.split('<tr').find(x=>x.includes('>r1<'));
+assert.match(r1row,/runrow[^"]*unreviewed/);
+assert.match(r1row,/class="stage unreviewed"[^>]*>unreviewed</);
+assert.match(r1row,/aria-label="Filter to run r1 · unreviewed"/);
+const r2row=runs.split('<tr').find(x=>x.includes('>r2<'));
+assert.doesNotMatch(r2row,/unreviewed/);
+const rqrow=runs.split('<tr').find(x=>x.includes('>rq<'));
+assert.doesNotMatch(rqrow,/unreviewed/);
+const agents=elem('agents').innerHTML;
+// task rows: failed step keeps its red dot+text AND the pill - the
+// review flag never reads as success
+const s2row=agents.split('<tr').find(x=>x.includes('>s2<'));
+assert.match(s2row,/unreviewed/);
+assert.match(s2row,/>failed/);
+assert.match(s2row,/aria-label="task s2 · unreviewed"/);
+const s3row=agents.split('<tr').find(x=>x.includes('>s3<'));
+assert.doesNotMatch(s3row,/unreviewed/);
+const s4row=agents.split('<tr').find(x=>x.includes('>plan-proposal<'));
+assert.doesNotMatch(s4row,/unreviewed/);
+const click=async(ds)=>handlers.click({target:{dataset:ds,
+  closest:()=>null,disabled:false},preventDefault:()=>{}});
+const open=async(step)=>{ const i=vm.runInContext(
+  'AGENTS.findIndex(a=>a.step==='+JSON.stringify(step)+')',ctx);
+  vm.runInContext('showDetail('+i+')',ctx); };
+(async()=>{
+  // task modal: review kv line + both buttons for an unreviewed task
+  await open('s1');
+  let body=elem('dbody').innerHTML;
+  assert.match(body,/<div class="k">review<\/div><div class="wrap">needs review<\/div>/);
+  assert.match(body,/data-review-step="r1"[^>]*data-step="s1"[^>]*data-review-set="1"[^>]*data-review-seq="1"/);
+  assert.match(body,/>Mark as reviewed</);
+  // clicking it posts to the step endpoint with its seq
+  await click({reviewStep:'r1',step:'s1',reviewSet:'1',reviewSeq:'1'});
+  assert.deepEqual(posts.pop(),
+    ['/api/runs/r1/steps/s1/review',{reviewed:true,seq:1}]);
+  // a reviewed task shows the reviewed line + the reversal button
+  await open('s3');
+  body=elem('dbody').innerHTML;
+  assert.match(body,/<div class="k">review<\/div><div class="wrap">reviewed 2026-10-14T01:00:00<\/div>/);
+  assert.match(body,/>Mark as needing review</);
+  await click({reviewStep:'r2',step:'s3',reviewSet:'0',reviewSeq:'1'});
+  assert.deepEqual(posts.pop(),
+    ['/api/runs/r2/steps/s3/review',{reviewed:false,seq:1}]);
+  // run modal: same control pair at run level
+  vm.runInContext("showRunDetails('/r1')",ctx);
+  body=elem('dbody').innerHTML;
+  assert.match(body,/<div class="k">review<\/div><div class="wrap">needs review<\/div>/);
+  assert.match(body,/data-review-run="r1"[^>]*data-review-set="1"[^>]*data-review-seq="2"/);
+  await click({reviewRun:'r1',reviewSet:'1',reviewSeq:'2'});
+  assert.deepEqual(posts.pop(),['/api/runs/r1/review',{reviewed:true,seq:2}]);
+  // a reviewed run offers the reversal; its kv names the mark
+  vm.runInContext("showRunDetails('/r2')",ctx);
+  body=elem('dbody').innerHTML;
+  assert.match(body,/<div class="k">review<\/div><div class="wrap">reviewed 2026-10-14T02:00:00<\/div>/);
+  assert.match(body,/>Mark as needing review</);
+  // proposal modal carries no review controls at all
+  vm.runInContext("showRunDetails('request:q1')",ctx);
+  body=elem('dbody').innerHTML;
+  assert.doesNotMatch(body,/data-review-/);
+  assert.doesNotMatch(body,/class="k">review/);
+  // ctx menus: same hooks at both levels
+  const ritems=vm.runInContext(
+    'ctxRunItems(lastData.runs[0]).map(i=>i.label)',ctx);
+  assert.ok(ritems.includes('Mark as reviewed'));
+  const r2items=vm.runInContext(
+    'ctxRunItems(lastData.runs[1]).map(i=>i.label)',ctx);
+  assert.ok(r2items.includes('Mark as needing review'));
+  const aitems=vm.runInContext(
+    'ctxAgentItems(AGENTS.find(a=>a.step===\'s1\')).map(i=>i.label)',ctx);
+  assert.ok(aitems.includes('Mark as reviewed'));
+  // planner row: run_dir is null -> no review item
+  const pitems=vm.runInContext(
+    'ctxAgentItems(AGENTS.find(a=>a.step===\'plan-proposal\')).map(i=>i.label)',ctx);
+  assert.ok(!pitems.includes('Mark as reviewed'));
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
