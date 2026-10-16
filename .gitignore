@@ -4,3 +4,10 @@ logs/
 __pycache__/
 *.pyc
 projects.local.toml
+
+# dashboard serve logs - written continuously by `serve`, must stay untracked
+# (a tracked log file dirties the checkout while a run is live, which
+# blocks the merge resolver)
+serve-*.log
+serve-*.err
+nul
