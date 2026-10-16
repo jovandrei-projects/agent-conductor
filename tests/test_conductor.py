@@ -50,9 +50,27 @@ def write_manifest(base: Path, steps: str, extra: str = "") -> Path:
 
 
 def run_manifest(manifest: Path, runs_dir: Path, resume=None) -> int:
-    return conductor.cmd_run(argparse.Namespace(
+    rc = conductor.cmd_run(argparse.Namespace(
         manifest=str(manifest), resume=resume, devin=MOCK,
         runs_dir=str(runs_dir), hub=False, keep_awake=False))
+    # cmd_run ran IN this process: the driver_pid it stamped is the live
+    # test runner. pid_alive's creation-window makes that read dead on
+    # Windows but alive forever on POSIX, and even on Windows a run in the
+    # suite's first seconds can fall inside the window - so restamp a
+    # genuinely dead pid. The driver DID exit; the record should say so.
+    try:
+        rd = (Path(resume) if resume and Path(resume).is_dir()
+              else max(Path(runs_dir).iterdir(),
+                       key=lambda p: p.stat().st_mtime))
+        st = json.loads((rd / "state.json").read_text(encoding="utf-8"))
+        if st.get("driver_pid") == os.getpid():
+            dead = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead.wait()
+            st["driver_pid"] = dead.pid
+            (rd / "state.json").write_text(json.dumps(st))
+    except (OSError, ValueError, StopIteration):
+        pass
+    return rc
 
 
 class ProjectsRegistryTests(unittest.TestCase):
@@ -5048,6 +5066,90 @@ const menuBtn=dataset=>({id:'',dataset,disabled:false,
   await handlers.click({target:onRow(runRow('/runs/done')),
     preventDefault:()=>{}});
   assert.equal(vm.runInContext('selectedRun',ctx),'/runs/done');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_merge_pending_disabled_while_run_executing(self):
+        """The manual-merge guard's UI half: while the server marks the
+        run 'executing' the menu item and the modal button render DISABLED
+        with the reason - the action can never imply safety mid-run. A
+        parked branch still counts as pending, so the gating is what
+        changes, not the visibility."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, posts=[];
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',scrollTop:0,style:{},querySelector:()=>null,
+  querySelectorAll:()=>[]}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const sel={isCollapsed:true,toString:()=>''};
+const window={innerWidth:1200,innerHeight:800,addEventListener:()=>{},
+  getSelection:()=>sel};
+// 'exe' is mid-flight between waves: its only step row reads 'failed'
+// (so pendingMerge is true) but the server says executing. 'st' is the
+// same shape genuinely stopped - merge must be offered there.
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',agents:[
+  {step:'p',run:'exe',run_dir:'/runs/exe',run_key:'/runs/exe',slug:'prj',
+   status:'failed',branch:'conductor/exe/p',merged:false,task:'t'},
+  {step:'q',run:'st',run_dir:'/runs/st',run_key:'/runs/st',slug:'prj',
+   status:'failed',branch:'conductor/st/q',merged:false,task:'t'}],
+ runs:[{run:'exe',dir:'/runs/exe',key:'/runs/exe',counts:{failed:1},
+        executing:true},
+       {run:'st',dir:'/runs/st',key:'/runs/st',counts:{failed:1},
+        executing:false,ended_at:'2026-10-16T01:00:00'}]};
+const fetch=async(url,opt)=>{
+  posts.push({url,body:opt&&opt.body?JSON.parse(opt.body):null});
+  if(url.startsWith('/api/state')) return {ok:true,json:async()=>data};
+  return {ok:true,json:async()=>({}),text:async()=>''};};
+const ctx=vm.createContext({document,window,fetch,confirm:()=>true,
+  alert:()=>{},location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const cls=c=>({contains:x=>c.split(' ').includes(x),add(){},remove(){}});
+const runRow=key=>({cls:'runrow',dataset:{runKey:key},
+  classList:cls('runrow'),isConnected:true,
+  focus(){},matches:s=>s==='tr.runrow'||s==='tr.runrow,tr.agen',
+  getBoundingClientRect:()=>({left:10,top:20,bottom:30})});
+const onRow=row=>({isContentEditable:false,dataset:{},
+  closest:sel=>{
+    if(sel==='#ctxmenu')return null;
+    if(sel.indexOf('input')===0)return null;
+    if(sel==='tr.runrow')return row.cls==='runrow'?row:null;
+    if(sel==='tr.runrow,tr.agen')return row;
+    return null;}});
+const rclick=t=>handlers.contextmenu({target:t,clientX:60,clientY:70,
+  preventDefault:()=>{}});
+(async()=>{
+  // executing run: the item exists (the pending merge is real) but is
+  // disabled with the explanation - it cannot be clicked into the POST
+  rclick(onRow(runRow('/runs/exe')));
+  const m=elem('ctxmenu');
+  assert.match(m.innerHTML,
+    /disabled[^>]*data-merge-run="exe"[^>]*>Merge pending branches/);
+  assert.match(m.innerHTML,/title="[^"]*still executing/);
+  // a genuinely stopped run: same item, enabled, normal title
+  rclick(onRow(runRow('/runs/st')));
+  assert.match(m.innerHTML,/data-merge-run="st"[^>]*>Merge pending branches/);
+  assert.doesNotMatch(m.innerHTML,/disabled[^>]*data-merge-run="st"/);
+  // the modal mirrors it: disabled + explained for the executing run
+  vm.runInContext('showRunDetails("/runs/exe")',ctx);
+  assert.match(elem('dbody').innerHTML,
+    /data-merge-run="exe"[^>]*disabled[^>]*title="[^"]*still executing/);
+  // ...enabled for the stopped one
+  vm.runInContext('showRunDetails("/runs/st")',ctx);
+  const hb=elem('dbody').innerHTML;
+  assert.match(hb,/data-merge-run="st"/);
+  assert.doesNotMatch(hb,/data-merge-run="st"[^>]*disabled/);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
