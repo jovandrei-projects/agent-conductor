@@ -4126,9 +4126,186 @@ assert.match(row('failed-run'),/Needs review/);   // planning failed, stale stay
 (async()=>{
   await vm.runInContext('openRequest("regen")',ctx);
   assert.match(elem('dbody').innerHTML,/Planning in progress/);
-  assert.doesNotMatch(elem('dbody').innerHTML,/Request fields changed/);
+  // the pending note stays silent mid-planning - the change is being
+  // regenerated already (a legacy rec's lumped stale flag reports as the
+  // opaque 'fields' marker, so it must not leak in here either)
+  assert.equal(elem('pend-note').hidden,true);
   await vm.runInContext('openRequest("review")',ctx);
-  assert.match(elem('dbody').innerHTML,/Request fields changed/);
+  assert.match(elem('pend-note').innerHTML,/Request fields changed/);
+  assert.equal(elem('pend-note').hidden,false);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_pending_notice_buttons_and_revert(self):
+        """The pending note, Apply and Start run follow a live field-vs-
+        baseline diff: an option change enables Apply (and names the
+        fields), a generation-input change disables it ('regenerate
+        first'), reverting to the baseline clears the mark, and Start run
+        stays disabled while anything is pending."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,
+  {innerHTML:'',hidden:true,textContent:'',value:'',checked:false,
+   disabled:false,title:''}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const BASE={raw:'tidy it',project:'proj',attachments:[],model:'swe-2',
+  effort:'max',on_failure:'continue',max_attempts:3,worktrees:false,
+  merge_resolver:false,followup:false};
+const reqs={
+  review:{id:'review',status:'ready',run:'review-run',label:'review',
+    raw:'tidy it',project:'proj',model:'swe-2',effort:'max',
+    on_failure:'continue',max_attempts:3,ask:false,plan_model:'',
+    plan_effort:'',attachments:[],
+    manifest:'manifests/m.toml',manifest_text:'[run]',
+    pending:{gen:[],opts:[]},baseline:BASE,
+    proposed_steps:[{step:'s',slug:'proj',model:'swe-2',effort:'max',
+      task:'t'}]},
+  state:{serve_boot:'b',generated_at:'x',agents:[],runs:[]}};
+const calls=[];
+const fetch=async(path,opt)=>{calls.push(path);
+  return {ok:true,json:async()=>reqs[path.split('/').pop()]||{id:'x'}};};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},fetch,confirm:()=>true});
+vm.runInContext(src,ctx);
+// the stub DOM does not parse innerHTML into input values - mirror what
+// a real form holds for this record
+const fill=rec=>{ for (const k of
+    ['raw','label','project','model','effort','on_failure','plan_model',
+     'plan_effort']) elem('rq-'+k).value=rec[k]||'';
+  for (const k of ['followup','worktrees','merge_resolver','ask'])
+    elem('rq-'+k).checked=!!rec[k];
+  elem('rq-attempts').value=String(rec.max_attempts??3);
+  elem('rq-manifest').value=rec.manifest_text||''; };
+const type=(id,v)=>{ elem(id).value=v;
+  return handlers.input({target:{id}}); };
+const check=(id,v)=>{ elem(id).checked=v;
+  return handlers.input({target:{id}}); };
+(async()=>{
+  await vm.runInContext('openRequest("review")',ctx);
+  fill(reqs.review);
+  await vm.runInContext('refreshPending()',ctx);
+  // matching the baselines: no note, Apply neutralized, Start available
+  assert.equal(elem('pend-note').hidden,true);
+  assert.equal(elem('rq-apply').disabled,true);
+  assert.match(elem('rq-apply').title,/nothing to apply/);
+  assert.equal(elem('rq-run').disabled,false);
+  // Regenerate is a neutral secondary - never the primary Start run look
+  assert.match(elem('dbody').innerHTML,
+    /id="rq-generate" class="btn secondary"/);
+  // an option change -> Apply-able, Start blocked, note names the field
+  await type('rq-effort','high');
+  assert.match(elem('pend-note').innerHTML,/step effort/);
+  assert.match(elem('pend-note').innerHTML,/Apply options to TOML/);
+  assert.equal(elem('pend-note').hidden,false);
+  assert.equal(elem('rq-apply').disabled,false);
+  assert.equal(elem('rq-run').disabled,true);
+  // revert to baseline clears the mark live - no save needed
+  await type('rq-effort','max');
+  assert.equal(elem('pend-note').hidden,true);
+  assert.equal(elem('rq-apply').disabled,true);
+  assert.equal(elem('rq-run').disabled,false);
+  // a checkbox the same: toggle on, toggle off
+  await check('rq-worktrees',true);
+  assert.match(elem('pend-note').innerHTML,/worktrees/);
+  assert.equal(elem('rq-apply').disabled,false);
+  await check('rq-worktrees',false);
+  assert.equal(elem('pend-note').hidden,true);
+  // a generation input -> Regenerate is the only way, Apply neutralized
+  await type('rq-raw','widen the scope');
+  assert.match(elem('pend-note').innerHTML,/request text/);
+  assert.match(elem('pend-note').innerHTML,/Regenerate tasks/);
+  assert.equal(elem('rq-apply').disabled,true);
+  assert.equal(elem('rq-run').disabled,true);
+  // both buckets -> the note explains the order
+  await type('rq-effort','high');
+  assert.match(elem('pend-note').innerHTML,/Two kinds/);
+  // reverting BOTH clears everything again
+  await type('rq-raw','tidy it');
+  await type('rq-effort','max');
+  assert.equal(elem('pend-note').hidden,true);
+  assert.equal(elem('rq-run').disabled,false);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_regenerate_confirms_and_names_unsaved_toml_edits(self):
+        """Regenerate replaces generated tasks, so it confirms every time;
+        a cancel must not POST anything, and unsaved edits in the TOML
+        editor are named in the confirm text so they are not silently
+        dropped."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,
+  {innerHTML:'',hidden:true,textContent:'',value:'',checked:false,
+   disabled:false,title:''}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const reqs={
+  review:{id:'review',status:'ready',run:'review-run',label:'review',
+    raw:'tidy it',project:'proj',model:'swe-2',effort:'max',
+    on_failure:'continue',max_attempts:3,attachments:[],
+    manifest:'manifests/m.toml',manifest_text:'[run] x',
+    pending:{gen:[],opts:[]},
+    baseline:{raw:'tidy it',project:'proj',attachments:[],model:'swe-2',
+      effort:'max',on_failure:'continue',max_attempts:3,worktrees:false,
+      merge_resolver:false,followup:false},
+    proposed_steps:[{step:'s',slug:'proj',model:'swe-2',effort:'max',
+      task:'t'}]},
+  state:{serve_boot:'b',generated_at:'x',agents:[],runs:[]}};
+const calls=[], seen=[];
+let allow=false;
+const fetch=async(path,opt)=>{calls.push(path);
+  return {ok:true,json:async()=>reqs[path.split('/').pop()]||{id:'x'}};};
+const confirm=msg=>{seen.push(msg);return allow;};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},fetch,confirm});
+vm.runInContext(src,ctx);
+const fill=rec=>{ for (const k of
+    ['raw','label','project','model','effort','on_failure','plan_model',
+     'plan_effort']) elem('rq-'+k).value=rec[k]||'';
+  for (const k of ['followup','worktrees','merge_resolver','ask'])
+    elem('rq-'+k).checked=!!rec[k];
+  elem('rq-attempts').value=String(rec.max_attempts??3);
+  elem('rq-manifest').value=rec.manifest_text||''; };
+(async()=>{
+  await vm.runInContext('openRequest("review")',ctx);
+  fill(reqs.review);
+  calls.length=0;             // the open itself fetches - count POSTs only
+  // cancelled confirm: nothing is saved, generated or touched
+  await vm.runInContext('requestAction("generate")',ctx);
+  assert.equal(calls.length,0);
+  assert.match(seen[0],/Regenerate the proposal/);
+  assert.doesNotMatch(seen[0],/unsaved TOML edits/);
+  // unsaved TOML edits are named before they would be dropped
+  elem('rq-manifest').value='[run] hand-edited';
+  await vm.runInContext('requestAction("generate")',ctx);
+  assert.match(seen[1],/unsaved TOML edits are dropped/);
+  assert.equal(calls.length,0);
+  // confirmed: fields save first, then the generation endpoint fires
+  allow=true;
+  await vm.runInContext('requestAction("generate")',ctx);
+  assert.deepEqual(calls.slice(0,2),
+    ['/api/requests/review/save','/api/requests/review/generate']);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
@@ -4416,7 +4593,7 @@ assert.match(runs,/<div class="rlabels">/);
 assert.ok(runs.indexOf('run-name') < runs.indexOf('class="rlabels"'));
 const sp=row('stale-paused');
 assert.match(sp,/class="rlabels">[^]*?class="stage paused"[^>]*>paused - resume ready</);
-assert.match(sp,/class="stage error">Needs review</);
+assert.match(sp,/class="stage error"[^>]*>Needs review</);
 // 'Needs review' groups with the chips BEFORE the hidden dir .sub -
 // an end-of-row position put it on the compact-clipped part
 assert.ok(sp.indexOf('Needs review') < sp.indexOf('>sp<'),
@@ -4445,7 +4622,7 @@ assert.match(tokc,/class="toksub"[^>]*>steps: 50k\/9k\/150k 11L · \$1\.50</);
 assert.match(tokc,/class="toksub"[^>]*>est \$1\.52</);
 const spc=row('stale-paused');
 assert.match(spc,/class="rlabels">[^]*?class="stage paused"[^>]*>paused - resume ready</);
-assert.match(spc,/class="stage error">Needs review</);
+assert.match(spc,/class="stage error"[^>]*>Needs review</);
 // back to full: the long labeled form returns, markup unchanged
 vm.runInContext("setDensity('full')",ctx);
 render();
@@ -5112,6 +5289,297 @@ prompt = "check the thing"
         self.assertTrue(cfg.merge_resolver)
         self.assertTrue(all(s.worktree for s in cfg.steps))
         self.assertTrue(all(s["wt"] for s in out["proposed_steps"]))
+
+
+class PendingStateTests(unittest.TestCase):
+    """Semantic staleness: 'gen' inputs (request text, project,
+    attachments) diff against the publish-time gen_inputs baseline and
+    'opts' (model/effort/attempts/failure policy/worktrees/resolver/
+    followup) diff against what the proposal TOML itself encodes.
+    Reverting a field to its baseline clears only that mark, Apply is
+    refused while generation inputs are pending, a failed operation keeps
+    the pending state, and launch refuses while either side diverges."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.proj = make_project(self.base)
+        self.runs = self.base / "runs"
+        self.requests = self.base / "requests"
+        self.manifests = self.base / "manifests"
+        self.manifests.mkdir()
+        patch = mock.patch.object(conductor, "load_projects", return_value={
+            "proj": {"path": self.proj, "cloud_ok": False}})
+        patch.start()
+        self.addCleanup(patch.stop)
+        for target, value in (("PLANNER_SPOOL", self.base / "spool"),
+                              ("WATCH_POLL_S", 0.02)):
+            p = mock.patch.object(conductor, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def proposal(self, description="Tidy the catalog", extra_steps=""):
+        return f'''[run]
+name = "catalog-cleanup"
+description = "{description}"
+on_failure = "continue"
+checkpoint = true
+
+[defaults]
+project = "proj"
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+max_attempts = 3
+
+[[step]]
+name = "organize"
+prompt = "Organize the catalog and verify results."
+{extra_steps}'''
+
+    def ready(self, **fields):
+        rec = conductor.create_request(
+            {"raw": "Please tidy the catalog carefully", "project": "proj",
+             "model": "swe-2", "effort": "max", **fields},
+            self.requests, self.runs)
+        return conductor.save_request(
+            rec["id"], {"manifest": self.proposal()},
+            self.requests, self.manifests, self.runs)
+
+    def save(self, rid, payload):
+        return conductor.save_request(rid, payload, self.requests,
+                                      self.manifests, self.runs)
+
+    def pending(self, rid):
+        return conductor.request_details(rid, self.requests,
+                                         self.manifests)["pending"]
+
+    def test_opt_change_and_revert_clears_pending(self):
+        rec = self.ready()
+        out = self.save(rec["id"], {"worktrees": True})
+        self.assertEqual(out["pending"], {"gen": [], "opts": ["worktrees"]})
+        self.assertTrue(out["stale"])
+        out = self.save(rec["id"], {"worktrees": False})
+        self.assertEqual(out["pending"], {"gen": [], "opts": []})
+        self.assertFalse(out["stale"])
+
+    def test_gen_change_and_revert_clears_pending(self):
+        rec = self.ready()
+        out = self.save(rec["id"], {"raw": "widen the scope"})
+        self.assertEqual(out["pending"], {"gen": ["raw"], "opts": []})
+        out = self.save(rec["id"],
+                        {"raw": "Please tidy the catalog carefully"})
+        self.assertEqual(out["pending"], {"gen": [], "opts": []})
+        self.assertFalse(out["stale"])
+
+    def test_attachments_are_a_gen_input(self):
+        att = [{"name": "shot.png", "path": "C:/x/shot.png"}]
+        rec = self.ready(attachments=att)
+        out = self.save(rec["id"], {"attachments": []})
+        self.assertEqual(out["pending"]["gen"], ["attachments"])
+        # a deterministic TOML patch cannot re-interpret a dropped image
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.apply_request(rec["id"], {}, self.requests,
+                                    self.manifests, self.runs)
+        self.assertEqual(e.exception.status, 409)
+        out = self.save(rec["id"], {"attachments": att})
+        self.assertEqual(out["pending"]["gen"], [])
+
+    def test_gen_and_opts_pending_independently(self):
+        rec = self.ready()
+        out = self.save(rec["id"], {"effort": "high"})
+        self.assertEqual(out["pending"], {"gen": [], "opts": ["effort"]})
+        out = self.save(rec["id"], {"raw": "widen the scope"})
+        self.assertEqual(out["pending"]["gen"], ["raw"])
+        self.assertEqual(out["pending"]["opts"], ["effort"])
+        # reverting one side clears only that side
+        out = self.save(rec["id"], {"effort": "max"})
+        self.assertEqual(out["pending"], {"gen": ["raw"], "opts": []})
+
+    def test_saved_gen_divergence_still_refuses_apply(self):
+        """The old check compared the payload to the last save, so a
+        divergence that was already saved slipped through Apply. The
+        refusal now runs against the publish-time baseline."""
+        rec = self.ready()
+        self.save(rec["id"], {"raw": "widen the scope"})
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.apply_request(rec["id"], {"effort": "high"},
+                                    self.requests, self.manifests,
+                                    self.runs)
+        self.assertEqual(e.exception.status, 409)
+        self.assertIn("regenerate", str(e.exception))
+
+    def test_apply_resolves_opt_pending_and_keeps_manual_toml_edits(self):
+        rec = self.ready()
+        p = Path(rec["manifest"])
+        edited = p.read_text(encoding="utf-8").replace(
+            'description = "Tidy the catalog"',
+            'description = "Tidy the catalog by hand"')
+        out = conductor.apply_request(
+            rec["id"], {"manifest": edited, "effort": "high"},
+            self.requests, self.manifests, self.runs)
+        text = Path(out["manifest"]).read_text(encoding="utf-8")
+        self.assertIn('description = "Tidy the catalog by hand"', text)
+        self.assertIn('effort = "high"', text)
+        self.assertFalse(out["stale"])
+
+    def test_launch_blocked_while_pending(self):
+        rec = self.ready()
+        self.save(rec["id"], {"effort": "high"})
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.launch_request(rec["id"], self.requests,
+                                     self.manifests, self.runs, ["devin"])
+        self.assertEqual(e.exception.status, 409)
+        self.assertIn("options", str(e.exception))
+        out = conductor.apply_request(rec["id"], {"effort": "high"},
+                                      self.requests, self.manifests,
+                                      self.runs)
+        self.assertFalse(out["stale"])
+        with mock.patch.object(conductor, "_launch_process",
+                               return_value=4321):
+            out = conductor.launch_request(rec["id"], self.requests,
+                                           self.manifests, self.runs,
+                                           ["devin"])
+        self.assertEqual(out["status"], "launching")
+
+    def test_failed_apply_keeps_pending_and_manual_toml(self):
+        rec = self.ready()
+        self.save(rec["id"], {"effort": "high"})
+        Path(rec["manifest"]).write_text("[run\nbroken = ", encoding="utf-8")
+        with self.assertRaises(conductor.RequestError):
+            conductor.apply_request(rec["id"], {"effort": "high"},
+                                    self.requests, self.manifests,
+                                    self.runs)
+        det = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertIn("manifest", det["pending"]["opts"])
+        self.assertTrue(det["stale"])
+        # the hand-broken manifest is left alone - a failed apply must not
+        # touch the TOML or reset the pending state
+        self.assertEqual(Path(rec["manifest"]).read_text(encoding="utf-8"),
+                         "[run\nbroken = ")
+
+    def test_failed_regeneration_keeps_gen_pending(self):
+        rec = self.ready()
+        original = Path(rec["manifest"]).read_text(encoding="utf-8")
+        self.save(rec["id"], {"raw": "widen the scope"})
+        with mock.patch.object(conductor, "_planner_response",
+                               side_effect=ValueError("unavailable")):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        det = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(det["status"], "error")
+        self.assertEqual(det["pending"]["gen"], ["raw"])
+        self.assertTrue(det["stale"])
+        self.assertEqual(Path(det["manifest"]).read_text(encoding="utf-8"),
+                         original)
+
+    def test_regenerate_resolves_gen_and_opt_pending(self):
+        """Both pending: Apply is refused (it cannot rewrite step prompts),
+        so the order is Regenerate first - the published proposal is built
+        around the new request AND carries the pending options, clearing
+        both buckets in one pass."""
+        rec = self.ready()
+        self.save(rec["id"], {"raw": "widen the scope", "effort": "high"})
+        det = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(det["pending"]["gen"], ["raw"])
+        self.assertIn("effort", det["pending"]["opts"])
+        with self.assertRaises(conductor.RequestError):
+            conductor.apply_request(rec["id"], {"effort": "high"},
+                                    self.requests, self.manifests,
+                                    self.runs)
+        proposal = self.proposal().replace('effort = "max"',
+                                           'effort = "high"')
+        with mock.patch.object(conductor, "_planner_response",
+                               return_value=proposal):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        det = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(det["status"], "ready")
+        self.assertEqual(det["pending"], {"gen": [], "opts": []})
+        self.assertIn('effort = "high"',
+                      Path(det["manifest"]).read_text(encoding="utf-8"))
+
+    def test_planner_only_and_label_changes_never_pending(self):
+        rec = self.ready()
+        out = self.save(rec["id"], {"plan_model": "gpt-6-luna",
+                                   "plan_effort": "low", "ask": True,
+                                   "label": "renamed"})
+        self.assertEqual(out["pending"], {"gen": [], "opts": []})
+        self.assertFalse(out["stale"])
+
+    def test_manual_toml_edit_rebaselines_options(self):
+        """A hand-edited manifest moves the option baseline itself: the
+        form field now diverges from what the TOML encodes, so the drift
+        stays flagged until the form is brought in line or Apply rewrites
+        the TOML. Nothing is silently discarded - the edit is the new
+        baseline."""
+        rec = self.ready()
+        p = Path(rec["manifest"])
+        edited = p.read_text(encoding="utf-8").replace(
+            'effort = "max"', 'effort = "high"')
+        out = self.save(rec["id"], {"manifest": edited})
+        self.assertEqual(out["pending"]["opts"], ["effort"])
+        self.assertTrue(out["stale"])
+        with self.assertRaises(conductor.RequestError):
+            conductor.launch_request(rec["id"], self.requests,
+                                     self.manifests, self.runs, ["devin"])
+        out = self.save(rec["id"], {"effort": "high"})
+        self.assertEqual(out["pending"], {"gen": [], "opts": []})
+
+    def test_pending_state_survives_reopen(self):
+        rec = self.ready()
+        self.save(rec["id"], {"raw": "widen the scope", "effort": "high"})
+        det = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(det["pending"]["gen"], ["raw"])
+        self.assertEqual(det["pending"]["opts"], ["effort"])
+        self.assertEqual(det["baseline"]["raw"],
+                         "Please tidy the catalog carefully")
+        self.assertEqual(det["baseline"]["effort"], "max")
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        self.assertEqual(d["runs"][0]["pending"]["gen"], ["raw"])
+        self.assertTrue(d["runs"][0]["stale"])
+
+    def test_legacy_stale_record_keeps_opaque_pending(self):
+        """A pre-baseline record whose stored flag is set cannot be
+        attributed - it reports the opaque 'fields' marker until a publish
+        re-baselines it."""
+        rec = self.ready()
+        rec.pop("gen_inputs")
+        rec["stale"] = True
+        conductor._save_request(rec, self.requests)
+        self.assertEqual(self.pending(rec["id"])["gen"], ["fields"])
+        self.assertTrue(conductor.request_details(
+            rec["id"], self.requests, self.manifests)["stale"])
+
+    def test_legacy_unstale_record_materializes_baseline(self):
+        """A never-stale pre-baseline record's stored fields ARE the
+        publish-time ones - the next save pins them so later diffs are
+        attributable."""
+        rec = self.ready()
+        rec.pop("gen_inputs")
+        conductor._save_request(rec, self.requests)
+        out = self.save(rec["id"], {"label": "renamed"})
+        self.assertFalse(out["stale"])
+        self.assertIn("gen_inputs", out)
+        out = self.save(rec["id"], {"raw": "widen the scope"})
+        self.assertEqual(out["pending"]["gen"], ["raw"])
+
+    def test_apply_without_changes_is_harmless(self):
+        rec = self.ready()
+        out = conductor.apply_request(rec["id"], {}, self.requests,
+                                      self.manifests, self.runs)
+        self.assertFalse(out["stale"])
+        self.assertEqual(out["pending"] if "pending" in out else
+                         self.pending(rec["id"]), {"gen": [], "opts": []})
 
 
 class LifecycleDisplayTests(unittest.TestCase):
