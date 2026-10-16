@@ -11296,7 +11296,7 @@ function intrComposerHTML(a){
   const draft = intrDrafts[key];
   const list = intrAttach[key]||[];
   const thumbs = editable =>
-    `<div class="attach-strip" aria-live="polite" ` +
+    `<div id="d-instr-attach" class="attach-strip" aria-live="polite" ` +
     `aria-label="Attached images"${list.length?'':' hidden'}>` +
     list.map(x=>
       `<span class="attach-item"><a href="/api/attachments/` +
