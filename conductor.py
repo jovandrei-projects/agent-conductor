@@ -4850,6 +4850,15 @@ def collect_dashboard(runs_dir: Path,
         eff = effective_statuses(st)
         flagged = _skip_flagged(sj.parent)     # 'Skip step' marks in place
         mbodies = _manifest_bodies(st)         # full text per step name
+        # Pipeline order for the task modal's prev/next: the manifest's
+        # step order IS the pipeline. Recorded steps the manifest no
+        # longer names (renamed, file gone) keep their record order after
+        # it; a missing manifest leaves record order alone.
+        cfg = _manifest_cached(st.get("manifest") or "")
+        pipe = [s.name for s in cfg.steps] if cfg else []
+        pipe += [n for n in (st.get("steps") or {}) if n not in set(pipe)]
+        seq_of = {n: i for i, n in enumerate(pipe)}
+        prop_seq = {name: i for i, name in enumerate(proposed)}
         for name, rec in st.get("steps", {}).items():
             plan = proposed.get(name) or {}
             t = rec.get("tokens")
@@ -4908,6 +4917,8 @@ def collect_dashboard(runs_dir: Path,
                 "run": st.get("run"), "run_dir": st.get("run_dir") or str(sj.parent),
                 "run_key": key, "request_id": st.get("request_id"),
                 "step": rec.get("name") or name, "slug": slug,
+                "seq": seq_of.get(rec.get("name") or name,
+                                  prop_seq.get(rec.get("name") or name)),
                 "work_dir": wd,
                 "status": status, "started_at": rec.get("started_at"),
                 "ended_at": rec.get("ended_at"),
@@ -4988,6 +4999,7 @@ def collect_dashboard(runs_dir: Path,
             row["resume_notes"] = _flag_text(
                 rnote_flag(sj.parent, row["step"]))
             row["prompt_edited"] = row["prompt_override"] is not None
+            row["seq"] = seq_of.get(row["step"], prop_seq.get(row["step"]))
             counts[row["status"]] = counts.get(row["status"], 0) + 1
             agents.append(row)
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
@@ -5088,11 +5100,12 @@ def collect_dashboard(runs_dir: Path,
                 "stdout_log": str(log_p) if log_p.is_file() else None,
                 "tail": gen_tail, "export": None, "prompt": None})
         pbodies = _manifest_bodies(rec)
-        for s in steps:
+        for i, s in enumerate(steps):
             a = proposal_agent(s, rec, projects, key, "planned")
             a["task_full"] = pbodies.get(s["step"]) or a.get("task")
             a["prompt_editable"] = False      # edited via the TOML review
             a["notes_enabled"] = False
+            a["seq"] = i               # proposal order is its pipeline
             agents.append(a)
     # session_id is discovered post-spawn (diff of `devin list`); while a
     # step runs the cell is empty. Attribute it live instead: among the
@@ -5227,6 +5240,15 @@ a { color:#58a6ff; text-decoration:none; }
 #detail .k { color:#8b949e; }
 #detail pre { white-space:pre-wrap; color:#8b949e; background:#0d1117; border-radius:6px; padding:8px 10px; font-size:12px; max-height:180px; overflow:auto; }
 #detail .x { position:absolute; top:10px; right:16px; cursor:pointer; color:#8b949e; background:none; border:0; font:inherit; }
+/* prev/next task bar - sticky like .topbar: top:0 plus margins that undo
+   #detail's padding so it pins flush over the scroll gap. The right pad
+   leaves room for the Close X which overlays the bar. */
+#detail .dnav { position:sticky; top:0; z-index:6; display:flex; align-items:center; gap:10px; margin:-18px -22px 12px; padding:7px 56px 7px 22px; background:#161b22; border-bottom:1px solid #30363d; border-radius:9px 9px 0 0; }
+#detail .dnav-btn { display:inline-flex; align-items:center; gap:6px; max-width:40%; background:#21262d; border:1px solid #30363d; color:#e6edf3; border-radius:6px; padding:4px 10px; font:inherit; font-size:12px; cursor:pointer; }
+#detail .dnav-btn span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#detail .dnav-btn:hover:not(:disabled) { border-color:#58a6ff; }
+#detail .dnav-btn:disabled { opacity:.4; cursor:default; }
+#detail .dnav-pos { margin:0 auto; color:#8b949e; font-size:12px; white-space:nowrap; }
 .arc { font-size:12px; border:1px solid #21262d; border-radius:6px; padding:6px 8px; max-height:280px; overflow-y:auto; background:#0d1117; }
 .arcrow { display:flex; gap:8px; padding:1px 0; }
 .arcspan { color:#8b949e; min-width:44px; text-align:right; flex:none; }
@@ -5476,7 +5498,7 @@ const AGENT_COLS = '<colgroup>' +
   '</colgroup>';
 
 let detailIdx = null;
-let detailKey = null;       // run_dir|step of the open agent modal - the
+let detailKey = null;       // run_key|step of the open agent modal - the
                             // payload re-sorts each tick, so the index is
                             // re-resolved by key before every re-render
 let modalRequest = null;
@@ -5487,7 +5509,10 @@ const qDismissed = new Set();   // request|qids sigs the human closed - the
                               // auto-popup never re-nags for the same set
 const promptDrafts = {};    // key -> unsaved 'Edit prompt' text
 const notesDrafts = {};     // key -> unsaved 'resume notes' text
-const agentKey = a => (a.run_dir||'') + '|' + a.step;
+// run_key namespaces per run/request - run_dir alone collides for
+// unlaunched proposals (their dir is null), which would let the detail
+// modal (and a nav click) land on another request's same-named step.
+const agentKey = a => (a.run_key||a.run_dir||'') + '|' + a.step;
 const qSig = (id, pend) => id + '|' + (pend||[]).map(q=>q.qid).join(',');
 function closeDetail(force=false){
   if (!force && modalRequest?.dirty && !confirm('Discard unsaved edits?')) return false;
@@ -5499,6 +5524,31 @@ function closeDetail(force=false){
   detailIdx = null; detailKey = null; modalRequest = null; modalQA = null;
   document.getElementById('backdrop').hidden = true;
   return true;
+}
+// The steps of one run (or proposal) ARE the pipeline - collect_dashboard
+// stamps each row with `seq` = its manifest/proposal position, so prev/next
+// walks execution order rather than the time-sorted table. Rows without a
+// seq (the plan-proposal planner) sit out of the chain.
+const pipeSibs = a => {
+  const rk = a && (a.run_key||a.run_dir||'');
+  if (!rk) return [];
+  return AGENTS.filter(x=>(x.run_key||x.run_dir||'')===rk && x.seq!=null)
+    .sort((x,y)=>x.seq-y.seq);
+};
+function navStep(d){
+  const a = AGENTS.find(x=>agentKey(x)===detailKey);
+  if (!a) return;
+  const sibs = pipeSibs(a);
+  const pos = sibs.findIndex(x=>agentKey(x)===detailKey);
+  const b = pos>=0 && sibs[pos+d];
+  if (b){
+    const j = AGENTS.findIndex(x=>agentKey(x)===agentKey(b));
+    if (j>=0){
+      showDetail(j);
+      const d = document.getElementById('detail');
+      if (d) d.scrollTop = 0;      // land on the task top, not mid-scroll
+    }
+  }
 }
 function showDetail(i){
   const a = AGENTS[i]; if(!a || !closeDetail()) return;
@@ -5533,7 +5583,23 @@ function showDetail(i){
     ['branch',a.branch],['merged',a.merged],
     ['prompt file',a.prompt],['stdout',a.stdout_log],['export',a.export],
     ['state file',a.state_md]];
+  // prev/next walks this step's own pipeline - sibling buttons name their
+  // target, the counter gives position. Hidden for a lone/seq-less row.
+  const sibs = pipeSibs(a);
+  const pos = sibs.findIndex(x=>agentKey(x)===detailKey);
+  const navBtn = (b,dir)=> b
+    ? `<button type="button" class="dnav-btn" ` +
+      `data-nav="${esc(agentKey(b))}" title="${esc(b.step)}">` +
+      (dir<0 ? `&larr; <span>${esc(b.step)}</span>`
+             : `<span>${esc(b.step)}</span> &rarr;`) + `</button>`
+    : `<button type="button" class="dnav-btn" disabled>` +
+      (dir<0 ? '&larr;' : '&rarr;') + `</button>`;
+  const navBar = (pos>=0 && sibs.length>1)
+    ? `<div class="dnav">${navBtn(sibs[pos-1],-1)}` +
+      `<span class="dnav-pos">task ${pos+1} of ${sibs.length}</span>` +
+      `${navBtn(sibs[pos+1],1)}</div>` : '';
   document.getElementById('dbody').innerHTML =
+    navBar +
     `<h3 id="modal-title">${esc(a.slug)} / ${esc(a.step)}</h3><div class="kv">` +
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">` +
       (k==='task prompt' ? `<pre>${esc(v??'-')}</pre>` : esc(v??'-')) +
@@ -6557,6 +6623,15 @@ document.addEventListener('click', async e=>{
   const runDetEl = t.closest && t.closest('[data-run-details]');
   if (runDetEl){
     showRunDetails(runDetEl.dataset.runDetails); return; }
+  const navEl = t.closest && t.closest('[data-nav]');
+  if (navEl){
+    const j = AGENTS.findIndex(x=>agentKey(x)===navEl.dataset.nav);
+    if (j>=0){
+      showDetail(j);
+      const d = document.getElementById('detail');
+      if (d) d.scrollTop = 0;
+    }
+    return; }
   if (t.dataset && t.dataset.resumeRun){
     if(!confirm('Resume this run? Every non-done step re-runs in a fresh ' +
                 'session with a fresh timeout - covers paused, stopped ' +
@@ -6859,6 +6934,17 @@ document.addEventListener('keydown', e=>{
     e.preventDefault();
     selectedRun = selectedRun===e.target.dataset.runKey ? null : e.target.dataset.runKey;
     if (lastData) render(lastData);
+  }
+  // Left/Right walks the open task's pipeline (same as the .dnav arrows)
+  // - but never while typing in a form field.
+  if ((e.key==='ArrowLeft'||e.key==='ArrowRight') && detailKey!=null &&
+      !document.getElementById('backdrop').hidden){
+    const ae = document.activeElement;
+    if (!(ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName||''))){
+      e.preventDefault();
+      navStep(e.key==='ArrowLeft'?-1:1);
+      return;
+    }
   }
   if (e.key==='Escape' && !document.getElementById('backdrop').hidden)
     closeDetail();

@@ -35,7 +35,9 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   manifests/ux-controls-followup.toml: merge the remaining parked
   branch, configurable verify_timeout_s, .agent_tasks merge-safety,
   flaky stop-flag test, live planner-ask smoke. NOT launched - human
-  review.
+  review. UPDATE 2026-10-15: task-modal-navigation merged via
+  resolve-task-modal-navigation - same both-append conflicts on
+  QUEUE.md + efficiency_stats.md, kept both sides.
 - DONE 2026-10-15 (run-link-affordance): run names in the runs table
   always render as links now (blue + underline, lighter blue on hover) -
   they are the run-modal affordance and previously looked like plain
@@ -45,6 +47,16 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   the ring outward 2px) - `td :is(a,button):focus-visible` now draws
   the ring inside the element (`outline-offset:-2px`), which also
   covers the show-more links. 199/199 mock tests green.
+- DONE 2026-10-15 (task-modal-navigation): the task detail modal gets a
+  sticky `.dnav` bar - prev/next buttons naming their sibling step and a
+  `task N of M` counter - walking the run's pipeline in manifest order
+  (`seq` stamped per agent by collect_dashboard; record-order fallback
+  for unmanifested steps, proposed_steps index for previews, none for the
+  plan-proposal row or 1-step pipelines). `[data-nav]` clicks and
+  ArrowLeft/ArrowRight share `navStep`; nav resets modal scroll, the 2s
+  rebuild doesn't. `agentKey` prefers run_key over run_dir so proposal
+  steps of different requests can't alias. 200/200 mock tests + demo
+  green.
 - DONE 2026-10-15 (trajectory drill-down + compact counters): each arc
   group is now an expandable `<details>` - per-entry timestamp,
   gap-to-next duration, and REAL per-turn in/out/cached tokens read
