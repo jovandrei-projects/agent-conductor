@@ -67,8 +67,9 @@ actionably on unexpected dialogs, and stays scoped to the leased serial.
 ## Where it stopped
 
 `python run_tests.py` green — 410/410 (30 new MobileDeviceTests + 2 new
-prompt assertions in DeviceOwnershipTests). Work is committed on this
-worktree's branch; nothing left but the conductor's own merge.
+prompt assertions in DeviceOwnershipTests). Conductor merged the branch
+to master as 2e6888e (one both-append conflict on efficiency_stats.md;
+both rows kept). Nothing left.
 
 ## Deferred or blocked
 
