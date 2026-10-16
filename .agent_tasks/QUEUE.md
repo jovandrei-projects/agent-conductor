@@ -50,7 +50,15 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   workflow-ux-safety run's own follow-up; its parked
   isolate-worktree-services branch is not this manifest's business)
   and anything already drafted in ux-controls-followup.toml /
-  proposal-ui-fixes-followup.toml.
+  proposal-ui-fixes-followup.toml. UPDATE 2026-10-16: merged via
+  resolve-follow-up-plan - was never a real conflict: conductor's
+  merge never started (events logged `files: []`) because the step's
+  own draft manifests/proposal-flow-fixes-followup.toml sat untracked
+  in the main checkout, byte-identical to the branch's copy - git
+  refuses to overwrite untracked files even then. Cleared it and the
+  branch fast-forwarded to 65cae4a (no merge commit). New trap class:
+  a same-path untracked file blocks merge start and reads as a
+  conflict to the driver.
 - DONE 2026-10-16 (fix-compact-labels, wave step of run
   20261016-013711-proposal-flow-fixes): "the labels under the run table,
   sometimes are not visible in the 'compact' view" - two losses, both
