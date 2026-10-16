@@ -5025,8 +5025,11 @@ details.arcgrp[open] > summary::before { content:'▾'; }
 .stage.halted { color:#8b949e; }
 .stage.archived { color:#8b949e; border-color:#21262d; }
 .linkbtn { background:none; border:0; color:#58a6ff; cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
-.run-name { color:#e6edf3; text-decoration:none; text-align:left; }
-.run-name:hover, .run-name:focus-visible { color:#58a6ff; text-decoration:underline; }
+.run-name { color:#58a6ff; text-decoration:underline; text-align:left; }
+.run-name:hover { color:#79c0ff; }
+/* td has padding-left:0 + overflow:hidden, so an outset focus ring is
+   clipped at the cell edge - draw it inside the element instead */
+td :is(a,button):focus-visible { outline-offset:-2px; }
 .btn { border:1px solid #388bfd; border-radius:6px; background:#1f6feb; color:#fff; padding:7px 12px; cursor:pointer; font:inherit; }
 .btn.secondary { color:#e6edf3; background:#21262d; border-color:#30363d; }
 .btn.danger { color:#ffb2aa; background:transparent; border-color:#9f3535; }
