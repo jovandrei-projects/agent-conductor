@@ -24,6 +24,26 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (run/session summaries - hand-implemented, same
+  session as obs-merge-telemetry): `final_report()` lifts the worker's
+  own closing prose from the ATIF export (trailing agent messages with
+  no tool calls, STATUS:/NEXT: stripped) and `step_summary_md` leads
+  with it as `## Report`; the run-level counterpart is `run.summary.md`
+  written by an opt-in detached `conductor.py summarize` session
+  (`[run] summarize = true|"<model>"`, dashboard Generate LLM summary
+  button, `POST /api/runs/<dir>/summarize`) fed run stats + each step's
+  closing report via `_summary_prompt` (`conductor-run-summary`
+  marker; mock answers it). Served by `GET /api/runs/<dir>/summary`
+  (LLM file else `run_report_md` deterministic roll-up), rendered
+  in-app via `openRunSummary` (`run|<key>` summaryView keys ride the
+  existing Back stack). `_summary_body` widened to ###/####, ordered
+  lists, `---`, italics - all still escaped. `.summarizing` pid marker
+  drives the dashboard state; `run_summarized`/`run_summary_failed`
+  events + `state.run_summary`/`state.summarize_model` record it.
+  Refused while any step is live (trap 5). Request form `summarize`
+  checkbox -> `run.summarize` via `_apply_fields_to_toml` +
+  `_guarantee_isolation`. 10 new RunSummaryTests + manifest-parse +
+  renderer coverage.
 - DONE 2026-10-16 (row-context-menus, wave step of run
   20261016-013719-workflow-ux-safety): right-click (or Shift+F10 / the
   Menu key on a focused row) opens a `#ctxmenu` action list on run and

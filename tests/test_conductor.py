@@ -6,6 +6,7 @@ import argparse
 import http.client
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -110,6 +111,29 @@ project = "x"
 prompt = "p"
 prompt_file = "f.md"
 ''')
+            with self.assertRaises(conductor.ManifestError):
+                conductor.load_manifest(m)
+
+    def test_summarize_flag_parses(self):
+        """run.summarize: absent/false = off, true = on with the CLI
+        default model (""), a string pins the summarizer's model,
+        anything else is a ManifestError."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            step = f'''
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "do a"
+'''
+            for extra, want in (("summarize = true", ""),
+                                ('summarize = "swe-2"', "swe-2"),
+                                ("summarize = false", None), ("", None)):
+                m = write_manifest(base, step, extra=extra)
+                self.assertEqual(
+                    conductor.load_manifest(m).summarize, want, extra)
+            m = write_manifest(base, step, extra="summarize = 7")
             with self.assertRaises(conductor.ManifestError):
                 conductor.load_manifest(m)
 
@@ -6938,6 +6962,210 @@ class StepSummaryTests(unittest.TestCase):
     def test_modal_purpose_row_wired(self):
         # the marker's token reaches the modal via the 'purpose' field
         self.assertIn("a.purpose", conductor._DASH_HTML)
+
+
+class RunSummaryTests(unittest.TestCase):
+    """The worker's own closing report - the trailing agent prose in the
+    ATIF export, minus the STATUS:/NEXT: contract lines - leads the step
+    summary, and the run-level view rolls them up (deterministically, or
+    an LLM-written run.summary.md when a summarizer session ran)."""
+
+    def _closing_export(self, rd: Path, msg: str,
+                        tail_toolcall: bool = False) -> Path:
+        exp = rd / "s1.export.json"
+        steps = [{"step_id": 1, "source": "agent",
+                  "tool_calls": [{"function_name": "exec"}],
+                  "message": "working on it"}]
+        if tail_toolcall:
+            steps.append({"step_id": 2, "source": "agent",
+                          "tool_calls": [{"function_name": "exec"}],
+                          "message": ""})
+        else:
+            steps.append({"step_id": 2, "source": "agent",
+                          "tool_calls": [], "message": msg})
+        exp.write_text(json.dumps({"steps": steps}), encoding="utf-8")
+        return exp
+
+    def _run_state(self, td: str, steps: dict) -> tuple[Path, Path]:
+        runs = Path(td) / "runs"
+        rd = runs / "20261015-000000-sum"
+        rd.mkdir(parents=True)
+        st = {"run": "sum", "started_at": "2026-10-15T00:00:00",
+              "ended_at": "2026-10-15T01:00:00", "steps": steps}
+        (rd / "state.json").write_text(json.dumps(st), encoding="utf-8")
+        return runs, rd
+
+    def test_final_report_strips_contract_lines(self):
+        with tempfile.TemporaryDirectory() as td:
+            exp = self._closing_export(
+                Path(td), "Did the work.\n\nSTATUS: done\nNEXT: nothing")
+            self.assertEqual(conductor.final_report(exp), "Did the work.")
+
+    def test_final_report_no_closing_prose_is_none(self):
+        """A turn that ends on a tool call (crash mid-work) or never
+        wrote an export has no closing report - not an empty string, so
+        callers fall back explicitly."""
+        with tempfile.TemporaryDirectory() as td:
+            exp = self._closing_export(Path(td), "x", tail_toolcall=True)
+            self.assertIsNone(conductor.final_report(exp))
+            self.assertIsNone(
+                conductor.final_report(Path(td) / "nope.json"))
+            bad = Path(td) / "bad.export.json"
+            bad.write_text("{not json", encoding="utf-8")
+            self.assertIsNone(conductor.final_report(bad))
+
+    def test_step_summary_leads_with_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            exp = self._closing_export(
+                Path(td), "## What happened\nAll landed; two bugs fixed."
+                          "\n\nSTATUS: done\nNEXT: polish")
+            runs, rd = self._run_state(td, {
+                "s1": {"status": "done", "task": "do the thing",
+                       "export": str(exp)}})
+            md = conductor.step_summary(rd.name, "s1", runs)
+            self.assertIn("## Report\n\n## What happened\nAll landed; "
+                          "two bugs fixed.", md)
+            # contract lines are lifted out of the prose - structured
+            # fields carry them
+            self.assertNotIn("All landed; two bugs fixed.\n\nSTATUS:",
+                             md)
+
+    def test_run_report_md_rolls_up(self):
+        with tempfile.TemporaryDirectory() as td:
+            exp = self._closing_export(Path(td), "did the work")
+            runs, rd = self._run_state(td, {
+                "s1": {"status": "done", "elapsed_s": 60,
+                       "export": str(exp), "merged": True,
+                       "tokens": {"prompt": 10, "completion": 5,
+                                  "cached": 0}},
+                "s2": {"status": "failed",
+                       "note": "exited 0 without a STATUS: line"}})
+            md = conductor.run_summary_doc("20261015-000000-sum", runs)
+            self.assertIn("# sum - run summary", md)
+            self.assertIn("## s1 - done", md)
+            self.assertIn("did the work", md)
+            self.assertIn("merged", md)
+            self.assertIn("## s2 - failed", md)
+            self.assertIn("ended without a closing report", md)
+            # an LLM-written run.summary.md takes precedence on disk
+            (rd / "run.summary.md").write_text("# llm roll-up\n",
+                                               encoding="utf-8")
+            self.assertEqual(
+                conductor.run_summary_doc("20261015-000000-sum", runs),
+                "# llm roll-up\n")
+
+    def test_summary_prompt_carries_reports(self):
+        with tempfile.TemporaryDirectory() as td:
+            rd = Path(td)
+            exp = self._closing_export(rd, "did the work")
+            st = {"run": "sum", "description": "ship it",
+                  "steps": {"s1": {"status": "done", "task": "task one",
+                                   "export": str(exp)},
+                            "s2": {"status": "failed",
+                                   "task": "task two"}}}
+            prompt = conductor._summary_prompt(st)
+            self.assertIn("conductor-run-summary", prompt)
+            self.assertIn("task one", prompt)
+            self.assertIn("did the work", prompt)
+            self.assertIn("task two", prompt)
+            self.assertIn("ended without one", prompt)
+
+    def test_summarize_run_writes_llm_summary(self):
+        """The end-of-run summarizer is a fresh devin session (here the
+        mock): it answers the conductor-run-summary prompt, its closing
+        message lands as run.summary.md, and the event + state fields
+        record it."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            rd = next(runs.iterdir())
+            self.assertTrue(conductor.summarize_run(
+                rd, shlex.split(MOCK)))
+            out = (rd / "run.summary.md").read_text(encoding="utf-8")
+            self.assertIn("Executive summary (mock)", out)
+            st = json.loads((rd / "state.json").read_text())
+            self.assertIn("run_summary", st)
+            self.assertTrue(st["run_summary"]["session"]
+                            .startswith("mock-"))
+            ev = (rd / "events.jsonl").read_text(encoding="utf-8")
+            self.assertIn('"run_summarized"', ev)
+            # marker is cleaned up; the endpoint now serves the file
+            self.assertFalse((rd / ".summarizing").exists())
+            self.assertIn("Executive summary (mock)",
+                          conductor.run_summary_doc(rd.name, runs))
+
+    def test_summarize_manifest_autospawns(self):
+        """[run] summarize = true fires the detached `conductor.py
+        summarize` subprocess at run end - no dashboard needed."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''', extra="summarize = true")
+            self.assertEqual(run_manifest(m, runs), 0)
+            rd = next(runs.iterdir())
+            st = json.loads((rd / "state.json").read_text())
+            self.assertEqual(st["summarize_model"], "")
+            for _ in range(450):
+                if (rd / "run.summary.md").is_file():
+                    break
+                time.sleep(0.1)
+            self.assertTrue((rd / "run.summary.md").is_file(),
+                            "summarizer subprocess did not produce "
+                            "run.summary.md")
+            self.assertIn("Executive summary (mock)",
+                          (rd / "run.summary.md").read_text(
+                              encoding="utf-8"))
+            self.assertFalse((rd / ".summarizing").exists())
+
+    def test_summarize_endpoint_guards(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run_state(td, {})
+            with self.assertRaises(conductor.RequestError):
+                conductor.summarize_run_start(rd.name, runs)
+            # a live step blocks the launch (trap 5: writes into a run
+            # dir a self-hosted worker may be watching) - fresh no-pid
+            # 'running' is a live shape in its own right
+            runs, rd = self._run_state(Path(td) / "t2", {
+                "s1": {"status": "running",
+                       "started_at": conductor.now_iso(),
+                       "timeout_min": 60}})
+            with self.assertRaises(conductor.RequestError):
+                conductor.summarize_run_start(rd.name, runs)
+
+    def test_summary_renderer_widened(self):
+        """The report body handles the markdown shapes agent prose
+        actually uses: ###/#### headings, numbered lists, ---, italics -
+        still escaped, still a narrow subset."""
+        md = ("# t\n\n### sub head\n\n1. one\n2. two\n\n---\n\n"
+              "*em* and **bold** and <x>\n")
+        frag = conductor._summary_body(md)
+        self.assertIn("<h3>sub head</h3>", frag)
+        self.assertIn("<ol><li>one</li><li>two</li></ol>", frag)
+        self.assertIn("<hr>", frag)
+        self.assertIn("<em>em</em>", frag)
+        self.assertIn("<strong>bold</strong>", frag)
+        self.assertIn("&lt;x&gt;", frag)
+
+    def test_run_summary_buttons_wired(self):
+        self.assertIn('data-run-summary="', conductor._DASH_HTML)
+        self.assertIn('data-summarize-run="', conductor._DASH_HTML)
+        self.assertIn("Run summary", conductor._DASH_HTML)
+        self.assertIn("Generate LLM summary", conductor._DASH_HTML)
+        self.assertIn("/summary?frag=1", conductor._DASH_HTML)
 
 
 class ModalDetailNavTests(unittest.TestCase):
