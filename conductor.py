@@ -32,6 +32,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -79,6 +80,17 @@ WAIT_POLL_S = 15.0        # wait() slice between STATUS checks on the log
 # listing cache is 120s stale) - don't read that as 'deleted' for the
 # first few minutes of a step.
 SESSION_GONE_GRACE_S = 300.0
+
+# A finished run older than this is auto-archived: files kept on disk
+# (state, logs, ATIF exports) but hidden from the default dashboard view -
+# the 'archived' view chip (/api/state?archived=1) lists it and the run
+# modal's Unarchive clears the stamp. CONDUCTOR_ARCHIVE_HOURS overrides;
+# 0 disables auto-archive.
+try:
+    ARCHIVE_AFTER_S = float(
+        os.environ.get("CONDUCTOR_ARCHIVE_HOURS") or 48) * 3600
+except ValueError:
+    ARCHIVE_AFTER_S = 48 * 3600
 
 PREAMBLE = """\
 This session was spawned unattended by agent-conductor
@@ -1804,6 +1816,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         # (e.g. 'Paused by user') until the loop re-stamps them.
         state.pop("aborted", None)
         state.pop("ended_at", None)
+        # A re-entered run is in flight again - drop the auto-archive
+        # stamp so it resurfaces on the default dashboard view.
+        state.pop("archived", None)
         save_state(run_dir, state)
         print(f"[resume] {run_dir.name}")
         # Resume must be able to start work again: drop any stop/drain
@@ -2179,31 +2194,44 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 # ---------------------------------------------------------------- hygiene
 
-def sweep_runs(runs_dir: Path, write: bool = True) -> list[str]:
-    """Re-mark orphaned 'running'/'queued' records as 'lost' and close runs
-    with nothing alive. Returns human-readable lines about what changed.
-
-    Write guard (trap 5): if a live step's work_dir contains runs_dir, a
-    self-hosted run is in flight and ANY write under runs_dir lands in the
-    worker's watched tree - so this degrades to a dry-run report.
-    """
-    states: list[tuple[Path, dict]] = []
-    watched = False
-    for sj in sorted(runs_dir.glob("*/state.json")):
-        try:
-            st = json.loads(sj.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        states.append((sj, st))
+def _runs_watched(runs_dir: Path, states: list[tuple[Path, dict]]) -> bool:
+    """Trap-5 write guard: True when a live step's work_dir contains
+    runs_dir - a self-hosted run is in flight and ANY write under runs_dir
+    lands in the worker's watched tree (an external edit ends its session)."""
+    for _sj, st in states:
         for rec in (st.get("steps") or {}).values():
             if step_live(rec):
                 wd = rec.get("work_dir") or rec.get("project")
                 try:
                     if wd and runs_dir.resolve().is_relative_to(
                             Path(wd).resolve()):
-                        watched = True
+                        return True
                 except OSError:
                     pass
+    return False
+
+
+def _load_run_states(runs_dir: Path) -> list[tuple[Path, dict]]:
+    states: list[tuple[Path, dict]] = []
+    for sj in sorted(runs_dir.glob("*/state.json")):
+        try:
+            states.append((sj, json.loads(sj.read_text(encoding="utf-8"))))
+        except (OSError, ValueError):
+            continue
+    return states
+
+
+def sweep_runs(runs_dir: Path, write: bool = True) -> list[str]:
+    """Re-mark orphaned 'running'/'queued' records as 'lost', close runs
+    with nothing alive, and archive finished runs older than
+    ARCHIVE_AFTER_S. Returns human-readable lines about what changed.
+
+    Write guard (trap 5): if a live step's work_dir contains runs_dir, a
+    self-hosted run is in flight and ANY write under runs_dir lands in the
+    worker's watched tree - so this degrades to a dry-run report.
+    """
+    states = _load_run_states(runs_dir)
+    watched = _runs_watched(runs_dir, states)
     lines: list[str] = []
     for sj, st in states:
         eff = effective_statuses(st)
@@ -2232,9 +2260,60 @@ def sweep_runs(runs_dir: Path, write: bool = True) -> list[str]:
             if watched:
                 lines.insert(0, f"DRY-RUN: a live worker watches {runs_dir} "
                                 f"(self-hosted run) - not writing (trap 5)")
-                return lines
+                break
             save_state(sj.parent, st)
+    lines += archive_runs(runs_dir, write=write)
     return lines
+
+
+def archive_runs(runs_dir: Path, write: bool = True,
+                 now: float | None = None) -> list[str]:
+    """Stamp state['archived'] on runs whose ended_at is older than
+    ARCHIVE_AFTER_S - the answer to run-dir clutter: old temp runs stay on
+    disk but drop out of the default dashboard view. A run only qualifies
+    once it HAS an ended_at (the close pass above supplies it for
+    interrupted runs), so a live or just-ended run is never touched. The
+    stamp is a view filter, not a move - resume/merge keep working, and
+    resuming a run clears it. Same trap-5 write guard as the sweep."""
+    if ARCHIVE_AFTER_S <= 0:
+        return []
+    now = time.time() if now is None else now
+    states = _load_run_states(runs_dir)
+    watched = _runs_watched(runs_dir, states)
+    lines: list[str] = []
+    for sj, st in states:
+        if st.get("archived"):
+            continue
+        ended = _iso_ts(st.get("ended_at"))
+        if ended is None or now - ended < ARCHIVE_AFTER_S:
+            continue
+        lines.append(f"{sj.parent.name}: archived (ended {st['ended_at']}, "
+                     f"over {ARCHIVE_AFTER_S / 3600:g}h old)")
+        if write and not watched:
+            st["archived"] = now_iso()
+            save_state(sj.parent, st)
+    if lines and write and watched:
+        lines.insert(0, f"DRY-RUN: a live worker watches {runs_dir} "
+                        f"(self-hosted run) - not writing (trap 5)")
+    return lines
+
+
+_ARCHIVE_TRIED = 0.0
+_ARCHIVE_POLL_S = 1800.0    # /api/state is polled ~2s; scan twice an hour
+
+
+def _auto_archive(runs_dir: Path) -> None:
+    """serve's startup sweep archives once at boot; a dashboard left up for
+    days would never hide runs that finished after boot without this
+    throttled pass (failures just keep the current view)."""
+    global _ARCHIVE_TRIED
+    if time.time() - _ARCHIVE_TRIED < _ARCHIVE_POLL_S:
+        return
+    _ARCHIVE_TRIED = time.time()
+    try:
+        archive_runs(runs_dir)
+    except Exception:
+        LOG.exception("auto-archive sweep failed")
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
@@ -3569,6 +3648,76 @@ def stop_run(run_name: str, body: dict,
     return {"stopping": live}
 
 
+def set_run_archived(run_name: str, body: dict,
+                     runs_dir: Path = RUNS_DIR) -> dict:
+    """Dashboard 'Archive run'/'Unarchive': the manual half of the
+    auto-archive pass. The stamp is only a default-view filter - the run
+    dir stays on disk and resume/merge keep working (a resumed run clears
+    the stamp itself). Refused while a step is live: archiving is for
+    finished work, and hiding live work would hide its controls."""
+    d, st = _run_dir_checked(run_name, runs_dir)
+    archived = body.get("archived") is not False    # default: archive
+    if archived and any(
+            step_live(r) for r in (st.get("steps") or {}).values()):
+        raise RequestError("This run still has a live agent - wait for it "
+                           "or let it die first", 409)
+    _assert_unwatched(runs_dir, d)
+    if archived:
+        st["archived"] = now_iso()
+    else:
+        st.pop("archived", None)
+    save_state(d, st)
+    return {"run": run_name, "archived": archived}
+
+
+def delete_run(run_name: str, body: dict,
+               runs_dir: Path = RUNS_DIR) -> dict:
+    """Dashboard 'Delete run': remove the run's whole on-disk record -
+    state, events, prompts, stdout logs, ATIF exports. Requires
+    {"confirm": true} and is refused while any step is live or a
+    resume/merge is in flight (same gates resume_run/merge_run use).
+    The devin sessions it spawned are NOT deleted - once the state.json
+    naming them is gone they leave the `sessions` whitelist and become
+    manual `devin rm <id>` cleanup, same as trap-13 orphans. Parked
+    worktree branches outlive the record."""
+    if body.get("confirm") is not True:
+        raise RequestError("Confirm delete explicitly")
+    d, st = _run_dir_checked(run_name, runs_dir)
+    if any(step_live(r) for r in (st.get("steps") or {}).values()):
+        raise RequestError("This run still has a live agent - wait for it "
+                           "or let it die first", 409)
+    pid = _RESUME_PIDS.get(run_name)
+    if pid and pid_alive(pid):
+        raise RequestError("A resume is already running for this run", 409)
+    with _MERGE_LOCK:
+        if run_name in _MERGE_BUSY:
+            raise RequestError("A merge is already running for this run",
+                               409)
+    _assert_unwatched(runs_dir, d)
+    try:
+        shutil.rmtree(d)
+    except OSError as exc:
+        raise RequestError(f"Could not delete the run dir: {exc}",
+                           500) from exc
+    # Sentinels in %TEMP% key on the run's resolved path - sweep the
+    # path-keyed set (stop/skip/prompt/rnote/timeout) plus the bare
+    # run-level legacy names. Step-level legacy names (stop-<run>-<step>)
+    # can't be told apart from a same-named run's keyed flags - left in
+    # place, they are inert empty files.
+    for f in _flag_dir().glob(f"*{_flag_key(d)}*"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    for prefix in ("stop", "drain", "pause"):
+        try:
+            (_flag_dir() / f"{prefix}-{_safe_name(d.name)}").unlink(
+                missing_ok=True)
+        except OSError:
+            pass
+    return {"deleted": run_name}
+
+
 def set_step_timeout(run_name: str, step_name: str, body: dict,
                      runs_dir: Path = RUNS_DIR) -> dict:
     """Dashboard timeout editor: a minutes value in a tempdir sentinel the
@@ -4110,10 +4259,15 @@ def _pending_agent(st: dict, sd: dict, key: str, run_dir: str,
 
 def collect_dashboard(runs_dir: Path,
                       devin_argv: list[str] | None = None,
-                      requests_dir: Path | None = None) -> dict:
+                      requests_dir: Path | None = None,
+                      include_archived: bool = False) -> dict:
     """Show executed run states alongside saved, not-yet-executed requests.
-    A launched request uses state.json for its rows, not its proposal preview."""
+    A launched request uses state.json for its rows, not its proposal
+    preview. Runs stamped state['archived'] (auto-archive, or the modal's
+    Archive button) are omitted unless include_archived - they stay on
+    disk either way, and the 'archived_runs' count always reflects them."""
     requests_dir = requests_dir or runs_dir.parent / "requests"
+    _auto_archive(runs_dir)
     sess_by_dir = live_sessions_by_dir(runs_dir, devin_argv or ["devin"])
     projects = load_projects()
     refresh_prices(runs_dir)
@@ -4128,6 +4282,7 @@ def collect_dashboard(runs_dir: Path,
                 str(rec.get("id") or "")) and rec.get("status") != "discarded":
             requests[rec["id"]] = rec
     launched: set[str] = set()
+    archived_runs = 0
     runs: list[dict] = []
     agents: list[dict] = []
     for sj in sorted(runs_dir.glob("*/state.json"), reverse=True):
@@ -4137,6 +4292,10 @@ def collect_dashboard(runs_dir: Path,
             continue
         if st.get("request_id"):
             launched.add(st["request_id"])
+        if st.get("archived"):
+            archived_runs += 1
+            if not include_archived:
+                continue
         key = (f"request:{st['request_id']}" if st.get("request_id")
                else str(sj.parent))
         counts: dict[str, int] = {}
@@ -4292,6 +4451,7 @@ def collect_dashboard(runs_dir: Path,
             agents.append(row)
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
                      "key": key, "request_id": st.get("request_id"),
+                     "archived": st.get("archived"),
                      "description": st.get("description") or
                      (request or {}).get("description"),
                      "started_at": st.get("started_at"),
@@ -4415,6 +4575,7 @@ def collect_dashboard(runs_dir: Path,
     return {"generated_at": now_iso(), "serve_boot": SERVE_BOOT,
             "cpu_count": os.cpu_count(),
             "free_ram_gb": free_ram_gb(), "runs": runs, "agents": agents,
+            "archived_runs": archived_runs,
             "project_options": [{"slug": slug, "cloud_ok": p["cloud_ok"]}
                                 for slug, p in sorted(projects.items())],
             "pricing": {"tier": "self-serve", "models": len(prices),
@@ -4541,6 +4702,7 @@ a { color:#58a6ff; text-decoration:none; }
 .stage.paused { color:#e3b341; border-color:#6b5a1f; background:#2a2317; }
 .stage.interrupted { color:#f0883e; border-color:#7a3d12; background:#2d1f14; }
 .stage.halted { color:#8b949e; }
+.stage.archived { color:#8b949e; border-color:#21262d; }
 .linkbtn { background:none; border:0; color:#58a6ff; cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
 .run-name { color:#e6edf3; text-decoration:none; text-align:left; }
 .run-name:hover, .run-name:focus-visible { color:#58a6ff; text-decoration:underline; }
@@ -4638,6 +4800,9 @@ const costTitle = c => !c ? 'no token data yet' :
 const store = (typeof localStorage!=='undefined') ? localStorage :
   {getItem:()=>null, setItem:()=>{}};
 let density = store.getItem('ac-density') || 'full';
+// 'archived' view chip: archived runs stay on disk but are hidden from the
+// default listing - the toggle refetches /api/state?archived=1 to list them.
+let showArchived = store.getItem('ac-arch') === '1';
 function syncTopbar(){
   const tb = document.querySelector && document.querySelector('.topbar');
   if (tb && document.documentElement)
@@ -4936,6 +5101,21 @@ function showRunDetails(key){
       `title="re-run every non-done step in a fresh session - covers ` +
       `paused, stopped and interrupted runs">` +
       `Resume unfinished steps</button>` : '') +
+    (r.stage ? '' : `<button type="button" class="btn secondary" ` +
+      `data-arch-run="${esc(base(r.dir))}" ` +
+      `data-arch-set="${r.archived?0:1}" ` +
+      `title="${r.archived
+        ? 'remove the archived stamp - the run returns to the default view'
+        : 'hide this run from the default view (auto-archive does this ' +
+          'after 48h finished; files stay on disk)'}">` +
+      `${r.archived?'Unarchive':'Archive run'}</button>` +
+      `<button type="button" class="btn danger" ` +
+      `data-delete-run="${esc(base(r.dir))}"` +
+      `${liveSteps.length?' disabled':''} ` +
+      `title="${liveSteps.length
+        ? 'disabled while a step is still live - stop the run first'
+        : 'permanently delete this run record - state, logs, prompts, ' +
+          'exports'}">Delete run</button>`) +
     '</div>';
   document.getElementById('backdrop').hidden = false;
 }
@@ -4947,7 +5127,8 @@ async function api(method,path,body){
   if (!res.ok) throw new Error(out.error||`HTTP ${res.status}`);
   return out;
 }
-async function refresh(){ render(await api('GET','/api/state')); }
+async function refresh(){ render(await api('GET','/api/state' +
+  (showArchived?'?archived=1':''))); }
 function effortOptionsFor(model){
   const e=(lastData?.model_options||{})[model];
   return (e && e.length ? e : ['min','low','medium','high','max'])
@@ -5263,6 +5444,13 @@ function render(d){
       `data-facet="${f}" aria-pressed="${facets.has(f)}">` +
       `${facetCounts[f]} ${f}${facets.has(f)?' ×':''}</button>`).join('') +
     '</span>' +
+    `<span class="filter-group"><span class="filter-label">view:</span>` +
+    `<button type="button" class="chip${showArchived?' active':''}" ` +
+    `data-arch aria-pressed="${showArchived}" ` +
+    `title="list archived runs - finished runs are auto-archived after ` +
+    `48h (CONDUCTOR_ARCHIVE_HOURS); files stay on disk, Unarchive in the ` +
+    `run modal brings one back">${d.archived_runs||0} archived` +
+    `${showArchived?' ×':''}</button></span>` +
     (only.size||facets.size?` <button type="button" class="chip" ` +
       `data-reset>clear filters</button>`:'');
 
@@ -5352,6 +5540,9 @@ function render(d){
             ? `<br><span class="sub">planner warming up - ` +
               `devin stays silent for the first minutes; watch the ` +
               `plan-proposal row below</span>` : '') :
+        (r.archived ? `<span class="stage archived" ` +
+          `title="auto-archived run - hidden from the default view; ` +
+          `files stay on disk">archived</span>` : '') +
         runStateChip(r) + `<br>` +
         `<span class="sub">${esc(base(r.dir))}</span>`) +
       (r.stale?` <span class="stage error">Needs review</span>`:'') +
@@ -5662,6 +5853,34 @@ document.addEventListener('click', async e=>{
           'Stop requested - nothing was live.');
     } catch(err){ alert('Stop failed: '+err.message); t.disabled=false; }
     return; }
+  if (t.dataset && t.dataset.archRun){
+    const on=t.dataset.archSet==='1';
+    t.disabled=true;
+    try {
+      await api('POST',
+        `/api/runs/${encodeURIComponent(t.dataset.archRun)}/archive`,
+        {archived:on});
+      closeDetail(true); await refresh();
+    } catch(err){ alert((on?'Archive':'Unarchive')+' failed: ' +
+      err.message); t.disabled=false; }
+    return; }
+  if (t.dataset && t.dataset.deleteRun){
+    const dir=t.dataset.deleteRun;
+    const r=(lastData?.runs||[]).find(x=>base(x.dir)===dir);
+    const unmerged=AGENTS.filter(a=>a.branch && a.merged!==true &&
+      (a.run_key||a.run_dir)===(r?runKey(r):'')).length;
+    if(!confirm(`Delete run '${r?r.run:dir}'? Its whole record - state, ` +
+      `logs, prompts, session exports - is removed from disk. There is ` +
+      `no undo.` +
+      (unmerged?` ${unmerged} worktree branch(es) are still unmerged - ` +
+        `merge them first or they stay parked.`:''))) return;
+    t.disabled=true;
+    try {
+      await api('POST',`/api/runs/${encodeURIComponent(dir)}/delete`,
+                {confirm:true});
+      closeDetail(true); await refresh();
+    } catch(err){ alert('Delete failed: '+err.message); t.disabled=false; }
+    return; }
   if (t.dataset && t.dataset.filterRun){
     selectedRun=t.dataset.filterRun;
     closeDetail(true); if (lastData) render(lastData); return; }
@@ -5669,6 +5888,11 @@ document.addEventListener('click', async e=>{
     selectedRun=null; if (lastData) render(lastData); return; }
   if (t.dataset && t.dataset.reset!==undefined){
     only.clear(); facets.clear(); if (lastData) render(lastData); return; }
+  if (t.dataset && t.dataset.arch!==undefined){   // 'N archived' view chip
+    showArchived=!showArchived;
+    store.setItem('ac-arch', showArchived?'1':'0');
+    await refresh(); return;
+  }
   if (t.dataset && t.dataset.st){            // status filter chip: show only
     only.has(t.dataset.st) ? only.delete(t.dataset.st)
                            : only.add(t.dataset.st);
@@ -5765,7 +5989,8 @@ document.addEventListener('mouseover', e=>{
   applyHl();
 });
 async function tick(){
-  try { render(await (await fetch('/api/state')).json()); }
+  try { render(await (await fetch('/api/state' +
+    (showArchived?'?archived=1':''))).json()); }
   catch(e){} finally { setTimeout(tick, 2000); } }
 setDensity(density);
 if (typeof window!=='undefined' && window.addEventListener)
@@ -5827,8 +6052,12 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
             try:
                 self._check_origin()
                 if path == "/api/state":
-                    self._json(collect_dashboard(runs_dir, devin_argv,
-                                                 requests_dir))
+                    q = urllib.parse.parse_qs(
+                        urllib.parse.urlsplit(self.path).query)
+                    self._json(collect_dashboard(
+                        runs_dir, devin_argv, requests_dir,
+                        include_archived=q.get("archived", [""])[0]
+                        in ("1", "true", "yes")))
                 elif (m := re.fullmatch(r"/api/requests/([^/]+)", path)):
                     rec = request_details(m[1], requests_dir,
                                           manifests_dir, runs_dir)
@@ -5887,6 +6116,11 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     self._json(stop_run(m.group(1),
                                         {**body, "pause": True},
                                         runs_dir), 202)
+                elif (m := re.fullmatch(r"/api/runs/([^/]+)/archive", path)):
+                    self._json(set_run_archived(m.group(1), body,
+                                                runs_dir))
+                elif (m := re.fullmatch(r"/api/runs/([^/]+)/delete", path)):
+                    self._json(delete_run(m.group(1), body, runs_dir))
                 elif (m := re.fullmatch(
                         r"/api/runs/([^/]+)/steps/([^/]+)/stop", path)):
                     self._json(stop_step(m.group(1), m.group(2), runs_dir),

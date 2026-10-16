@@ -218,6 +218,24 @@ merge loop for parked branches, spawns the `resolve-*` session when the
 manifest opts in, and 409s while any step is live - the fix for "the
 conductor died/conflicted before merging" without `--resume`.
 
+Run hygiene keeps the runs table short without touching files: a run
+whose `ended_at` is older than `CONDUCTOR_ARCHIVE_HOURS` (default 48, 0
+disables) is stamped `state["archived"]` by `archive_runs` - folded into
+`sweep`/`serve` startup, plus a 30-min throttled pass inside
+`collect_dashboard` so a long-lived server still catches up. The stamp
+is only a default-view filter: `/api/state` omits archived runs (the
+payload's `archived_runs` count drives the `view: N archived` chip,
+which refetches `?archived=1` to list them), while resume/merge still
+work and `--resume` clears the stamp so a re-entered run resurfaces.
+The run modal's **Archive run**/**Unarchive** (`POST .../archive`
+`{archived}`) flips it manually for finished runs, and **Delete run**
+(`POST .../delete` `{confirm:true}`) `rmtree`s the record outright -
+state, logs, prompts, exports; refused (409) while a step is live or a
+resume/merge is in flight, and the JS button is disabled then too. A
+deleted run's spawned devin sessions are NOT removed - they leave the
+`sessions` whitelist and age into manual `devin rm <id>` (trap-13
+shape), and its parked worktree branches outlive the record.
+
 Prompt controls sit beside the lifecycle ones on the agent modal.
 **Edit prompt** (`POST .../steps/<step>/prompt` `{prompt}`) writes a
 `prompt-<key>-<step>` sentinel holding a replacement task body that
