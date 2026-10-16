@@ -23,14 +23,19 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 - DONE 2026-10-15 (follow-up-plan, closing step of run
   20261015-182057-ux-controls): reviewed the run - 6/8 steps merged
-  clean; `image-attachments` + `task-modal-navigation` are done work but
+  clean; `image-attachments` + `task-modal-navigation` were done work
   parked unmerged (conflicts only on .agent_tasks/QUEUE.md +
   efficiency_stats.md; the resolver's untracked-files guard refused
-  silently - fixed since f261937). task-modal-navigation's verify hit
-  the hard-coded 600s gate despite a green suite. Drafted
-  manifests/ux-controls-followup.toml: merge the two parked branches,
-  configurable verify_timeout_s, .agent_tasks merge-safety, flaky
-  stop-flag test, live planner-ask smoke. NOT launched - human review.
+  silently - fixed since f261937). UPDATE 2026-10-15: image-attachments
+  merged via resolve-image-attachments (merge commit 07915de; all three
+  conflicts were both-append - kept both sides, normalized a stray `||`
+  row prefix in efficiency_stats.md; 206/206 mock tests green).
+  task-modal-navigation still parked - its verify hit the hard-coded
+  600s gate despite a green suite. Drafted
+  manifests/ux-controls-followup.toml: merge the remaining parked
+  branch, configurable verify_timeout_s, .agent_tasks merge-safety,
+  flaky stop-flag test, live planner-ask smoke. NOT launched - human
+  review.
 - DONE 2026-10-15 (run-link-affordance): run names in the runs table
   always render as links now (blue + underline, lighter blue on hover) -
   they are the run-modal affordance and previously looked like plain
