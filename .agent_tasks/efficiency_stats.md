@@ -41,3 +41,4 @@ accounted for.
 | agent-conductor / steps-counters-clarity (token counters self-label: in/out/cached/turns + planner:/steps: prefixes; 171/172 - unrelated stop-flag flake, demo green) | n/a | n/a | n/a | n/a |
 | agent-conductor / run-lifecycle-cleanup (auto-archive stamp + delete-run endpoint + archived view chip; 182/182 + demo green) | n/a | n/a | n/a | n/a |
 | agent-conductor / planner-questions (opt-in 'ask' box: planner emits BEGIN_QUESTIONS, request parks at 'questions' stage, one-question-per-modal answers feed a refine pass, 3-round cap; 193/193 + demo green) | n/a | n/a | n/a | n/a |
+| agent-conductor / task-modal-navigation (sticky .dnav prev/next bar walking pipeline seq order + arrow keys; agentKey->run_key; 200/200 + demo green) | n/a | n/a | n/a | n/a |

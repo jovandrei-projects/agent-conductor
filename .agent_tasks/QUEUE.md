@@ -21,6 +21,16 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-15 (task-modal-navigation): the task detail modal gets a
+  sticky `.dnav` bar - prev/next buttons naming their sibling step and a
+  `task N of M` counter - walking the run's pipeline in manifest order
+  (`seq` stamped per agent by collect_dashboard; record-order fallback
+  for unmanifested steps, proposed_steps index for previews, none for the
+  plan-proposal row or 1-step pipelines). `[data-nav]` clicks and
+  ArrowLeft/ArrowRight share `navStep`; nav resets modal scroll, the 2s
+  rebuild doesn't. `agentKey` prefers run_key over run_dir so proposal
+  steps of different requests can't alias. 200/200 mock tests + demo
+  green.
 - DONE 2026-10-15 (trajectory drill-down + compact counters): each arc
   group is now an expandable `<details>` - per-entry timestamp,
   gap-to-next duration, and REAL per-turn in/out/cached tokens read
