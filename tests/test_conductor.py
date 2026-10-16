@@ -3065,6 +3065,82 @@ assert.ok(!cls.contains('compact'));          // default = full
         self.assertEqual(p.returncode, 0, p.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_compact_genline_live_output(self):
+        """Compact density hides the run row's .sub planner-output line,
+        so the same gen_last also renders inline as a .genline span -
+        display:none at full density, inline under body.compact. It
+        reuses the prevTail diff for the .fresh flash: a changed gen_last
+        flashes, an unchanged one does not, first paint never flashes."""
+        html = conductor._DASH_HTML
+        self.assertRegex(html, r'\.genline \{[^}]*display:\s*none')
+        self.assertRegex(
+            html, r'body\.compact td \.genline \{[^}]*display:\s*inline')
+        js = html.split("<script>\n", 1)[1].split("</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,
+  {innerHTML:'',hidden:true,textContent:''}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+// the questions auto-popup fetches the request - reject is caught inside
+// openQuestions, so a throwaway stub keeps the row renderable
+const fetch=async()=>{throw new Error('no net')};
+const ctx=vm.createContext({document,fetch,location:{reload:()=>{}},
+  setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const mk=last=>({serve_boot:'b',generated_at:'2026-10-14T00:00:00',
+  agents:[],runs:[
+  {run:'req',key:'request:r1',request_id:'r1',stage:'generating',
+   gen_last:last,dir:'',counts:{planned:2},projects:['p']},
+  {run:'plain',dir:'/plain',counts:{done:1}}]});
+const render=d=>vm.runInContext('render('+JSON.stringify(d)+')',ctx);
+// first paint: the line carries the planner's latest output; no flash -
+// there is nothing to diff against yet
+render(mk('reading the repo'));
+let runs=elem('runs').innerHTML;
+assert.match(runs,/class="genline" title="reading the repo">reading the repo</);
+// the same value still renders as the full-view .sub line
+assert.match(runs,/class="sub">reading the repo</);
+// exactly one genline - the plain run row has none
+assert.equal((runs.match(/class="genline/g)||[]).length,1);
+// a streamed update flashes both the compact line and the .sub line
+render(mk('drafting step two'));
+runs=elem('runs').innerHTML;
+assert.match(runs,/class="genline fresh"[^>]*>drafting step two</);
+assert.match(runs,/class="sub fresh">drafting step two</);
+// an unchanged value does not re-flash - bump an unrelated field so the
+// render sig differs and the row actually rebuilds
+const same=mk('drafting step two'); same.runs[1].counts={done:2};
+render(same);
+runs=elem('runs').innerHTML;
+assert.match(runs,/class="genline" title="drafting step two">/);
+assert.doesNotMatch(runs,/sub fresh/);
+// a newline-less narration blob keeps only its tail - the fresh end
+const blob='x'.repeat(200)+'tail-end';
+render(mk(blob));
+runs=elem('runs').innerHTML;
+assert.match(runs,/class="genline fresh" title="[^"]*tail-end">…x+tail-end</);
+// before the first output, the line says the planner is warming up
+// (gen_last flipped to null - that change flashes too)
+render(mk(null));
+assert.match(elem('runs').innerHTML,
+  /class="genline[^"]*"[^>]*>planner warming up</);
+// a questions-stage row shows the waiting hint in the same slot
+const q=mk(null); q.runs[0].stage='questions';
+q.runs[0].questions=[{qid:'q0',header:'Scope',question:'Which?'}];
+render(q);
+assert.match(elem('runs').innerHTML,
+  /class="genline[^"]*"[^>]*>planner waits on 1 answer\(s\)</);
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_run_dir_basename_on_windows_paths(self):
         """Regression: _DASH_HTML is a Python string, so '\\\\' in the
         source reached JS as '\\' - /[\\\\/]/ split on '/' only and
