@@ -5407,6 +5407,15 @@ body.compact td.wrap, body.compact td.res {
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 body.compact td .sub { display:none; }
 body.compact td br { display:none; }
+/* .genline: a proposal row's compact live-output line - display:none at
+   full density (the .sub line under the stage chip shows the same
+   gen_last there), inline on the row's one line under compact, ellipsized
+   by the td. .fresh flashes it on new output - the same animation the
+   agent result cells use, on the .sub line too. */
+.genline { display:none; }
+body.compact td .genline { display:inline; color:#8b949e;
+  font-size:12px; margin-left:6px; }
+.genline.fresh, td .sub.fresh { animation:fresh 1.2s ease-out; }
 .counts span { background:#161b22; border-radius:8px; padding:1px 8px; margin-right:5px; font-size:12px; }
 a { color:#58a6ff; text-decoration:none; }
 [hidden] { display:none !important; }
@@ -5654,7 +5663,9 @@ const only = new Set();   // status chips: empty = all, else show ONLY these
 const facets = new Set();
 let selectedRun = null;
 const prevTail = {};      // run|step -> last tail_last shown; a change
-                          // flashes the result cell (.fresh) as logs stream
+                          // flashes the result cell (.fresh) as logs stream.
+                          // 'genline|<runkey>' keys the same diff for a
+                          // proposal row's compact live-output line
 const SHOW_N = 10;
 let runsShown = SHOW_N;   // visible run-table rows; active runs never hide
 const ORDER = ['running','queued','waiting','planned','done','partial',
@@ -6586,6 +6597,20 @@ function render(d){
       .join('');
     const runUsd = (r.cost&&r.cost.usd!=null)||(r.plan_cost&&r.plan_cost.usd!=null)
       ? (r.cost&&r.cost.usd||0)+(r.plan_cost&&r.plan_cost.usd||0) : null;
+    // Compact density hides the .sub planner-output line entirely, so the
+    // same gen_last also rides inline on the row as .genline (display:none
+    // at full density). The prevTail diff drives the .fresh flash - the
+    // same mechanism agent tail cells use. gen_last can be one giant
+    // newline-less blob - keep its END, where the fresh text is.
+    const gk = 'genline|' + runKey(r);
+    const gfresh = r.stage && gk in prevTail && prevTail[gk] !== r.gen_last;
+    if (r.stage) prevTail[gk] = r.gen_last;
+    const glast = r.gen_last && r.gen_last.length > 160
+      ? '…' + r.gen_last.slice(-160) : r.gen_last;
+    const cgen = !r.stage ? '' :
+      r.stage==='questions' && (r.questions||[]).length
+        ? `planner waits on ${r.questions.length} answer(s)`
+        : glast || (r.stage==='generating' ? 'planner warming up' : '');
     h += `<tr class="runrow${runKey(r)===selectedRun?' selected':''}" ` +
       `data-run-key="${esc(runKey(r))}" tabindex="0" ` +
       `aria-label="Filter to run ${esc(r.run)}"><td class="wrap">` +
@@ -6608,10 +6633,13 @@ function render(d){
         (r.stage==='generating'
           ? `<span class="dots"><span>.</span><span>.</span><span>.</span></span>`
           : '') + `</span>` +
+        (cgen ? ` <span class="genline${gfresh?' fresh':''}" ` +
+          `title="${esc(cgen)}">${esc(cgen)}</span>` : '') +
         (r.stage==='questions' && (r.questions||[]).length
           ? `<br><span class="sub">planner waits on ` +
             `${r.questions.length} answer(s) - open to reply</span>`
-          : r.gen_last ? `<br><span class="sub">${esc(r.gen_last)}</span>` :
+          : r.gen_last ? `<br><span class="sub${gfresh?' fresh':''}">` +
+            `${esc(r.gen_last)}</span>` :
           r.stage==='generating'
             ? `<br><span class="sub">planner warming up - ` +
               `devin stays silent for the first minutes; watch the ` +

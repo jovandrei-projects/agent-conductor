@@ -47,4 +47,5 @@ accounted for.
 | agent-conductor / task-modal-navigation (sticky .dnav prev/next bar walking pipeline seq order + arrow keys; agentKey->run_key; 200/200 + demo green) | n/a | n/a | n/a | n/a |
 | agent-conductor / resolve-task-modal-navigation (merge resolution: both-append conflicts on QUEUE.md + efficiency_stats.md; merge e8c79e9) | n/a | n/a | n/a | n/a |
 | agent-conductor / stop-proposal-preparation (stopgen sentinel + _GEN_PROCS kill + gen_id attempt scoping, Stop proposal on 3 modals; 216/216 + demo + real-proc smoke green) | n/a | n/a | n/a | n/a |
+| agent-conductor / compact-live-output (proposal run rows get a .genline last-output line under compact density, .fresh flash via prevTail incl. the full-view .sub; 211/211 green) | n/a | n/a | n/a | n/a |
 | agent-conductor / follow-up-plan (proposal-ui-fixes run review: 1/2 steps landed, compact-live-output parked on flaky-verify false-fail; drafted proposal-ui-fixes-followup.toml - merge parked branch + harden _flag_soon family + live smoke) | n/a | n/a | n/a | n/a |
