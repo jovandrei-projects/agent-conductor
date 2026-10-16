@@ -52,6 +52,18 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   even though ~98% was cache-served - the Desktop card reports only
   the uncached delta instead. First LLM call on a fresh agent-conductor
   session already carries ~107k prompt tokens.
+- DONE 2026-10-15 (image-attachments): request-form image attachments -
+  drop image files anywhere on the request dialog or paste a clipboard
+  screenshot; each uploads raw bytes to `POST /api/attachments`
+  (magic-byte sniffed PNG/JPEG/GIF/WebP/BMP, 20MB cap, same
+  `_assert_unwatched` trap-5 guard as request writes), saves under
+  `data/attachments/<ts>-<rand>.<ext>`, and its absolute path is
+  inserted into `rq-raw` at the caret. The `[{name,path}]` list rides
+  `attachments` on the request JSON (`_attachment_fields`, cap 20,
+  changes mark a proposal stale), renders as a thumbnail strip via
+  `GET /api/attachments/<name>` with a per-image `x` remove while the
+  stage is editable, and lands in the planner prompt as an IMAGE
+  ATTACHMENTS block. 199/199 mock tests + demo green.
 - DONE 2026-10-15 (run-lifecycle-cleanup): finished runs auto-archive
   after `CONDUCTOR_ARCHIVE_HOURS` (default 48) - a `state["archived"]`
   stamp hides them from the default `/api/state` while files stay on

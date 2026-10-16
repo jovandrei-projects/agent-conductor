@@ -183,6 +183,21 @@ errors out. A Regenerate, an edited `raw`/`project`, or any manifest
 publish drops the parked set - the questions were drafted against the
 old request. Unchecked, or a planner that simply has none, is byte-for-
 byte the old flow.
+Request image attachments: dropping an image file anywhere on the
+request dialog or pasting a clipboard screenshot uploads the raw bytes
+to `POST /api/attachments` (magic-byte sniffed - PNG/JPEG/GIF/WebP/BMP,
+20MB cap; the declared Content-Type is never trusted), which saves it as
+`data/attachments/<ts>-<rand>.<ext>`; the absolute path is inserted into
+`rq-raw` at the caret and the `{name,path}` pair joins `rec.attachments`
+(`_attachment_fields` shape-checks, cap 20). The thumbnail strip under
+the textarea is served by `GET /api/attachments/<name>` (name-regex +
+resolved-parent checks keep it inside the dir) and each image has an `x`
+remove while the stage is editable (draft..questions - never after
+launch). Attachments feed the planner prompt as an IMAGE ATTACHMENTS
+block, and changing them marks an existing proposal stale. Uploads take
+the same `_assert_unwatched` trap-5 guard as request writes, since
+`data/` sits inside a self-hosted run's watched cwd. Removed/unsaved
+uploads leave orphan files in `data/` - ignored, same class as runs/.
 Real runs still use `state.json` as their registry. Run controls use one
 naming system - each visible name a distinct semantics: **Pause run**
 (POST `/api/runs/<dir>/pause`) is the graceful hold - in-flight steps

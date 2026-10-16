@@ -1982,6 +1982,162 @@ prompt = "Report the outcome."
         self.assertTrue(popen.call_args.kwargs["shell"])
         self.assertNotIn("creationflags", popen.call_args.kwargs)
 
+    def test_attachment_upload_serve_and_persistence(self):
+        """POST /api/attachments stores raw image bytes under
+        data/attachments (type sniffed from magic, not the header), GET
+        serves it back for the thumbnail strip, and the [{name,path}] list
+        round-trips through create/save/details."""
+        attaches = self.base / "attachments"
+        handler = conductor.make_dashboard_handler(
+            self.runs, ["no-such-devin"], self.requests, self.manifests,
+            attaches)
+        server = conductor.http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_port
+
+        def call(method, path, data=None, ctype="application/json",
+                 raw=False):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            body = (data if raw else
+                    json.dumps(data).encode("utf-8")
+                    if data is not None else None)
+            conn.request(method, path, body,
+                         {"Content-Type": ctype,
+                          "Origin": f"http://127.0.0.1:{port}"})
+            res = conn.getresponse()
+            payload = res.read()
+            conn.close()
+            return res.status, res.getheader("Content-Type"), payload
+
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
+        status, _, payload = call("POST", "/api/attachments", png,
+                                  ctype="image/png", raw=True)
+        self.assertEqual(status, 201)
+        att = json.loads(payload)
+        self.assertTrue(att["name"].endswith(".png"))
+        self.assertEqual((attaches / att["name"]).read_bytes(), png)
+        self.assertEqual(att["path"],
+                         str((attaches / att["name"]).resolve()))
+        # thumbnails serve the stored bytes with the sniffed image type
+        status, ctype, body = call("GET", f"/api/attachments/{att['name']}")
+        self.assertEqual((status, ctype, body), (200, "image/png", png))
+        # a lying Content-Type can't save a non-image; junk names 404
+        status, _, _ = call("POST", "/api/attachments", b"MZ" + b"x" * 64,
+                            ctype="image/png", raw=True)
+        self.assertEqual(status, 415)
+        status, _, _ = call("GET", "/api/attachments/..%2Fsecret.txt")
+        self.assertEqual(status, 404)
+        status, _, _ = call("GET", "/api/attachments/nope.png")
+        self.assertEqual(status, 404)
+        with mock.patch.object(conductor, "ATTACH_MAX_BYTES", 16):
+            status, _, _ = call("POST", "/api/attachments", png,
+                                ctype="image/png", raw=True)
+        self.assertEqual(status, 413)
+        # the attachment list persists through create -> details -> save
+        status, _, payload = call("POST", "/api/requests", {
+            "raw": "See the attached mockup", "project": "proj",
+            "model": "swe-2", "effort": "max", "attachments": [att]})
+        self.assertEqual(status, 201)
+        rid = json.loads(payload)["id"]
+        detail = json.loads(call("GET", f"/api/requests/{rid}")[2])
+        self.assertEqual(detail["attachments"], [att])
+        status, _, payload = call("POST", f"/api/requests/{rid}/save",
+                                  {"attachments": []})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["attachments"], [])
+        status, _, _ = call("POST", f"/api/requests/{rid}/save",
+                            {"attachments": [{"name": "../x"}]})
+        self.assertEqual(status, 400)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_request_attachments_strip_drop_paste_remove(self):
+        """The request form's thumbnail strip renders saved attachments,
+        attachFiles uploads + inserts the path at the caret, the per-image
+        x removes it, and requestFields carries the list to the server."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, posts=[];
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',value:'',classList:{add(){},remove(){},toggle(){}}});
+  return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,fn)=>{handlers[ev]=fn;}};
+const fetch=async(path,opts)=>{posts.push({path,type:opts&&opts.headers&&
+  opts.headers['Content-Type']});
+  return {ok:true,status:201,json:async()=>(
+    {name:'a1.png',path:'D:/data/attachments/a1.png'})};};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},fetch,Event:class Event{constructor(){}}});
+vm.runInContext(src,ctx);
+const d={serve_boot:'b',generated_at:'2026-10-14',agents:[],runs:[],
+  project_options:[{slug:'p',cloud_ok:false}],
+  defaults:{model:'swe-2',effort:'max'}};
+vm.runInContext('render('+JSON.stringify(d)+')',ctx);
+vm.runInContext('openNew()',ctx);
+assert.match(elem('dbody').innerHTML,/id="rq-attach"/);
+const ta=elem('rq-raw'); ta.value='Do this'; ta.selectionStart=7;
+ta.selectionEnd=7;
+// a reopened draft renders its saved attachments with remove controls
+vm.runInContext('rqAttachments=[{name:"old.png",path:"D:/x/old.png"}];' +
+  'renderAttach(true)',ctx);
+assert.match(elem('rq-attach').innerHTML,/api\/attachments\/old\.png/);
+assert.match(elem('rq-attach').innerHTML,/data-attach-rm="old\.png"/);
+(async()=>{
+  // file drop on the request dialog uploads + attaches + inserts the path
+  let prevented=false;
+  handlers.drop({dataTransfer:{files:[{type:'image/png'}]},
+    preventDefault:()=>{prevented=true;}});
+  await new Promise(r=>setImmediate(r));
+  assert.equal(prevented,true);
+  assert.equal(posts.length,1);
+  assert.equal(posts[0].type,'image/png');
+  assert.match(ta.value,/D:\/data\/attachments\/a1\.png/);
+  assert.match(ta.value,/Do this\n/);
+  assert.match(elem('rq-attach').innerHTML,/api\/attachments\/a1\.png/);
+  assert.equal(elem('rq-attach').hidden,false);
+  const f=vm.runInContext('requestFields()',ctx);
+  // vm-boundary objects have foreign prototypes - compare serialized
+  assert.equal(JSON.stringify(f.attachments),JSON.stringify(
+    [{name:'old.png',path:'D:/x/old.png'},
+     {name:'a1.png',path:'D:/data/attachments/a1.png'}]));
+  // per-image remove works pre-submit
+  await handlers.click({preventDefault:()=>{},target:{dataset:{},
+    closest:s=>s==='[data-attach-rm]'?{dataset:{attachRm:'old.png'}}:null}});
+  assert.equal(JSON.stringify(
+    vm.runInContext('requestFields()',ctx).attachments),
+    JSON.stringify([{name:'a1.png',path:'D:/data/attachments/a1.png'}]));
+  // non-image drops are refused without an upload
+  await vm.runInContext('attachFiles([{type:"text/plain"}])',ctx);
+  assert.equal(posts.length,1);
+  // a clipboard screenshot paste goes through the same path
+  const item={kind:'file',type:'image/png',
+    getAsFile:()=>({type:'image/png'})};
+  prevented=false;
+  handlers.paste({clipboardData:{items:[item]},
+    preventDefault:()=>{prevented=true;}});
+  await new Promise(r=>setImmediate(r));
+  assert.equal(prevented,true);
+  assert.equal(posts.length,2);
+  // text pastes are untouched by the listener
+  prevented=false;
+  handlers.paste({clipboardData:{items:[{kind:'string',type:'text/plain'}]},
+    preventDefault:()=>{prevented=true;}});
+  assert.equal(prevented,false);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
 
 class BackgroundProcessTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows console flags")
