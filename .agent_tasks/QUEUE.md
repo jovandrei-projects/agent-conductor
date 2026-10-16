@@ -24,6 +24,28 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (summary-purpose-parsing, wave step of run
+  20261016-013719-workflow-ux-safety): the reported
+  `/summary` page for resolve-task-modal-navigation rendered the raw
+  `<!-- conductor-purpose: resolve-merge -->` marker as its Task text
+  (and the comment ate ~45 of the 160-char summary budget). Root cause
+  was task-description selection treating conductor metadata as prose,
+  not the comment token itself. New `split_purpose`/`purpose_label`/
+  `task_display`/`task_summary` helpers recognize the marker ONLY at the
+  head of a body - a mid-text mention (like this step's own prompt) or
+  an unrelated HTML comment in task text is never stripped. Dispatched
+  records now store `purpose` as its own machine-readable field with a
+  marker-free `task`; old marker-bearing records are parsed back at read
+  time so existing runs render clean retroactively. Marker-only tasks
+  display `conductor task: <label>` (resolve-merge -> "merge conflict
+  resolution"). The marker still ships verbatim in the dispatched prompt
+  file - mock_devin's resolve-merge trigger relies on it - and pending
+  rows keep `task_full` literal since it doubles as the Edit-prompt
+  prefill (a save round-trip must not drop embedded metadata). Summary
+  gains a `- **purpose:** `token` (label)` bullet; the modal gains a
+  `purpose` kv row; agents rows carry `purpose`. HTML sanitization
+  unchanged - escaping tests + new injection test green. 262/262 mock
+  tests + demo green; verified against the real run's state.json.
 - DONE 2026-10-16 (deferred-merge-engine, wave step of run
   20261016-013719-workflow-ux-safety): `merge = "deferred"` (run-level
   or per-step; implies worktree) separates worktree isolation from
