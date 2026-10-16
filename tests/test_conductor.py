@@ -4575,6 +4575,370 @@ const click=t=>handlers.click({target:{...t,closest:()=>null},
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class ContextMenuTests(unittest.TestCase):
+    """Right-click / Shift+F10 row context menus on the runs and agents
+    tables. Menu items reuse the modal's data-* hooks (one delegated click
+    handler, one set of server endpoints); availability mirrors the modal
+    via shared runCtl. The native menu stays for selections, editable
+    fields, non-row targets and Shift+right-click."""
+
+    def test_context_menu_element_is_in_the_page(self):
+        html = conductor._DASH_HTML
+        self.assertIn('id="ctxmenu"', html)
+        self.assertIn('role="menu"', html)
+        # rows advertise the menu to AT and are keyboard-focusable
+        self.assertIn('aria-haspopup="menu"', html)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_run_menu_state_actions_and_dispatch(self):
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, posts=[], alerts=[];
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',scrollTop:0,style:{},querySelector:()=>null,
+  querySelectorAll:()=>[]}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const sel={isCollapsed:true,toString:()=>''};
+const window={innerWidth:1200,innerHeight:800,addEventListener:()=>{},
+  getSelection:()=>sel};
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',agents:[
+  {step:'live-step',run:'live',run_dir:'/runs/live',run_key:'/runs/live',
+   slug:'p',status:'running',task:'t1'},
+  {step:'queued-step',run:'live',run_dir:'/runs/live',run_key:'/runs/live',
+   slug:'p',status:'queued',task:'t2',prompt_editable:true}],runs:[
+  {run:'live',dir:'/runs/live',key:'/runs/live',counts:{running:1,queued:1}},
+  {run:'done',dir:'/runs/done',key:'/runs/done',counts:{done:1,failed:1},
+   ended_at:'2026-10-16T01:00:00'},
+  {run:'req',key:'request:r1',request_id:'r1',stage:'generating',
+   counts:{planned:1}}]};
+const fetch=async(url,opt)=>{
+  posts.push({url,body:opt&&opt.body?JSON.parse(opt.body):null});
+  if(url.startsWith('/api/state')) return {ok:true,json:async()=>data};
+  return {ok:true,json:async()=>({pausing:['live-step'],
+    stopping:['live-step']}),text:async()=>''}; };
+const ctx=vm.createContext({document,window,fetch,confirm:()=>true,
+  alert:m=>alerts.push(m),location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const cls=c=>{let s=c;return {contains:x=>s.split(' ').includes(x),
+  add:x=>{s+=' '+x;},remove:x=>{s=s.split(' ').filter(v=>v!==x).join(' ');},
+  has:x=>s.split(' ').includes(x)};};
+const runRow=key=>({cls:'runrow',dataset:{runKey:key},classList:cls('runrow'),
+  isConnected:true,focused:0,focus(){this.focused++;},
+  matches:s=>s==='tr.runrow'||s==='tr.runrow,tr.agen',
+  getBoundingClientRect:()=>({left:10,top:20,bottom:30})});
+const onRow=row=>({isContentEditable:false,dataset:{},
+  closest:sel=>{
+    if(sel==='#ctxmenu')return null;
+    if(sel.indexOf('input')===0)return null;
+    if(sel==='tr.runrow')return row.cls==='runrow'?row:null;
+    if(sel==='tr.agen')return row.cls==='agen'?row:null;
+    if(sel==='tr.runrow,tr.agen')return row;
+    return null;}});
+const rclick=(t,o)=>{let pd=0;handlers.contextmenu({target:t,clientX:60,
+  clientY:70,shiftKey:!!(o&&o.shift),preventDefault:()=>{pd++;}});return pd;};
+const menuBtn=dataset=>({id:'',dataset,disabled:false,
+  closest:sel=>{
+    if(sel==='#ctxmenu')return {inMenu:1};
+    const m=sel.match(/^\[data-([a-z-]+)\]$/);
+    if(m){const k=m[1].replace(/-([a-z])/g,(s,c)=>c.toUpperCase());
+      return k in dataset?{dataset}:null;}
+    return null;}});
+(async()=>{
+  // live run: Open details + Filter + Pause/Stop, Archive, disabled Delete
+  assert.equal(rclick(onRow(runRow('/runs/live'))),1);
+  const m=elem('ctxmenu');
+  assert.equal(m.hidden,false);
+  assert.match(m.innerHTML,/data-run-details="\/runs\/live"[^>]*>Open details/);
+  assert.match(m.innerHTML,/data-filter-run="\/runs\/live"[^>]*>Filter by this item/);
+  assert.match(m.innerHTML,/data-pause-run="live"[^>]*>Pause run/);
+  assert.match(m.innerHTML,/data-stop-run="live"[^>]*>Stop run now/);
+  assert.match(m.innerHTML,/data-arch-run="live"[^>]*>Archive run/);
+  assert.match(m.innerHTML,/disabled[^>]*data-delete-run="live"/);
+  assert.doesNotMatch(m.innerHTML,/Resume unfinished steps/);
+  assert.doesNotMatch(m.innerHTML,/Merge pending branches/);
+  assert.match(m.innerHTML,/Shift\+F10/);            // escape-hatch hint
+  // clamped to the viewport (menu estimated at 240px wide in the harness)
+  assert.equal(m.style.left,'60px');
+  // finished run: Pause/Stop absent, Resume + enabled Delete present
+  assert.equal(rclick(onRow(runRow('/runs/done'))),1);
+  assert.match(m.innerHTML,/data-resume-run="done"[^>]*>Resume unfinished steps/);
+  assert.doesNotMatch(m.innerHTML,/data-pause-run/);
+  assert.doesNotMatch(m.innerHTML,/data-stop-run/);
+  assert.match(m.innerHTML,/data-delete-run="done"[^>]*>Delete run/);
+  assert.doesNotMatch(m.innerHTML,/disabled[^>]*data-delete-run/);
+  // proposal row: request modal + Stop proposal, never lifecycle buttons
+  assert.equal(rclick(onRow(runRow('request:r1'))),1);
+  assert.match(m.innerHTML,/data-open-request="r1"[^>]*>Open details/);
+  assert.match(m.innerHTML,/data-stop-gen="r1"[^>]*>Stop proposal/);
+  assert.match(m.innerHTML,/data-filter-run="request:r1"/);
+  assert.doesNotMatch(m.innerHTML,/data-pause-run|data-arch-run|data-delete-run/);
+  // 'Filter by this item' selects the run through the shared handler
+  await handlers.click({target:menuBtn({filterRun:'/runs/done'}),
+    preventDefault:()=>{}});
+  assert.equal(m.hidden,true);                       // item click closed it
+  assert.equal(vm.runInContext('selectedRun',ctx),'/runs/done');
+  assert.match(elem('runs').innerHTML,/runrow selected/);
+  // and the filtered row now offers Clear run filter instead
+  assert.equal(rclick(onRow(runRow('/runs/done'))),1);
+  assert.match(m.innerHTML,/>Clear run filter</);
+  // Pause run posts to the existing endpoint via the shared handler
+  assert.equal(rclick(onRow(runRow('/runs/live'))),1);
+  posts.length=0;
+  await handlers.click({target:menuBtn({pauseRun:'live'}),
+    preventDefault:()=>{}});
+  assert.equal(posts[0].url,'/api/runs/live/pause');
+  assert.equal(m.hidden,true);
+  // 'Open details' from the menu is the same modal the name button opens
+  assert.equal(rclick(onRow(runRow('/runs/done'))),1);
+  await handlers.click({target:menuBtn({runDetails:'/runs/done'}),
+    preventDefault:()=>{}});
+  assert.equal(elem('backdrop').hidden,false);
+  assert.match(elem('dbody').innerHTML,/>done</);
+  // outside click is a pure dismissal: menu gone, and the row under the
+  // click did NOT toggle its filter (no accidental navigation)
+  vm.runInContext('selectedRun=null; render(lastData)',ctx);
+  assert.equal(rclick(onRow(runRow('/runs/live'))),1);
+  assert.equal(m.hidden,false);
+  await handlers.click({target:onRow(runRow('/runs/done')),
+    preventDefault:()=>{}});
+  assert.equal(m.hidden,true);
+  assert.equal(vm.runInContext('selectedRun',ctx),null);   // swallowed
+  // the next identical click really is on the row now
+  await handlers.click({target:onRow(runRow('/runs/done')),
+    preventDefault:()=>{}});
+  assert.equal(vm.runInContext('selectedRun',ctx),'/runs/done');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_task_menu_state_actions_and_dispatch(self):
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, posts=[], alerts=[];
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',scrollTop:0,style:{},querySelector:()=>null,
+  querySelectorAll:()=>[]}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const sel={isCollapsed:true,toString:()=>''};
+const window={innerWidth:1200,innerHeight:800,addEventListener:()=>{},
+  getSelection:()=>sel};
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',agents:[
+  {step:'live-step',run:'live',run_dir:'/runs/live',run_key:'/runs/live',
+   slug:'p',status:'running',task:'t1'},
+  {step:'queued-step',run:'live',run_dir:'/runs/live',run_key:'/runs/live',
+   slug:'p',status:'queued',task:'t2',prompt_editable:true},
+  {step:'held',run:'done',run_dir:'/runs/done',run_key:'/runs/done',
+   slug:'p',status:'skipped',skipped_by_user:true,task:'t3'},
+  {step:'plan-proposal',run:'req',run_key:'request:r1',slug:'p',
+   status:'running',request_id:'r1',task:'planner'}],runs:[
+  {run:'live',dir:'/runs/live',key:'/runs/live',counts:{running:1,queued:1}},
+  {run:'done',dir:'/runs/done',key:'/runs/done',counts:{skipped:1},
+   ended_at:'2026-10-16T01:00:00'}]};
+const fetch=async(url,opt)=>{
+  posts.push({url,body:opt&&opt.body?JSON.parse(opt.body):null});
+  if(url.startsWith('/api/state')) return {ok:true,json:async()=>data};
+  return {ok:true,json:async()=>({}),text:async()=>'<p>sum</p>'}; };
+const ctx=vm.createContext({document,window,fetch,confirm:()=>true,
+  alert:m=>alerts.push(m),location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const cls=c=>({contains:x=>c.split(' ').includes(x),add(){},remove(){}});
+const agenRow=i=>({cls:'agen',dataset:{i:String(i)},classList:cls('agen'),
+  isConnected:true,focused:0,focus(){this.focused++;},
+  matches:s=>s==='tr.agen'||s==='tr.runrow,tr.agen',
+  getBoundingClientRect:()=>({left:10,top:20,bottom:30})});
+const onRow=row=>({isContentEditable:false,dataset:{},
+  closest:sel=>{
+    if(sel==='#ctxmenu')return null;
+    if(sel.indexOf('input')===0)return null;
+    if(sel==='tr.agen')return row.cls==='agen'?row:null;
+    if(sel==='tr.runrow')return null;
+    if(sel==='tr.runrow,tr.agen')return row;
+    return null;}});
+const rclick=t=>{let pd=0;handlers.contextmenu({target:t,clientX:60,
+  clientY:70,preventDefault:()=>{pd++;}});return pd;};
+const menuBtn=dataset=>({id:'',dataset,disabled:false,
+  closest:sel=>{
+    if(sel==='#ctxmenu')return {inMenu:1};
+    const m=sel.match(/^\[data-([a-z-]+)\]$/);
+    if(m){const k=m[1].replace(/-([a-z])/g,(s,c)=>c.toUpperCase());
+      return k in dataset?{dataset}:null;}
+    return null;}});
+(async()=>{
+  const m=elem('ctxmenu');
+  // running task: Stop this step; queued: Skip + Edit prompt; skipped:
+  // Unskip - the same gates the modal applies
+  assert.equal(rclick(onRow(agenRow(0))),1);
+  assert.match(m.innerHTML,/data-agent-detail="\/runs\/live\|live-step"[^>]*>Open details/);
+  assert.match(m.innerHTML,/data-summary="\/runs\/live\|live-step"[^>]*>Session summary/);
+  assert.match(m.innerHTML,/data-filter-run="\/runs\/live"[^>]*>Filter by this item/);
+  assert.match(m.innerHTML,/data-stop-agent="live"[^>]*data-step="live-step"[^>]*>Stop this step/);
+  assert.doesNotMatch(m.innerHTML,/Skip step|Unskip|Edit prompt/);
+  assert.equal(rclick(onRow(agenRow(1))),1);
+  assert.match(m.innerHTML,/data-skip-step="live"[^>]*data-step="queued-step"[^>]*>Skip step/);
+  assert.match(m.innerHTML,/data-edit-prompt="\/runs\/live\|queued-step"[^>]*>Edit prompt/);
+  assert.doesNotMatch(m.innerHTML,/Stop this step/);
+  assert.equal(rclick(onRow(agenRow(2))),1);
+  assert.match(m.innerHTML,/data-unskip-step="done"[^>]*data-step="held"[^>]*>Unskip step/);
+  // planner row (no run_dir): request link + Stop proposal; no step kill,
+  // no summary, no prompt editing
+  assert.equal(rclick(onRow(agenRow(3))),1);
+  assert.match(m.innerHTML,/data-open-request="r1"[^>]*>View request \/ runbook/);
+  assert.match(m.innerHTML,/data-stop-gen="r1"[^>]*>Stop proposal/);
+  assert.doesNotMatch(m.innerHTML,/data-stop-agent|data-summary=|Edit prompt/);
+  // 'Open details' is the same task modal the row click opens
+  await handlers.click({target:menuBtn({agentDetail:'/runs/live|queued-step'}),
+    preventDefault:()=>{}});
+  assert.equal(elem('backdrop').hidden,false);
+  assert.match(elem('dbody').innerHTML,/p \/ queued-step/);
+  assert.equal(m.hidden,true);
+  // 'Stop this step' hits the existing sentinel endpoint
+  assert.equal(rclick(onRow(agenRow(0))),1);
+  posts.length=0;
+  await handlers.click({target:menuBtn({stopAgent:'live',step:'live-step'}),
+    preventDefault:()=>{}});
+  assert.equal(posts[0].url,'/api/runs/live/steps/live-step/stop');
+  // task filtering narrows the table to its run through the shared handler
+  assert.equal(rclick(onRow(agenRow(2))),1);
+  await handlers.click({target:menuBtn({filterRun:'/runs/done'}),
+    preventDefault:()=>{}});
+  assert.equal(vm.runInContext('selectedRun',ctx),'/runs/done');
+  assert.doesNotMatch(elem('agents').innerHTML,/>live-step</);
+  assert.match(elem('agents').innerHTML,/>held</);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_context_menu_native_and_keyboard(self):
+        """The browser menu is preserved on editable fields, live text
+        selections and Shift+right-click; the Menu key / Shift+F10 opens
+        ours from a focused row; Esc dismisses and returns focus; the
+        scroll path and outside clicks close it."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',scrollTop:0,style:{},querySelector:()=>null,
+  querySelectorAll:()=>[]}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const sel={isCollapsed:true,toString:()=>''};
+const window={innerWidth:1200,innerHeight:800,addEventListener:()=>{},
+  getSelection:()=>sel};
+const ctx=vm.createContext({document,window,location:{reload:()=>{}},
+  setTimeout:()=>{},fetch:async()=>({ok:true,json:async()=>({})})});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',agents:[
+  {step:'s1',run:'r',run_dir:'/r',run_key:'/r',slug:'p',status:'queued',
+   task:'t',prompt_editable:true}],runs:[
+  {run:'r',dir:'/r',key:'/r',counts:{queued:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const cls=c=>({contains:x=>c.split(' ').includes(x),add(){},remove(){}});
+const runRow=key=>({cls:'runrow',dataset:{runKey:key},classList:cls('runrow'),
+  isConnected:true,focused:0,focus(){this.focused++;},
+  matches:s=>s==='tr.runrow'||s==='tr.runrow,tr.agen',
+  getBoundingClientRect:()=>({left:10,top:20,bottom:30})});
+const agenRow=i=>({cls:'agen',dataset:{i:String(i)},classList:cls('agen'),
+  isConnected:true,focused:0,focus(){this.focused++;},
+  matches:s=>s==='tr.agen'||s==='tr.runrow,tr.agen',
+  getBoundingClientRect:()=>({left:10,top:20,bottom:30})});
+const onRow=row=>({isContentEditable:false,dataset:{},
+  closest:sel=>{
+    if(sel==='#ctxmenu')return null;
+    if(sel.indexOf('input')===0)return null;
+    if(sel==='tr.runrow')return row.cls==='runrow'?row:null;
+    if(sel==='tr.agen')return row.cls==='agen'?row:null;
+    if(sel==='tr.runrow,tr.agen')return row;
+    return null;}});
+const rclick=(t,o)=>{let pd=0;handlers.contextmenu({target:t,clientX:60,
+  clientY:70,shiftKey:!!(o&&o.shift),preventDefault:()=>{pd++;}});return pd;};
+const key=(k,t,o)=>{let pd=0;handlers.keydown(
+  {key:k,shiftKey:!!(o&&o.shift),ctrlKey:false,altKey:false,
+   target:t||{closest:()=>null,matches:()=>false},
+   preventDefault:()=>{pd++;}});return pd;};
+(async()=>{
+  const m=elem('ctxmenu');
+  const rr=runRow('/r'), ar=agenRow(0);
+  // editable fields keep the native menu entirely (no preventDefault) -
+  // the editable check wins even when the field sits inside a row
+  const inp={isContentEditable:false,dataset:{},
+    closest:sel=>{
+      if(sel.indexOf('input')===0)return {tag:'INPUT'};
+      return onRow(rr).closest(sel);}};
+  assert.equal(rclick(inp),0);
+  assert.equal(m.hidden,true);
+  // a live text selection keeps the native menu (copy stays native)
+  sel.isCollapsed=false; sel.toString=()=>'selected text';
+  assert.equal(rclick(onRow(rr)),0);
+  assert.equal(m.hidden,true);
+  sel.isCollapsed=true;
+  // Shift+right-click is the documented escape route to the native menu
+  assert.equal(rclick(onRow(rr),{shift:true}),0);
+  assert.equal(m.hidden,true);
+  // right-click off a row: nothing happens (native menu everywhere else)
+  assert.equal(rclick({isContentEditable:false,dataset:{},
+    closest:()=>null}),0);
+  assert.equal(m.hidden,true);
+  // keyboard: Menu key on a focused run row opens the same menu...
+  assert.equal(key('ContextMenu',onRow(rr)),1);
+  assert.equal(m.hidden,false);
+  assert.match(m.innerHTML,/data-run-details="\/r"/);
+  // ...Esc dismisses and hands focus back to the row
+  assert.equal(key('Escape'),1);
+  assert.equal(m.hidden,true);
+  assert.equal(rr.focused,1);
+  // Shift+F10 on a task row does the same for task actions
+  assert.equal(key('F10',onRow(ar),{shift:true}),1);
+  assert.equal(m.hidden,false);
+  assert.match(m.innerHTML,/data-agent-detail="\/r\|s1"/);
+  // Menu key nowhere near a row does not hijack the keyboard
+  assert.equal(key('ContextMenu'),0);
+  // Enter/Space outside the open menu dismiss it instead of toggling the row
+  key('ContextMenu',onRow(rr));
+  assert.equal(key('Enter',onRow(rr)),1);
+  assert.equal(m.hidden,true);
+  assert.equal(vm.runInContext('selectedRun',ctx),null);
+  // scroll hides the menu with the view it belongs to
+  key('ContextMenu',onRow(rr));
+  assert.equal(m.hidden,false);
+  handlers.scroll();
+  assert.equal(m.hidden,true);
+  // Enter on a focused task row remains the left-click detail open
+  // (the focused element IS the row - e.target, not a cell inside it)
+  assert.equal(key('Enter',ar),1);
+  assert.equal(elem('backdrop').hidden,false);
+  assert.match(elem('dbody').innerHTML,/p \/ s1/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
 class ApplyRequestTests(unittest.TestCase):
     """The deterministic 'Apply options to TOML' path: option fields patch
     the proposal in place; request text and project still need a planner."""
