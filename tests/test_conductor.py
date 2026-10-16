@@ -287,6 +287,20 @@ class GitTests(unittest.TestCase):
             self.assertTrue(conductor.is_git_repo(proj))
             self.assertFalse(conductor.is_git_repo(nested))
 
+    def test_git_dirty_tracked_ignores_untracked(self):
+        """The merge-resolver guard fears only tracked modifications -
+        untracked junk (stray `nul`, a pending generated manifest) can
+        never join a merge commit, so it must not refuse the resolver."""
+        with tempfile.TemporaryDirectory() as td:
+            proj = make_project(Path(td))
+            # ('nul' can't be a real file on Windows - the name writes
+            # to the null device; use an ordinary stray name)
+            (proj / "stray.tmp").write_text("stray", encoding="utf-8")
+            self.assertTrue(conductor.git_dirty(proj))
+            self.assertFalse(conductor.git_dirty_tracked(proj))
+            (proj / "WORK.txt").write_text("dirty", encoding="utf-8")
+            self.assertTrue(conductor.git_dirty_tracked(proj))
+
 
 class RunTests(unittest.TestCase):
     def test_two_step_run(self):

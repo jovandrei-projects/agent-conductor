@@ -731,6 +731,15 @@ def git_dirty(path: Path) -> bool:
     return bool(_git(path, "status", "--porcelain").stdout.strip())
 
 
+def git_dirty_tracked(path: Path) -> bool:
+    """Modified TRACKED files only - the merge-resolver guard. Untracked
+    files can never join a merge commit (git merge itself refuses the
+    one collision case), so loose junk like a stray `nul` or a pending
+    generated manifest must not refuse the resolver."""
+    return bool(_git(path, "status", "--porcelain",
+                     "--untracked-files=no").stdout.strip())
+
+
 def git_commit(path: Path, msg: str, allow_empty: bool = False) -> bool:
     _git(path, "add", "-A")
     cmd = ["commit", "-m", msg]
@@ -1723,12 +1732,13 @@ def resolve_merge_conflict(step: Step, slug: str, repo_dir: Path,
     work sitting in the tree would get swept into the merge commit
     (trap 10 shape) - that is human territory.
     """
-    if git_dirty(repo_dir):
-        LOG.warning("%s: main checkout dirty; not spawning a merge resolver",
-                    step.name)
+    if git_dirty_tracked(repo_dir):
+        LOG.warning("%s: main checkout has modified tracked files; not "
+                    "spawning a merge resolver", step.name)
         rec = state["steps"].get(step.name, {})
-        _append_note(rec, "merge resolver refused: main checkout dirty "
-                          "(trap 10/11 - clean it, then resume)")
+        _append_note(rec, "merge resolver refused: modified tracked files "
+                          "in main checkout (trap 10/11 - commit or stash "
+                          "them, then resume)")
         save_state(run_dir, state)
         return False
     r = _git(repo_dir, "merge", "--no-edit", branch)
