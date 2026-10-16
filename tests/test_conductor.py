@@ -9984,5 +9984,451 @@ const open=step=>vm.runInContext(
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class CumulativeElapsedTests(_RunControlBase):
+    """Elapsed time is CUMULATIVE across dispatches. Every run_step
+    dispatch appends one exec_interval {start,end} to the step record and
+    every driver session appends one to the run; views sum the closed
+    intervals (the live one ticks to now) - a resume can neither
+    overwrite nor double-count what a prior dispatch banked, and the
+    idle gap between attempts never enters the total. Run totals are the
+    driver's own intervals, never a sum of overlapping step spans. All
+    stamping routes through conductor._now so the clock is deterministic.
+    """
+
+    class _Clock:
+        """Deterministic conductor._now: +quantum per call keeps every
+        stamp ordered; advance() simulates real elapsed idle time."""
+        def __init__(self, t: float = 1_700_000_000.0, quantum: float = 0.5):
+            self.t = t
+            self.quantum = quantum
+
+        def __call__(self) -> float:
+            self.t += self.quantum
+            return self.t
+
+        def advance(self, s: float) -> None:
+            self.t += s
+
+    @staticmethod
+    def _state(run_dir: Path) -> dict:
+        return json.loads((run_dir / "state.json").read_text())
+
+    @staticmethod
+    def _one_step(base: Path, prompt: str = "work", extra: str = "") -> Path:
+        proj = make_project(base)
+        return write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "{prompt}"
+''', extra)
+
+    @staticmethod
+    def _iv_span(iv: dict) -> float:
+        return conductor._iso_ts(iv["end"]) - conductor._iso_ts(iv["start"])
+
+    def test_failed_step_resume_keeps_prior_dispatch_elapsed(self):
+        """The reported bug: a failed step's elapsed_s was only dispatch
+        1's span, and resume overwrote it with dispatch 2's. Both must
+        bank; the idle hour between them is not execution time."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            m = self._one_step(base)
+            runs = base / "runs"
+            clock = self._Clock()
+            with mock.patch.object(conductor, "_now", clock,
+                                   create=True), \
+                    mock.patch.dict(os.environ, {"MOCK_FAIL": "1"}):
+                self.assertEqual(run_manifest(m, runs), 1)
+            run_dir = next(d.parent for d in runs.glob("*/state.json"))
+            st = self._state(run_dir)
+            rec = st["steps"]["s1"]
+            self.assertEqual(rec["status"], "failed")
+            first_elapsed = rec["elapsed_s"]
+            first_start = rec["started_at"]
+            first_end = rec["ended_at"]
+            run_start = st["started_at"]
+            self.assertGreater(first_elapsed, 0)
+            clock.advance(3600)          # an idle hour, then resume
+            with mock.patch.object(conductor, "_now", clock,
+                                   create=True):
+                self.assertEqual(run_manifest(m, runs, resume=str(run_dir)),
+                                 0)
+            st = self._state(run_dir)
+            rec = st["steps"]["s1"]
+            self.assertEqual(rec["status"], "done")
+            ivs = rec["exec_intervals"]
+            self.assertEqual(len(ivs), 2)
+            self.assertEqual(ivs[0]["start"], first_start)
+            self.assertEqual(ivs[0]["end"], first_end)
+            # original start survives; started_at is the live dispatch's
+            self.assertEqual(rec["first_started_at"], first_start)
+            self.assertEqual(rec["started_at"], ivs[1]["start"])
+            banked = sum(self._iv_span(i) for i in ivs)
+            self.assertAlmostEqual(rec["elapsed_s"], banked, places=1)
+            self.assertGreater(rec["elapsed_s"], first_elapsed)
+            wall = conductor._iso_ts(rec["ended_at"]) - \
+                conductor._iso_ts(rec["first_started_at"])
+            self.assertGreater(wall, 3600)
+            self.assertLess(rec["elapsed_s"], wall - 3500)
+            # run level: one interval per driver session, same contract
+            rivs = st["exec_intervals"]
+            self.assertEqual(len(rivs), 2)
+            self.assertEqual(st["started_at"], run_start)
+            self.assertAlmostEqual(
+                conductor.run_elapsed_s(st),
+                sum(self._iv_span(i) for i in rivs), places=1)
+
+    def test_multiple_resumes_accumulate_intervals(self):
+        """fail -> resume -> fail -> resume -> done: three disjoint
+        intervals, each banked once; a re-read of state.json changes
+        nothing (elapsed is derived, never re-added)."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            m = self._one_step(base)
+            runs = base / "runs"
+            clock = self._Clock()
+            with mock.patch.object(conductor, "_now", clock, create=True), \
+                    mock.patch.dict(os.environ, {"MOCK_FAIL": "1"}):
+                self.assertEqual(run_manifest(m, runs), 1)
+            run_dir = next(d.parent for d in runs.glob("*/state.json"))
+            e1 = self._state(run_dir)["steps"]["s1"]["elapsed_s"]
+            clock.advance(600)
+            with mock.patch.object(conductor, "_now", clock, create=True), \
+                    mock.patch.dict(os.environ, {"MOCK_FAIL": "1"}):
+                self.assertEqual(run_manifest(m, runs, resume=str(run_dir)),
+                                 1)
+            e2 = self._state(run_dir)["steps"]["s1"]["elapsed_s"]
+            self.assertGreater(e2, e1)
+            clock.advance(600)
+            with mock.patch.object(conductor, "_now", clock, create=True):
+                self.assertEqual(run_manifest(m, runs, resume=str(run_dir)),
+                                 0)
+            st = self._state(run_dir)
+            rec = st["steps"]["s1"]
+            self.assertEqual(len(rec["exec_intervals"]), 3)
+            self.assertAlmostEqual(
+                rec["elapsed_s"],
+                sum(self._iv_span(i) for i in rec["exec_intervals"]),
+                places=1)
+            self.assertGreater(rec["elapsed_s"], e2)
+            self.assertEqual(len(st["exec_intervals"]), 3)
+            # reload + re-derive is idempotent - no double counting
+            again = conductor.rec_elapsed_s(rec)
+            self.assertAlmostEqual(again, rec["elapsed_s"], places=1)
+            self.assertEqual(conductor.rec_elapsed_s(
+                rec, now=conductor._iso_ts(rec["ended_at"]) + 86400),
+                rec["elapsed_s"])   # terminal records never tick
+
+    def test_stop_then_restart_banks_first_dispatch(self):
+        """'Stop run now' kills the worker mid-sleep; resume re-runs the
+        step. The stopped dispatch's real span stays banked."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            m = self._one_step(base, "sleep=30 then work")
+            runs = base / "runs"
+            t, _rc = self._start_run(m, runs)
+            run_dir = self._wait_run_dir(runs, "s1")
+            conductor.stop_run(run_dir.name, {}, runs)
+            t.join(timeout=30)
+            st = self._state(run_dir)
+            rec = st["steps"]["s1"]
+            self.assertEqual(rec["status"], "stopped")
+            self.assertEqual(len(rec["exec_intervals"]), 1)
+            e1 = rec["elapsed_s"]
+            self.assertGreater(e1, 0)
+            self.assertAlmostEqual(
+                e1, self._iv_span(rec["exec_intervals"][0]), places=1)
+            self.assertEqual(
+                run_manifest(m, runs, resume=str(run_dir)), 0)
+            st = self._state(run_dir)
+            rec = st["steps"]["s1"]
+            self.assertEqual(rec["status"], "done")
+            self.assertEqual(len(rec["exec_intervals"]), 2)
+            self.assertAlmostEqual(
+                rec["elapsed_s"],
+                sum(self._iv_span(i) for i in rec["exec_intervals"]),
+                places=1)
+            self.assertGreater(rec["elapsed_s"], e1)
+            self.assertEqual(len(st["exec_intervals"]), 2)
+
+    def test_concurrent_steps_run_total_is_driver_span(self):
+        """Two wave=1 steps overlap in wall time; the run's elapsed is
+        the driver's interval, never the sum of concurrent tasks."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            p1 = make_project(base, "p1")
+            p2 = make_project(base, "p2")
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{p1.as_posix()}"
+prompt = "sleep=2 then work"
+wave = 1
+
+[[step]]
+name = "s2"
+project = "{p2.as_posix()}"
+prompt = "sleep=2 then work"
+wave = 1
+''', 'max_parallel = 2\n')
+            self.assertEqual(run_manifest(m, runs), 0)
+            st = self._state(
+                next(d.parent for d in runs.glob("*/state.json")))
+            self.assertEqual(len(st["exec_intervals"]), 1)
+            iv = st["exec_intervals"][0]
+            self.assertAlmostEqual(conductor.run_elapsed_s(st),
+                                   self._iv_span(iv), places=1)
+            step_sum = sum(conductor.rec_elapsed_s(r)
+                           for r in st["steps"].values())
+            # overlap: two ~2s tasks inside one ~2s driver window
+            self.assertGreaterEqual(step_sum, 3.0)
+            self.assertLess(conductor.run_elapsed_s(st), step_sum)
+            self.assertLessEqual(conductor.run_elapsed_s(st),
+                                 self._iv_span(iv) + 1)
+
+    def test_missing_historical_timing_stays_honest(self):
+        """Records without timing show '-', never an invented span; a
+        legacy record's stored fields seed an honest first interval the
+        moment new code re-dispatches it."""
+        self.assertIsNone(conductor.rec_elapsed_s({"status": "done"}))
+        self.assertEqual(conductor.rec_elapsed_s({"elapsed_s": 5.0}), 5.0)
+        self.assertEqual(conductor.rec_elapsed_s(
+            {"started_at": "2026-10-16T01:00:00",
+             "ended_at": "2026-10-16T01:00:10"}), 10.0)
+        # a still-running legacy row ticks off its own start
+        self.assertAlmostEqual(conductor.rec_elapsed_s(
+            {"status": "running",
+             "started_at": "2026-10-16T01:00:00"},
+            now=conductor._iso_ts("2026-10-16T01:00:00") + 7), 7.0)
+        # legacy resume: stored start/end fold into interval 1
+        rec = {"status": "failed", "started_at": "2026-10-16T01:00:00",
+               "ended_at": "2026-10-16T01:01:00", "elapsed_s": 60.0}
+        conductor._iv_open(rec, "2026-10-16T02:00:00")
+        self.assertEqual(rec["exec_intervals"][0],
+                         {"start": "2026-10-16T01:00:00",
+                          "end": "2026-10-16T01:01:00"})
+        self.assertAlmostEqual(
+            conductor.rec_elapsed_s(
+                rec, now=conductor._iso_ts("2026-10-16T02:00:30"),
+                live=True),      # run_step restamps status/ended_at
+            90.0)                # 60 banked + 30 live
+        # span-only legacy rec: endpoints gone, duration kept as 'dur'
+        rec2 = {"status": "done", "elapsed_s": 42.0}
+        conductor._iv_open(rec2, "2026-10-16T02:00:00")
+        self.assertEqual(rec2["exec_intervals"][0], {"dur": 42.0})
+        # run level
+        self.assertIsNone(conductor.run_elapsed_s({}))
+        self.assertEqual(conductor.run_elapsed_s(
+            {"started_at": "2026-10-16T01:00:00",
+             "ended_at": "2026-10-16T01:00:10"}), 10.0)
+        # resumed legacy run: only the last driver span is recoverable
+        self.assertEqual(conductor.run_elapsed_s(
+            {"started_at": "2026-10-16T01:00:00",
+             "driver_started_at": "2026-10-16T02:00:00",
+             "ended_at": "2026-10-16T02:01:00"}), 60.0)
+        # a live legacy run ticks off its driver start
+        with mock.patch.object(conductor, "driver_alive",
+                               return_value=True):
+            self.assertAlmostEqual(conductor.run_elapsed_s(
+                {"started_at": "2026-10-16T01:00:00",
+                 "driver_started_at": "2026-10-16T01:00:00"},
+                now=conductor._iso_ts("2026-10-16T01:00:00") + 30), 30.0)
+
+    def test_legacy_run_resume_migrates_recorded_spans(self):
+        """A state.json written before exec_intervals existed still banks
+        its recorded spans when resumed - the old start/end pair becomes
+        interval 1 instead of being discarded."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            m = self._one_step(base)
+            proj = base / "proj"
+            runs = base / "runs"
+            run_dir = runs / "20260101-000000-t"
+            (run_dir / "prompts").mkdir(parents=True)
+            (run_dir / "state.json").write_text(json.dumps({
+                "run": "t", "manifest": str(m),
+                "started_at": "2026-10-16T01:00:00",
+                "ended_at": "2026-10-16T01:05:00",
+                "driver_pid": 99999999,
+                "driver_started_at": "2026-10-16T01:00:00",
+                "flags": "v2",
+                "steps": {"s1": {
+                    "name": "s1", "slug": str(proj),
+                    "project": str(proj), "work_dir": str(proj),
+                    "status": "failed",
+                    "started_at": "2026-10-16T01:00:05",
+                    "ended_at": "2026-10-16T01:04:05",
+                    "elapsed_s": 240.0}}}))
+            clock = self._Clock()
+            with mock.patch.object(conductor, "_now", clock, create=True):
+                self.assertEqual(run_manifest(m, runs, resume=str(run_dir)),
+                                 0)
+            st = self._state(run_dir)
+            rec = st["steps"]["s1"]
+            self.assertEqual(rec["status"], "done")
+            ivs = rec["exec_intervals"]
+            self.assertEqual(ivs[0], {"start": "2026-10-16T01:00:05",
+                                      "end": "2026-10-16T01:04:05"})
+            self.assertEqual(len(ivs), 2)
+            self.assertEqual(rec["first_started_at"],
+                             "2026-10-16T01:00:05")
+            self.assertGreaterEqual(rec["elapsed_s"], 240.0)
+            rivs = st["exec_intervals"]
+            self.assertEqual(rivs[0], {"start": "2026-10-16T01:00:00",
+                                       "end": "2026-10-16T01:05:00"})
+            self.assertEqual(len(rivs), 2)
+            self.assertGreaterEqual(conductor.run_elapsed_s(st), 300.0)
+
+    def test_sweep_closes_orphaned_interval_at_last_witness(self):
+        """A driver that died mid-dispatch leaves the interval open; the
+        'lost' sweep closes it at the step log's mtime - the last sign
+        of life - not at sweep time, so the dead gap stays out."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "runs"
+            run_dir = runs / "20260101-000000-t"
+            run_dir.mkdir(parents=True)
+            log = run_dir / "s1.stdout.log"
+            log.write_text("partial output\n")
+            witness = time.time() - 7200      # died two hours ago
+            os.utime(log, (witness, witness))
+            (run_dir / "state.json").write_text(json.dumps({
+                "run": "t", "flags": "v2",
+                "started_at": "2026-10-16T01:00:00",
+                "driver_pid": 99999999,
+                "driver_started_at": "2026-10-16T01:00:00",
+                "steps": {"s1": {
+                    "name": "s1", "status": "running",
+                    "started_at": "2026-10-16T01:00:10",
+                    "stdout_log": str(log), "timeout_min": 60,
+                    "exec_intervals": [
+                        {"start": "2026-10-16T01:00:10", "end": None}]}}}))
+            conductor.sweep_runs(runs)
+            st = self._state(run_dir)
+            rec = st["steps"]["s1"]
+            self.assertEqual(rec["status"], "lost")
+            iv = rec["exec_intervals"][0]
+            self.assertIsNotNone(iv["end"])
+            # closed at the log's last write, hours before the sweep
+            self.assertAlmostEqual(conductor._iso_ts(iv["end"]), witness,
+                                   delta=2)
+            self.assertLess(conductor._iso_ts(iv["end"]),
+                            time.time() - 7000)
+
+    def test_dashboard_emits_cumulative_step_and_run_elapsed(self):
+        """Payload contract: agent rows carry the closed cumulative and
+        their first start; run rows carry elapsed_s + exec_start so the
+        runs table can tick a live run without a payload refresh."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            run_dir = runs / "20260101-000000-t"
+            run_dir.mkdir(parents=True)
+            (run_dir / "state.json").write_text(json.dumps({
+                "run": "t", "flags": "v2",
+                "started_at": "2026-10-16T01:00:00",
+                "ended_at": "2026-10-16T01:10:00",
+                "driver_pid": 99999999,
+                "driver_started_at": "2026-10-16T01:00:00",
+                "devin_argv": ["no-such-devin"],
+                "exec_intervals": [
+                    {"start": "2026-10-16T01:00:00",
+                     "end": "2026-10-16T01:04:00"},
+                    {"start": "2026-10-16T01:06:00",
+                     "end": "2026-10-16T01:10:00"}],
+                "steps": {"s1": {
+                    "name": "s1", "slug": "x", "status": "done",
+                    "project": str(proj), "work_dir": str(proj),
+                    "started_at": "2026-10-16T01:06:00",
+                    "first_started_at": "2026-10-16T01:00:10",
+                    "ended_at": "2026-10-16T01:10:00",
+                    "elapsed_s": 330.0,
+                    "exec_intervals": [
+                        {"start": "2026-10-16T01:00:10",
+                         "end": "2026-10-16T01:04:10"},
+                        {"start": "2026-10-16T01:06:00",
+                         "end": "2026-10-16T01:10:00"}]}}}))
+            d = conductor.collect_dashboard(runs, ["no-such-devin"])
+            a = next(a for a in d["agents"] if a["step"] == "s1")
+            self.assertEqual(a["elapsed_s"], 330.0)
+            self.assertEqual(a["first_started_at"],
+                             "2026-10-16T01:00:10")
+            r = d["runs"][0]
+            self.assertEqual(r["elapsed_s"], 480.0)   # 240+240, not 600
+            self.assertIsNone(r["exec_start"])
+            # live run: exec_start carries the open interval's start so
+            # the client ticks base+now-start
+            with mock.patch.object(conductor, "driver_alive",
+                                   return_value=True):
+                els, start = conductor._run_elapsed_split({
+                    "driver_started_at": "2026-10-16T02:00:00",
+                    "exec_intervals": [
+                        {"start": "2026-10-16T01:00:00",
+                         "end": "2026-10-16T01:04:00"},
+                        {"start": "2026-10-16T02:00:00", "end": None}]})
+            self.assertEqual(els, 240.0)
+            self.assertEqual(start, "2026-10-16T02:00:00")
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_elapsed_column_and_cumulative_tick_js(self):
+        """JS contract: elapsed() shows stored cumulative + the live
+        interval for running rows (queued rows show the banked value,
+        never idle-tick); the runs table gained an elapsed column whose
+        live cell ticks via data-rel."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,textContent:''}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  activeElement:null,addEventListener:(e,h)=>{handlers[e]=h;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const now=Date.parse('2026-10-16T02:00:30Z');
+// running: banked 120s + 30s live interval
+assert.equal(vm.runInContext('elapsed({elapsed_s:120,status:"running",'+
+  'started_at:"2026-10-16T02:00:00Z"},'+now+')',ctx),'2m30s');
+// terminal: stored cumulative verbatim
+assert.equal(vm.runInContext('elapsed({elapsed_s:120,status:"done",'+
+  'started_at:"2026-10-16T01:50:00Z"},'+now+')',ctx),'2m0s');
+// queued resumed step: banked value, no idle-tick off the old start
+assert.equal(vm.runInContext('elapsed({elapsed_s:120,status:"queued",'+
+  'started_at:"2026-10-16T01:50:00Z"},'+now+')',ctx),'2m0s');
+// legacy running row (no elapsed_s): ticks from started_at alone
+assert.equal(vm.runInContext('elapsed({status:"running",'+
+  'started_at:"2026-10-16T02:00:00Z"},'+now+')',ctx),'30s');
+assert.equal(vm.runInContext('elapsed({status:"done"},'+now+')',ctx),'-');
+// run rows: closed cumulative + live interval start
+assert.equal(vm.runInContext('runElapsed({elapsed_s:240,'+
+  'exec_start:"2026-10-16T02:00:00Z"},'+now+')',ctx),'4m30s');
+assert.equal(vm.runInContext('runElapsed({elapsed_s:240},'+now+')',ctx),
+  '4m0s');
+assert.equal(vm.runInContext('runElapsed({},'+now+')',ctx),'-');
+// render() uses real Date.now() - build fixtures 30s in the past so
+// the live interval adds exactly 30s on top of the banked totals
+const liveStart=new Date(Date.now()-30000).toISOString();
+const data={serve_boot:'b',generated_at:liveStart,agents:[
+  {step:'s1',run:'r',run_dir:'/r',slug:'p',status:'running',task:'t',
+   elapsed_s:120,started_at:liveStart}],
+ runs:[{run:'r',dir:'/r',counts:{running:1},elapsed_s:240,
+   exec_start:liveStart}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const runs=elem('runs').innerHTML;
+assert.match(runs,/<th[^>]*>elapsed<\/th>/);
+assert.match(runs,/data-rel=/);
+assert.match(runs,/>4m3[01]s</);             // 240s banked + ~30s live
+assert.match(elem('agents').innerHTML,/>2m3[01]s</);  // 120 + ~30 live
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

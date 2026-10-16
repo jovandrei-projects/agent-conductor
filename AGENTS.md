@@ -126,6 +126,24 @@ auto-refreshes, shows elapsed time ticking for running agents). The same
 run row is live-posted to `hub.db`, so `http://127.0.0.1:8762/tasks-ui`
 shows coarse progress on the phone without any new wiring.
 
+Elapsed time is **cumulative across dispatches**: every `run_step`
+dispatch appends `{start,end}` to the step's `exec_intervals` and every
+driver session appends one to the run's own `exec_intervals`
+(opened at create/resume alongside `driver_started_at`, closed wherever
+`ended_at` is stamped). `elapsed_s` stays the closed-intervals cache;
+`first_started_at` keeps the original start while `started_at` is the
+live dispatch's (pid/liveness windows need it). A resume therefore
+accumulates instead of overwriting, idle gaps between attempts never
+count, and run elapsed is driver time - never a sum of overlapping step
+spans. `rec_elapsed_s`/`run_elapsed_s` are the one authoritative calc
+(dashboard payload, `cmd_status`, summaries all share it); every
+recorded stamp routes through the `_now()` seam so tests run a
+deterministic clock. A crashed dispatch's orphaned interval closes at
+its last sign of life (log mtime / newest state stamp), not at
+discovery. Pre-interval records seed once from their stored
+started/ended/elapsed fields - `{'dur': span}` when endpoints are gone,
+never fabricated endpoints; nothing recorded renders as `-`.
+
 Parallel: adjacent `[[step]]` entries sharing `wave = N` run concurrently,
 bounded by the cap. Steps on the *same* project in a wave need
 `worktree = true` - each runs in `data/worktrees/<run>/<step>` on branch
