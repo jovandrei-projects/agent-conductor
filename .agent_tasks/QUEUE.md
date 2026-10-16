@@ -17,6 +17,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 4 | Worktree merge matrix: exhaustive tests + merge_resolver + lab fixtures | done | wt-matrix/ | landed on dev/merge-tests (commits 5ba30c4, 7f7dcd9); live lab run 21/21, 8 real conflicts resolved |
 | 5 | Dashboard request drafts + proposal review/start, run filters/token help, silent Windows probes | done | — | 98/98 mock tests + demo green; live planner not dispatched |
 | 6 | Task prompt editing: pre-dispatch Edit prompt, resume notes for ran steps, full prompt text in modal | done | task-prompt-editing/ | 172/172 mock tests + demo green; prompt-/rnote- sentinels survive resume |
+| 7 | Planner 'ask me questions' checkbox: questionnaire modal before manifest, answers feed a refine pass | done | planner-questions/ | 193/193 mock tests + demo green; live planner not dispatched |
 
 ## Not yet filed as tasks
 

@@ -168,6 +168,21 @@ applied to `cloud=true` steps; wave-required members always keep
 `_apply_fields_to_toml` syncs run-level keys + per-step overrides the
 form owns, so an unchecked `worktrees` strips planner-added flags except
 where a same-project wave requires them.
+The `Ask me questions` checkbox (`ask`) is a generation-time permission,
+never a TOML key: the planner may answer with `BEGIN_QUESTIONS`/JSON/
+`END_QUESTIONS` instead of a manifest, which parks the request at stage
+`questions` with the sanitized set in `pending_questions` (a manifest
+always wins when both appear). The dashboard pops one question per modal
+- option cards, free text, Skip/`Skip all` (`POST
+/api/requests/<id>/answer`, `{skip_all:true}` bulk-skips) - and each
+answer accumulates in `rec.qa` on disk, so the queue survives restarts
+and closed browsers. Emptying `pending_questions` restarts generation as
+a refine pass: the prompt carries the collected Q&A block and may ask a
+fresh set, capped at `MAX_QUESTION_ROUNDS` (3) rounds before the request
+errors out. A Regenerate, an edited `raw`/`project`, or any manifest
+publish drops the parked set - the questions were drafted against the
+old request. Unchecked, or a planner that simply has none, is byte-for-
+byte the old flow.
 Real runs still use `state.json` as their registry. Run controls use one
 naming system - each visible name a distinct semantics: **Pause run**
 (POST `/api/runs/<dir>/pause`) is the graceful hold - in-flight steps
