@@ -410,6 +410,34 @@ dispatched. The modal's `task prompt` row shows the full body
 path. Rows stay glued to their agent across re-sorts via a run_dir|step
 key, and unsaved form drafts survive the 2s modal rebuild.
 
+**Interrupt + instruct** (`POST .../steps/<step>/interrupt`
+`{instructions, attachments?}`; task-modal composer and running-row
+context menu) is the in-flight steering control Stop this step lacks:
+the operator's text + image refs land in a durable JSON `intrq-`
+sentinel `wait_worker` polls in the same slot as a stop flag, and only
+the driver acts on it - the worker's tree dies, its product is committed
+like any attempt's, the request folds into the `rnote-` channel (as an
+`INTERRUPT <ts>` block carrying the text and attachment paths), and the
+SAME step respawns under `INTERRUPT_NOTE` + the original prompt. It is
+not a retry - `attempt`/`max_attempts` are untouched, a per-interrupt
+`*.interruptN` prompt/log/export set records the dispatch, and
+`rec.interrupts` counts the respawns. Races resolve toward never losing
+the request: landing after the turn's STATUS, during verify/teardown,
+or beside a real stop flag banks it into notes for the next dispatch
+instead of respawning a finished or deliberately-stopped step (a real
+stop still wins the terminal status). The sentinel is deleted only
+after the notes write lands, so a driver restart mid-transition applies
+exactly once - `clear_run_flags` preserves `intrq-` like `rnote-`, and a
+pending flag folds at the next dispatch's pre-spawn read. The endpoint
+refuses a second request while one is pending (409 - no 'latest wins'
+queue), dead or finished steps, and runs whose driver predates the
+sentinel (`state.intrq` is stamped by runs this code drives, same scheme
+as `flags:"v2"`); the UI's composer is a view change until the explicit
+confirm, stays open across the 2s rebuild via keyed drafts, tracks the
+transition as requested -> stopping -> resuming -> done off the row's
+`intr_pending`/`interrupts` fields, and degrades to a tombstone if the
+step ends while it is open.
+
 Cost display: `serve` fetches self-serve rates from
 `docs.devin.ai/desktop/chat/models.md` (the Mintlify page embeds a
 `modelCostData` JS array; `TEAMS_TIER_PRO` is the self-serve tier),
