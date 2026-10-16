@@ -24,6 +24,35 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (row-context-menus, wave step of run
+  20261016-013719-workflow-ux-safety): right-click (or Shift+F10 / the
+  Menu key on a focused row) opens a `#ctxmenu` action list on run and
+  task rows. Items are plain buttons carrying the SAME data-* hooks the
+  modal action buttons use - one delegated click handler, one set of
+  sentinel endpoints, server-side state validation unchanged. Run menu:
+  Open details (request modal for proposal rows, run modal otherwise),
+  View original request / TOML, Filter by this item / Clear run filter,
+  Pause run / Stop run now / Resume unfinished steps / Merge pending
+  branches, Archive, Delete (disabled while live). Task menu: Open
+  details, Session summary, Filter by this item, View request / runbook,
+  Stop this step / Skip step / Unskip step / Stop proposal / Edit prompt
+  - availability mirrors the modal, both now computed by the shared
+  `runCtl()` helper extracted from `showRunDetails`. New delegated attrs:
+  data-agent-detail + data-edit-prompt keyed by agentKey. Native menu is
+  preserved on editable fields, a live text selection, non-row targets,
+  and via Shift+right-click as the documented escape (hint lives in the
+  menu footer + the topbar flow line). Dismissal: outside click is
+  swallowed (the row under it never fires - no accidental filter/detail
+  jump), Esc closes and returns focus to the row, scroll/resize close
+  it, the questions auto-popup clears it, Tab is trapped while arrows
+  move focus. tr.agen rows are now focusable (tabindex + Enter/Space
+  opens details; aria-haspopup on both row types). Position clamps to
+  the viewport; keyboard-opened menus anchor to the row rect. 276/276
+  mock tests + demo green; 4 new ContextMenuTests (run/task state items
+  + dispatch to endpoints, filter, disabled/unavailable actions,
+  outside-click swallow, Esc/scroll dismissal, editable/selection/
+  Shift+right-click native preservation, ContextMenu/Shift+F10 open,
+  focus restore) + a 25-check Playwright probe against real Chromium.
 - DONE 2026-10-16 (full-trajectory-view, wave step of run
   20261016-013719-workflow-ux-safety): arc entries in the task modal are
   now nested `<details class="arcent">` that expand to the step's FULL
