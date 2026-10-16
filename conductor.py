@@ -7286,6 +7286,28 @@ td :is(a,button):focus-visible { outline-offset:-2px; }
 .qopt:hover { border-color:#58a6ff; }
 .qopt.on { border-color:#58a6ff; background:#1c3041; }
 .qopt .sub { display:block; margin-top:2px; }
+/* row context menus: a fixed-position action list on right-click (or
+   Shift+F10 / the Menu key on a focused row). Items are plain buttons
+   carrying the same data-* hooks the modal action buttons use - one
+   control path, the server still validates state. */
+#ctxmenu { position:fixed; z-index:60; min-width:220px; max-width:340px;
+  background:#1c2128; border:1px solid #30363d; border-radius:8px;
+  padding:4px; box-shadow:0 8px 24px rgba(0,0,0,.55); user-select:none; }
+#ctxmenu .ctxi { display:block; width:100%; text-align:left; background:none;
+  border:0; color:#e6edf3; font:inherit; font-size:12px; padding:6px 10px;
+  border-radius:5px; cursor:pointer; box-sizing:border-box; }
+#ctxmenu .ctxi:hover:not(:disabled), #ctxmenu .ctxi:focus-visible {
+  background:#1f6feb; color:#fff; outline:none; }
+#ctxmenu .ctxi.danger { color:#ffb2aa; }
+#ctxmenu .ctxi.danger:hover:not(:disabled),
+#ctxmenu .ctxi.danger:focus-visible { background:#9f3535; color:#fff; }
+#ctxmenu .ctxi:disabled { opacity:.45; cursor:default; }
+#ctxmenu .ctxsep { height:1px; background:#30363d; margin:4px 2px; }
+#ctxmenu .ctxhint { color:#6e7681; font-size:10px; padding:5px 8px 3px;
+  border-top:1px solid #21262d; margin-top:4px; }
+/* the row a menu is open on keeps a marker while the hover highlight is
+   gone (mouseover on the menu clears hoverRun) */
+tr.ctxanchor td { background:#1c3041; }
 @media (max-width:640px) { .hide-s { display:none; } #detail { width:92vw; } #detail .field-row { grid-template-columns:1fr; } }
 </style></head><body>
 <div class="topbar">
@@ -7299,11 +7321,12 @@ td :is(a,button):focus-visible { outline-offset:-2px; }
       <button type="button" data-density="full" class="on">Full</button>
     </div>
   </div>
-  <div class="sub tb-flow">Save draft &rarr; generate proposal &rarr; review &rarr; start when ready. Generating never runs tasks.</div>
+  <div class="sub tb-flow">Save draft &rarr; generate proposal &rarr; review &rarr; start when ready. Generating never runs tasks. Right-click a run or task row for its actions (Shift+F10 from the keyboard; Shift+right-click keeps the browser menu).</div>
   <div class="sub" id="filters"></div>
 </div>
 <h2>runs</h2><div class="wrapw"><table id="runs"></table></div>
 <h2>agents by project</h2><div id="agents"></div>
+<div id="ctxmenu" role="menu" aria-label="row actions" hidden></div>
 <div id="backdrop" hidden><div id="detail" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button type="button" class="x" id="dx">Close ×</button><div id="dbody"></div></div></div>
 <script>
 const COLORS = {done:'#3fb950',partial:'#d29922',blocked:'#d29922',
@@ -7468,6 +7491,8 @@ let summaryView = null;     // {key: agentKey} while the summary modal shows
 let modalScroll = null;     // scrollTop a Back navigation restores on render
 const modalHist = [];       // Back stack: {kind, key|id, scroll} entries of
                             // the view each modal-to-modal jump left behind
+let ctxState = null;        // {items, idx, anchor, returnEl} while the row
+                            // context menu is open; null when closed
 let rqAttachments = [];     // [{name,path}] on the open request form
 const qDismissed = new Set();   // request|qids sigs the human closed - the
                               // auto-popup never re-nags for the same set
@@ -8022,6 +8047,29 @@ function showDetail(i, keepStack){
   document.getElementById('backdrop').hidden = false;
 }
 
+// One source for "which lifecycle controls apply to this run right now" -
+// the run-details modal and the row context menu both read it, so neither
+// can drift into its own idea of what is currently allowed.
+function runCtl(r){
+  const key = runKey(r);
+  const liveSteps = AGENTS.filter(a=>(a.run_key||a.run_dir)===key &&
+    ['running','queued'].includes(a.status));
+  const cks = Object.keys(r.counts||{});
+  return {key, liveSteps,
+    canResume: !!(cks.length &&
+      !cks.some(s=>['running','queued'].includes(s)) &&
+      cks.some(s=>s!=='done')),
+    // worktree branches that never landed (conflict parked the worktree, or
+    // the conductor died between the wave and the merge) - mergeable once
+    // nothing in the run is live
+    pendingMerge: AGENTS.some(a=>a.branch && a.merged!==true &&
+      (a.run_key||a.run_dir)===key &&
+      !['running','queued'].includes(a.status)),
+    // 'paused' means someone clicked Pause run (a graceful hold); a run
+    // with no ended_at and nothing live means the conductor itself died.
+    interrupted: !r.ended_at && !r.aborted && !liveSteps.length &&
+      cks.some(s=>s!=='done')};
+}
 function showRunDetails(key, keepStack){
   const r = lastData?.runs.find(x=>runKey(x)===key);
   if (!r) return;
@@ -8046,23 +8094,11 @@ function showRunDetails(key, keepStack){
     ['sessions', AGENTS.filter(a=>(a.run_key||a.run_dir)===key &&
       a.session_id).map(a=>`${a.step}: ${a.session_id}`).join(' \u00b7 ')
       ||'-']];
-  const canResume = Object.keys(r.counts||{}).length &&
-    !Object.keys(r.counts).some(s=>['running','queued'].includes(s)) &&
-    Object.keys(r.counts).some(s=>s!=='done');
-  // Steps whose worktree branch never landed (conflict parked the worktree,
-  // or the conductor died between the wave and the merge) - mergeable from
-  // here once nothing in the run is live.
-  const pendingMerge = AGENTS.some(a=>a.branch && a.merged!==true &&
-    (a.run_key||a.run_dir)===key &&
-    !['running','queued'].includes(a.status));
-  const liveSteps = AGENTS.filter(a=>(a.run_key||a.run_dir)===key &&
-    ['running','queued'].includes(a.status));
-  // Paused vs interrupted: 'paused' means someone clicked Pause run (a
-  // graceful hold - in-flight steps finished first); a run with no
-  // ended_at and nothing live means the conductor itself died (crash or
-  // reboot). Both resume from committed state.
-  const interrupted = !r.ended_at && !r.aborted && !liveSteps.length &&
-    Object.keys(r.counts||{}).some(s=>s!=='done');
+  const ctl = runCtl(r);
+  const canResume = ctl.canResume;
+  const pendingMerge = ctl.pendingMerge;
+  const liveSteps = ctl.liveSteps;
+  const interrupted = ctl.interrupted;
   const notice = (r.aborted==='paused' && canResume)
     ? `<div class="notice warn">Paused - in-flight steps finished and ` +
       `nothing new launched. Resume continues where it left off ` +
@@ -8123,6 +8159,176 @@ function showRunDetails(key, keepStack){
     '</div>';
   applyModalScroll();
   document.getElementById('backdrop').hidden = false;
+}
+// --- row context menus -------------------------------------------------
+// Right-click (or Shift+F10 / Menu key on a focused row) opens a small
+// action menu on run and task rows. Menu items are <button>s carrying the
+// SAME data-* hooks the modal action buttons use, so activation runs
+// through the one delegated click handler (confirms, sentinel endpoints
+// and their server-side state validation included) - there is no second
+// execution-control path here, just a new way to reach the existing one.
+// The native menu is deliberately preserved where it matters: on an
+// editable field, on a live text selection (copy stays native), and
+// everywhere via Shift+right-click as the explicit escape.
+const ctxAttrs = o => Object.entries(o)
+  .map(([k,v])=>` data-${k}="${esc(v)}"`).join('');
+function hideCtxMenu(){
+  const m = document.getElementById('ctxmenu');
+  if (m) m.hidden = true;
+  if (ctxState && ctxState.anchor && ctxState.anchor.classList)
+    ctxState.anchor.classList.remove('ctxanchor');
+  ctxState = null;
+}
+// Availability mirrors the modal's predicates exactly (runCtl for runs);
+// items the state doesn't allow are simply absent - same as the modal -
+// except Delete run, which the modal also renders but disables while live.
+function ctxRunItems(r){
+  const c = runCtl(r), key = c.key, it = [];
+  if (r.stage){
+    // proposal/request row: the name button opens the request modal, so
+    // 'Open details' does too
+    it.push({label:'Open details', attrs:ctxAttrs({'open-request':r.request_id}),
+      title:'open the request / proposal review'});
+    if (r.stage==='questions' && (r.questions||[]).length)
+      it.push({label:'Answer questions',
+        attrs:ctxAttrs({'open-questions':r.request_id})});
+    if (r.stage==='generating')
+      it.push({label:'Stop proposal', danger:true,
+        attrs:ctxAttrs({'stop-gen':r.request_id}),
+        title:'cancel this planning pass - the request stays editable'});
+  } else {
+    it.push({label:'Open details', attrs:ctxAttrs({'run-details':key}),
+      title:'run details - same as clicking the run name'});
+    if (r.request_id)
+      it.push({label:'View original request / TOML',
+        attrs:ctxAttrs({'open-request':r.request_id})});
+  }
+  if (selectedRun===key)
+    it.push({label:'Clear run filter', attrs:ctxAttrs({'clear-run':''})});
+  else
+    it.push({label:'Filter by this item', attrs:ctxAttrs({'filter-run':key}),
+      title:'show only this run and its tasks'});
+  if (!r.stage){
+    const act = [];
+    if (c.liveSteps.length){
+      act.push({label:'Pause run', attrs:ctxAttrs({'pause-run':base(r.dir)}),
+        title:'let in-flight steps finish, then hold the run - nothing ' +
+          'new launches until Resume'});
+      act.push({label:'Stop run now', danger:true,
+        attrs:ctxAttrs({'stop-run':base(r.dir)}),
+        title:'kill every live step now - committed work stays; Resume ' +
+          'restarts unfinished steps'});
+    }
+    if (c.canResume)
+      act.push({label:'Resume unfinished steps',
+        attrs:ctxAttrs({'resume-run':base(r.dir)}),
+        title:'re-run every non-done step in a fresh session'});
+    if (c.pendingMerge)
+      act.push({label:'Merge pending branches',
+        attrs:ctxAttrs({'merge-run':base(r.dir),'rk':key})});
+    if (act.length) it.push({sep:1}, ...act);
+    it.push({sep:1});
+    it.push({label:r.archived?'Unarchive run':'Archive run',
+      attrs:ctxAttrs({'arch-run':base(r.dir),'arch-set':r.archived?0:1})});
+    it.push({label:'Delete run', danger:true, dis:!!c.liveSteps.length,
+      attrs:ctxAttrs({'delete-run':base(r.dir)}),
+      title:c.liveSteps.length
+        ? 'disabled while a step is still live - stop the run first'
+        : 'permanently delete this run record - state, logs, prompts, ' +
+          'exports'});
+  }
+  return it;
+}
+function ctxAgentItems(a){
+  const key = agentKey(a), it = [];
+  it.push({label:'Open details', attrs:ctxAttrs({'agent-detail':key}),
+    title:'task details - same as clicking the row'});
+  if (a.run_dir)
+    it.push({label:'Session summary', attrs:ctxAttrs({'summary':key}),
+      title:'the end-of-session report for this step, opened in this ' +
+        'dialog'});
+  it.push({label:'Filter by this item',
+    attrs:ctxAttrs({'filter-run':a.run_key||a.run_dir||''}),
+    title:'show only the run this task belongs to'});
+  if (a.request_id)
+    it.push({label:'View request / runbook',
+      attrs:ctxAttrs({'open-request':a.request_id})});
+  const act = [];
+  if (a.status==='running' && a.run_dir)
+    act.push({label:'Stop this step', danger:true,
+      attrs:ctxAttrs({'stop-agent':base(a.run_dir),'step':a.step}),
+      title:'tree-kill this agent now - the run proceeds to the next step'});
+  if ((a.status==='queued'||a.status==='waiting') && !a.skipped_by_user &&
+      a.run_dir)
+    act.push({label:'Skip step',
+      attrs:ctxAttrs({'skip-step':base(a.run_dir),'step':a.step}),
+      title:'never launch this step while marked - stays in force until ' +
+        'Unskip'});
+  if (a.skipped_by_user && a.run_dir)
+    act.push({label:'Unskip step',
+      attrs:ctxAttrs({'unskip-step':base(a.run_dir),'step':a.step})});
+  if (a.step==='plan-proposal' && a.status==='running' && a.request_id)
+    act.push({label:'Stop proposal', danger:true,
+      attrs:ctxAttrs({'stop-gen':a.request_id})});
+  if (a.prompt_editable && a.run_dir)
+    act.push({label:'Edit prompt', attrs:ctxAttrs({'edit-prompt':key}),
+      title:'open the task and jump to the prompt editor'});
+  if (act.length) it.push({sep:1}, ...act);
+  return it;
+}
+function openCtxMenu(row, items, x, y){
+  const m = document.getElementById('ctxmenu');
+  if (!m || !items.length) return;
+  hideCtxMenu();
+  ctxState = {items, idx:0, anchor:row, returnEl:row};
+  m.innerHTML = items.map((it,i)=> it.sep
+    ? '<div class="ctxsep"></div>'
+    : `<button type="button" class="ctxi${it.danger?' danger':''}" ` +
+      `role="menuitem" data-ctxi="${i}"` +
+      (it.dis?' disabled':'') +
+      (it.title?` title="${esc(it.title)}"`:'') + it.attrs +
+      `>${esc(it.label)}</button>`).join('') +
+    '<div class="ctxhint">Shift+F10 reopens this menu from the keyboard · ' +
+    'Shift+right-click keeps the browser menu</div>';
+  // clamp inside the viewport - hidden elements have no layout, so unhide
+  // first (the test harness has no layout - fall back to fixed estimates)
+  m.hidden = false;
+  const st = m.style || (m.style = {});
+  const W = (typeof window!=='undefined' && window.innerWidth) || 1e9;
+  const H = (typeof window!=='undefined' && window.innerHeight) || 1e9;
+  const mw = m.offsetWidth || 240, mh = m.offsetHeight || items.length*26+30;
+  st.left = Math.max(4, Math.min(x, W-mw-4)) + 'px';
+  st.top  = Math.max(4, Math.min(y, H-mh-4)) + 'px';
+  if (row.classList) row.classList.add('ctxanchor');
+  // native menus grab focus - keyboard users need the items reachable, and
+  // Esc returning focus to the row keeps the flow
+  const first = m.querySelector &&
+    m.querySelector('.ctxi:not([disabled])');
+  if (first && first.focus) first.focus();
+}
+function openRowMenu(row, x, y){
+  if (!row || !row.dataset) return;
+  let items = null;
+  if (row.classList && row.classList.contains('runrow')){
+    const r = (lastData?.runs||[]).find(v=>runKey(v)===row.dataset.runKey);
+    if (r) items = ctxRunItems(r);
+  } else if (row.classList && row.classList.contains('agen')){
+    const a = AGENTS[+row.dataset.i];
+    if (a) items = ctxAgentItems(a);
+  }
+  if (items && items.length) openCtxMenu(row, items, x, y);
+}
+function ctxMoveFocus(key){
+  const m = document.getElementById('ctxmenu');
+  if (!m || !m.querySelectorAll) return;
+  const bs = [...m.querySelectorAll('.ctxi:not([disabled])')];
+  if (!bs.length) return;
+  let i = ctxState ? ctxState.idx : -1;
+  if (key==='Home') i = 0;
+  else if (key==='End') i = bs.length-1;
+  else i = (i + (key==='ArrowDown'?1:-1) + bs.length) % bs.length;
+  ctxState.idx = i;
+  if (bs[i].focus) bs[i].focus();
 }
 async function api(method,path,body){
   const opt = method==='GET' ? {} : {method,
@@ -8733,6 +8939,7 @@ function render(d){
         ? ` <span class="stage error">Needs review</span>`:'';
     h += `<tr class="runrow${runKey(r)===selectedRun?' selected':''}" ` +
       `data-run-key="${esc(runKey(r))}" tabindex="0" ` +
+      `aria-haspopup="menu" ` +
       `aria-label="Filter to run ${esc(r.run)}"><td class="wrap">` +
       (r.counts&&r.counts.running
         ? `<span class="dot run" style="background:#58a6ff" ` +
@@ -8858,7 +9065,9 @@ function render(d){
           `title="live session (inferred - recorded at step end)">` +
           `${esc(sess)}…</td>`
         : `<td class="hide-s"${sess==='…'?' title="recorded when the step ends"':''}>${esc(sess)}</td>`;
-      h += `<tr class="agen" data-i="${a._i}" data-run-key="${esc(a.run_key||a.run_dir||'')}">` +
+      h += `<tr class="agen" data-i="${a._i}" ` +
+        `data-run-key="${esc(a.run_key||a.run_dir||'')}" tabindex="0" ` +
+        `aria-haspopup="menu" aria-label="task ${esc(a.step)}">` +
         `<td><span class="dot${pulse}" style="background:${c}" ` +
         `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>` +
         `${a.status}` +
@@ -8937,12 +9146,54 @@ function render(d){
   const qr = !modalQA && document.getElementById('backdrop').hidden &&
     d.runs.find(r=>r.stage==='questions' && (r.questions||[]).length);
   if (qr && !qDismissed.has(
-      qr.request_id+'|'+qr.questions.map(q=>q.qid).join(',')))
-    openQuestions(qr.request_id);
+      qr.request_id+'|'+qr.questions.map(q=>q.qid).join(','))){
+    hideCtxMenu();
+    openQuestions(qr.request_id); }
   syncTopbar();      // filter rows can wrap and change the bar height
 }
+// right-click on a run/task row opens the action menu INSTEAD of the
+// browser menu - but the native one stays where it matters: editable
+// fields, a live text selection (copy keeps working), right-click
+// anywhere that isn't a row, and Shift+right-click as the explicit escape.
+document.addEventListener('contextmenu', e=>{
+  const t = e.target;
+  if (t && t.closest && t.closest('#ctxmenu')){ e.preventDefault(); return; }
+  hideCtxMenu();
+  if (!t || !t.closest) return;
+  if (e.shiftKey) return;
+  if (t.isContentEditable ||
+      t.closest('input,textarea,select,[contenteditable]:not([contenteditable="false"])'))
+    return;
+  const sel = typeof window!=='undefined' && window.getSelection &&
+              window.getSelection();
+  if (sel && !sel.isCollapsed && sel.toString && sel.toString().length)
+    return;
+  const row = t.closest('tr.runrow') || t.closest('tr.agen');
+  if (!row) return;
+  e.preventDefault();
+  // a keyboard-triggered contextmenu event (a platform the keydown didn't
+  // catch) arrives at 0,0 - anchor to the row's rect instead of a corner
+  let x = e.clientX||0, y = e.clientY||0;
+  if (!x && !y){
+    const rc = row.getBoundingClientRect ? row.getBoundingClientRect()
+      : {left:24, bottom:40};
+    x = rc.left+8; y = rc.bottom;
+  }
+  openRowMenu(row, x, y);
+});
+// the menu dies with the view it belongs to (scrolled off / resized away)
+document.addEventListener('scroll', ()=>{ if (ctxState) hideCtxMenu(); },
+  true);
 document.addEventListener('click', async e=>{
   const t = e.target;
+  // context menu: an item click closes it and falls through to the normal
+  // data-* dispatch below; ANY click outside it is a pure dismissal and
+  // must never reach the row under it (no accidental filter/detail jump)
+  const inCtx = t.closest && t.closest('#ctxmenu');
+  if (ctxState){
+    hideCtxMenu();
+    if (!inCtx) return;
+  }
   if (t.id==='dx' || t.id==='backdrop'){
     closeDetail(); return; }
   if (t.id==='new-request'){
@@ -9018,6 +9269,22 @@ document.addEventListener('click', async e=>{
       showDetail(j, true);
       const d = document.getElementById('detail');
       if (d) d.scrollTop = 0;
+    }
+    return; }
+  // context-menu task entries - keyed by agentKey so a re-sorted table
+  // can't open the wrong row (same keying the modal refresh uses)
+  const adEl = t.closest && t.closest('[data-agent-detail]');
+  if (adEl){
+    const j = AGENTS.findIndex(x=>agentKey(x)===adEl.dataset.agentDetail);
+    if (j>=0) showDetail(j);
+    return; }
+  const epEl = t.closest && t.closest('[data-edit-prompt]');
+  if (epEl){
+    const j = AGENTS.findIndex(x=>agentKey(x)===epEl.dataset.editPrompt);
+    if (j>=0){
+      showDetail(j);
+      const p = document.getElementById('d-prompt');
+      if (p && p.focus) p.focus();
     }
     return; }
   // trajectory expansion controls - state lives in trajOpen (keyed per
@@ -9387,6 +9654,47 @@ document.addEventListener('paste', e=>{
   if(files.length){ e.preventDefault(); attachFiles(files); }
 });
 document.addEventListener('keydown', e=>{
+  // the open row menu owns the keyboard: Esc dismisses (focus returns to
+  // the row it came from) and arrows/Home/End move between items; a
+  // focused item's Enter/Space is the native button activation
+  if (ctxState){
+    if (e.key==='Escape'){
+      e.preventDefault();
+      const r = ctxState.returnEl;
+      hideCtxMenu();
+      if (r && r.isConnected !== false && r.focus) r.focus();
+      return;
+    }
+    if (e.key==='ArrowDown'||e.key==='ArrowUp'||
+        e.key==='Home'||e.key==='End'){
+      e.preventDefault(); ctxMoveFocus(e.key); return; }
+    // Tab stays trapped inside the menu like a native one (Esc leaves)
+    if (e.key==='Tab'){
+      e.preventDefault(); ctxMoveFocus(e.shiftKey?'ArrowUp':'ArrowDown');
+      return; }
+    // Enter/Space landing outside the menu while it's open is treated like
+    // a dismissal - never a stray activation of the row behind the click
+    if ((e.key==='Enter'||e.key===' ') &&
+        e.target.closest && !e.target.closest('#ctxmenu')){
+      e.preventDefault(); hideCtxMenu(); return; }
+  }
+  // keyboard equivalent of right-click: the Menu key or Shift+F10 on a
+  // focused run/task row opens the same menu anchored to the row (not while
+  // a modal is up - the rows it acts on are covered anyway)
+  if ((e.key==='ContextMenu' || (e.key==='F10' && e.shiftKey)) &&
+      !e.ctrlKey && !e.altKey &&
+      document.getElementById('backdrop').hidden){
+    const el = (e.target && e.target.closest) ? e.target
+      : (document.activeElement || {});
+    const row = el.closest && el.closest('tr.runrow,tr.agen');
+    if (row){
+      e.preventDefault();
+      const rc = row.getBoundingClientRect ? row.getBoundingClientRect()
+        : {left:24, top:24, bottom:40};
+      openRowMenu(row, rc.left+8, rc.bottom);
+      return;
+    }
+  }
   if (e.key==='Enter' && modalQA && e.target.id==='q-free'){
     e.preventDefault();
     const pend=(modalQA.rec.pending_questions||[]);
@@ -9402,6 +9710,13 @@ document.addEventListener('keydown', e=>{
     e.preventDefault();
     selectedRun = selectedRun===e.target.dataset.runKey ? null : e.target.dataset.runKey;
     if (lastData) render(lastData);
+  }
+  // task rows are focusable too (Shift+F10 works on them) - Enter/Space on
+  // one is the left-click equivalent: open its details
+  if ((e.key==='Enter'||e.key===' ') &&
+      e.target.matches && e.target.matches('tr.agen')){
+    e.preventDefault();
+    showDetail(+e.target.dataset.i);
   }
   // Left/Right walks the open task's (or open summary's) pipeline - same
   // chain as the .dnav arrows - but never while typing in a form field.
@@ -9438,7 +9753,8 @@ async function tick(){
   catch(e){} finally { setTimeout(tick, 2000); } }
 setDensity(density);
 if (typeof window!=='undefined' && window.addEventListener)
-  window.addEventListener('resize', syncTopbar);
+  window.addEventListener('resize', ()=>{ syncTopbar();
+    if (ctxState) hideCtxMenu(); });
 tick();
 </script></body></html>"""
 
