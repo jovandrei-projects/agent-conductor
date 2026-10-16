@@ -1,0 +1,17 @@
+[run]
+name = "disk-cleanup-blue-icon"
+description = "Change the disk-cleanup app icon color to blue."
+on_failure = "continue"
+checkpoint = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 30
+max_attempts = 3
+
+[[step]]
+name = "recolor-icon-blue"
+project = "disk-cleanup"
+prompt = "Find the app icon for the disk-cleanup app (check the project's icon/assets directories and any platform config such as app.json, AndroidManifest.xml, adaptive-icon XML, or asset catalogs that reference the icon). Recolor the icon to a blue color scheme: update the source icon image files (or their vector/generator source if one exists) so the dominant icon color is blue, and update any associated background/tint colors (e.g. adaptive icon background, splash, or theme color entries tied to the icon) to a matching blue. Regenerate derived icon sizes if the project has a generation script; otherwise edit each existing icon file in place. Do not change anything unrelated to the icon's color. When done, briefly report which files were changed."
