@@ -202,7 +202,7 @@ FOLLOWUP_STEP = '''
 name = "follow-up-plan"
 project = "{slug}"
 timeout_min = 30
-prompt = 'This run just ended. Review what it accomplished against the request it ran from: per-step logs, STATUS/NEXT/OUTCOME lines and notes are under {runs} (the newest dir ending in -{run}), and progress files live under this project .agent_tasks/. Then write a NEW conductor TOML manifest proposing ONLY the still-unfinished or newly discovered work, saved as {manifests}/{run}-followup.toml. Do not implement or launch that manifest - a human reviews it first.'
+prompt = 'This run just ended. Review what it accomplished against the request it ran from: per-step logs, STATUS/NEXT/OUTCOME lines and notes are under {runs} (the newest dir ending in -{run}), and progress files live under this project .agent_tasks/. Then write a NEW conductor TOML manifest proposing ONLY the still-unfinished or newly discovered work, saved as {manifests}/{run}-followup.toml - if nothing remains, write the file anyway but with no [[step]] entries (a run table + comments saying so), which registers as "no work remains" rather than a runnable job. The file is imported into the proposals list automatically - write it exactly once, do not implement or launch it, and do not schedule anything: only a human can start it.'
 '''
 
 RESOLVE_BODY = """\
@@ -3761,6 +3761,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     for rec in state["steps"].values():
         counts[rec["status"]] = counts.get(rec["status"], 0) + 1
     print(f"run {cfg.name}: {dict(counts)}  ({run_dir})")
+    # A closing follow-up-plan step's output is an intake artifact of THIS
+    # run: register <run>-followup.toml as a proposal request so it shows
+    # as 'Ready to run' - never launched. Best-effort only: a checkout a
+    # live agent still watches defers to the dashboard's rescan rather
+    # than failing the run.
+    try:
+        for line in discover_followups(runs_dir, manifests_dir=MANIFESTS_DIR,
+                                       run_dir=run_dir, scan_orphans=False):
+            print(f"[followup] {line}")
+    except Exception as exc:
+        LOG.exception("follow-up discovery failed")
+        print(f"[followup] discovery failed: {exc}")
     # [run] summarize: a detached `conductor.py summarize` session reads
     # the step exports and writes run.summary.md - out of process so the
     # run's exit code is already fixed and a hung session can't hold the
@@ -3992,6 +4004,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
                              or os.environ.get("CONDUCTOR_DEVIN") or "devin")
     lines += sweep_sessions(runs_dir, devin_argv,
                             getattr(args, "keep_hours", 48.0))
+    lines += [f"followup: {ln}" for ln in discover_followups(runs_dir)]
     print("\n".join(lines) if lines else "nothing stale")
     return 0
 
@@ -4985,8 +4998,7 @@ def save_request(request_id: str, payload: dict,
         _assert_unwatched(runs_dir, requests_dir, manifests_dir)
         rec = _read_request(request_id, requests_dir)
         stage = _request_status(rec, runs_dir)
-        if stage not in ("draft", "ready", "error", "launch_failed",
-                         "questions"):
+        if stage not in _REQUEST_EDITABLE_STAGES:
             raise RequestError("This request is being processed or already run", 409)
         rec["status"] = stage
         fields = _request_fields(payload, rec)
@@ -5036,8 +5048,7 @@ def apply_request(request_id: str, payload: dict,
         _assert_unwatched(runs_dir, requests_dir, manifests_dir)
         rec = _read_request(request_id, requests_dir)
         stage = _request_status(rec, runs_dir)
-        if stage not in ("draft", "ready", "error", "launch_failed",
-                         "questions"):
+        if stage not in _REQUEST_EDITABLE_STAGES:
             raise RequestError("This request is being processed or already run",
                                409)
         if not rec.get("manifest"):
@@ -5075,6 +5086,671 @@ def apply_request(request_id: str, payload: dict,
         patched = _apply_fields_to_toml(text, fields, manifests_dir)
         return _publish_proposal(rec, patched, requests_dir, manifests_dir,
                                  runs_dir)
+
+
+# ------------------------------------------------------------- follow-up intake
+# A run's closing follow-up-plan step is asked to write
+# manifests/<run>-followup.toml (a worktree producer's own checkout also
+# works - the prompt path is absolute, but workers have committed the file
+# on their branch before). Discovery turns that file into an ordinary
+# proposal request - status 'ready' - so it lands in the Runs section for a
+# human to review, edit, Start or Discard. Registration NEVER launches:
+# the row is a proposal like any other, and only the separate Start run
+# click runs it. Outputs that cannot be a launchable proposal still land
+# as records so nothing is silently lost:
+#   ready   - the file parses and passes the whole proposal gate
+#   empty   - the file parses but declares no [[step]] (nothing remains),
+#             or the step ended reporting nothing left to write
+#   error   - the file exists but is malformed or fails validation
+#   missing - the follow-up-plan step claims completion but wrote no file
+# state["followup"] links the run row forward to the request; the request's
+# source_run/source_manifest fields link it back and keep the original file
+# reachable (the request owns a COPY - the source is only ever read).
+FOLLOWUP_INDEX = "followups.index"   # data/requests/ ledger - JSON inside,
+                                     # named .index so *.json globs in the
+                                     # request paths never misread it as a
+                                     # request record
+_FOLLOWUP_POLL_S = 60.0              # collect_dashboard rescan throttle
+_FOLLOWUP_TRIED = 0.0
+# Owned proposal copies are <request-id>-<run>.toml - the id prefix is the
+# orphan scan's exclusion so a copy can never re-import as a new proposal.
+_FOLLOWUP_OWNED_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}-.+\.toml$")
+# The step's own report saying there was nothing left to write - consulted
+# only when it left no file at all (a zero-step TOML is the stronger,
+# file-backed 'empty' signal).
+_FOLLOWUP_EMPTY_RE = re.compile(
+    r"\b(?:no (?:remaining|further|unfinished|follow[- ]?up|work)|"
+    r"nothing (?:left|remains|to do|to propose|else)|"
+    r"no work (?:left|remains)|nothing more to do|"
+    r"all (?:the )?work (?:is )?(?:done|complete))\b", re.I)
+# Stages a follow-up record can be in that still allow form edits/discard -
+# the classic set plus the two terminal intake statuses.
+_REQUEST_EDITABLE_STAGES = ("draft", "ready", "error", "launch_failed",
+                            "questions", "empty", "missing")
+
+
+def _followup_index_path(requests_dir: Path) -> Path:
+    return requests_dir / FOLLOWUP_INDEX
+
+
+def _followup_index(requests_dir: Path) -> dict:
+    """The follow-up registration ledger: source key -> {request, sha,
+    discarded, ...}. It is what makes registration idempotent across
+    retries, rescans and restarts - and makes Discard a durable veto (a
+    discarded source never silently re-registers; the explicit import path
+    can always override)."""
+    try:
+        doc = json.loads(
+            _followup_index_path(requests_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"entries": {}}
+    if not isinstance(doc, dict) or not isinstance(doc.get("entries"), dict):
+        return {"entries": {}}
+    return doc
+
+
+def _save_followup_index(requests_dir: Path, index: dict) -> None:
+    requests_dir.mkdir(parents=True, exist_ok=True)
+    p = _followup_index_path(requests_dir)
+    tmp = p.with_suffix(".index.tmp")
+    tmp.write_text(json.dumps(index, indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+
+def _followup_mark(requests_dir: Path, request_id: str,
+                   discarded: bool) -> None:
+    """Flip the veto mark on every ledger entry that produced this request:
+    Discard sets it (the source stays parked), Restore clears it."""
+    index = _followup_index(requests_dir)
+    changed = False
+    for ent in index["entries"].values():
+        if ent.get("request") == request_id and \
+                bool(ent.get("discarded")) != discarded:
+            ent["discarded"] = discarded
+            ent["updated_at"] = now_iso()
+            changed = True
+    if changed:
+        _save_followup_index(requests_dir, index)
+
+
+def _followup_sources(st: dict, owner_md: Path) -> list[Path]:
+    """Existing files a run's follow-up output could be, canonical first:
+    the checkout manifests/<run>-followup.toml the prompt asks for (its
+    {manifests} interpolation is the DRIVER's own checkout manifests
+    dir), the dir the run's manifest lived in (a driver in another
+    checkout wrote there), and the same relative path inside the step's
+    worktree (a worktree producer can commit it on its branch)."""
+    name = st.get("run") or ""
+    if not name:
+        return []
+    rec = (st.get("steps") or {}).get("follow-up-plan") or {}
+    cands = [owner_md / f"{name}-followup.toml"]
+    if st.get("manifest"):
+        p = Path(st["manifest"]).resolve().parent / f"{name}-followup.toml"
+        if p not in cands:
+            cands.append(p)
+    wd = rec.get("work_dir")
+    if wd:
+        p = Path(wd) / "manifests" / f"{name}-followup.toml"
+        if p not in cands:
+            cands.append(p)
+    return [p for p in cands if p.is_file()]
+
+
+def _classify_followup(text: str, manifests_dir: Path,
+                       doc: dict | None = None
+                       ) -> tuple[str, "Manifest | None", str | None]:
+    """(status, cfg, error) for a written follow-up file. 'ready' means it
+    passed the whole proposal gate - parse, run section, registered slugs,
+    git-repo targets, wave shape, execution options. 'empty' is a parseable
+    TOML declaring no [[step]] - the worker's file-backed way to say
+    nothing remains; it must never read as a runnable job. Anything else
+    is 'error', kept for review rather than dropped."""
+    if doc is None:
+        try:
+            doc = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            return "error", None, f"not valid TOML: {exc}"
+    if not isinstance(doc, dict):
+        return "error", None, "not a TOML document"
+    steps = doc.get("step")
+    if steps is None or steps == []:
+        return "empty", None, None
+    if not isinstance(steps, list):
+        return "error", None, "a [step] table is not a [[step]] list"
+    try:
+        cfg = validate_proposal(text, manifests_dir)
+    except RequestError as exc:
+        return "error", None, str(exc)
+    return "ready", cfg, None
+
+
+def _followup_rec_base(source: Path | None, run_ctx: dict | None) -> dict:
+    """The record skeleton every follow-up intake shares. Option fields
+    start neutral; a 'ready' classification then syncs them to what the
+    TOML itself encodes (the same baseline _manifest_options gives the
+    pending diff, so a fresh import is not born 'stale')."""
+    run_ctx = run_ctx or {}
+    run_name = run_ctx.get("run") or ""
+    return {"status": "draft", "created_at": now_iso(),
+            "manifest": None, "description": "",
+            "run": f"{run_name}-followup" if run_name else "",
+            "proposed_steps": [], "stale": False, "error": None,
+            "label": f"follow-up: {run_name}" if run_name else "",
+            "raw": (f"Follow-up drafted by run {run_ctx.get('dir')}'s "
+                    "follow-up-plan step."
+                    if run_ctx.get("dir") else "Imported proposal manifest."),
+            "project": "", "attachments": [], "model": "", "effort": "",
+            "on_failure": "continue", "max_attempts": 1,
+            "followup": False, "worktrees": False, "merge_resolver": False,
+            "summarize": False, "ask": False,
+            "imported": "followup",
+            "source_run": run_ctx.get("dir"),
+            "source_run_key": (f"request:{run_ctx.get('request')}"
+                               if run_ctx.get("request")
+                               else run_ctx.get("path")),
+            "source_request": run_ctx.get("request"),
+            "source_step": run_ctx.get("step"),
+            "source_manifest": str(source) if source else None,
+            "pending_questions": []}
+
+
+def _followup_apply(rec: dict, text: str, manifests_dir: Path,
+                    requests_dir: Path, runs_dir: Path) -> str:
+    """Copy the source text into the request's owned manifest and set the
+    status fields - 'ready'/'empty'/'error'. The owned copy keeps the
+    request inside the normal proposal machinery (_manifest_path, Apply,
+    Discard, launch); the source file is only ever read."""
+    _assert_unwatched(runs_dir, requests_dir, manifests_dir)
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        doc = None
+    status, cfg, err = _classify_followup(text, manifests_dir, doc)
+    run_doc = doc.get("run") if isinstance(doc, dict) else None
+    run_doc = run_doc if isinstance(run_doc, dict) else {}
+    name = cfg.name if cfg else str(run_doc.get("name") or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,59}", name):
+        name = _safe_name(Path(
+            rec.get("source_manifest") or "followup").stem)[:60]
+    if status == "empty":
+        # Nothing to launch or review in TOML terms: keep the source
+        # pointer, no owned copy, no steps - the row reads 'No work
+        # remains' and can never drift stale or be started.
+        rec.update(manifest=None, proposed_steps=[],
+                   run=name or rec.get("run"),
+                   description=str(run_doc.get("description") or "")[:300],
+                   error=None, stale=False)
+        rec["status"] = "empty"
+        return "empty"
+    p = manifests_dir / f"{rec['id']}-{name}.toml"
+    tmp = p.with_suffix(".toml.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(p)
+    # A re-import under a new [run].name leaves the previous owned copy
+    # behind - drop it so manifests/ keeps one file per registered
+    # proposal (only ever <id>-prefixed, never the source).
+    old = Path(rec["manifest"]) if rec.get("manifest") else None
+    if old is not None and old != p \
+            and old.name.startswith(f"{rec['id']}-") \
+            and old.parent.resolve() == manifests_dir.resolve():
+        old.unlink(missing_ok=True)
+    rec["manifest"] = str(p)
+    if status == "ready":
+        opts = _manifest_options(text, manifests_dir)
+        rec.update(
+            status="ready", run=cfg.name,
+            description=cfg.description.strip(), error=None,
+            gen_inputs=_gen_inputs_of(rec), pending_questions=[],
+            model=opts.get("model") or "", effort=opts.get("effort") or "",
+            on_failure=opts.get("on_failure") or "continue",
+            max_attempts=opts.get("max_attempts") or 1,
+            worktrees=bool(opts.get("worktrees")),
+            merge_resolver=bool(opts.get("merge_resolver")),
+            followup=bool(opts.get("followup")),
+            summarize=cfg.summarize is not None,
+            proposed_steps=[{
+                "step": s.name, "slug": s.project, "model": s.model,
+                "effort": s.effort, "mode": s.mode,
+                "task": task_summary(s.prompt), "wt": s.worktree,
+                "cloud": s.cloud} for s in cfg.steps])
+        pend = _pending_actions(rec)
+        rec["stale"] = bool(pend["gen"] or pend["opts"])
+    else:
+        # Kept for review: the broken text stays inspectable in the modal
+        # through the owned copy; 'manifest' in pending names the culprit.
+        rec.update(status="error", run=name or rec.get("run"),
+                   proposed_steps=[],
+                   error=(f"Follow-up manifest failed validation: {err}"
+                          if err else
+                          "Follow-up manifest failed validation")[:300],
+                   stale=False)
+    return status
+
+
+def _followup_entry(source: Path | None, rec: dict, sha: str | None,
+                    run_ctx: dict | None) -> dict:
+    ent = {"request": rec["id"], "sha": sha, "discarded": False,
+           "status": rec.get("status"), "updated_at": now_iso()}
+    if source is not None:
+        ent["source"] = str(source.resolve())
+    if run_ctx:
+        ent.update(run=run_ctx.get("dir"), step=run_ctx.get("step"))
+    return ent
+
+
+def _register_followup_source(source: Path, run_ctx: dict | None,
+                              index: dict, requests_dir: Path,
+                              manifests_dir: Path, runs_dir: Path,
+                              force: bool = False
+                              ) -> tuple[str, dict | None]:
+    """Register a written follow-up file as a proposal request - the whole
+    idempotency story in one place. Keyed on the resolved path: a rescanned
+    unchanged file is a no-op, a rewritten file re-publishes into the same
+    record (retries, merges landing the worktree copy), a discarded source
+    stays vetoed unless force, and a consumed record (launched, or owned by
+    a planner pass) is left alone. Raises RequestError on the trap-5
+    watched-dir guard - the caller defers or reports."""
+    key = "file:" + str(source.resolve())
+    ent = index["entries"].get(key)
+    if ent and ent.get("discarded") and not force:
+        return "discarded", None
+    try:
+        text = source.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # a binary/garbled drop still lands as a reviewable 'error'
+        text = source.read_text(encoding="utf-8", errors="replace")
+    sha = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    rec = None
+    if ent:
+        try:
+            rec = _read_request_file(ent["request"], requests_dir)
+        except RequestError:
+            rec = None
+    alt_key = None
+    if rec is None and run_ctx:
+        # the file resolves a 'missing'/'empty' outcome record this same
+        # (run, step) already landed - fold it in place so the one logical
+        # row flips to its real status instead of shadowing a stale twin
+        alt_key = f"run:{run_ctx['dir']}:{run_ctx['step']}"
+        aent = index["entries"].get(alt_key)
+        if aent and not aent.get("discarded"):
+            try:
+                rec = _read_request_file(aent["request"], requests_dir)
+            except RequestError:
+                rec = None
+            if rec is not None and \
+                    rec.get("status") not in ("missing", "empty"):
+                rec = None          # not ours to fold - register normally
+    if rec is not None:
+        stage = _request_status(rec, runs_dir)
+        if stage in ("launched", "launching", "generating", "questions"):
+            return f"kept:{stage}", rec
+        if ent and ent.get("sha") == sha and \
+                rec.get("status") == ent.get("status"):
+            # the source is unchanged: leave the record (and any human
+            # edits to the owned copy) alone - only a MISSING owned copy
+            # is quietly re-copied
+            owned = rec.get("manifest")
+            if not owned:
+                return "unchanged", rec
+            p = Path(owned)
+            if p.is_file():
+                return "unchanged", rec
+            _assert_unwatched(runs_dir, requests_dir, manifests_dir)
+            tmp = p.with_suffix(".toml.tmp")
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(p)
+            return "repaired", rec
+        if ent and ent.get("sha") != sha and rec.get("manifest"):
+            # the source moved - but a human edit to the owned copy wins:
+            # the file on disk no longer matches what we last imported,
+            # so re-copying would clobber their work. The request's own
+            # pending state already surfaces that divergence.
+            p = Path(rec["manifest"])
+            if p.is_file():
+                try:
+                    cur = hashlib.sha1(p.read_text(
+                        encoding="utf-8").encode("utf-8")).hexdigest()
+                except (OSError, UnicodeDecodeError):
+                    cur = None
+                if cur and cur != ent.get("sha") and cur != sha:
+                    return "edited", rec
+        status = _followup_apply(rec, text, manifests_dir, requests_dir,
+                                 runs_dir)
+        if run_ctx:
+            rec.update(source_run=run_ctx.get("dir")
+                       or rec.get("source_run"),
+                       source_run_key=(f"request:{run_ctx['request']}"
+                                       if run_ctx.get("request")
+                                       else run_ctx.get("path"))
+                       or rec.get("source_run_key"),
+                       source_request=run_ctx.get("request")
+                       or rec.get("source_request"),
+                       source_step=run_ctx.get("step")
+                       or rec.get("source_step"))
+        rec["source_manifest"] = str(source)
+        _save_request(rec, requests_dir)
+        entry = _followup_entry(source, rec, sha, run_ctx)
+        index["entries"][key] = entry
+        if alt_key is not None:
+            index["entries"][alt_key] = dict(entry)
+        _save_followup_index(requests_dir, index)
+        return "updated", rec
+    rec = _followup_rec_base(source, run_ctx)
+    rec["id"] = (f"{dt.datetime.now():%Y%m%d-%H%M%S}-"
+                 f"{secrets.token_hex(4)}")
+    status = _followup_apply(rec, text, manifests_dir, requests_dir,
+                             runs_dir)
+    _save_request(rec, requests_dir)
+    index["entries"][key] = _followup_entry(source, rec, sha, run_ctx)
+    _save_followup_index(requests_dir, index)
+    return "registered", rec
+
+
+def _followup_empty_signal(step_rec: dict) -> bool:
+    """The step left no file - did it say there was nothing to write?
+    Reads its own report lines (recorded fields plus the log's OUTCOME/
+    NEXT), never guesses."""
+    parts = [str(step_rec.get(k) or "") for k in
+             ("outcome", "next", "status_line", "note")]
+    log = step_rec.get("stdout_log")
+    if log:
+        parts += [tail_outcome(Path(log)) or "",
+                  tail_next(Path(log)) or ""]
+    return bool(_FOLLOWUP_EMPTY_RE.search(" ".join(parts)))
+
+
+def _register_followup_outcome(run_ctx: dict, step_rec: dict,
+                               expected: Path, index: dict,
+                               requests_dir: Path, manifests_dir: Path,
+                               runs_dir: Path,
+                               force: bool = False
+                               ) -> tuple[str, dict | None]:
+    """No file was produced: land the outcome as its own dismissible record
+    so a finished follow-up-plan step can never silently lose its result.
+    'empty' when the step's report says nothing remained; 'missing' when it
+    claimed completion without the artifact."""
+    key = f"run:{run_ctx['dir']}:{run_ctx['step']}"
+    s = step_rec.get("status")
+    if s not in ("done", "partial"):
+        # a step that failed/stopped/timed out never claimed an artifact -
+        # the run row already carries that failure; the stamp only
+        return "absent", None
+    ent = index["entries"].get(key)
+    if ent and ent.get("discarded") and not force:
+        return "discarded", None
+    status = "empty" if _followup_empty_signal(step_rec) else "missing"
+    error = (
+        None if status == "empty" else
+        (f"The follow-up-plan step finished "
+         f"({step_rec.get('status')}) but wrote no manifest - expected "
+         f"{expected}. Import it with `python conductor.py import <file>` "
+         "once it exists, or Discard this record."))
+    rec = None
+    if ent:
+        try:
+            rec = _read_request_file(ent["request"], requests_dir)
+        except RequestError:
+            rec = None
+    if rec is not None:
+        stage = _request_status(rec, runs_dir)
+        if stage in ("launched", "launching", "generating", "questions"):
+            return f"kept:{stage}", rec
+        if rec.get("status") == status and rec.get("error") == error \
+                and not rec.get("manifest"):
+            return "unchanged", rec
+        _assert_unwatched(runs_dir, requests_dir)
+        rec.update(status=status, error=error, manifest=None,
+                   proposed_steps=[], stale=False)
+        _save_request(rec, requests_dir)
+        index["entries"][key] = _followup_entry(None, rec, None, run_ctx)
+        _save_followup_index(requests_dir, index)
+        return "updated", rec
+    _assert_unwatched(runs_dir, requests_dir)
+    rec = _followup_rec_base(None, run_ctx)
+    rec["id"] = (f"{dt.datetime.now():%Y%m%d-%H%M%S}-"
+                 f"{secrets.token_hex(4)}")
+    rec.update(status=status, error=error,
+               description=("follow-up-plan reported no remaining work"
+                            if status == "empty" else
+                            "follow-up-plan wrote no manifest"))
+    _save_request(rec, requests_dir)
+    index["entries"][key] = _followup_entry(None, rec, None, run_ctx)
+    _save_followup_index(requests_dir, index)
+    return "registered", rec
+
+
+def _followup_stamp(st: dict, outcome: str, rec: dict | None,
+                    source: Path | None) -> tuple[dict, bool]:
+    """The run-side half of the link: what this run's follow-up-plan step
+    left behind, rendered as a small chip on the run row. Returns (stamp,
+    unchanged) - 'at' refreshes only when the substance moves, so a quiet
+    rescan doesn't rewrite state.json forever."""
+    status = (rec.get("status") if rec else
+              {"missing": "missing", "deferred": "deferred",
+               "discarded": "discarded", "absent": "absent"}.get(outcome))
+    if status == "ready":
+        status = "registered"
+    fu = {"status": status or outcome, "at": now_iso()}
+    if rec is not None:
+        fu["request"] = rec["id"]
+    if source is not None:
+        fu["source"] = str(source)
+    old = st.get("followup") or {}
+    st["followup"] = fu
+    same = {k: v for k, v in old.items() if k != "at"} == \
+        {k: v for k, v in fu.items() if k != "at"}
+    return fu, same
+
+
+def _followup_source_run(src: Path, runs_dir: Path) -> Path | None:
+    """Best-effort originating run dir for an imported file: the newest
+    <ts>-<name> dir for a <name>-followup.toml stem."""
+    m = re.fullmatch(r"(.+)-followup", src.stem)
+    if not m:
+        return None
+    cands = [d for d in runs_dir.glob(f"*-{m.group(1)}")
+             if d.is_dir() and (d / "state.json").is_file()]
+    return max(cands, key=lambda d: d.name) if cands else None
+
+
+def import_followup_file(path, requests_dir: Path = REQUESTS_DIR,
+                         manifests_dir: Path = MANIFESTS_DIR,
+                         runs_dir: Path = RUNS_DIR,
+                         *, run_dir: str | None = None,
+                         force: bool = True) -> dict:
+    """The explicit import/recovery path: register an already-written
+    follow-up (or any proposal) TOML as a request record. Idempotent on the
+    resolved source path; the default force honours a deliberate import
+    over a past Discard veto. Links the record to its originating run when
+    one can be named or derived. Never launches anything."""
+    if path is None or not str(path).strip():
+        raise RequestError("Missing manifest path")
+    src = Path(path)
+    if not src.is_file():
+        raise RequestError(f"Follow-up file not found: {src}", 404)
+    with REQUEST_LOCK:
+        index = _followup_index(requests_dir)
+        run_ctx = None
+        rd = (runs_dir / run_dir) if run_dir else _followup_source_run(
+            src, runs_dir)
+        if rd is not None and (rd / "state.json").is_file():
+            try:
+                st = json.loads(
+                    (rd / "state.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                st = {}
+            run_ctx = {"run": st.get("run"), "dir": rd.name,
+                       "request": st.get("request_id"),
+                       "step": "follow-up-plan", "path": str(rd)}
+        outcome, rec = _register_followup_source(
+            src, run_ctx, index, requests_dir, manifests_dir, runs_dir,
+            force=force)
+        if rec is None:
+            raise RequestError(
+                f"The follow-up could not be registered ({outcome})", 409)
+        return dict(rec)
+
+
+def _followup_owner_dir(runs_dir: Path) -> Path:
+    """The manifests dir a data tree owns: the checkout's own manifests/
+    when runs_dir is this checkout's data tree (ROOT/data/runs);
+    <checkout>/manifests for another checkout's data/runs; the flat
+    sibling 'manifests' dir for a test sandbox - a dashboard must never
+    reach into a tree it doesn't serve."""
+    try:
+        if runs_dir.resolve().parent == RUNS_DIR.resolve().parent:
+            return MANIFESTS_DIR
+    except OSError:
+        pass
+    for cand in (runs_dir.parent.parent / "manifests",
+                     runs_dir.parent / "manifests"):
+        if cand.is_dir():
+            return cand.resolve()
+    return runs_dir.parent / "manifests"
+
+
+def discover_followups(runs_dir: Path = RUNS_DIR,
+                       requests_dir: Path | None = None,
+                       manifests_dir: Path | None = None,
+                       *, run_dir: Path | None = None,
+                       scan_orphans: bool = True,
+                       manifests_dirs: list[Path] | None = None
+                       ) -> list[str]:
+    """Register produced follow-up manifests as proposal requests -
+    idempotent across run_end, serve startup, sweep and the throttled
+    dashboard rescan. With run_dir set, only that run's step is examined
+    (the driver's end-of-run path); a full scan also sweeps
+    manifests_dirs (default: the owner dir) for files no recorded run
+    produced - other checkouts, pre-discovery runs. Each run's SOURCE is
+    found beside its own recorded manifest (a worktree-driven run resolves
+    to that tree), while copies + validation land in the owner dir.
+    Registration only - nothing here can launch work."""
+    requests_dir = requests_dir or runs_dir.parent / "requests"
+    owner_md = manifests_dir or _followup_owner_dir(runs_dir)
+    manifests_dirs = ([Path(d) for d in manifests_dirs]
+                      if manifests_dirs is not None else [owner_md])
+    lines: list[str] = []
+    with REQUEST_LOCK:
+        index = _followup_index(requests_dir)
+        sjs = ([run_dir / "state.json"] if run_dir else
+               sorted(runs_dir.glob("*/state.json"), reverse=True))
+        for sj in sjs:
+            try:
+                st = json.loads(sj.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            rd = sj.parent
+            steprec = (st.get("steps") or {}).get("follow-up-plan")
+            if steprec is None:
+                continue
+            live = step_live(steprec, driver_alive(st))
+            # Produced is produced: an existing file registers even while
+            # the step record is mid-flight; only its absence waits on a
+            # terminal step state.
+            sources = _followup_sources(st, owner_md)
+            source = (max(sources, key=lambda p: p.stat().st_mtime)
+                      if sources else None)
+            run_ctx = {"run": st.get("run"), "dir": rd.name,
+                       "request": st.get("request_id"),
+                       "step": "follow-up-plan", "path": str(rd)}
+            try:
+                if source is not None:
+                    outcome, rec = _register_followup_source(
+                        source, run_ctx, index, requests_dir,
+                        owner_md, runs_dir)
+                elif not live and (steprec.get("ended_at")
+                                   or st.get("ended_at")):
+                    outcome, rec = _register_followup_outcome(
+                        run_ctx, steprec,
+                        owner_md / f"{st.get('run')}-followup.toml",
+                        index, requests_dir, owner_md, runs_dir)
+                else:
+                    continue
+            except (RequestError, OSError) as exc:
+                # a busy checkout (live watcher, open merge) defers - the
+                # next pass retries instead of losing the output
+                outcome, rec = "deferred", None
+                st["followup"] = {"status": "deferred", "at": now_iso(),
+                                  "note": str(exc)[:160]}
+                save_state(rd, st)
+                lines.append(f"{rd.name}: follow-up registration deferred "
+                             f"({exc})")
+                continue
+            fu, same = _followup_stamp(st, outcome, rec, source)
+            if not same:
+                save_state(rd, st)
+            # log once when the substance moves: a fresh registration, a
+            # re-import, or a stamp transition (incl. discarded/vetoed);
+            # steady-state passes stay quiet
+            if not same or outcome in ("registered", "updated", "repaired",
+                                       "absent"):
+                log_event(rd, event=f"followup_{outcome}",
+                          status=fu["status"],
+                          request=(rec or {}).get("id"),
+                          source=str(source) if source else None)
+                lines.append(f"{rd.name}: follow-up {fu['status']}"
+                             + (f" -> request {rec['id']}" if rec else ""))
+        if scan_orphans:
+            owned = set()
+            for rf in requests_dir.glob("*.json"):
+                try:
+                    r = json.loads(rf.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if r.get("manifest"):
+                    owned.add(str(Path(r["manifest"]).resolve()))
+            for md in manifests_dirs:
+                for p in sorted(md.glob("*-followup.toml")):
+                    if _FOLLOWUP_OWNED_RE.match(p.name) or \
+                            str(p.resolve()) in owned:
+                        continue   # a request's own copy - never re-imports
+                    key = "file:" + str(p.resolve())
+                    if key in index["entries"]:
+                        continue  # already registered (its run or before)
+                    rd = _followup_source_run(p, runs_dir)
+                    run_ctx = None
+                    if rd is not None:
+                        try:
+                            ost = json.loads(
+                                (rd / "state.json").read_text(
+                                    encoding="utf-8"))
+                            run_ctx = {"run": ost.get("run"),
+                                       "dir": rd.name,
+                                       "request": ost.get("request_id"),
+                                       "step": "follow-up-plan",
+                                       "path": str(rd)}
+                        except (OSError, ValueError):
+                            pass
+                    try:
+                        outcome, rec = _register_followup_source(
+                            p, run_ctx, index, requests_dir, owner_md,
+                            runs_dir)
+                    except (RequestError, OSError) as exc:
+                        lines.append(f"{p.name}: follow-up import deferred "
+                                     f"({exc})")
+                        continue
+                    if outcome in ("registered", "updated"):
+                        lines.append(
+                            f"{p.name}: follow-up {rec['status']} -> "
+                            f"request {rec['id']}")
+    return lines
+
+
+def _auto_followups(runs_dir: Path, requests_dir: Path) -> None:
+    """Throttled rescan for a long-lived serve: a follow-up file landing
+    after the driver already left (a late write, a merge landing the
+    worktree copy, a run this process never drove) still registers within
+    a minute."""
+    global _FOLLOWUP_TRIED
+    if time.time() - _FOLLOWUP_TRIED < _FOLLOWUP_POLL_S:
+        return
+    _FOLLOWUP_TRIED = time.time()
+    try:
+        discover_followups(runs_dir, requests_dir)
+    except Exception:
+        LOG.exception("follow-up discovery failed")
 
 
 def request_details(request_id: str, requests_dir: Path = REQUESTS_DIR,
@@ -5905,8 +6581,7 @@ def start_generation(request_id: str,
         # watched cwd), so a live worker or an in-progress merge must not
         # block generation. Only the deferred publish waits on the repo.
         rec = _read_request(request_id, requests_dir)
-        if _request_status(rec, runs_dir) not in (
-                "draft", "ready", "error", "launch_failed", "questions"):
+        if _request_status(rec, runs_dir) not in _REQUEST_EDITABLE_STAGES:
             raise RequestError("Only drafts or unrun proposals can be generated", 409)
         # A leftover sentinel from a stopped attempt would kill this new
         # pass on the first wait_worker poll - clear before marking.
@@ -6754,6 +7429,31 @@ def cmd_summarize(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_import(args: argparse.Namespace) -> int:
+    """`conductor.py import <file.toml>` - the explicit intake path for an
+    already-written manifest (a follow-up discovery never saw, or any
+    proposal TOML): validate + register it as a 'Ready to run' request row.
+    Registration only - nothing is scheduled or launched."""
+    runs_dir = Path(args.runs_dir).resolve() if args.runs_dir else RUNS_DIR
+    try:
+        rec = import_followup_file(
+            args.manifest, runs_dir.parent / "requests",
+            _followup_owner_dir(runs_dir), runs_dir,
+            run_dir=getattr(args, "run", None))
+    except RequestError as exc:
+        print(f"import: {exc}")
+        return 1
+    print(f"request {rec['id']}: {rec['status']}"
+          + (f" - {rec['error']}" if rec.get("error") else ""))
+    if rec.get("manifest"):
+        print(f"  proposal: {rec['manifest']}")
+    if rec.get("source_manifest"):
+        print(f"  source:   {rec['source_manifest']}")
+    if rec.get("source_run"):
+        print(f"  linked run: {rec['source_run']}")
+    return 0 if rec.get("status") in ("ready", "empty") else 1
+
+
 def _run_dir_checked(name: str, runs_dir: Path) -> tuple[Path, dict]:
     """Resolve + load a run dir for dashboard mutation endpoints."""
     if not RUN_DIR_RE.fullmatch(name):
@@ -7427,8 +8127,7 @@ def discard_request(request_id: str,
     trash_dir = trash_dir or _trash_root(runs_dir)
     with REQUEST_LOCK:
         rec = _read_request(request_id, requests_dir)   # overlay wins
-        if _request_status(rec, runs_dir) not in (
-                "draft", "ready", "error", "launch_failed", "questions"):
+        if _request_status(rec, runs_dir) not in _REQUEST_EDITABLE_STAGES:
             raise RequestError("A running or launched proposal cannot be discarded",
                                409)
         _assert_unwatched(runs_dir, requests_dir, manifests_dir, trash_dir)
@@ -7475,6 +8174,9 @@ def discard_request(request_id: str,
         _trash_write_meta(entry_dir, meta)
         _trash_log(trash_dir, event="trash_add", kind="request",
                    ref=request_id, entry=meta["id"], name=meta["name"])
+        # An imported follow-up's source file stays on disk after Discard -
+        # the veto mark is what keeps discovery from resurrecting the row
+        _followup_mark(requests_dir, request_id, True)
         out = dict(rec)
         out.update(trashed=True, trash_id=meta["id"],
                    expires_at=meta["expires_at"])
@@ -7647,6 +8349,9 @@ def restore_trash(entry_id: str, trash_dir: Path = TRASH_DIR,
     elif meta.get("kind") == "request":
         out = _restore_request_entry(entry_dir, meta, requests_dir,
                                      manifests_dir, runs_dir)
+        # a restored import resumes its registration - discovery updates it
+        # again instead of treating the source as vetoed
+        _followup_mark(requests_dir, out.get("restored") or "", False)
     else:
         raise RequestError("Unknown trash entry kind", 500)
     shutil.rmtree(entry_dir, ignore_errors=True)
@@ -8244,6 +8949,7 @@ def collect_dashboard(runs_dir: Path,
     requests_dir = requests_dir or runs_dir.parent / "requests"
     _auto_archive(runs_dir)
     _auto_drain()
+    _auto_followups(runs_dir, requests_dir)
     sess_by_dir = live_sessions_by_dir(runs_dir, devin_argv or ["devin"])
     projects = load_projects()
     refresh_prices(runs_dir)
@@ -8491,6 +9197,7 @@ def collect_dashboard(runs_dir: Path,
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
                      "key": key, "request_id": st.get("request_id"),
                      "archived": st.get("archived"),
+                     "followup": st.get("followup"),
                      "description": st.get("description") or
                      (request or {}).get("description"),
                      "started_at": st.get("started_at"),
@@ -8535,6 +9242,16 @@ def collect_dashboard(runs_dir: Path,
         runs.append({"run": rec.get("run") or rec.get("label"),
                      "key": key, "request_id": rid,
                      "description": rec.get("description"),
+                     "followup_src": ({"run": rec.get("source_run"),
+                                      "key": rec.get("source_run_key") or
+                                      (f"request:{rec['source_request']}"
+                                       if rec.get("source_request")
+                                       else rec.get("source_run")),
+                                      "step": rec.get("source_step"),
+                                      "manifest": rec.get("source_manifest")}
+                                     if rec.get("source_run")
+                                     or rec.get("source_manifest")
+                                     else None),
                      "dir": rec.get("manifest") or "",
                      "created_at": rec.get("created_at"),
                      "updated_at": rec.get("updated_at"),
@@ -8868,6 +9585,9 @@ td .stage { max-width:100%; overflow:hidden; text-overflow:ellipsis;
 .stage.paused { color:#e3b341; border-color:#6b5a1f; background:#2a2317; }
 .stage.interrupted { color:#f0883e; border-color:#7a3d12; background:#2d1f14; }
 .stage.questions { color:#ffa657; border-color:#7a3d12; background:#2d1f14; }
+.stage.empty { color:#8b949e; border-color:#30363d; }
+.stage.missing { color:#f0883e; border-color:#7a3d12; background:#2d1f14; }
+.stage.followup { color:#8b949e; }
 .stage.halted { color:#8b949e; }
 .stage.archived { color:#8b949e; border-color:#21262d; }
 .linkbtn { background:none; border:0; color:#58a6ff; cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
@@ -8994,11 +9714,13 @@ stopped:'#d29922',
 failed:'#f85149',timed_out:'#f0883e',running:'#58a6ff',queued:'#8b949e',
 waiting:'#8b949e',skipped:'#6e7681',planned:'#bc8cff',ready:'#bc8cff',
 generating:'#bc8cff',draft:'#d29922',questions:'#ffa657',
-launching:'#58a6ff',launch_failed:'#f85149',lost:'#6e7681'};
+launching:'#58a6ff',launch_failed:'#f85149',lost:'#6e7681',
+empty:'#8b949e',missing:'#f0883e'};
 const STAGES = {draft:'Draft · unsent',generating:'Preparing proposal',
   questions:'Needs your answers',
   ready:'Ready to run',launching:'Starting run',launch_failed:'Start failed',
-  error:'Planning failed'};
+  error:'Planning failed',empty:'No work remains',
+  missing:'Follow-up missing'};
 const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,
   c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 // basename for win/posix paths. fromCharCode(92) is a backslash - a '\\'
@@ -11164,6 +11886,32 @@ function render(d){
       ` - resumable</span>`;
     return '';
   };
+  // What a run's closing follow-up-plan step left behind: a link into the
+  // imported proposal row when one exists (it IS a request record -
+  // opening it is the same modal), a muted word when nothing produced.
+  const fuChip = fu => {
+    const L = {registered:'ready', empty:'no work', missing:'missing',
+      invalid:'invalid', deferred:'pending', discarded:'discarded',
+      absent:'none'};
+    const T = {registered:'follow-up manifest registered as a proposal',
+      empty:'follow-up reported nothing remains',
+      missing:'follow-up step wrote no manifest',
+      invalid:'follow-up manifest failed validation',
+      deferred:'follow-up registration is waiting on the checkout',
+      discarded:'follow-up proposal was discarded',
+      absent:'follow-up step did not finish cleanly - no file produced'};
+    const label = L[fu.status] || fu.status || '?';
+    const tip = (T[fu.status] || 'follow-up-plan outcome') +
+      (fu.source ? ` - source ${fu.source}` : '');
+    return fu.request
+      ? ` <button type="button" class="linkbtn" ` +
+        `data-open-request="${esc(fu.request)}" ` +
+        `title="${esc(tip)} - open the proposal">` +
+        `follow-up &rarr; ${esc(label)}</button>`
+      : ` <span class="stage ${esc(fu.status==='registered' ? 'followup' :
+        (fu.status || 'followup'))}" ` +
+        `title="${esc(tip)}">follow-up &rarr; ${esc(label)}</span>`;
+  };
   for (const r of shownRuns){
     const counts = Object.entries(r.counts||{})
       .map(([k,v])=>`<span style="color:${COLORS[k]||'#8b949e'}">${v} ${k}</span>`)
@@ -11236,6 +11984,19 @@ function render(d){
         (r.stage==='generating'
           ? `<span class="dots"><span>.</span><span>.</span><span>.</span></span>`
           : '') + `</span>` + staleChip +
+        (r.followup_src
+          ? (r.followup_src.run
+            ? ` <button type="button" class="linkbtn" ` +
+              `data-run-details="${esc(r.followup_src.key ||
+                r.followup_src.run)}" ` +
+              `title="follow-up drafted by run ` +
+              `${esc(r.followup_src.run)}` +
+              `${r.followup_src.manifest
+                ? ` - source ${esc(r.followup_src.manifest)}` : ''}">` +
+              `follow-up of ${esc(r.followup_src.run)}</button>`
+            : ` <span class="stage followup" ` +
+              `title="imported proposal manifest">imported</span>`)
+          : '') +
         (cgen ? ` <span class="genline${gfresh?' fresh':''}" ` +
           `title="${esc(cgen)}">${esc(cgen)}</span>` : '') +
         (r.stage==='questions' && (r.questions||[]).length
@@ -11250,7 +12011,8 @@ function render(d){
         (r.archived ? `<span class="stage archived" ` +
           `title="auto-archived run - hidden from the default view; ` +
           `files stay on disk">archived</span>` : '') +
-        runStateChip(r) + staleChip + `<br>` +
+        runStateChip(r) + staleChip +
+        (r.followup ? fuChip(r.followup) : '') + `<br>` +
         `<span class="sub">${esc(base(r.dir))}</span>`) +
       `</div></td>` +
       `<td class="wrap">${r.description?esc(r.description):
@@ -12503,6 +13265,13 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 body = self._body()
                 if path == "/api/requests":
                     self._json(create_request(body, requests_dir, runs_dir), 201)
+                elif path == "/api/requests/import":
+                    # the explicit recovery path: register an
+                    # already-written follow-up/proposal file as a request
+                    # row - never launches it
+                    self._json(import_followup_file(
+                        body.get("path"), requests_dir, manifests_dir,
+                        runs_dir, run_dir=body.get("run")), 201)
                 elif (m := re.fullmatch(r"/api/requests/([^/]+)/"
                                          r"(save|generate|run|discard|apply"
                                          r"|answer|stop)", path)):
@@ -12633,6 +13402,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # replays deferred publishes and lands parked questions/errors.
     for rid in drain_planner_spool():
         print(f"sweep: adopted planner spool for request {rid}")
+    # ...and registers follow-up manifests produced while it was down -
+    # the same pass then reruns throttled inside the dashboard loop.
+    for line in discover_followups(runs_dir):
+        print(f"sweep: {line}")
     handler = make_dashboard_handler(runs_dir, devin_argv)
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     print(f"conductor dashboard: http://127.0.0.1:{args.port}  "
@@ -12710,12 +13483,20 @@ def main(argv: list[str] | None = None) -> int:
              "land a run's pending (deferred/parked) branches"),
             ("summarize", cmd_summarize,
              "write a run's LLM executive summary (run.summary.md)"),
+            ("import", cmd_import,
+             "register an already-written manifest as a proposal "
+             "(follow-up recovery - never launches)"),
             ("sessions", cmd_sessions,
              "list / clean up conductor-spawned devin sessions"),
             ("demo", cmd_demo, "self-test against a mock devin")):
         p = sub.add_parser(name, help=helptext)
-        if name in ("plan", "run"):
+        if name in ("plan", "run", "import"):
             p.add_argument("manifest")
+        if name == "import":
+            p.add_argument("--run", default=None,
+                           help="originating run dir name to link the "
+                                "imported proposal to (derived from the "
+                                "<run>-followup.toml name when omitted)")
         if name == "run":
             p.add_argument("--request-id", default=None, help=argparse.SUPPRESS)
             p.add_argument("--resume", nargs="?", const="latest", default=None,
@@ -12730,7 +13511,7 @@ def main(argv: list[str] | None = None) -> int:
                                 "Split with shlex - quote or use forward "
                                 "slashes in Windows paths")
         if name in ("run", "demo", "serve", "sweep", "sessions", "merge",
-                    "summarize"):
+                    "summarize", "import"):
             p.add_argument("--runs-dir", default=None, help=argparse.SUPPRESS)
         if name in ("sessions", "sweep"):
             p.add_argument("--keep-hours", type=float, default=48,
@@ -12764,7 +13545,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     return {"plan": cmd_plan, "run": cmd_run, "status": cmd_status,
             "serve": cmd_serve, "sweep": cmd_sweep, "merge": cmd_merge,
-            "summarize": cmd_summarize,
+            "summarize": cmd_summarize, "import": cmd_import,
             "sessions": cmd_sessions, "demo": cmd_demo}[args.cmd](args)
 
 

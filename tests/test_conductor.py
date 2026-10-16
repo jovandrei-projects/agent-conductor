@@ -9771,5 +9771,345 @@ const open=step=>vm.runInContext(
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class FollowupDiscoveryTests(unittest.TestCase):
+    """A produced <run>-followup.toml is intake, not execution: discovery
+    registers it as a persisted proposal request for a human to review and
+    explicitly Start - malformed/missing/empty outputs land as honest,
+    dismissible statuses, and registration never spawns work."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.proj = make_project(self.base)
+        self.runs = self.base / "runs"
+        self.requests = self.base / "requests"
+        self.manifests = self.base / "manifests"
+        self.manifests.mkdir()
+        patch = mock.patch.object(conductor, "load_projects", return_value={
+            "proj": {"path": self.proj, "cloud_ok": False}})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def proposal(self, name="rest-followup",
+                 description="Finish the leftover work"):
+        return f'''[run]
+name = "{name}"
+description = "{description}"
+checkpoint = true
+
+[defaults]
+project = "proj"
+model = "swe-2"
+effort = "max"
+max_attempts = 2
+
+[[step]]
+name = "leftover"
+prompt = "Finish the leftovers."
+'''
+
+    def run_dir(self, name="rest", steps=None, **state):
+        d = self.runs / f"20261017-000000-{name}"
+        d.mkdir(parents=True, exist_ok=True)
+        st = {"run": name, "manifest": str(self.manifests / f"{name}.toml"),
+              "ended_at": "2026-10-17T01:00:00",
+              "steps": steps if steps is not None else {
+                  "follow-up-plan": {"status": "done",
+                                     "ended_at": "2026-10-17T01:00:00"}}}
+        st.update(state)
+        (d / "state.json").write_text(json.dumps(st), encoding="utf-8")
+        return d
+
+    def followup_file(self, name="rest", text=None, manifests=None):
+        p = (manifests or self.manifests) / f"{name}-followup.toml"
+        p.write_text(text if text is not None
+                     else self.proposal(f"{name}-followup"),
+                     encoding="utf-8")
+        return p
+
+    def recs(self):
+        return [json.loads(p.read_text(encoding="utf-8"))
+                for p in self.requests.glob("*.json")]
+
+    def test_valid_registers_ready_and_durable(self):
+        run = self.run_dir("rest")
+        src = self.followup_file("rest")
+        lines = conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        self.assertTrue(any("registered" in l for l in lines), lines)
+        recs = self.recs()
+        self.assertEqual(len(recs), 1)
+        rec = recs[0]
+        self.assertEqual(rec["status"], "ready")
+        self.assertEqual(rec["source_run"], run.name)
+        self.assertEqual(rec["source_step"], "follow-up-plan")
+        self.assertEqual(rec["source_manifest"], str(src))
+        self.assertEqual(rec["imported"], "followup")
+        self.assertEqual(len(rec["proposed_steps"]), 1)
+        owned = Path(rec["manifest"])
+        self.assertTrue(owned.name.startswith(rec["id"] + "-"))
+        self.assertTrue(owned.is_file())
+        self.assertEqual(owned.read_text(encoding="utf-8"),
+                         src.read_text(encoding="utf-8"))
+        self.assertTrue(src.is_file())          # source is only read
+        # durable listing: the row reads 'Ready to run' across collection
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        row = next(r for r in d["runs"]
+                   if r.get("request_id") == rec["id"])
+        self.assertEqual(row["stage"], "ready")
+        self.assertEqual(row["counts"], {"planned": 1})
+        self.assertEqual(row["followup_src"]["run"], run.name)
+        self.assertEqual({a["status"] for a in d["agents"]
+                          if a["step"] == "leftover"}, {"planned"})
+        self.assertTrue(any(
+            a["status"] == "done" and a["step"] == "follow-up-plan"
+            for a in d["agents"]))       # the producer step itself
+        run_row = next(r for r in d["runs"] if r.get("dir") == str(run))
+        self.assertEqual(run_row["followup"]["status"], "registered")
+        self.assertEqual(run_row["followup"]["request"], rec["id"])
+        st = json.loads((run / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(st["followup"]["request"], rec["id"])
+
+    def test_repeated_passes_never_duplicate_or_launch(self):
+        self.run_dir("rest")
+        self.followup_file("rest")
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        rid = self.recs()[0]["id"]
+        # retries, refresh rescans and restarts all reconcile to one record
+        for _ in range(3):
+            conductor.discover_followups(
+                self.runs, self.requests, self.manifests)
+        self.assertEqual([r["id"] for r in self.recs()], [rid])
+        self.assertEqual(len(list(self.runs.iterdir())), 1)   # no run dir
+        rec = self.recs()[0]
+        self.assertIsNone(conductor._request_run_dir(rec, self.runs))
+        # the strongest guarantee: the spawn path was never touched
+        src2 = self.followup_file("other")
+        with mock.patch.object(conductor, "_launch_process") as lp:
+            rec2 = conductor.import_followup_file(
+                src2, self.requests, self.manifests, self.runs)
+            lp.assert_not_called()
+        self.assertEqual(rec2["status"], "ready")
+        self.assertEqual(len(list(self.runs.iterdir())), 1)
+
+    def test_rewrite_updates_same_request(self):
+        self.run_dir("rest")
+        src = self.followup_file("rest")
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        rid = self.recs()[0]["id"]
+        src.write_text(self.proposal(
+            "rest-followup", "Finish the leftover work v2"),
+            encoding="utf-8")
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        recs = self.recs()
+        self.assertEqual([r["id"] for r in recs], [rid])
+        self.assertEqual(recs[0]["description"],
+                         "Finish the leftover work v2")
+        self.assertEqual(recs[0]["status"], "ready")
+
+    def test_human_edit_to_owned_copy_beats_source_rewrite(self):
+        self.run_dir("rest")
+        src = self.followup_file("rest")
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        rec = self.recs()[0]
+        owned = Path(rec["manifest"])
+        owned.write_text(
+            "# human review notes\n" + owned.read_text(encoding="utf-8"),
+            encoding="utf-8")
+        # a rewrite of the SOURCE must not clobber the edit: the owned
+        # copy no longer matches the last imported sha
+        src.write_text(self.proposal("rest-followup", "v3 rewrite"),
+                       encoding="utf-8")
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        self.assertIn("# human review notes",
+                      owned.read_text(encoding="utf-8"))
+        self.assertEqual(len(self.recs()), 1)
+
+    def test_malformed_file_is_error_not_runnable(self):
+        self.run_dir("rest")
+        self.followup_file("rest", text='[run\nname = "broken"\n[[step]\n')
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        rec = self.recs()[0]
+        self.assertEqual(rec["status"], "error")
+        self.assertIn("TOML", rec["error"])
+        self.assertTrue(Path(rec["manifest"]).is_file())  # inspectable
+        with self.assertRaises(conductor.RequestError):
+            conductor.launch_request(rec["id"], self.requests,
+                                     self.manifests, self.runs, ["devin"])
+
+    def test_invalid_proposal_is_error_not_ready(self):
+        self.run_dir("rest")
+        self.followup_file("rest", text='''[run]
+name = "rest-followup"
+description = "x"
+checkpoint = true
+
+[[step]]
+name = "s"
+project = "no-such-slug"
+prompt = "p"
+''')
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        rec = self.recs()[0]
+        self.assertEqual(rec["status"], "error")
+        self.assertIn("no-such-slug", rec["error"])
+        with self.assertRaises(conductor.RequestError):
+            conductor.launch_request(rec["id"], self.requests,
+                                     self.manifests, self.runs, ["devin"])
+
+    def test_missing_output_lands_as_actionable_status(self):
+        run = self.run_dir("rest")           # done step, nothing written
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        rec = self.recs()[0]
+        self.assertEqual(rec["status"], "missing")
+        self.assertIn("import", rec["error"])
+        self.assertIsNone(rec["manifest"])
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        row = next(r for r in d["runs"]
+                   if r.get("request_id") == rec["id"])
+        self.assertEqual(row["stage"], "missing")
+        st = json.loads((run / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(st["followup"]["status"], "missing")
+        # ...and the file landing later resolves the SAME row
+        self.followup_file("rest")
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        recs = self.recs()
+        self.assertEqual([r["id"] for r in recs], [rec["id"]])
+        self.assertEqual(recs[0]["status"], "ready")
+        self.assertTrue(recs[0]["manifest"])
+
+    def test_empty_file_means_no_work_remains(self):
+        self.run_dir("rest")
+        self.followup_file("rest", text='''# the run finished everything
+[run]
+name = "rest-followup"
+description = "nothing remains"
+''')
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        rec = self.recs()[0]
+        self.assertEqual(rec["status"], "empty")
+        self.assertIsNone(rec["manifest"])
+        self.assertFalse(rec["proposed_steps"])
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        row = next(r for r in d["runs"]
+                   if r.get("request_id") == rec["id"])
+        self.assertEqual(row["stage"], "empty")
+        with self.assertRaises(conductor.RequestError):
+            conductor.launch_request(rec["id"], self.requests,
+                                     self.manifests, self.runs, ["devin"])
+
+    def test_empty_report_without_file_is_not_missing(self):
+        self.run_dir("rest", steps={"follow-up-plan": {
+            "status": "done", "ended_at": "2026-10-17T01:00:00",
+            "outcome": "All work landed - no remaining work to propose"}})
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        rec = self.recs()[0]
+        self.assertEqual(rec["status"], "empty")
+        self.assertIsNone(rec["error"])
+
+    def test_failed_step_marks_absent_without_record(self):
+        run = self.run_dir("rest", steps={"follow-up-plan": {
+            "status": "failed", "ended_at": "2026-10-17T01:00:00"}})
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        self.assertEqual(self.recs(), [])
+        st = json.loads((run / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(st["followup"]["status"], "absent")
+
+    def test_worktree_produced_file_registers(self):
+        wt = self.base / "wt"
+        wt_man = wt / "manifests"
+        wt_man.mkdir(parents=True)
+        src = self.followup_file("rest", manifests=wt_man)
+        self.run_dir("rest", steps={"follow-up-plan": {
+            "status": "done", "ended_at": "2026-10-17T01:00:00",
+            "work_dir": str(wt)}})
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        rec = self.recs()[0]
+        self.assertEqual(rec["status"], "ready")
+        self.assertEqual(rec["source_manifest"], str(src))
+        self.assertTrue(Path(rec["manifest"]).is_file())
+        self.assertEqual(Path(rec["manifest"]).parent, self.manifests)
+
+    def test_orphan_file_imports_without_run_link(self):
+        self.followup_file("stray")          # no run dir at all
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        rec = self.recs()[0]
+        self.assertEqual(rec["status"], "ready")
+        self.assertIsNone(rec["source_run"])
+        self.assertEqual(rec["run"], "stray-followup")
+
+    def test_owned_copy_never_reimports(self):
+        self.followup_file(
+            "rest", manifests=self.manifests,
+            text=self.proposal("rest-followup")).unlink()
+        owned = self.manifests / ("20261017-010203-a1b2c3d4-"
+                                "rest-followup.toml")
+        owned.write_text(self.proposal("rest-followup"), encoding="utf-8")
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        self.assertEqual(self.recs(), [])
+
+    def test_discard_vetoes_rescan_but_explicit_import_overrides(self):
+        self.run_dir("rest")
+        src = self.followup_file("rest")
+        rec = conductor.import_followup_file(
+            src, self.requests, self.manifests, self.runs)
+        self.assertEqual(rec["status"], "ready")
+        self.assertEqual(rec["source_run"], "20261017-000000-rest")
+        conductor.discard_request(rec["id"], self.requests,
+                                  self.manifests, self.runs)
+        conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        self.assertEqual(self.recs(), [])          # veto held
+        rec2 = conductor.import_followup_file(
+            src, self.requests, self.manifests, self.runs)
+        self.assertEqual(rec2["status"], "ready")  # deliberate import wins
+        self.assertNotEqual(rec2["id"], rec["id"])
+
+    def test_run_end_registration_hook(self):
+        """cmd_run registers the file its closing step was meant to write -
+        the driver's own pass, not a later sweep."""
+        m = write_manifest(self.base, f'''
+[[step]]
+name = "s1"
+project = "{self.proj.as_posix()}"
+prompt = "s1 work"
+
+[[step]]
+name = "follow-up-plan"
+project = "{self.proj.as_posix()}"
+timeout_min = 5
+prompt = "the manifest was already written; say done"
+''')
+        self.followup_file("t")      # producer writes <run>-followup.toml
+        with mock.patch.object(conductor, "MANIFESTS_DIR", self.manifests):
+            rc = run_manifest(m, self.runs)
+        self.assertEqual(rc, 0)
+        recs = self.recs()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["status"], "ready")
+        run = next(self.runs.iterdir())
+        self.assertEqual(recs[0]["source_run"], run.name)
+        st = json.loads((run / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(st["followup"]["status"], "registered")
+
+
 if __name__ == "__main__":
     unittest.main()
