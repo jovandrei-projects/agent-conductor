@@ -931,6 +931,19 @@ def tail_agent_model(export_path: Path) -> str | None:
     return name if isinstance(name, str) and name else None
 
 
+def tail_session_id(export_path: Path) -> str | None:
+    """The session id recorded in the ATIF export - top-level `session_id`
+    (the mock writes `session` instead). None when the session never wrote
+    an export (killed early) or the file can't be parsed."""
+    try:
+        d = json.loads(export_path.read_text(encoding="utf-8",
+                                             errors="replace"))
+    except (OSError, ValueError):
+        return None
+    sid = d.get("session_id") or d.get("session")
+    return sid if isinstance(sid, str) and sid else None
+
+
 # Trajectory arc: condense an ATIF export's `steps` array into labeled
 # phase spans (setup -> audit -> implement -> test -> ... -> commit) so
 # the task modal can show "what the session did" in ~15 lines instead of
@@ -2823,6 +2836,10 @@ PLANNER_ORPHAN_GRACE_S = 60   # gen.log this fresh may still be written by
                               # an orphaned planner - drain waits it out
 _DRAIN_POLL_S = 10.0          # collect_dashboard drain throttle
 _DRAIN_TRIED = 0.0
+# rec['plan_sessions'] is bounded preparation history - one record per
+# planner attempt (done/stopped/failed/questions-parked), enough that a
+# repeatedly regenerated request can't grow the JSON without limit.
+PLAN_HISTORY_MAX = 12
 
 
 class RequestError(ValueError):
@@ -3735,6 +3752,12 @@ STATUS: done
             "--respect-workspace-trust", "false"]
         rid = rec.get("id")
         sflag = gen_stop_flag(rid) if rid else None
+        # The planner's session id is worth banking even when the pass
+        # dies: the dashboard keeps it as preparation history ('step 0').
+        # `devin list` is cwd-scoped, so diff while the tempdir still
+        # exists; the export/log refs cover a session that never
+        # registered there (killed before list propagation).
+        before = session_ids(devin_argv, Path(wd)) or set()
         with open(log, "ab" if fix_note else "wb") as out:
             # The planner gets its own process group like run workers
             # (trap 15): a merge elsewhere must not reach it, and a serve
@@ -3757,6 +3780,13 @@ STATUS: done
                     with REQUEST_LOCK:
                         if _GEN_PROCS.get(rid) is proc:
                             _GEN_PROCS.pop(rid, None)
+        sids = sorted(
+            (session_ids(devin_argv, Path(wd)) or set()) - before)
+        ref = tail_session_id(export_path) or tail_session_ref(log)
+        if ref and ref not in sids:
+            sids.append(ref)
+        if sids:
+            rec["_gen_session_ids"] = sids
         if stopped or (sflag is not None and sflag.is_file()):
             raise GenerationStopped(f"request {rid} proposal stopped")
         if timed_out or rc != 0:
@@ -3808,13 +3838,25 @@ def _job_meta(spool: Path) -> dict:
 def _disk_untouched(request_id: str, requests_dir: Path, job: dict) -> bool:
     """job.json recorded the request file's stamp when the generation
     started; any other value means a human write landed while the
-    generation was parked, and the parked state must not overwrite it."""
+    generation was parked, and the parked state must not overwrite it.
+
+    updated_at has only SECOND granularity, so a same-second write - a
+    stop_generation restore racing the publish check - used to pass this
+    gate and let a killed attempt's state land over the restored record.
+    The file's mtime (ns resolution) and its generation_stopped_at stamp
+    are compared too: a stop always rewrites both."""
     if job.get("base_updated_at") is None:
         return False
     try:
-        return _read_request_file(request_id, requests_dir).get(
-            "updated_at") == job["base_updated_at"]
-    except RequestError:
+        disk = _read_request_file(request_id, requests_dir)
+        if disk.get("updated_at") != job["base_updated_at"]:
+            return False
+        if disk.get("generation_stopped_at") != job.get("base_stopped_at"):
+            return False                     # a stop landed mid-generation
+        base_mtime = job.get("base_mtime_ns")
+        return base_mtime is None or _request_path(
+            request_id, requests_dir).stat().st_mtime_ns == base_mtime
+    except (RequestError, OSError):
         return False                   # the request was deleted outright
 
 
@@ -3866,7 +3908,8 @@ def _flush_spool(request_id: str, spool: Path, requests_dir: Path,
 def _publish_from_spool(request_id: str, text: str, spool: Path,
                         requests_dir: Path, manifests_dir: Path,
                         runs_dir: Path, tok_plan: dict | None = None,
-                        gen_id: str | None = None) -> None:
+                        gen_id: str | None = None,
+                        gen_sids: list[str] | None = None) -> None:
     """The deferred publish - the ONLY part of generation that waits on
     the repo. The planner's whole output is already durable in the spool;
     this just validates and lands it once no watcher or open merge owns
@@ -3893,6 +3936,20 @@ def _publish_from_spool(request_id: str, text: str, spool: Path,
                             dict(overlay.get("plan_tokens") or {}), tok_plan)
                         if plan_tok:
                             overlay["plan_tokens"] = plan_tok
+                    # plan_gen_id marks the attempt that produced THIS
+                    # manifest - the row labelled 'plan-proposal' at rest.
+                    # An earlier stopped/superseded session is never
+                    # attributed to a later attempt's plan. A drain-driven
+                    # publish has no captured ids - the spooled export is
+                    # the fallback source.
+                    sids = list(gen_sids or [])
+                    if not sids:
+                        sid = tail_session_id(spool / "gen.export.json")
+                        if sid:
+                            sids = [sid]
+                    overlay["plan_gen_id"] = gen_id
+                    _record_plan_attempt(overlay, _plan_attempt_entry(
+                        overlay, gen_id, sids, "done", tok_plan))
                     _copy_spool_artifacts(request_id, spool, requests_dir,
                                           include_draft=False)
                     _publish_proposal(overlay, text, requests_dir,
@@ -3910,6 +3967,45 @@ def _publish_from_spool(request_id: str, text: str, spool: Path,
             raise
 
 
+def _plan_attempt_entry(rec: dict, gen_id: str, sids: list[str],
+                        outcome: str, tok: dict | None = None,
+                        note: str | None = None) -> dict:
+    """One planner attempt's terminal record for rec['plan_sessions'] -
+    the persistent 'step 0' association between a create-proposal
+    session and the plan it produced (or tried to). `outcome` is the
+    session's real terminal status: done (published, or parked its
+    questions), stopped, or failed."""
+    entry = {"gen_id": gen_id, "status": outcome,
+             "session_id": sids[-1] if sids else None,
+             "started_at": rec.get("generation_started_at"),
+             "ended_at": now_iso(),
+             "model": rec.get("plan_model") or rec.get("model"),
+             "effort": (rec.get("plan_effort")
+                        if rec.get("plan_effort") is not None
+                        else rec.get("effort"))}
+    if len(sids) > 1:
+        entry["session_ids"] = list(sids)
+    if tok:
+        entry["tokens"] = dict(tok)
+    if note:
+        entry["note"] = note
+    t0, t1 = _iso_ts(entry["started_at"]), _iso_ts(entry["ended_at"])
+    if t0 and t1:
+        entry["elapsed_s"] = round(t1 - t0, 1)
+    return entry
+
+
+def _record_plan_attempt(rec: dict, entry: dict) -> None:
+    """Append a finished planner attempt to rec['plan_sessions'] - the
+    preparation history the dashboard renders as step-0 rows. Deduped by
+    gen_id (each attempt records exactly one terminal outcome) and bounded
+    by PLAN_HISTORY_MAX."""
+    sess = [a for a in (rec.get("plan_sessions") or [])
+            if a.get("gen_id") != entry.get("gen_id")]
+    sess.append(entry)
+    rec["plan_sessions"] = sess[-PLAN_HISTORY_MAX:]
+
+
 def _finish_generation(request_id: str, requests_dir: Path,
                        manifests_dir: Path, runs_dir: Path,
                        devin_argv: list[str], gen_id: str) -> None:
@@ -3923,6 +4019,11 @@ def _finish_generation(request_id: str, requests_dir: Path,
     replays whatever the spool holds."""
     tok_plan: dict[str, int] = {}
     spool = _spool_dir(request_id)
+    # Session ids of the devin sessions this attempt spawned - captured by
+    # _planner_response (a malformed-TOML retry spawns a second one). They
+    # land in the attempt's plan_sessions record, the persistent link
+    # between the proposal and the session that drafted it.
+    gen_sids: list[str] = []
 
     def still_mine(rec: dict) -> bool:
         return rec.get("status") == "generating" \
@@ -3943,12 +4044,19 @@ def _finish_generation(request_id: str, requests_dir: Path,
         rec = _read_request(request_id, requests_dir)
         spool.mkdir(parents=True, exist_ok=True)
         base = _read_request_file(request_id, requests_dir)
+        try:
+            base_mtime = _request_path(
+                request_id, requests_dir).stat().st_mtime_ns
+        except OSError:
+            base_mtime = None
         (spool / "job.json").write_text(json.dumps({
             "request_id": request_id, "requests_dir": str(requests_dir),
             "manifests_dir": str(manifests_dir), "runs_dir": str(runs_dir),
             "gen_id": gen_id,
             "base_updated_at": base.get("updated_at"),
             "base_status": base.get("status"),
+            "base_stopped_at": base.get("generation_stopped_at"),
+            "base_mtime_ns": base_mtime,
             "created_at": now_iso()}), encoding="utf-8")
         log_path = spool / "gen.log"
         _rotate_log(log_path)
@@ -3958,6 +4066,7 @@ def _finish_generation(request_id: str, requests_dir: Path,
         try:
             text = _planner_response(rec, projects, devin_argv, log_path,
                                      qa=qa)
+            gen_sids += rec.pop("_gen_session_ids", [])
             _merge_tokens(tok_plan, tail_metrics(export_path))
             if not save_draft(text):
                 return              # stopped/superseded - nothing to publish
@@ -3969,6 +4078,7 @@ def _finish_generation(request_id: str, requests_dir: Path,
                 # with the parse error fed back.
                 text = _planner_response(rec, projects, devin_argv,
                                          log_path, fix_note=str(exc), qa=qa)
+                gen_sids += rec.pop("_gen_session_ids", [])
                 _merge_tokens(tok_plan, tail_metrics(export_path))
                 if not save_draft(text):
                     return          # stopped/superseded mid-retry
@@ -3979,6 +4089,7 @@ def _finish_generation(request_id: str, requests_dir: Path,
             # modal at a time; answer_request restarts this function as the
             # refine pass once every question has an answer or a skip.
             # The parked overlay is crash-recoverable: drain lands it.
+            gen_sids += rec.pop("_gen_session_ids", [])
             _merge_tokens(tok_plan, tail_metrics(export_path))
             with REQUEST_LOCK:
                 rec = _read_request(request_id, requests_dir)
@@ -3989,6 +4100,9 @@ def _finish_generation(request_id: str, requests_dir: Path,
                     dict(rec.get("plan_tokens") or {}), tok_plan)
                 if plan_tok:
                     rec["plan_tokens"] = plan_tok
+                _record_plan_attempt(rec, _plan_attempt_entry(
+                    rec, gen_id, gen_sids, "done", tok_plan,
+                    "asked clarifying questions"))
                 if rounds > MAX_QUESTION_ROUNDS:
                     rec.update(
                         status="error", pending_questions=[],
@@ -4021,12 +4135,14 @@ def _finish_generation(request_id: str, requests_dir: Path,
                                "regenerate or edit the TOML directly")
         _publish_from_spool(request_id, text, spool, requests_dir,
                             manifests_dir, runs_dir, tok_plan,
-                            gen_id=gen_id)
+                            gen_id=gen_id, gen_sids=gen_sids)
     except GenerationStopped:
         # stop_generation already restored the record (draft, or ready with
-        # the previous proposal). Bank the killed attempt's token usage -
-        # plan_tokens accumulates across attempts - and touch nothing else;
-        # a newer attempt may already own the 'generating' slot.
+        # the previous proposal). Bank the killed attempt's token usage and
+        # record its session as a stopped preparation attempt - the entry
+        # is keyed by this attempt's own gen_id, so it can never be read
+        # as the producer of a plan some other attempt published.
+        gen_sids += rec.pop("_gen_session_ids", [])
         try:
             _assert_unwatched(runs_dir, requests_dir)
             with REQUEST_LOCK:
@@ -4038,22 +4154,41 @@ def _finish_generation(request_id: str, requests_dir: Path,
                     dict(rec.get("plan_tokens") or {}), tok_plan)
                 if plan_tok:
                     rec["plan_tokens"] = plan_tok
-                    _save_request(rec, requests_dir)
+                _record_plan_attempt(rec, _plan_attempt_entry(
+                    rec, gen_id, gen_sids, "stopped", tok_plan,
+                    "stopped before producing a plan"))
+                _save_request(rec, requests_dir)
         except RequestError:
             pass
     except Exception as exc:
+        gen_sids += rec.pop("_gen_session_ids", [])
         _wait_writable(runs_dir, requests_dir, LOGS_DIR)
         LOG.warning("request %s generation failed: %s", request_id, exc)
         msg = (f"Planner returned malformed TOML ({exc})"
                if isinstance(exc, tomllib.TOMLDecodeError) else str(exc))
-        overlay = _spool_rec(request_id)
-        if overlay is not None and still_mine(overlay):
-            plan_tok = _merge_tokens(
-                dict(overlay.get("plan_tokens") or {}), tok_plan)
-            if plan_tok:
-                overlay["plan_tokens"] = plan_tok
-            overlay.update(status="error", error=msg[:300])
-            _save_spool(overlay, spool)
+        with REQUEST_LOCK:
+            overlay = _spool_rec(request_id)
+            if overlay is None and _disk_untouched(
+                    request_id, requests_dir, _job_meta(spool)):
+                # The planner died before a draft ever spooled, so no
+                # overlay exists yet - the untouched file is still the
+                # record this attempt owns, and parking it as 'error'
+                # keeps the failure (and the session record) visible
+                # instead of silently reverting to the pre-run stage.
+                try:
+                    overlay = _read_request_file(request_id, requests_dir)
+                except RequestError:
+                    overlay = None
+            if overlay is not None and still_mine(overlay):
+                plan_tok = _merge_tokens(
+                    dict(overlay.get("plan_tokens") or {}), tok_plan)
+                if plan_tok:
+                    overlay["plan_tokens"] = plan_tok
+                _record_plan_attempt(overlay, _plan_attempt_entry(
+                    overlay, gen_id, gen_sids, "failed", tok_plan,
+                    msg[:160]))
+                overlay.update(status="error", error=msg[:300])
+                _save_spool(overlay, spool)
         # Flush only while this attempt still owns the spool - a newer
         # generation rewrote job.json with its own gen_id and its parked
         # state is not ours to land (or delete).
@@ -4165,6 +4300,10 @@ def _drain_generating(rid: str, overlay: dict, spool: Path,
             # attempt being drained - a Regenerate may have claimed it.
             if (cur or overlay).get("gen_id") == gid:
                 cur = dict(cur or overlay)
+                sid = tail_session_id(spool / "gen.export.json")
+                _record_plan_attempt(cur, _plan_attempt_entry(
+                    cur, gid, [sid] if sid else [], "failed", None,
+                    f"Recovered draft failed to publish: {exc}"[:160]))
                 cur.update(
                     status="error",
                     error=f"Recovered draft failed to publish: {exc}"[:300])
@@ -4180,6 +4319,10 @@ def _drain_generating(rid: str, overlay: dict, spool: Path,
     if overlay.get("status") == "generating" and \
             (_spool_rec(rid) or {}).get("gen_id") == gid:
         overlay = dict(overlay)
+        sid = tail_session_id(spool / "gen.export.json")
+        _record_plan_attempt(overlay, _plan_attempt_entry(
+            overlay, gid, [sid] if sid else [], "failed", None,
+            "interrupted by a server restart"))
         overlay.update(
             status="error",
             error="Planning was interrupted by a server restart - the "
@@ -4338,6 +4481,21 @@ def stop_generation(request_id: str,
             raise RequestError(
                 "This request is not preparing a proposal", 409)
         _flag_raise(gen_stop_flag(request_id).name)
+        # Drop the parked spool overlay BEFORE restoring the file: it
+        # still says 'generating' and outranks the file for every
+        # _read_request caller, so the restored stage would stay
+        # invisible (and the stopped attempt's draft publishable by a
+        # drain) until the spool was cleaned. Delete first so a crash
+        # mid-stop can't leave the stale overlay masking the file. Only
+        # an overlay owned by THIS attempt is touched - a newer
+        # generation's overlay is that attempt's problem.
+        spool_overlay = _spool_rec(request_id)
+        if (spool_overlay or {}).get("gen_id") == rec.get("gen_id"):
+            try:
+                (_spool_dir(request_id) / "request.json").unlink(
+                    missing_ok=True)
+            except OSError:
+                pass
         rec["status"] = "ready" if rec.get("manifest") else "draft"
         rec["error"] = None
         rec["generation_stopped_at"] = now_iso()
@@ -5314,6 +5472,84 @@ def proposal_agent(step: dict, rec: dict, projects: dict, key: str,
             else None}
 
 
+def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
+                        log_path: Path, prices: dict) -> list[dict]:
+    """Agent rows for a request's recorded planner sessions - the 'step 0'
+    preparation history of its plan.
+
+    Each completed attempt lands one row carrying its real terminal
+    status and the session id captured while it ran. Labels keep
+    agentKey (run_key|step) unique AND keep attribution honest: at rest,
+    the attempt that produced the current manifest (rec['plan_gen_id'])
+    is 'plan-proposal'; every other recorded attempt is 'plan-proposal-N'
+    by attempt order. While a newer pass is generating, the live row
+    holds the bare name and all completed attempts are numbered - an
+    earlier session is never shown as a later attempt's producer. Only
+    the newest completed attempt gets log/export/tail links: all attempts
+    write the same <id>.gen.* files, so only its content is on disk.
+
+    These rows are history, not work: no run_dir, no counts, never
+    runnable (retry/resume operate on state.json + the manifest)."""
+    entries = rec.get("plan_sessions") or []
+    if not entries:
+        return []
+    producer = rec.get("plan_gen_id")
+    export_path = log_path.with_suffix(".export.json")
+    task = "Propose a TOML runbook for: " + " ".join(
+        (rec.get("raw") or "").split())[:120]
+    out = []
+    for i, e in enumerate(entries):
+        produced = bool(e.get("gen_id")) and e.get("gen_id") == producer
+        files = i == len(entries) - 1 and not generating
+        log = str(log_path) if files and log_path.is_file() else None
+        exp = str(export_path) if files and export_path.is_file() else None
+        status = e.get("status") or "done"
+        if produced:
+            note = ("prepared this plan - preparation history, not a "
+                    "run step")
+        elif status == "stopped":
+            note = e.get("note") or "stopped before producing a plan"
+        elif e.get("note"):
+            note = e["note"]
+        elif status == "failed":
+            note = "preparation attempt failed"
+        else:
+            note = "superseded by a later preparation"
+        out.append({
+            "run": rec.get("run") or rec.get("label"),
+            "run_dir": None, "run_key": key, "request_id": rec["id"],
+            "step": ("plan-proposal" if produced and not generating
+                     else f"plan-proposal-{i + 1}"),
+            "slug": rec.get("project") or "agent-conductor",
+            "work_dir": "planner tempdir (auto-cleaned)",
+            "status": status,
+            "created_at": e.get("started_at") or rec.get("updated_at"),
+            "started_at": e.get("started_at"),
+            "ended_at": e.get("ended_at"),
+            "elapsed_s": e.get("elapsed_s"),
+            "alive": False, "pid": None,
+            "session_id": e.get("session_id"), "session_gone": False,
+            "model": e.get("model"),
+            "model_actual": e.get("model_actual"),
+            "effort": e.get("effort"),
+            "mode": "planner", "cloud": False, "verify_ok": None,
+            "task": task, "task_full": task,
+            "note": note, "next": None, "exit_code": None,
+            "branch": None, "merged": None,
+            "tokens": e.get("tokens"), "wt": False,
+            "cost": estimate_cost(e.get("tokens"), e.get("model"),
+                                  e.get("effort"), prices,
+                                  e.get("model_actual")),
+            "stdout_log": log,
+            "tail": stdout_tail(log) if log else None,
+            "export": exp,
+            "arc": cached_arc(exp) if exp else None,
+            "prompt": None, "prompt_editable": False,
+            "notes_enabled": False, "skipped_by_user": False,
+            "seq": -1 if produced else None})
+    return out
+
+
 def _manifest_pending(st: dict, projects: dict) -> list[dict]:
     """Steps the run's manifest declares but state.json has no record for -
     CLI-launched runs get the same pending placeholder rows request runs
@@ -5412,6 +5648,9 @@ def collect_dashboard(runs_dir: Path,
             # a parked planner overlay is more current than the file
             requests[rec["id"]] = _spool_rec(rec["id"]) or rec
     launched: set[str] = set()
+    emitted_prep: set[str] = set()   # plan_sessions rows emitted once
+                                     # per request (dup run dirs share
+                                     # the same request:<id> agentKey)
     archived_runs = 0
     runs: list[dict] = []
     agents: list[dict] = []
@@ -5591,6 +5830,17 @@ def collect_dashboard(runs_dir: Path,
             row["seq"] = seq_of.get(row["step"], prop_seq.get(row["step"]))
             counts[row["status"]] = counts.get(row["status"], 0) + 1
             agents.append(row)
+        # Preparation history rides the launched run's task list under
+        # the same request:<id> run_key - the session that wrote this
+        # plan, kept as step 0. Deliberately NOT in counts: it is not a
+        # run step, and a 'stopped' planner row must never read as
+        # resumable work.
+        if request and request["id"] not in emitted_prep:
+            emitted_prep.add(request["id"])
+            agents.extend(plan_attempt_agents(
+                request, key, generating=False,
+                log_path=requests_dir / f"{request['id']}.gen.log",
+                prices=prices))
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
                      "key": key, "request_id": st.get("request_id"),
                      "archived": st.get("archived"),
@@ -5694,6 +5944,14 @@ def collect_dashboard(runs_dir: Path,
             a["notes_enabled"] = False
             a["seq"] = i               # proposal order is its pipeline
             agents.append(a)
+        # Step 0: completed planner sessions stay on the plan's task list
+        # after preparation ends (and after reload - they are rebuilt from
+        # the request record each poll). While a new pass generates, the
+        # live 'plan-proposal' row above holds the bare name and every
+        # completed attempt is numbered instead.
+        agents.extend(plan_attempt_agents(
+            rec, key, generating=stage == "generating",
+            log_path=log_p, prices=prices))
     # session_id is discovered post-spawn (diff of `devin list`); while a
     # step runs the cell is empty. Attribute it live instead: among the
     # unclaimed ids in the step's work_dir, the spawned one is the session
@@ -5806,21 +6064,41 @@ button.chip:focus-visible, button:focus-visible, tr.runrow:focus-visible { outli
 @keyframes pulse { 50% { opacity:.35; } }
 .wrapw { }  /* overflow here would create a scroll container and break
    the sticky th - tables are width:100% fixed, nothing overflows */
-/* compact density: one line per row - wrap cells ellipsize, sub-lines
-   (dir path, plan tokens) hide */
+/* compact density: wrap cells ellipsize to fewer lines, sub-lines
+   (dir path, planner output, other second-line detail) hide */
 body.compact td { padding-top:2px; padding-bottom:2px; }
 body.compact td.wrap, body.compact td.res {
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 body.compact td .sub { display:none; }
 body.compact td br { display:none; }
+/* .toksub looks like .sub but survives compact: the labeled
+   planner:/steps:/est token lines in a run's steps cell are meant to
+   render there (fmtTc is their compact form). The <br> that stacks
+   them at full density hides in compact, so block gives each label
+   its own line. .rlabels is a plain block box keeping the run row's
+   chips on their own line under the name in both densities (a <br>
+   would disappear in compact and let them clip inline after the
+   name); its one rule is below. */
+.toksub { color:#8b949e; font-size:12px; }
+body.compact td .toksub { display:block; }
+/* Chips on the .rlabels line must never clip invisibly at the td edge:
+   compact squeezes td.wrap to nowrap, which pins every chip to one line -
+   a pill starting mid-line can shrink to max-width:100% yet still
+   overflow past the cell. Normal whitespace lets a following chip wrap
+   to its own line inside the label block instead (harmless at full
+   density, where td.wrap already wraps). */
+.rlabels { white-space:normal; }
 /* .genline: a proposal row's compact live-output line - display:none at
    full density (the .sub line under the stage chip shows the same
-   gen_last there), inline on the row's one line under compact, ellipsized
-   by the td. .fresh flashes it on new output - the same animation the
-   agent result cells use, on the .sub line too. */
+   gen_last there). Under compact it is one nowrap ellipsized line: as an
+   inline-block with max-width it keeps its own line when the .rlabels
+   wrap puts it after a chip, and ellipsizes at the cell edge rather
+   than clipping. .fresh flashes it on new output - the same animation
+   the agent result cells use, on the .sub line too. */
 .genline { display:none; }
-body.compact td .genline { display:inline; color:#8b949e;
-  font-size:12px; margin-left:6px; }
+body.compact td .genline { display:inline-block; max-width:100%;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  vertical-align:bottom; color:#8b949e; font-size:12px; margin-left:6px; }
 .genline.fresh, td .sub.fresh { animation:fresh 1.2s ease-out; }
 .counts span { background:#161b22; border-radius:8px; padding:1px 8px; margin-right:5px; font-size:12px; }
 a { color:#58a6ff; text-decoration:none; }
@@ -5868,6 +6146,11 @@ details.arcgrp[open] > summary::before { content:'▾'; }
 .arc-commit { color:#3fb950; }
 
 .stage { display:inline-block; border-radius:9px; padding:1px 7px; font-size:11px; border:1px solid #30363d; white-space:nowrap; }
+/* a pill wider than its column clipped invisibly at the td edge
+   (narrow viewports) - ellipsize inside the pill instead, and keep its
+   baseline even with overflow:hidden so siblings still line up */
+td .stage { max-width:100%; overflow:hidden; text-overflow:ellipsis;
+  vertical-align:top; }
 .stage.draft { color:#e3b341; border-color:#6b5a1f; background:#2a2317; }
 .stage.ready { color:#bc8cff; border-color:#614b84; background:#251d35; }
 .stage.generating { color:#58a6ff; background:#172638;
@@ -6895,9 +7178,11 @@ function render(d){
   // Only rebuild the tables when the payload actually changes - rebuilding
   // innerHTML every 2s resets animations/hover and looks like a reload.
   // `tail` is excluded: live log growth streams into the open modal instead.
+  // density is in the sig: fmtT/fmtTc token text differs per density, so
+  // a Compact|Full flip must re-render even when the payload is identical.
   const sig = JSON.stringify([d.runs, d.agents.map(({tail,...r})=>r),
     selectedRun, [...only].sort(), [...facets].sort(), expanded,
-    runsShown===Infinity?'all':runsShown]);
+    runsShown===Infinity?'all':runsShown, density]);
   const tailEl = document.getElementById('dtail');
   if (sig === lastSig){
     tickElapsed(now);
@@ -7017,6 +7302,12 @@ function render(d){
       r.stage==='questions' && (r.questions||[]).length
         ? `planner waits on ${r.questions.length} answer(s)`
         : glast || (r.stage==='generating' ? 'planner warming up' : '');
+    // stale survives until _publish_proposal clears it, so mid-planning
+    // stages would double-label the row ('Preparing proposal' + 'Needs
+    // review'); the flag only means something once planning has stopped
+    const staleChip = r.stale &&
+      r.stage!=='generating' && r.stage!=='questions'
+        ? ` <span class="stage error">Needs review</span>`:'';
     h += `<tr class="runrow${runKey(r)===selectedRun?' selected':''}" ` +
       `data-run-key="${esc(runKey(r))}" tabindex="0" ` +
       `aria-label="Filter to run ${esc(r.run)}"><td class="wrap">` +
@@ -7033,12 +7324,21 @@ function render(d){
           `<b>${esc(r.run)}</b></button>`
         : `<button type="button" class="linkbtn run-name" ` +
           `data-run-details="${esc(runKey(r))}" title="run details">` +
-          `<b>${esc(r.run)}</b></button>`) + `<br>` +
-      (r.stage ? `<span class="stage ${esc(r.stage)}">` +
+          `<b>${esc(r.run)}</b></button>`) +
+      // Compact hides td <br> and squeezes td.wrap to one ellipsized
+      // line, so these labels used to collapse INLINE after the run
+      // name and clip away depending on name length / column width -
+      // the "labels under the run table sometimes not visible" report.
+      // .rlabels is a plain block box: the chips + genline keep their
+      // own line under the name in BOTH densities (it replaces the <br>
+      // that broke after the name at full density).
+      `<div class="rlabels">` +
+      (r.stage ? `<span class="stage ${esc(r.stage)}" ` +
+        `title="${esc(STAGES[r.stage]||r.stage)}">` +
         `${esc(STAGES[r.stage]||r.stage)}` +
         (r.stage==='generating'
           ? `<span class="dots"><span>.</span><span>.</span><span>.</span></span>`
-          : '') + `</span>` +
+          : '') + `</span>` + staleChip +
         (cgen ? ` <span class="genline${gfresh?' fresh':''}" ` +
           `title="${esc(cgen)}">${esc(cgen)}</span>` : '') +
         (r.stage==='questions' && (r.questions||[]).length
@@ -7053,30 +7353,29 @@ function render(d){
         (r.archived ? `<span class="stage archived" ` +
           `title="auto-archived run - hidden from the default view; ` +
           `files stay on disk">archived</span>` : '') +
-        runStateChip(r) + `<br>` +
+        runStateChip(r) + staleChip + `<br>` +
         `<span class="sub">${esc(base(r.dir))}</span>`) +
-      // stale survives until _publish_proposal clears it, so mid-planning
-      // stages would double-label the row ('Preparing proposal' + 'Needs
-      // review'); the flag only means something once planning has stopped
-      (r.stale && r.stage!=='generating' && r.stage!=='questions'
-        ? ` <span class="stage error">Needs review</span>`:'') +
-      `</td>` +
+      `</div></td>` +
       `<td class="wrap">${r.description?esc(r.description):
         r.stage?'<span class="sub">Awaiting proposal</span>':'-'}</td>` +
       `<td>${(r.projects||[]).map(p=>`<span class="chip">${esc(p)}</span>`).join('')}</td>` +
       `<td>${loc(r.started_at)}</td>` +
       `<td>${r.ended_at?loc(r.ended_at):(r.started_at?'<b>running</b>':'-')}</td>` +
       `<td class="counts">` +
-      `${counts||'<span class="sub">not planned</span>'}` +
-      (r.plan_tokens ? `<br><span class="sub" ` +
+      `${counts||'<span class="toksub">not planned</span>'}` +
+      // .toksub, not .sub: these labeled lines are meant to render in
+      // compact too (fmtTc is the compact form) - the blanket td .sub
+      // hide made the compact branch unreachable
+      (r.plan_tokens ? `<br><span class="toksub" ` +
         `title="${esc(tokTitle(r.plan_tokens))}">planner: ` +
         `${density==='compact' ? fmtTc(r.plan_tokens) : fmtT(r.plan_tokens)}` +
         (r.plan_cost?` · ${fmtC(r.plan_cost)}`:'') + `</span>` : '') +
-      (r.tokens ? `<br><span class="sub" ` +
+      (r.tokens ? `<br><span class="toksub" ` +
         `title="${esc(tokTitle(r.tokens))}">steps: ` +
         `${density==='compact' ? fmtTc(r.tokens) : fmtT(r.tokens)}` +
         (r.cost?` · ${fmtC(r.cost)}`:'') + `</span>` : '') +
-      (runUsd!=null ? `<br><span class="sub" title="estimated self-serve ` +
+      (runUsd!=null ? `<br><span class="toksub" ` +
+        `title="estimated self-serve ` +
         `cost, plan + steps${r.cost&&r.cost.unpriced
           ?`; ${r.cost.unpriced} step(s) have no rate`:''}">` +
         `est ${fmtC({usd:runUsd})}</span>` : '') +

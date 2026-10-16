@@ -19,9 +19,40 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 6 | Task prompt editing: pre-dispatch Edit prompt, resume notes for ran steps, full prompt text in modal | done | task-prompt-editing/ | 172/172 mock tests + demo green; prompt-/rnote- sentinels survive resume |
 | 7 | Planner 'ask me questions' checkbox: questionnaire modal before manifest, answers feed a refine pass | done | planner-questions/ | 193/193 mock tests + demo green; live planner not dispatched |
 | 8 | Stop proposal during preparation: stopgen sentinel + _GEN_PROCS kill + per-attempt gen_id scoping, restores draft/ready | done | stop-proposal-preparation/ | 216/216 mock tests + demo + real-proc smoke green |
+| 9 | Retain the create-proposal session as step-0 preparation history on the plan's task list | done | retain-proposal-session/ | 221/221 mock tests + demo green; plan_sessions + plan_gen_id persisted per attempt |
+| 10 | Verify the three proposal-flow changes together (stop / retain-session / compact labels) in the merged state | done | verify-proposal-flow/ | both parked branches merged, 4 integration regressions fixed (same-second publish race, stale overlay, drain records, chip wrap); 232/232 + demo + live probe green |
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (fix-compact-labels, wave step of run
+  20261016-013711-proposal-flow-fixes): "the labels under the run table,
+  sometimes are not visible in the 'compact' view" - two losses, both
+  reproduced with Playwright probes (evidence in
+  fix-compact-labels/STATE.md + scratch/). (a) `td br { display:none }`
+  in compact collapsed the `.stage` chips (running / paused - resume
+  ready / Preparing proposal / archived / Needs review) INLINE after the
+  run name where `td.wrap`'s ellipsis clipped them depending on name
+  length + column width - the "sometimes". The chips + `.genline` + dir
+  `.sub` now live in a `<div class="rlabels">` block that keeps its own
+  line under the name in both densities; `Needs review` groups there too.
+  (b) `planner:`/`steps:`/`est`/`not planned` were `.sub` spans hidden
+  by the blanket compact `.sub` rule despite `fmtTc()` being written as
+  their compact form (dead branch since efec536) - they're `.toksub`
+  now (same look, exempt from the hide, block-stacked in compact).
+  Also: `td .stage` ellipsizes inside the pill when wider than the
+  column (+`title=` tooltip); `render()` sig now includes `density` so a
+  Compact|Full flip re-renders the fmtT/fmtTc swap even when the payload
+  is unchanged (previously the format never updated until data changed).
+  New node-harness test `test_compact_run_row_labels_stay_visible` green.
+  Suite: 225 tests, 2 PRE-EXISTING failures - StopProposalTests x2
+  (stash-verified on the base commit): `stop_generation` restores the
+  record but `_publish_from_spool` only gates on `_disk_untouched`
+  (`updated_at`, SECOND granularity) - a same-second Stop still gets its
+  late TOML published as `ready` + replaces an earlier manifest.
+  Interaction of merged stop-proposal-preparation x
+  isolate-proposal-planning; owner = verify-proposal-flow / a follow-up
+  (suggested: publish gate should re-read the file's status+gen_id, or
+  clear gen_id in the stop write).
 - DONE 2026-10-16 (follow-up-plan, closing step of run
   20261016-013703-proposal-ui-fixes): reviewed the run - 1/2 worker steps
   landed. `fix-regenerate-label` done + merged (e1eaa7c): 'Needs review'
