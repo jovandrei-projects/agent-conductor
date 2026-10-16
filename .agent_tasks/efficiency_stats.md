@@ -47,3 +47,4 @@ accounted for.
 | agent-conductor / task-modal-navigation (sticky .dnav prev/next bar walking pipeline seq order + arrow keys; agentKey->run_key; 200/200 + demo green) | n/a | n/a | n/a | n/a |
 | agent-conductor / resolve-task-modal-navigation (merge resolution: both-append conflicts on QUEUE.md + efficiency_stats.md; merge e8c79e9) | n/a | n/a | n/a | n/a |
 | agent-conductor / stop-proposal-preparation (stopgen sentinel + _GEN_PROCS kill + gen_id attempt scoping, Stop proposal on 3 modals; 216/216 + demo + real-proc smoke green) | n/a | n/a | n/a | n/a |
+| agent-conductor / retain-proposal-session (plan_sessions + plan_gen_id per attempt; step-0 history rows on ready+launched plans; 221/221 + demo green) | n/a | n/a | n/a | n/a |
