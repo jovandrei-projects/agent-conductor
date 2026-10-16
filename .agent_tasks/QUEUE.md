@@ -41,7 +41,11 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   both UI fixes, closing follow-up-plan step. NOT launched - human
   review. Overlap note inside the file: supersedes the still-unlaunched
   ux-controls-followup flake step; its merge/verify-timeout/ask-smoke
-  steps are deliberately not duplicated here.
+  steps are deliberately not duplicated here. UPDATE 2026-10-16:
+  compact-live-output merged via resolve-compact-live-output (merge
+  commit 7e5f3cf; both conflicts were both-append bookkeeping on
+  QUEUE.md + efficiency_stats.md - kept both sides, chronological
+  order).
 - DONE 2026-10-16 (compact-live-output): compact density hid every
   `.sub`/`<br>` in the proposal run row, so a generating request showed
   only the 'Preparing proposal' chip with no live output. The same
