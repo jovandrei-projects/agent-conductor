@@ -3966,6 +3966,18 @@ class StepSummaryTests(unittest.TestCase):
         self.assertIn("/summary", conductor._DASH_HTML)
         self.assertIn("Session summary", conductor._DASH_HTML)
 
+    def test_summary_html_escapes_agent_text(self):
+        md = ("# run / s1\n\n- **status:** done\n\n## Task\n\n"
+              "inject <script>alert(1)</script> **here**\n\n"
+              "## stdout tail\n\n```\n<tag> raw\n```\n")
+        page = conductor.summary_html(md, "t")
+        self.assertIn("<h1>run / s1</h1>", page)
+        self.assertIn("<h2>Task</h2>", page)
+        self.assertIn("<strong>here</strong>", page)
+        self.assertIn("&lt;script&gt;", page)
+        self.assertIn("&lt;tag&gt; raw", page)
+        self.assertNotIn("<script>", page)
+
 
 if __name__ == "__main__":
     unittest.main()
