@@ -25,6 +25,7 @@ import concurrent.futures
 import dataclasses
 import datetime as dt
 import hashlib
+import html
 import http.server
 import json
 import logging
@@ -1230,7 +1231,70 @@ def step_summary(run_name: str, step_name: str,
     return md
 
 
-def _merge_tokens(acc: dict[str, int], tok: dict | None) -> dict:
+def summary_html(md: str, title: str) -> str:
+    """Render our own generated summary markdown as a styled page.
+
+    We only emit a narrow markdown subset (#, ##, - bullets, ``` fences,
+    **bold**, `code`), and every line is HTML-escaped BEFORE inline
+    markup is applied, so agent-authored content (task text, stdout,
+    trajectory heads) can never inject markup."""
+    def inline(s: str) -> str:
+        s = html.escape(s)
+        s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+        return re.sub(r"`(.+?)`", r"<code>\1</code>", s)
+
+    body, in_ul, in_pre = [], False, False
+
+    def close_ul() -> None:
+        nonlocal in_ul
+        if in_ul:
+            body.append("</ul>")
+            in_ul = False
+
+    for ln in md.splitlines():
+        if in_pre:
+            if ln.strip() == "```":
+                body.append("</pre>")
+                in_pre = False
+            else:
+                body.append(html.escape(ln))
+            continue
+        if ln.strip() == "```":
+            close_ul()
+            body.append("<pre>")
+            in_pre = True
+        elif ln.startswith("## "):
+            close_ul()
+            body.append(f"<h2>{inline(ln[3:])}</h2>")
+        elif ln.startswith("# "):
+            close_ul()
+            body.append(f"<h1>{inline(ln[2:])}</h1>")
+        elif ln.startswith("- "):
+            if not in_ul:
+                body.append("<ul>")
+                in_ul = True
+            body.append(f"<li>{inline(ln[2:])}</li>")
+        elif not ln.strip():
+            close_ul()
+        else:
+            close_ul()
+            body.append(f"<p>{inline(ln)}</p>")
+    close_ul()
+    if in_pre:
+        body.append("</pre>")
+    return ("<!doctype html><html><head><meta charset=utf-8>"
+            f"<title>{html.escape(title)}</title><style>"
+            "body{background:#0d1117;color:#c9d1d9;font:14px/1.5 "
+            "'Segoe UI',system-ui,sans-serif;max-width:900px;margin:"
+            "24px auto;padding:0 16px}"
+            "h1{font-size:20px;border-bottom:1px solid #21262d;"
+            "padding-bottom:8px}h2{font-size:15px;color:#58a6ff;"
+            "margin:20px 0 6px}ul{padding-left:20px}li{margin:3px 0}"
+            "code{background:#161b22;border-radius:4px;padding:1px 5px;"
+            "font-size:12px}pre{background:#161b22;border-radius:6px;"
+            "padding:10px 12px;font-size:12px;overflow:auto;"
+            "white-space:pre-wrap}strong{color:#e6edf3}</style></head>"
+            f"<body>{''.join(body)}</body></html>")
     for k, v in (tok or {}).items():
         if isinstance(v, (int, float)):
             acc[k] = acc.get(k, 0) + int(v)
@@ -5745,7 +5809,10 @@ function showRunDetails(key){
     ['est cost',runUsd!=null?fmtC({usd:runUsd})+
       (r.cost&&r.cost.unpriced?` (+${r.cost.unpriced} step(s) unpriced)`:'')+
       ` (self-serve rates, plan + steps)`:'-'],
-    ['manifest / dir',r.dir]];
+    ['manifest / dir',r.dir],
+    ['sessions', AGENTS.filter(a=>(a.run_key||a.run_dir)===key &&
+      a.session_id).map(a=>`${a.step}: ${a.session_id}`).join(' \u00b7 ')
+      ||'-']];
   const canResume = Object.keys(r.counts||{}).length &&
     !Object.keys(r.counts).some(s=>['running','queued'].includes(s)) &&
     Object.keys(r.counts).some(s=>s!=='done');
@@ -7042,9 +7109,17 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     self._json(rec)
                 elif (m := re.fullmatch(
                         r"/api/runs/([^/]+)/steps/([^/]+)/summary", path)):
-                    self._send(step_summary(m.group(1), m.group(2),
-                                            runs_dir).encode("utf-8"),
-                               "text/plain; charset=utf-8")
+                    md = step_summary(m.group(1), m.group(2), runs_dir)
+                    q = urllib.parse.parse_qs(
+                        urllib.parse.urlsplit(self.path).query)
+                    if q.get("raw", [""])[0] in ("1", "true"):
+                        self._send(md.encode("utf-8"),
+                                   "text/markdown; charset=utf-8")
+                    else:
+                        self._send(summary_html(
+                            md, f"{m.group(1)} / {m.group(2)}")
+                            .encode("utf-8"),
+                            "text/html; charset=utf-8")
                 elif (m := re.fullmatch(r"/api/attachments/([^/]+)", path)):
                     data, ctype = read_attachment(
                         urllib.parse.unquote(m[1]), attachments_dir)
