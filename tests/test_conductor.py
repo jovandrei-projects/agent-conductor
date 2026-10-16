@@ -7508,7 +7508,8 @@ class RunLifecycleCleanupTests(unittest.TestCase):
     """Auto-archive: a run whose ended_at is older than ARCHIVE_AFTER_S is
     stamped state['archived'] and drops out of the default dashboard view
     (kept on disk; ?archived=1 / Unarchive brings it back). 'Delete run'
-    removes the whole record, gated on {confirm:true} and no live work."""
+    moves the whole record to recoverable trash (48h, Undo/Restore), gated
+    on {confirm:true} and no live work."""
 
     def _ended_run(self, runs: Path, name: str, hours_ago: float,
                    **extra) -> Path:
@@ -7609,20 +7610,38 @@ class RunLifecycleCleanupTests(unittest.TestCase):
                 p.wait()
 
     def test_delete_run_removes_the_record(self):
+        """'Delete' now lands the record in data/trash - the run dir leaves
+        runs/, the entry carries meta + payload, and Undo restores it."""
         with tempfile.TemporaryDirectory() as td:
             runs = Path(td) / "runs"
+            trash = Path(td) / "trash"
             rd = self._ended_run(runs, "20260101-000000-t", 1)
             (rd / "prompts").mkdir()
             (rd / "prompts" / "a.md").write_text("p", encoding="utf-8")
             with self.assertRaises(conductor.RequestError):
                 conductor.delete_run(rd.name, {}, runs)      # unconfirmed
             self.assertTrue((rd / "state.json").is_file())
-            out = conductor.delete_run(rd.name, {"confirm": True}, runs)
+            out = conductor.delete_run(rd.name, {"confirm": True}, runs,
+                                       trash_dir=trash)
             self.assertEqual(out["deleted"], rd.name)
+            self.assertTrue(out["trashed"])
             self.assertFalse(rd.exists())
+            entry = trash / out["trash_id"]
+            self.assertTrue((entry / "meta.json").is_file())
+            self.assertTrue((entry / "payload" / "00-run" /
+                             "state.json").is_file())
+            self.assertTrue((entry / "payload" / "00-run" / "prompts" /
+                             "a.md").is_file())
             with self.assertRaises(conductor.RequestError) as e:
-                conductor.delete_run(rd.name, {"confirm": True}, runs)
+                conductor.delete_run(rd.name, {"confirm": True}, runs,
+                                     trash_dir=trash)
             self.assertEqual(e.exception.status, 404)
+            out = conductor.restore_trash(out["trash_id"], trash, runs,
+                                          Path(td) / "requests",
+                                          Path(td) / "manifests")
+            self.assertEqual(out["restored"], rd.name)
+            self.assertTrue((rd / "state.json").is_file())
+            self.assertFalse(entry.exists())
 
     def test_delete_run_refuses_a_live_step(self):
         with tempfile.TemporaryDirectory() as td:
@@ -7678,6 +7697,591 @@ prompt = "work"
         for name in ("Archive run", "Unarchive", "Delete run",
                      "archived"):
             self.assertIn(name, html)
+
+
+class RecoverableTrashTests(unittest.TestCase):
+    """Delete/discard is a move to data/trash (48h retention), never an
+    rmtree: entries carry meta + payload, restore puts each back at its
+    recorded destination (collisions rename, never overwrite), a bounded
+    sweep purges only the expired, and 'Empty trash' is the one
+    irreversible op behind an explicit confirm. All fixtures are
+    temporary."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.proj = make_project(self.base)
+        self.runs = self.base / "runs"
+        self.requests = self.base / "requests"
+        self.manifests = self.base / "manifests"
+        self.manifests.mkdir()
+        self.trash = self.base / "trash"
+        patch = mock.patch.object(conductor, "load_projects", return_value={
+            "proj": {"path": self.proj, "cloud_ok": False}})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.spool = self.base / "planner-spool"
+        for target, value in (("PLANNER_SPOOL", self.spool),
+                              ("WATCH_POLL_S", 0.02)):
+            p = mock.patch.object(conductor, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    # ---- fixtures ------------------------------------------------------
+    def _ended_run(self, name, hours_ago=1, **extra):
+        rd = (self.runs / name).resolve()
+        rd.mkdir(parents=True, exist_ok=True)
+        t = (conductor.dt.datetime.now()
+             - conductor.dt.timedelta(hours=hours_ago)).isoformat(
+                 timespec="seconds")
+        st = {"run": name, "started_at": t, "ended_at": t,
+              "run_dir": str(rd),
+              "steps": {"a": {"status": "done", "started_at": t,
+                              "ended_at": t,
+                              "prompt": str(rd / "prompts" / "a.md"),
+                              "stdout_log": str(rd / "a.stdout.log"),
+                              "export": str(rd / "a.export.json")}},
+              **extra}
+        (rd / "state.json").write_text(json.dumps(st), encoding="utf-8")
+        (rd / "events.jsonl").write_text("{}\n", encoding="utf-8")
+        (rd / "a.stdout.log").write_text("log\n", encoding="utf-8")
+        (rd / "prompts").mkdir(exist_ok=True)
+        (rd / "prompts" / "a.md").write_text("prompt\n", encoding="utf-8")
+        return rd
+
+    def _proposal(self, description="Tidy the catalog"):
+        return f'''[run]
+name = "catalog-cleanup"
+description = "{description}"
+on_failure = "continue"
+
+[defaults]
+project = "proj"
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+
+[[step]]
+name = "organize"
+prompt = "Organize the catalog and verify results."
+'''
+
+    def _ready(self, **fields):
+        payload = {"raw": "Please tidy the catalog carefully",
+                   "project": "proj", "model": "swe-2", "effort": "max"}
+        payload.update(fields)
+        rec = conductor.create_request(payload, self.requests, self.runs)
+        return conductor.save_request(
+            rec["id"], {"manifest": self._proposal()},
+            self.requests, self.manifests, self.runs)
+
+    def _entry_meta(self, entry_id):
+        return json.loads((self.trash / entry_id / "meta.json").read_text(
+            encoding="utf-8"))
+
+    # ---- run trash ------------------------------------------------------
+    def test_delete_run_moves_everything_to_a_recorded_entry(self):
+        rd = self._ended_run("20260101-000000-t",
+                             request_id="20260101-000000-abcdef01")
+        out = conductor.delete_run(rd.name, {"confirm": True}, self.runs,
+                                   trash_dir=self.trash)
+        self.assertFalse(rd.exists())
+        meta = self._entry_meta(out["trash_id"])
+        self.assertEqual(meta["kind"], "run")
+        self.assertEqual(meta["ref"], rd.name)
+        self.assertEqual(meta["origin"], str(rd.resolve()))
+        self.assertEqual([i["slot"] for i in meta["items"]], ["run"])
+        # 48h retention, persisted on disk so a restart still knows
+        self.assertEqual(
+            round((conductor._iso_ts(meta["expires_at"])
+                   - conductor._iso_ts(meta["deleted_at"])) / 3600), 48)
+        # hidden from normal listings, visible in trash
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        self.assertEqual(d["runs"], [])
+        self.assertEqual(d["trash_count"], 1)
+        entries = conductor.list_trash(self.trash, self.requests)
+        self.assertEqual([e["id"] for e in entries], [out["trash_id"]])
+        self.assertGreater(entries[0]["expires_in_s"], 0)
+        # audit trail survives the record's own disappearance
+        log = (self.trash / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn("trash_add", log)
+
+    def test_restore_run_returns_the_record_byte_for_byte(self):
+        rd = self._ended_run("20260101-000000-t")
+        out = conductor.delete_run(rd.name, {"confirm": True}, self.runs,
+                                   trash_dir=self.trash)
+        res = conductor.restore_trash(out["trash_id"], self.trash,
+                                      self.runs, self.requests,
+                                      self.manifests)
+        self.assertEqual(res["restored_as"], rd.name)
+        self.assertFalse(res["renamed"])
+        self.assertTrue((rd / "state.json").is_file())
+        self.assertTrue((rd / "prompts" / "a.md").is_file())
+        st = json.loads((rd / "state.json").read_text())
+        self.assertEqual(st["steps"]["a"]["stdout_log"],
+                         str(rd / "a.stdout.log"))
+        events = (rd / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn("run_restored", events)
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        self.assertEqual([r["run"] for r in d["runs"]], [rd.name])
+        self.assertEqual(d["trash_count"], 0)
+
+    def test_restore_run_name_collision_renames_without_overwriting(self):
+        rd = self._ended_run("20260101-000000-t")
+        out = conductor.delete_run(rd.name, {"confirm": True}, self.runs,
+                                   trash_dir=self.trash)
+        # newer work took the name while the old record sat in trash
+        newer = self._ended_run(rd.name, 0)
+        (newer / "state.json").write_text(
+            json.dumps({"run": rd.name, "steps": {}}), encoding="utf-8")
+        res = conductor.restore_trash(out["trash_id"], self.trash,
+                                      self.runs, self.requests,
+                                      self.manifests)
+        self.assertTrue(res["renamed"])
+        self.assertEqual(res["restored_as"], rd.name + "-restored")
+        # the newer run is untouched, the restored dir's self-paths moved
+        self.assertEqual(json.loads((newer / "state.json").read_text())
+                         ["steps"], {})
+        restored = self.runs / res["restored_as"]
+        st = json.loads((restored / "state.json").read_text())
+        self.assertEqual(st["run_dir"], str(restored))
+        self.assertEqual(st["steps"]["a"]["stdout_log"],
+                         str(restored / "a.stdout.log"))
+
+    def test_delete_run_refuses_watched_trash_destination(self):
+        """A live self-hosted worker watching the sandbox covers runs/ AND
+        trash/ - the move would write into its cwd, so 409 (trap 5)."""
+        self._ended_run("20260101-000000-t")
+        watcher = self.runs / "20260102-000000-live"
+        watcher.mkdir(parents=True)
+        (watcher / "state.json").write_text(json.dumps({"steps": {
+            "live": {"status": "running",
+                     "started_at": conductor.now_iso(), "timeout_min": 60,
+                     "work_dir": str(self.base)}}}))
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.delete_run("20260101-000000-t", {"confirm": True},
+                                 self.runs, trash_dir=self.trash)
+        self.assertEqual(e.exception.status, 409)
+        self.assertTrue((self.runs / "20260101-000000-t").is_dir())
+
+    def test_live_step_and_active_merge_still_refuse(self):
+        rd = self._ended_run("20260101-000000-t")
+        st = json.loads((rd / "state.json").read_text())
+        st["steps"]["a"]["status"] = "running"
+        st["steps"]["a"]["started_at"] = conductor.now_iso()
+        (rd / "state.json").write_text(json.dumps(st))
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.delete_run(rd.name, {"confirm": True}, self.runs,
+                                 trash_dir=self.trash)
+        self.assertEqual(e.exception.status, 409)
+        with conductor._MERGE_LOCK:
+            conductor._MERGE_BUSY.add(rd.name)
+        try:
+            st["steps"]["a"]["status"] = "done"
+            (rd / "state.json").write_text(json.dumps(st))
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.delete_run(rd.name, {"confirm": True}, self.runs,
+                                     trash_dir=self.trash)
+            self.assertEqual(e.exception.status, 409)
+        finally:
+            conductor._MERGE_BUSY.discard(rd.name)
+        self.assertTrue(rd.is_dir())
+
+    # ---- request trash --------------------------------------------------
+    def test_discard_moves_the_whole_bundle_and_restores_it(self):
+        rec = self._ready()
+        rid = rec["id"]
+        manifest = Path(rec["manifest"])
+        # side artifacts a planner pass leaves behind
+        (self.requests / f"{rid}.gen.log").write_text("planner log\n")
+        (self.requests / f"{rid}.draft.toml").write_text("draft\n")
+        spool = conductor._spool_dir(rid)
+        spool.mkdir(parents=True)
+        (spool / "gen.log").write_text("live spool\n")
+        # the parked overlay is authoritative - distinguish it on restore
+        (spool / "request.json").write_text(
+            json.dumps({**rec, "status": "ready", "id": rid,
+                        "raw": "overlay wins"}))
+        out = conductor.discard_request(rid, self.requests,
+                                        self.manifests, self.runs,
+                                        self.trash)
+        self.assertTrue(out["trashed"])
+        self.assertFalse((self.requests / f"{rid}.json").exists())
+        self.assertFalse(manifest.exists())
+        self.assertFalse(spool.exists())
+        self.assertFalse((self.requests / f"{rid}.gen.log").exists())
+        meta = self._entry_meta(out["trash_id"])
+        self.assertEqual(meta["kind"], "request")
+        slots = {i["slot"] for i in meta["items"]}
+        self.assertEqual(slots, {"record", "manifest", "artifact", "spool"})
+        # the record payload is the parked overlay, not the stale shadow
+        payload = self.trash / out["trash_id"] / "payload"
+        recp = next(payload.glob("*-record"))
+        self.assertEqual(json.loads(recp.read_text())["raw"],
+                         "overlay wins")
+        self.assertTrue((payload / f"{meta['items'][0]['payload']}" /
+                         "gen.log").is_file())
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        self.assertEqual(d["runs"], [])
+        self.assertEqual(d["trash_count"], 1)
+        res = conductor.restore_trash(out["trash_id"], self.trash,
+                                      self.runs, self.requests,
+                                      self.manifests)
+        self.assertEqual(res["restored"], rid)
+        det = conductor.request_details(rid, self.requests,
+                                        self.manifests)
+        self.assertEqual(det["status"], "ready")
+        self.assertEqual(det["manifest_text"], self._proposal())
+        self.assertEqual(det["proposed_steps"],
+                         rec["proposed_steps"])
+        self.assertTrue(spool.is_dir())          # parked spool restored
+        self.assertTrue((self.requests / f"{rid}.gen.log").is_file())
+        self.assertTrue((self.requests / f"{rid}.draft.toml").is_file())
+
+    def test_discard_preserves_attachments_and_followup_flag(self):
+        att = self.base / "attachments" / "shot.png"
+        att.parent.mkdir(parents=True)
+        att.write_bytes(b"\x89PNG")
+        rec = self._ready(attachments=[{"name": "shot.png",
+                                      "path": str(att)}], followup=True)
+        manifest = Path(rec["manifest"])
+        self.assertIn("follow-up-plan", manifest.read_text())
+        out = conductor.discard_request(rec["id"], self.requests,
+                                        self.manifests, self.runs,
+                                        self.trash)
+        conductor.restore_trash(out["trash_id"], self.trash, self.runs,
+                                self.requests, self.manifests)
+        det = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(det["attachments"],
+                         [{"name": "shot.png", "path": str(att)}])
+        self.assertTrue(det["followup"])
+        self.assertIn("follow-up-plan", det["manifest_text"])
+        self.assertTrue(att.is_file())      # shared file never moved
+
+    def test_manifest_collision_restores_beside_newer_work(self):
+        rec = self._ready()
+        old_manifest = Path(rec["manifest"])
+        out = conductor.discard_request(rec["id"], self.requests,
+                                        self.manifests, self.runs,
+                                        self.trash)
+        # a republish wrote a newer file at the same name
+        old_manifest.write_text("[run]\nname = \"newer\"\n")
+        res = conductor.restore_trash(out["trash_id"], self.trash,
+                                      self.runs, self.requests,
+                                      self.manifests)
+        self.assertEqual(res["restored"], rec["id"])
+        self.assertEqual(old_manifest.read_text(),
+                         "[run]\nname = \"newer\"\n")
+        restored = conductor._read_request_file(rec["id"], self.requests)
+        self.assertTrue(Path(restored["manifest"]).name.startswith(
+            f"{rec['id']}-"))
+        self.assertIn("-restored", restored["manifest"])
+        self.assertIn("catalog-cleanup",
+                      Path(restored["manifest"]).read_text())
+
+    def test_occupied_request_record_refuses_the_whole_restore(self):
+        rec = self._ready()
+        out = conductor.discard_request(rec["id"], self.requests,
+                                        self.manifests, self.runs,
+                                        self.trash)
+        (self.requests / f"{rec['id']}.json").write_text(
+            json.dumps({"id": rec["id"], "status": "draft"}))
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.restore_trash(out["trash_id"], self.trash,
+                                    self.runs, self.requests,
+                                    self.manifests)
+        self.assertEqual(e.exception.status, 409)
+        # nothing moved - the entry is intact for a retry
+        self.assertEqual(len(conductor.list_trash(self.trash,
+                                                  self.requests)), 1)
+        self.assertTrue((self.trash / out["trash_id"]).is_dir())
+
+    # ---- expiry / sweep ---------------------------------------------------
+    def test_expired_entries_purge_on_a_controllable_clock(self):
+        rd = self._ended_run("20260101-000000-t")
+        out = conductor.delete_run(rd.name, {"confirm": True}, self.runs,
+                                   trash_dir=self.trash)
+        meta = self._entry_meta(out["trash_id"])
+        exp_ts = conductor._iso_ts(meta["expires_at"])
+        self.assertIsNotNone(exp_ts)
+        t = time.time()
+        # not yet expired -> kept
+        self.assertEqual(conductor.sweep_trash(
+            self.trash, self.requests, self.runs, now=t), [])
+        self.assertTrue((self.trash / out["trash_id"]).is_dir())
+        # past expiry -> purged, payload gone for real this time
+        lines = conductor.sweep_trash(
+            self.trash, self.requests, self.runs,
+            now=exp_ts + 1)
+        self.assertEqual(len(lines), 1)
+        self.assertIn(out["trash_id"], lines[0])
+        self.assertFalse((self.trash / out["trash_id"]).exists())
+        self.assertIn("trash_purge", (self.trash / "events.jsonl")
+                      .read_text(encoding="utf-8"))
+
+    def test_sweep_is_bounded_and_skips_unexpired_and_inflight(self):
+        ids = []
+        for i in range(3):
+            rd = self._ended_run(f"2026010{i + 1}-000000-t{i}")
+            ids.append(conductor.delete_run(
+                rd.name, {"confirm": True}, self.runs,
+                trash_dir=self.trash)["trash_id"])
+        fresh = self._ended_run("20260110-000000-fresh")
+        fresh_id = conductor.delete_run(
+            fresh.name, {"confirm": True}, self.runs,
+            trash_dir=self.trash)["trash_id"]
+        # an entry with no meta yet is an in-flight move, never purged
+        inflight = self.trash / "20260101-000000-ffffff"
+        (inflight / "payload").mkdir(parents=True)
+        # age the first three entries' expiries into the past
+        for eid in ids:
+            mp = self.trash / eid / "meta.json"
+            meta = json.loads(mp.read_text())
+            meta["expires_at"] = (conductor.dt.datetime.now()
+                                  - conductor.dt.timedelta(hours=1)
+                                  ).isoformat(timespec="seconds")
+            mp.write_text(json.dumps(meta))
+        lines = conductor.sweep_trash(self.trash, self.requests,
+                                      self.runs, limit=2)
+        self.assertEqual(len(lines), 2)
+        left = {d.name for d in self.trash.iterdir() if d.is_dir()}
+        self.assertEqual(len(left & set(ids)), 1)       # cap held
+        self.assertIn(fresh_id, left)
+        self.assertIn("20260101-000000-ffffff", left)
+        lines = conductor.sweep_trash(self.trash, self.requests,
+                                      self.runs, limit=64)
+        self.assertEqual(len(lines), 1)
+        self.assertIn(fresh_id, {d.name for d in self.trash.iterdir()
+                                 if d.is_dir()})
+
+    def test_sweep_folds_into_sweep_runs(self):
+        rd = self._ended_run("20260101-000000-t")
+        out = conductor.delete_run(rd.name, {"confirm": True}, self.runs,
+                                   trash_dir=self.trash)
+        mp = self.trash / out["trash_id"] / "meta.json"
+        meta = json.loads(mp.read_text())
+        meta["expires_at"] = "2020-01-01T00:00:00"
+        mp.write_text(json.dumps(meta))
+        lines = conductor.sweep_runs(self.runs)
+        self.assertTrue(any("purged" in l for l in lines))
+        self.assertFalse((self.trash / out["trash_id"]).exists())
+
+    def test_sweep_dry_runs_while_the_data_tree_is_watched(self):
+        rd = self._ended_run("20260101-000000-t")
+        out = conductor.delete_run(rd.name, {"confirm": True}, self.runs,
+                                   trash_dir=self.trash)
+        mp = self.trash / out["trash_id"] / "meta.json"
+        meta = json.loads(mp.read_text())
+        meta["expires_at"] = "2020-01-01T00:00:00"
+        mp.write_text(json.dumps(meta))
+        watcher = self.runs / "20260102-000000-live"
+        watcher.mkdir(parents=True)
+        (watcher / "state.json").write_text(json.dumps({"steps": {
+            "live": {"status": "running",
+                     "started_at": conductor.now_iso(), "timeout_min": 60,
+                     "work_dir": str(self.base)}}}))
+        lines = conductor.sweep_trash(self.trash, self.requests, self.runs)
+        self.assertTrue(any(l.startswith("DRY-RUN") for l in lines))
+        self.assertTrue((self.trash / out["trash_id"]).is_dir())
+
+    # ---- empty trash -----------------------------------------------------
+    def test_empty_trash_requires_confirm_and_is_final(self):
+        rd = self._ended_run("20260101-000000-t")
+        out = conductor.delete_run(rd.name, {"confirm": True}, self.runs,
+                                   trash_dir=self.trash)
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.empty_trash({}, self.trash, self.requests,
+                                  self.runs)
+        self.assertEqual(e.exception.status, 400)
+        self.assertTrue((self.trash / out["trash_id"]).is_dir())
+        res = conductor.empty_trash({"confirm": True}, self.trash,
+                                    self.requests, self.runs)
+        self.assertEqual(res["emptied"], 1)
+        self.assertFalse((self.trash / out["trash_id"]).exists())
+        # a restored-after-empty id 404s - nothing recoverable remains
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.restore_trash(out["trash_id"], self.trash,
+                                    self.runs, self.requests,
+                                    self.manifests)
+        self.assertEqual(e.exception.status, 404)
+        self.assertIn("trash_empty", (self.trash / "events.jsonl")
+                      .read_text(encoding="utf-8"))
+
+    # ---- legacy tombstones -----------------------------------------------
+    def _legacy_discard(self, hours_ago=1):
+        rec = self._ready()
+        manifest = Path(rec["manifest"])
+        manifest.unlink()
+        rec.update(status="discarded", proposed_steps=[], manifest=None)
+        conductor._save_request(rec, self.requests)
+        return rec
+
+    def test_legacy_discards_list_restore_and_expire(self):
+        rec = self._legacy_discard()
+        entries = conductor.list_trash(self.trash, self.requests)
+        self.assertEqual([e["id"] for e in entries],
+                         [f"legacy-{rec['id']}"])
+        self.assertTrue(entries[0]["legacy"])
+        res = conductor.restore_trash(f"legacy-{rec['id']}", self.trash,
+                                      self.runs, self.requests,
+                                      self.manifests)
+        self.assertEqual(res["restored"], rec["id"])
+        self.assertEqual(conductor.request_details(
+            rec["id"], self.requests, self.manifests)["status"], "draft")
+        # expiry is measured from the recorded deletion (updated_at)
+        rec = self._legacy_discard()
+        lines = conductor.sweep_trash(self.trash, self.requests,
+                                    self.runs,
+                                    now=time.time() +
+                                    conductor.TRASH_RETAIN_S + 10)
+        self.assertTrue(any(f"legacy-{rec['id']}" in l for l in lines))
+        self.assertFalse((self.requests / f"{rec['id']}.json").exists())
+
+    # ---- partial failure / path validation --------------------------------
+    def test_partial_restore_failure_keeps_the_remaining_items(self):
+        rec = self._ready()
+        (self.requests / f"{rec['id']}.gen.log").write_text("log\n")
+        out = conductor.discard_request(rec["id"], self.requests,
+                                        self.manifests, self.runs,
+                                        self.trash)
+        # make every requests/ destination unwritable: the dir is a file
+        self.requests.rename(self.base / "requests-away")
+        (self.requests).write_text("blocked")
+        try:
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.restore_trash(out["trash_id"], self.trash,
+                                        self.runs, self.requests,
+                                        self.manifests)
+            self.assertIn("partial", str(e.exception))
+        finally:
+            self.requests.unlink()
+            (self.base / "requests-away").rename(self.requests)
+        # the entry kept ONLY what failed - restore retries cleanly
+        meta = self._entry_meta(out["trash_id"])
+        self.assertTrue(any(i["slot"] == "record" for i in meta["items"]))
+        res = conductor.restore_trash(out["trash_id"], self.trash,
+                                      self.runs, self.requests,
+                                      self.manifests)
+        self.assertEqual(res["restored"], rec["id"])
+        self.assertTrue((self.requests / f"{rec['id']}.gen.log")
+                        .is_file())
+
+    def test_a_crafted_meta_cannot_escape_the_managed_roots(self):
+        rec = self._ready()
+        out = conductor.discard_request(rec["id"], self.requests,
+                                        self.manifests, self.runs,
+                                        self.trash)
+        entry = self.trash / out["trash_id"]
+        mp = entry / "meta.json"
+        meta = json.loads(mp.read_text())
+        # A real payload whose recorded destination escapes its root...
+        (entry / "payload" / "99-evil").write_text("x")
+        meta["items"].append({"slot": "artifact", "payload": "99-evil",
+                              "dest": "requests", "name": "../evil.json",
+                              "dir": False})
+        mp.write_text(json.dumps(meta))
+        with self.assertRaises(conductor.RequestError):
+            conductor.restore_trash(out["trash_id"], self.trash,
+                                    self.runs, self.requests,
+                                    self.manifests)
+        # ...and a payload path that escapes payload/ itself - both are
+        # refused BEFORE anything moves
+        meta["items"][-1] = {"slot": "artifact", "payload": "../state.json",
+                             "dest": "requests", "name": "safe.json",
+                             "dir": False}
+        mp.write_text(json.dumps(meta))
+        with self.assertRaises(conductor.RequestError):
+            conductor.restore_trash(out["trash_id"], self.trash,
+                                    self.runs, self.requests,
+                                    self.manifests)
+        meta["items"].pop()
+        mp.write_text(json.dumps(meta))
+        self.assertFalse((self.base / "evil.json").exists())
+        self.assertFalse((self.base / "safe.json").exists())
+        self.assertTrue((entry / "meta.json").is_file())
+        # un-poison the entry -> it restores normally
+        res = conductor.restore_trash(out["trash_id"], self.trash,
+                                      self.runs, self.requests,
+                                      self.manifests)
+        self.assertEqual(res["restored"], rec["id"])
+        # and a non-regex entry id never reaches the filesystem
+        with self.assertRaises(conductor.RequestError) as e:
+            conductor.restore_trash("../runs", self.trash, self.runs,
+                                    self.requests, self.manifests)
+        self.assertEqual(e.exception.status, 404)
+
+    # ---- dashboard surface -------------------------------------------------
+    def test_state_carries_trash_fields_and_the_view_list(self):
+        rd = self._ended_run("20260101-000000-t")
+        out = conductor.delete_run(rd.name, {"confirm": True}, self.runs,
+                                   trash_dir=self.trash)
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        self.assertEqual(d["trash_count"], 1)
+        self.assertEqual(d["trash_ids"], [out["trash_id"]])
+        self.assertIsNone(d["trash"])
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests, include_trash=True)
+        self.assertEqual([e["id"] for e in d["trash"]],
+                         [out["trash_id"]])
+        self.assertIn("expires_in_s", d["trash"][0])
+
+    def test_dashboard_html_surfaces_trash_and_undo(self):
+        html = conductor._DASH_HTML
+        for marker in ('data-trash', 'data-undo-trash', 'data-restore-trash',
+                       'data-empty-trash', 'id="undobar"', 'id="trashwrap"',
+                       'Empty trash', 'Undo', 'trash_count'):
+            self.assertIn(marker, html)
+
+    def test_http_trash_routes(self):
+        handler = conductor.make_dashboard_handler(
+            self.runs, ["no-such-devin"], self.requests, self.manifests,
+            trash_dir=self.trash)
+        server = conductor.http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_port
+
+        def call(method, path, data=None):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request(method, path,
+                         json.dumps(data).encode("utf-8")
+                         if data is not None else None,
+                         {"Content-Type": "application/json",
+                          "Origin": f"http://127.0.0.1:{port}"})
+            res = conn.getresponse()
+            payload = json.loads(res.read().decode("utf-8"))
+            conn.close()
+            return res.status, payload
+
+        rd = self._ended_run("20260101-000000-t")
+        status, out = call("POST", f"/api/runs/{rd.name}/delete",
+                           {"confirm": True})
+        self.assertEqual(status, 200)
+        trash_id = out["trash_id"]
+        status, d = call("GET", "/api/state?trash=1")
+        self.assertEqual([e["id"] for e in d["trash"]], [trash_id])
+        self.assertEqual(d["trash_count"], 1)
+        status, out = call("POST", f"/api/trash/{trash_id}/restore", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(out["restored_as"], rd.name)
+        status, out = call("POST", "/api/trash/empty", {})
+        self.assertEqual(status, 400)
+        status, out = call("POST", f"/api/trash/{trash_id}/restore", {})
+        self.assertEqual(status, 404)
+        call("POST", f"/api/runs/{rd.name}/delete", {"confirm": True})
+        status, out = call("POST", "/api/trash/empty", {"confirm": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(out["emptied"], 1)
+        self.assertEqual(call("GET", "/api/state?trash=1")[1]["trash"], [])
 
 
 class PurposeMarkerTests(unittest.TestCase):
