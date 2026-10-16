@@ -20,6 +20,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 7 | Planner 'ask me questions' checkbox: questionnaire modal before manifest, answers feed a refine pass | done | planner-questions/ | 193/193 mock tests + demo green; live planner not dispatched |
 | 8 | Stop proposal during preparation: stopgen sentinel + _GEN_PROCS kill + per-attempt gen_id scoping, restores draft/ready | done | stop-proposal-preparation/ | 216/216 mock tests + demo + real-proc smoke green |
 | 9 | Retain the create-proposal session as step-0 preparation history on the plan's task list | done | retain-proposal-session/ | 221/221 mock tests + demo green; plan_sessions + plan_gen_id persisted per attempt |
+| 10 | Verify the three proposal-flow changes together (stop / retain-session / compact labels) in the merged state | done | verify-proposal-flow/ | both parked branches merged, 4 integration regressions fixed (same-second publish race, stale overlay, drain records, chip wrap); 232/232 + demo + live probe green |
 
 ## Not yet filed as tasks
 

@@ -69,6 +69,13 @@ work.
 
 Done: 221/221 mock tests + demo green. Wave can merge.
 
+UPDATE 2026-10-16 (verify-proposal-flow): merged into the verify branch
+as 1c1f1d5. The semantic merge moved attempt recording onto the spool
+architecture (records land on the overlay for publish/questions/failed,
+on the restored file record for stopped; `_publish_from_spool` owns
+`plan_gen_id` + `gen_sids`). Drain-recovered generations record attempts
+too. 232/232 green in the merged state.
+
 ## Deferred or blocked
 
 - Live session-id attribution while `generating` (post-wait capture only;

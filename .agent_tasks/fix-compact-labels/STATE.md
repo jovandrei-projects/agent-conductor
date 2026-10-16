@@ -98,3 +98,14 @@ for the owner: gate the publish on the on-disk record, e.g. file
 Implemented + verified in this worktree; committed locally (see git
 log), pending the run's merge/verify step. Serve process on :8791 was
 killed before finishing.
+
+UPDATE 2026-10-16 (verify-proposal-flow): merged into the verify branch
+as c3e19b4. The two StopProposalTests failures diagnosed above were the
+same-second `updated_at` publish race - fixed there via
+`generation_stopped_at` + `st_mtime_ns` in `_disk_untouched`, plus
+`stop_generation` deleting the stopped attempt's overlay. One residual
+clip found in the merged probe: a SECOND `.stage` chip on the
+`td.wrap`-nowrap line still clipped at the td edge (max-width caps the
+first chip only) - fixed by `white-space:normal` on `.rlabels` (chips
+wrap to their own line) + `.genline` inline-block. 232/232 + live
+Playwright probe at 1400/900/700px in both densities green.
