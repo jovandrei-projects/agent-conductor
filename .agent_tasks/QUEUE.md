@@ -783,3 +783,27 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   notes inside the file: verify-timeout duplicates the still-unlaunched
   ux-controls-followup item; the flake step is scoped to this run's two
   observed failures vs proposal-ui-fixes-followup's _flag_soon family.
+- DONE 2026-10-16 (integration-regressions, closing step of run
+  20261016-013719-workflow-ux-safety): verified the landed wave together
+  on isolated instances + synthetic runs - `python run_tests.py` 423
+  green, mock demo green, Playwright probe 60/60 (task modal prev/next
+  + Back chain across task/summary/request, full trajectory + Expand
+  all + per-entry Copy, ctx-menu items + disabled-Delete + Esc +
+  native-menu preserved on editables, request dirty pend-note
+  show/revert, image picker + thumbnail + remove, Regenerate confirm
+  naming unsaved TOML edits, model combobox groups, Interrupt+instruct
+  composer + sentinel POST carrying instructions+attachment, trash
+  table + restore), deferred-merge e2e 22/22 (sequential baseline FF,
+  non-main recorded target, staged atomic merge, conflict keep-pending),
+  gen-during-merge e2e 10/10 (planner spools through an open MERGE_HEAD,
+  publishes at merge end). ONE real regression fixed: the composer's
+  attach-strip lacked `id="d-instr-attach"` so `renderIntrAttach()`
+  never repainted - composer attachments uploaded invisibly and were
+  unremovable; id added + regression assert in InterruptInstructTests.
+  Probe lessons recorded in STATE.md (row-key collision request:<id> vs
+  launched run, exact .run-name selectors, <details> manifest textarea,
+  dialog accept/dismiss mode). Three parked branches confirmed
+  unlanded-by-design pending_merges: isolate-worktree-services,
+  project-merge-targets, deferred-merge-controls. mobile_device.py
+  post-tap stale-dump can false-timeout - bounded + fail-safe, left as
+  documented limitation.

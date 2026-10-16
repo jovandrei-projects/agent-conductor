@@ -7324,6 +7324,9 @@ const KEY='/runs/live|live-step';
     preventDefault:()=>{}});
   assert.match(body(),/id="d-instr"/);
   assert.match(body(),/Interrupt \+ resume/);
+  // the attach strip carries the id renderIntrAttach() repaints - without
+  // it picked images upload but never display and can't be removed
+  assert.match(body(),/id="d-instr-attach"/);
   posts.length=0;
   // Cancel is a pure view change: the section closes, still no POST
   await handlers.click({target:btn({intrCancel:''}),
