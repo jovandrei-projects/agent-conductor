@@ -21,6 +21,16 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (fix-regenerate-label): clicking Regenerate on a stale
+  proposal showed 'Preparing proposal...' AND 'Needs review' at once -
+  `stale` is only cleared by `_publish_proposal` on success, so it
+  outlives the whole planning pass. Both stale surfaces (the runs-table
+  chip and the modal's 'Request fields changed' nag) now gate on the
+  stage not being `generating`/`questions`: the in-flight planning chip
+  owns the row while the planner runs, and 'Needs review' returns if
+  generation fails or the proposal still mismatches once planning stops.
+  The `stale` flag itself is untouched - it still gates launch. 210/210
+  mock tests green.
 - DONE 2026-10-15 (follow-up-plan, closing step of run
   20261015-182057-ux-controls): reviewed the run - 6/8 steps merged
   clean; `image-attachments` + `task-modal-navigation` were done work

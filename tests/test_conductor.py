@@ -2857,6 +2857,70 @@ const btn={dataset:{runDetails:'/paused'}}, btn2={dataset:{runDetails:'/healed'}
         self.assertEqual(p.returncode, 0, p.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_regenerating_proposal_shows_planning_not_needs_review(self):
+        """Regression: 'stale' survives a Regenerate click until the new
+        proposal publishes - a mid-planning row must wear only the
+        'Preparing proposal' chip, not 'Needs review' on top of it (the
+        flag means something again only once planning stops)."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,textContent:''}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  addEventListener:(event,handler)=>{handlers[event]=handler;}};
+const reqs={
+  regen:{id:'regen',status:'generating',run:'regen-run',label:'regen',raw:'r',
+    project:'p',model:'swe-2',effort:'max',manifest:'manifests/m.toml',
+    manifest_text:'[run]',stale:true,
+    proposed_steps:[{step:'s',slug:'p',model:'m',effort:'e',task:'t'}],
+    generation_started_at:'2026-10-14T00:00:00'},
+  parked:{id:'parked',status:'questions',run:'parked-run',label:'parked',
+    raw:'r',project:'p',model:'swe-2',effort:'max',manifest:'manifests/m.toml',
+    manifest_text:'[run]',stale:true,
+    pending_questions:[{qid:'q1',header:'Scope',question:'pick one'}],
+    proposed_steps:[{step:'s',slug:'p',model:'m',effort:'e',task:'t'}]},
+  review:{id:'review',status:'ready',run:'review-run',label:'review',raw:'r',
+    project:'p',model:'swe-2',effort:'max',manifest:'manifests/m.toml',
+    manifest_text:'[run]',stale:true,
+    proposed_steps:[{step:'s',slug:'p',model:'m',effort:'e',task:'t'}]}};
+const fetch=async path=>({ok:true,json:async()=>reqs[path.split('/').pop()]});
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{},fetch});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-14T00:00:00',agents:[],runs:[
+  {run:'regen-run',key:'request:regen',request_id:'regen',stage:'generating',
+   stale:true,counts:{planned:1}},
+  {run:'parked-run',key:'request:parked',request_id:'parked',stage:'questions',
+   stale:true,counts:{planned:1}},
+  {run:'review-run',key:'request:review',request_id:'review',stage:'ready',
+   stale:true,counts:{planned:1}},
+  {run:'failed-run',key:'request:failed',request_id:'failed',stage:'error',
+   stale:true,counts:{planned:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const rows=elem('runs').innerHTML.split('runrow');
+const row=name=>rows.find(r=>r.includes('>'+name+'<'));
+assert.match(row('regen-run'),/Preparing proposal/);
+assert.doesNotMatch(row('regen-run'),/Needs review/);
+assert.match(row('parked-run'),/Needs your answers/);
+assert.doesNotMatch(row('parked-run'),/Needs review/);
+assert.match(row('review-run'),/Needs review/);   // stale + ready: awaiting review
+assert.match(row('failed-run'),/Needs review/);   // planning failed, stale stays
+(async()=>{
+  await vm.runInContext('openRequest("regen")',ctx);
+  assert.match(elem('dbody').innerHTML,/Planning in progress/);
+  assert.doesNotMatch(elem('dbody').innerHTML,/Request fields changed/);
+  await vm.runInContext('openRequest("review")',ctx);
+  assert.match(elem('dbody').innerHTML,/Request fields changed/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_task_modal_prev_next_pipeline_nav(self):
         """The task modal's sticky bar walks the run's pipeline (`seq` =
         manifest order, not the time-sorted table): prev/next buttons

@@ -5953,7 +5953,10 @@ function showRequestForm(rec){
       `Starting the run requires a separate, explicit click. Generated TOML ` +
       `is a tracked file: review it before sharing.</div>` +
     (rec.error ? `<div class="notice error">${esc(rec.error)}</div>`:'') +
-    (rec.stale ? `<div class="notice warn">Request fields changed since ` +
+    // no 'fields changed' nag while planning is in flight - the change is
+    // being regenerated/answered already
+    (rec.stale && stage!=='generating' && stage!=='questions'
+      ? `<div class="notice warn">Request fields changed since ` +
       `the proposal. Regenerate tasks, or use <b>Apply options to TOML</b> ` +
       `to write the model/effort/attempts/failure/worktree options into ` +
       `the manifest without regenerating (request text and project ` +
@@ -6480,7 +6483,11 @@ function render(d){
           `files stay on disk">archived</span>` : '') +
         runStateChip(r) + `<br>` +
         `<span class="sub">${esc(base(r.dir))}</span>`) +
-      (r.stale?` <span class="stage error">Needs review</span>`:'') +
+      // stale survives until _publish_proposal clears it, so mid-planning
+      // stages would double-label the row ('Preparing proposal' + 'Needs
+      // review'); the flag only means something once planning has stopped
+      (r.stale && r.stage!=='generating' && r.stage!=='questions'
+        ? ` <span class="stage error">Needs review</span>`:'') +
       `</td>` +
       `<td class="wrap">${r.description?esc(r.description):
         r.stage?'<span class="sub">Awaiting proposal</span>':'-'}</td>` +
