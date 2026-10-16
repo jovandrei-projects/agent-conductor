@@ -1,4 +1,4 @@
-# Task queue
+﻿# Task queue
 
 The master ordered list. One line per task. This answers "what next"; the
 task's own `STATE.md` answers "where in it".
@@ -15,7 +15,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 2 | Pre-live hygiene: liveness probe, lost/sweep, sessions cleanup, cloud marks | done | hygiene/ | os.kill probe bug found + fixed (was killing live workers) |
 | 3 | Dashboard favicon: baton-over-orchestra glyph | done | favicon/ | second dispatch; first was eaten by trap-10 commit swallow |
 | 4 | Worktree merge matrix: exhaustive tests + merge_resolver + lab fixtures | done | wt-matrix/ | landed on dev/merge-tests (commits 5ba30c4, 7f7dcd9); live lab run 21/21, 8 real conflicts resolved |
-| 5 | Dashboard request drafts + proposal review/start, run filters/token help, silent Windows probes | done | — | 98/98 mock tests + demo green; live planner not dispatched |
+| 5 | Dashboard request drafts + proposal review/start, run filters/token help, silent Windows probes | done | â€” | 98/98 mock tests + demo green; live planner not dispatched |
 | 6 | Task prompt editing: pre-dispatch Edit prompt, resume notes for ran steps, full prompt text in modal | done | task-prompt-editing/ | 172/172 mock tests + demo green; prompt-/rnote- sentinels survive resume |
 | 7 | Planner 'ask me questions' checkbox: questionnaire modal before manifest, answers feed a refine pass | done | planner-questions/ | 193/193 mock tests + demo green; live planner not dispatched |
 | 8 | Stop proposal during preparation: stopgen sentinel + _GEN_PROCS kill + per-attempt gen_id scoping, restores draft/ready | done | stop-proposal-preparation/ | 216/216 mock tests + demo + real-proc smoke green |
@@ -258,7 +258,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   `?raw=1` markdown and the standalone page are unchanged, so direct URLs
   stay usable). The in-modal view gets the same `.dnav` chrome as the task
   nav - sibling-named arrows + `task N of M`, disabled at the pipeline
-  ends, ArrowLeft/Right shared - and an 'Open as page ↗' escape hatch.
+  ends, ArrowLeft/Right shared - and an 'Open as page â†—' escape hatch.
   New `modalHist` Back stack: task -> request/runbook and request -> run
   details push the view they leave ({kind,key|id,scroll}); Back restores
   the exact task/request/run incl. scroll offset, skipping entries whose
@@ -514,9 +514,9 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   record (confirm + live/resume/merge guards); spawned devin sessions
   become trap-13-style manual cleanup. 182/182 mock tests + demo green.
 - DONE 2026-10-15 (steps-counters-clarity): run/agent token counters
-  name themselves - `fmtT` renders `in X · out Y · cached Z · N turns`
+  name themselves - `fmtT` renders `in X Â· out Y Â· cached Z Â· N turns`
   (cached always shown; turns = LLM steps, not manifest steps) instead
-  of `X/Y+Zc ·Nst`; run rows read `planner:`/`steps:`; `steps` column
+  of `X/Y+Zc Â·Nst`; run rows read `planner:`/`steps:`; `steps` column
   header + tooltips + the `?` explainer use the same words.
 - DONE 2026-10-15 (run-control-taxonomy): one name per lifecycle
   action. `Pause run` is now the graceful hold (in-flight steps finish,
@@ -658,3 +658,44 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   cell. 2 new TaskTableNavTests (click targets, keyboard, filtering,
   nav, highlight lifecycle) + test_modal_edit_form_locks updated for
   the new entry point; 322/322 + demo green.
+- DONE 2026-10-16 (emulator-resource-ownership, wave step of run
+  20261016-013719-workflow-ux-safety): Android devices were entirely
+  worker-side prompt business - workers hardcoded `adb -s emulator-5554`,
+  switched to the physical handset ad hoc, and one step's cleanup ran
+  `emu kill` on a serial a sibling could have been using (evidence in
+  20261014-235630-apartment-play-edit artifacts; mobile steps also
+  overlapped across runs 20261014/20261016 by wall clock). Now a
+  `[[step]] device = ...` ("any"|"emulator"|"physical"|exact serial;
+  `true` = any; inherited from [defaults] or the project's
+  `projects.toml` entry like `verify`; device+cloud is a manifest
+  error) leases ONE adb serial machine-wide in
+  `%TEMP%/agent-conductor-devices/` for the step's whole life -
+  attempts, interrupt respawns and the verify gate get
+  `ANDROID_SERIAL` + `CONDUCTOR_DEVICE_SERIAL` and the prompt gets a
+  device note. Lease files are O_EXCL + token + owner/worker-pid
+  liveness (merge-lock shape; owner_started_at is the owner's own
+  process-creation stamp so a slow interpreter start can't mark a
+  live owner dead); a fresh-but-tokenless file counts as held so an
+  O_EXCL winner's half-written lease can't be unlinked under it
+  (Windows PermissionError). Busy-but-attached queues uncapped
+  (`queued` + `device_wait`, halt sentinels honored, prompt-edit /
+  rnote / intrq re-folded after the wait); never-attached ends
+  `blocked` after `device_wait_s` (600, 0 = forever).
+  `device = "emulator"` (or `any`+`device_boot`) boots a free AVD on
+  a free even console port where the emulator binary + AVDs exist
+  (`avd-<name>` slot lease stops double-boots, `emu avd name`
+  excludes already-running images); lease `booted`+`emu_pid` makes
+  release kill exactly that instance (`emu kill` -> image-name-
+  checked taskkill) and a stale-lease break reaps a recorded orphan
+  the same way - never a user's device or someone else's emulator.
+  adb/emulator discovery: CONDUCTOR_ADB/_EMULATOR, PATH, then SDK
+  dirs. Surface: device/device_spec/device_booted/device_wait(_s)
+  on the rec, dashboard row + modal field, `[device=]` plan tag,
+  device_{wait,acquired,booted,released,blocked,reaped} events.
+  Known gap documented in AGENTS.md: the lease owns the SERIAL, not
+  the shared adb server - workers must still pick free host ports
+  for `adb forward tcp:NNNN` rather than reusing fixed ones. 14 new
+  DeviceOwnershipTests (competing projects queue, explicit serial,
+  stop-while-queued, live/stale owner recovery, booted-emu reap
+  with image-name guard, verify env, manifest validation);
+  380/380 + demo green.

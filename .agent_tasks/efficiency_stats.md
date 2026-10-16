@@ -1,4 +1,4 @@
-# Session cost
+﻿# Session cost
 
 Appended at the end of every session, by the agent, before it stops. One row
 per session. The purpose is to notice if the task workspace is costing more
@@ -77,3 +77,4 @@ accounted for.
 | agent-conductor / resolve-modal-refresh-stability (merge resolution: both-append on QUEUE.md + efficiency_stats.md + refresh()/tick() collision in conductor.py - kept branch's stateReqSeq guard but routed it through HEAD's stateUrl() so showTrash's trash=1 param survives; merge 8cb3988; 351/351 green) | n/a | n/a | n/a | n/a |
 | agent-conductor / followup-run-discovery (followup output -> persisted Ready-to-run request: followups.index sha-idempotent registration + classification (ready/empty/error/missing/absent), run_end+serve+sweep+60s-dashboard hooks, owner-dir scoping (no cross-tree imports), Discard veto + explicit import override, fold-in-place + human-edit-beats-rewrite, run-row followup chips; +15 tests, suite green) | n/a | n/a | n/a | n/a |
 | agent-conductor / resolve-followup-run-discovery (merge resolution: both-append on efficiency_stats.md only - kept HEAD's modal-refresh-stability + resolve-modal-refresh-stability rows AND the branch's followup-run-discovery row; merge 9794ec5; 366/366 green) | n/a | n/a | n/a | n/a |
+| agent-conductor / emulator-resource-ownership (evidence: workers shared adb serials ad hoc + emu kill'd a shared emulator; implemented machine-wide serial leases - explicit spec, cross-run ownership, uncapped queue on busy device, bounded block on absent, AVD boot on free port where tooling allows, ownership-scoped cleanup; ANDROID_SERIAL env to worker+verify; +14 DeviceOwnershipTests, 380/380 + demo green) | n/a | n/a | n/a | n/a |
