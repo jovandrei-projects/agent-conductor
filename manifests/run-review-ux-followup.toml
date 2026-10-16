@@ -1,0 +1,223 @@
+# Follow-up proposal drafted by the run-review-ux run's closing
+# follow-up-plan step (run dir: data/runs/20261016-100852-run-review-ux,
+# request 20261016-100358-0d289b96). Reviewed but NOT launched - a human
+# reviews this file, then `python conductor.py run` or dashboard Start run.
+#
+# Reviewed evidence: run state.json + events.jsonl, all step stdout/verify
+# logs, each merged step's QUEUE.md ledger entry, the run-review-ux STATE.md
+# + DESIGN.md carried on the integration-verification branch, and the merged
+# git state on master.
+#
+# Run outcome vs the human request (review labels/accents for finished
+# runs + tasks with reversible ack, a human-readable per-task outcome field,
+# named watcher warning, 'wt' run chip, run-name filter + step-name modal
+# target + no bare-row modal + persistent row highlight, runs-table elapsed
+# column, manual merge blocked while a run executes, modal scroll stability,
+# cumulative elapsed across resume):
+#
+#   MERGED to master mid-run, verified:
+#     task-outcome-summary     d57e9c2  OUTCOME: contract line -> rec
+#                              outcome/outcomes, modal row + result column;
+#                              STATUS/NEXT untouched.
+#     task-table-navigation    12fbe2b  step-name button opens modal,
+#                              run-name filters, bare-row catch-all gone,
+#                              .dsel highlight lifecycle.
+#     modal-refresh-stability  8cb3988  in-place repaint + landmark scroll
+#                              anchor; reproduced RESET->STABLE in real
+#                              Chromium.
+#     execution-context-labels 6b1418c  'wt'/'wt N/M' chip from configured
+#                              isolation + watcher identity in the trap-5
+#                              409 and all dry-run/refusal surfaces.
+#
+#   PARKED with completed work (recorded `failed`, none a real work
+#   failure - see below). All four worker branches are confirmed ancestors
+#   of the integration-verification branch tip 31ee57f, which union-merges
+#   them and was verified COMBINED in-worktree: 457/457 tests + demo +
+#   live serve smoke (review endpoints flip state over HTTP, run_executing
+#   predicates verified).
+#     inspect-and-design       59b3c18  docs only (DESIGN.md + STATE.md);
+#                              gate hit 1 ProposalFlowIntegrationTests
+#                              flake ('generating' != 'ready').
+#     review-workflow          8888cb7  completion_seq + review-* sentinel
+#                              persistence + /review endpoints + pill/row
+#                              accents + modal/ctx actions; 290/290 gate
+#                              GREEN; recorded failed only because the
+#                              worker exited 0 without printing STATUS:.
+#     cumulative-elapsed-time  6f1af6f  exec_intervals + rec_elapsed_s +
+#                              runs-table elapsed column; 369/369
+#                              in-worktree; gate "verify timed out after
+#                              600s".
+#     manual-merge-guard       e81d03b  run_executing predicate +
+#                              merge-<runkey> claim + resume/delete/sweep
+#                              coordination + disabled UI with reason;
+#                              in-worktree suite 434 tests w/ 2 unrelated
+#                              StepControlTests load flakes; gate timed
+#                              out 600s.
+#     integration-verification 31ee57f  the union branch itself + mojibake
+#                              repair commit; its own gate also hit the
+#                              600s cap after the worker's own 457/457 run.
+#
+# What remains (the only scope below):
+#   1. Land the parked work - one merge of integration-verification lands
+#      all four; the conductor merge verb then stamps the per-step records
+#      and collects the remaining no-op/small merges.
+#   2. The hard-coded 600s verify cap is now a GUARANTEED false-fail on
+#      this project (suite ~783s combined, still growing) - it must become
+#      configurable before any future gate means anything.
+#   3. Two gate flakes this run produced: the proposal publish/stop race
+#      test and the StepControlTests _wait_run_dir deadline under load.
+#   4. The recorded manual-check remainder: a real-browser pass over the
+#      combined dashboard (node harnesses cover DOM behavior, not paint).
+#
+# Zero-agent alternative for item 1: once no run has a live driver in this
+# repo, `python conductor.py merge data/runs/20261016-100852-run-review-ux`
+# (or the run modal's Merge pending branches) lands all pending branches in
+# manifest order with record-keeping - though one-by-one costs up to five
+# conflict rounds vs landing the union branch once.
+#
+# Overlaps with still-unlaunched sibling proposals (reconcile at review):
+#   - manifests/ux-controls-followup.toml already drafts a
+#     verify-timeout-config step (written when the suite was 300-500s;
+#     this run proved the cap is now always hit). Kept here because this
+#     manifest is self-sufficient either way - drop one before launching
+#     both.
+#   - manifests/proposal-ui-fixes-followup.toml covers the _flag_soon /
+#     queued-flag wall-clock flake family; the flake step here is scoped
+#     to the two failures THIS run's gates produced.
+#   - manifests/proposal-flow-fixes-followup.toml owns the general
+#     transitively-merged-records fix; this manifest only uses the merge
+#     verb's own stamping for THIS run's records.
+#   - run 20261016-013719-workflow-ux-safety is still LIVE at draft time
+#     (integration-regressions step running; it has 3 parked branches of
+#     its own) - its leftovers belong to its own follow-up, not here.
+#
+#   python conductor.py plan manifests\run-review-ux-followup.toml
+#   python conductor.py run  manifests\run-review-ux-followup.toml
+
+[run]
+name = "run-review-ux-followup"
+description = "Land the five parked run-review-ux branches (review marks, cumulative elapsed time, manual merge guard, design docs - already union-verified on the integration-verification branch), make the 600s verify cap configurable, harden the two gate flakes this run exposed, and do the deferred real-browser pass over the combined dashboard."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 60
+max_attempts = 3
+verify = "python run_tests.py"
+
+# Every step below carries verify = "" on purpose: the DRIVING conductor's
+# gate is still hard-capped at 600s while this suite already needs ~780s,
+# so the registered command would false-fail every step exactly like it did
+# three times in the parent run. Each step prompt requires running
+# `python run_tests.py` manually to green instead - same gate, uncapped.
+
+# ---------------------------------------------------------------------------
+# Step 1 runs in the MAIN checkout on purpose: merging parked branches into
+# the checked-out master is checkout-level work (established convention from
+# ux-controls-followup). It cannot be worktree-isolated.
+[[step]]
+name = "land-run-review-ux-branches"
+project = "agent-conductor"
+timeout_min = 90
+verify = ""
+prompt = '''
+Land the parked worktree branches of run 20261016-100852-run-review-ux onto master in THIS (main) checkout. All feature work on them is complete and was already verified by the workers - your job is the merges, the run-record bookkeeping the merge verb does, and a final combined verification, not re-doing features.
+
+Background: `conductor/20261016-100852-run-review-ux/integration-verification` (tip 31ee57f at draft time) already union-merges the other four parked branches - inspect-and-design 59b3c18, review-workflow 8888cb7, cumulative-elapsed-time 6f1af6f, manual-merge-guard e81d03b (re-confirm with `git merge-base --is-ancestor <branch> conductor/20261016-100852-run-review-ux/integration-verification`) - and carries a combined-state verification: 457/457 tests + demo green in its worktree plus a live serve smoke of the new review endpoints. Merging that ONE branch first lands everything; the per-step branches then reduce to already-up-to-date no-ops.
+
+Preflight - do NOT skip (a sibling run was still live at draft time):
+- Confirm the parent run ended: data/runs/20261016-100852-run-review-ux/state.json has no step still `running` and its driver_pid is dead.
+- Check every OTHER data/runs/*/state.json: if any has a live driver_pid or a step whose work_dir is inside this repo (run 20261016-013719-workflow-ux-safety was live at draft time), finish `blocked` and name it - a foreign driver's `git add -A` checkpoint can sweep your mid-merge tree into a stray "checkpoint" commit (documented incident), and a same-repo merge lock may already be held.
+- Require `git status` clean and the checkout on master before starting.
+
+Then:
+1. `git merge --no-edit conductor/20261016-100852-run-review-ux/integration-verification`. Expected conflicts: .agent_tasks/QUEUE.md + .agent_tasks/efficiency_stats.md (both-append bookkeeping - union them: keep every DONE line and stats row from both sides, chronological order, drop only exact-duplicate lines) and possibly conductor.py / tests hunks where master's later commits moved nearby code - resolve semantically, never by dropping a side. Afterwards `git grep -n "^<<<<<<<"` must be empty.
+2. `python conductor.py merge data/runs/20261016-100852-run-review-ux` - the supported pending-branch path stamps merged/merged_at + step_merged events and merges the rest in manifest order. The four worker branches are ancestors now; their kept worktrees auto-remove on success. The follow-up-plan branch is the only real remaining merge (bookkeeping + the new manifests/run-review-ux-followup.toml). KNOWN TRAP: if an UNTRACKED copy of that same manifest file sits in this checkout's manifests/ dir (the review workflow drops it there), delete it or verify it byte-identical BEFORE the merge - git refuses to overwrite an untracked same-path file and reports it as a conflict (burned run 20261016-013711-proposal-flow-fixes this way).
+3. Verify: `git merge-base --is-ancestor <tip> master` succeeds for all six branches; state.json records show merged=true (the verb also flips their status off `failed`); `git worktree list` shows no 20261016-100852-run-review-ux worktrees left; `python run_tests.py` run to green (the combined suite needs ~780s - normal here; the conductor 600s gate cap is the NEXT step's job); `python conductor.py demo` green.
+4. If the merged tree genuinely fails, investigate and fix on master (commit fixes separately from the merge) - do not just rerun. NEVER finish with a merge in progress: each merge ends committed or `git merge --abort`ed.
+
+Update .agent_tasks (most QUEUE.md/efficiency_stats.md ledger entries already ride the merged branches - add only what is missing) and commit bookkeeping separately from fixes.
+'''
+
+# ---------------------------------------------------------------------------
+[[step]]
+name = "verify-timeout-config"
+project = "agent-conductor"
+worktree = true
+timeout_min = 75
+verify = ""
+prompt = '''
+The post-step verify gate is hard-capped at 600s and this project outgrew it: in run 20261016-100852-run-review-ux three steps (cumulative-elapsed-time, manual-merge-guard, integration-verification) recorded `failed` with `verify timed out after 600s` in their .verify.log while the suite was green in-worktree (~457 tests, ~783s combined and still growing). Every gate on the registered `python run_tests.py` now false-fails.
+
+Make the verify timeout configurable in conductor.py:
+- New optional `verify_timeout_s` key honored per [[step]] and in [defaults] (numeric seconds, a sane floor such as >= 60; invalid values fail manifest validation loudly like max_attempts does). Raise the built-in default to 1200.
+- Apply it at BOTH hard-coded sites: the post-step verify in run_step (`timeout=600` near line 3748 - and make the "verify timed out after Ns" log line print the configured N) and the deferred-staging verify (same pattern near line 7979). Grep for any other verify timeout site and cover it too.
+- Record the effective value on the step record (e.g. rec["verify_timeout_s"]) so it is inspectable; keep the payload shape stable otherwise.
+- Document the key in AGENTS.md where verify gates are described and in the annotated example manifest(s) under examples/ that document verify; also update AGENTS.md if it still claims a stale suite duration.
+- Optional, only if it fits existing env-knob conventions (ARCHIVE_AFTER_S / TRASH_RETAIN_S style): a CONDUCTOR_VERIFY_TIMEOUT_S override. Skip rather than bolt on awkwardly.
+
+Tests: manifest parse, validation bounds, default value, both call sites honoring the configured value, the log line text, and unchanged project-verify inheritance. Note this step's own conductor gate is useless (the driving conductor still has the old cap) - run `python run_tests.py` yourself to green; budget ~15min for it. Update .agent_tasks and commit code separately from bookkeeping.
+'''
+
+# ---------------------------------------------------------------------------
+[[step]]
+name = "verify-gate-flake-hardening"
+project = "agent-conductor"
+worktree = true
+timeout_min = 75
+verify = ""
+prompt = '''
+Two verify-gate failures inside run 20261016-100852-run-review-ux were flakiness, not real defects - reproduce, root-cause, and harden both so the gate stops false-failing:
+
+1. tests/test_conductor.py ProposalFlowIntegrationTests.test_stop_edit_reprepare_retain_then_launch_runs_step1 failed inside the inspect-and-design gate (verify log tail: AssertionError 'generating' != 'ready' around line 3286, ~458s into the suite, and the same test class was already flagged flaky in the earlier proposal-flow-fixes run). The verify-proposal-flow step already patched the same-second publish race once (_disk_untouched mtime + generation_stopped_at compare) - the residual is likely a drain/ordering edge where the record still reads 'generating'. Reproduce (loop the test, run it under parallel load, or shrink the timing windows), root-cause for real, then fix the underlying race if it is one or convert the test to wait on the actual condition instead of fixed sleeps.
+
+2. manual-merge-guard's in-worktree suite run reported 2 StepControlTests failures where the `_wait_run_dir` helper's 10s deadline expired under full-suite load (both pass standalone). Same treatment: reproduce under load, root-cause, deterministic synchronization or a properly bounded deadline - not a blind sleep bump.
+
+A sibling proposal (manifests/proposal-ui-fixes-followup.toml) covers the `_flag_soon` wall-clock / queued-flag flake family - if either failure here turns out to be that same family, fix the underlying race once rather than layering test patches, and say so in the report.
+
+Acceptance: each touched test passes 20 consecutive runs, `python run_tests.py` is green end-to-end (run it manually - the driving conductor still caps its gate at 600s until verify-timeout-config ships in a later driver), and suite wall time does not grow meaningfully. Update .agent_tasks; commit code separately from bookkeeping.
+'''
+
+# ---------------------------------------------------------------------------
+[[step]]
+name = "review-ux-live-smoke"
+project = "agent-conductor"
+worktree = true
+timeout_min = 60
+verify = ""
+prompt = '''
+The run-review-ux feature set is only mock/node-harness verified - the parent run's integration-verification worker explicitly left "a real-browser pass over the combined dashboard" as the manual-check remainder (the node harness asserts DOM behavior, not painted CSS). Do that pass now against the LANDED master state (land-run-review-ux-branches ran first).
+
+TRAP-5-safe setup (proven pattern): copy the repo to a scratch dir nobody watches - robocopy/xcopy C:\Projects\agent-conductor -> %TEMP%\ac-rrux-smoke-<ts> EXCLUDING .git, data, worktrees and caches; run `python examples/make_demo_projects.py` in the copy so data/demo1 exists; then `python conductor.py serve --port <free 87xx>` FROM THE COPY so every write lands under the copy's data/. First check no run driver is live in the real checkout (data/runs/*/state.json driver_pid liveness) - do not disturb a live run.
+
+Against the scratch serve, exercise the original request end-to-end and report what each item actually did (seed finished/interrupted runs with `python conductor.py demo` or fabricated state.json fixtures as needed):
+- Review marks: a freshly completed run row and task rows show the needs-review pill/accent (cyan by design; a FAILED unreviewed task must show red status + pill together - the flag never recolors); "Mark as reviewed" / "Mark as needing review" work from the run modal, the task modal, and both context menus; the ack survives a serve restart; an ack sent against a stale completion_seq is rejected; a simulated re-completion re-flags despite the older ack.
+- Task outcome: the task modal shows the outcome row, the agents-table result column leads with it, a pre-contract record shows the honest unavailable state, and STATUS/NEXT-derived fields are untouched.
+- Agents table: the step-name button opens the task modal, the run-name applies the run filter, a bare-row click does NOT open a modal, the .dsel selected-row highlight survives refresh and follows prev/next navigation, and closing the modal clears it. Keyboard: Tab focus, Enter/Space opens, ArrowLeft/ArrowRight navigate, Esc closes, Shift+F10 opens the context menu.
+- Task modal scroll: while a run's log keeps growing, the 2s repaint preserves scroll position (reuse the modal-refresh-stability probe approach).
+- Runs table: the elapsed column ticks for a live run and shows banked+cumulative time on a resumed record; the 'wt' chip appears on a worktree-configured run (incl. the 'wt N/M' mixed form).
+- Merge pending branches is disabled WITH its explanation while a run executes (fabricate a live driver_pid the way ManualMergeGuardTests does) and works once the run ends.
+
+Use a real browser engine where available (Playwright/Chromium - past sessions have driven it here); otherwise node-harness + DOM assertions, and state plainly which checks were pixel-verified vs DOM-only. COMMIT the probe script under tests/ or a probes dir this time - past probes lived in scratch/ and were lost (a design-doc gap).
+
+Verify, do not fix: if something is broken live, record it precisely in .agent_tasks and finish `partial` rather than patching in this step. Kill EVERY spawned process (serve, browser drivers) BEFORE printing STATUS - a live child keeps this session from exiting (trap 12). Commit bookkeeping only.
+'''
+
+# ---------------------------------------------------------------------------
+[[step]]
+name = "follow-up-plan"
+project = "agent-conductor"
+worktree = true
+timeout_min = 30
+verify = ""
+prompt = '''
+Review what this run accomplished against the residuals it targeted: the parked run-review-ux branches landed on master (or not), the configurable verify timeout, the two gate flakes hardened, and the real-browser smoke of the combined dashboard.
+
+Per-step logs, STATUS/NEXT lines and notes are under C:/Projects/agent-conductor/data/runs in the newest dir ending in 'run-review-ux-followup', alongside this project's .agent_tasks files and the merged git state. Read them to judge what is done, what failed or was skipped, and what new issues were discovered. Check whether the sibling proposals that were still unlaunched at draft time (manifests/ux-controls-followup.toml, proposal-ui-fixes-followup.toml, proposal-flow-fixes-followup.toml, plus any follow-up produced by run 20261016-013719-workflow-ux-safety once it ends) were launched meanwhile, so overlapping items are not proposed twice.
+
+Then write a NEW conductor TOML manifest proposing only still-unfinished or newly discovered work, saved as 'C:/Projects/agent-conductor/manifests/run-review-ux-followup-2.toml' using forward slashes. Follow this manifest's conventions: registered project slugs, worktree = true for code steps, the registered verification command in [defaults], max_attempts = 3, merge_resolver = true, a closing follow-up-plan step, and verify = "" per step while the driving conductor's gate cannot run the full suite inside its cap. Do NOT launch or implement the follow-up - a human reviews it. If nothing remains, say so explicitly in the manifest header comment without inventing work.
+'''
