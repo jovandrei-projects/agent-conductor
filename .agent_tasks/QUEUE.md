@@ -20,6 +20,15 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-15 (run-lifecycle-cleanup): finished runs auto-archive
+  after `CONDUCTOR_ARCHIVE_HOURS` (default 48) - a `state["archived"]`
+  stamp hides them from the default `/api/state` while files stay on
+  disk; `sweep`/`serve` startup apply it plus a 30min throttled pass in
+  `collect_dashboard`, the `view: N archived` chip lists them via
+  `?archived=1`, the modal's Archive/Unarchive flips it manually, and
+  `--resume` clears it. **Delete run** in the run modal `rmtree`s the
+  record (confirm + live/resume/merge guards); spawned devin sessions
+  become trap-13-style manual cleanup. 182/182 mock tests + demo green.
 - DONE 2026-10-15 (steps-counters-clarity): run/agent token counters
   name themselves - `fmtT` renders `in X · out Y · cached Z · N turns`
   (cached always shown; turns = LLM steps, not manifest steps) instead

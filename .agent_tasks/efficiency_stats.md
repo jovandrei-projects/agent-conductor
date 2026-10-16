@@ -39,3 +39,4 @@ accounted for.
 | agent-conductor / run-control-taxonomy (audit -> graceful-pause merge, stopped no longer trips on_failure, durable skip sentinel, manifest pending rows; 164/164 + demo green) | n/a | n/a | n/a | n/a |
 | agent-conductor / task-prompt-editing (pre-dispatch Edit prompt + resume notes sentinels, full-text modal task field; 172/172 + demo green) | n/a | n/a | n/a | n/a |
 | agent-conductor / steps-counters-clarity (token counters self-label: in/out/cached/turns + planner:/steps: prefixes; 171/172 - unrelated stop-flag flake, demo green) | n/a | n/a | n/a | n/a |
+| agent-conductor / run-lifecycle-cleanup (auto-archive stamp + delete-run endpoint + archived view chip; 182/182 + demo green) | n/a | n/a | n/a | n/a |
