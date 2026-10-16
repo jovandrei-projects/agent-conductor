@@ -755,3 +755,28 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   Identifiers only - task text never enters an error string. 13 new
   tests (iso derivation matrix + watcher identity/multi/fallback +
   node chip render).
+- DONE 2026-10-16 (manual-merge-guard, wave step of run
+  20261016-100852-run-review-ux): 'Merge pending branches' is now gated
+  on the run ACTUALLY being done executing, not just on no step reading
+  'running' - `run_executing()` (new shared predicate: live driver_pid,
+  else live step records) refuses a run whose conductor is mid-verify,
+  between waves, queued-under-cap, or still finishing a stop/pause
+  shutdown (a raised sentinel is a request, never proof the driver is
+  gone). The op takes a new per-run merge claim - `merge-<runkey>` in the
+  flag dir, O_EXCL+pid like the repo merge lock but machine-global -
+  holds it for the whole operation and re-reads state under it, so a
+  resume mid-stamp is caught at execution time instead of overlapping;
+  `run --resume` holds the same claim while it stamps driver_pid (and
+  now refuses a live driver outright - the double-driver hole), while
+  `resume_run`, `delete_run`, `sweep`/`archive` and `clear_run_flags`
+  all respect the claim. Run rows carry `executing` server-computed;
+  `runCtl` consumes it so the modal button + context item render
+  disabled with the reason rather than hiding, and the POST's 409 is
+  the stale-page backstop. Conductor-managed merges (post-wave,
+  resume-finalize, deferred staging, resolve-* sessions) are untouched.
+  Test-helper fix: run_manifest restamps a dead driver_pid after the
+  in-process cmd_run exits (the test-runner pid read alive forever on
+  POSIX, and could sit inside the creation-window early on Windows).
+  10 new ManualMergeGuardTests + 1 node render test; 434-test suite:
+  2 unrelated _wait_run_dir timing flakes (10s deadline under full-suite
+  load, both pass standalone).
