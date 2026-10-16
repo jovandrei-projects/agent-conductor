@@ -991,10 +991,21 @@ def _arc_head(step: dict) -> str:
     return ("think: " + rc[:100]) if rc else "(no detail)"
 
 
+def _arc_ts(s: dict) -> float | None:
+    """Entry timestamp as epoch seconds (None if absent/unparseable)."""
+    try:
+        return dt.datetime.fromisoformat(str(s["timestamp"])).timestamp()
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
 def trajectory_arc(export_path) -> dict | None:
     """Phase-grouped timeline of an ATIF export for the task modal.
     None for missing/corrupt exports, mocks, and live steps (the export
-    is written once when the session ends - there is nothing mid-run)."""
+    is written once when the session ends - there is nothing mid-run).
+    Groups collapse in the UI; each carries its raw entries (timestamps,
+    gap-to-next durations, REAL per-step token metrics - ATIF exports
+    meter every LLM call, so nothing here is estimated)."""
     try:
         d = json.loads(Path(export_path).read_text(
             encoding="utf-8", errors="replace"))
@@ -1008,20 +1019,42 @@ def trajectory_arc(export_path) -> dict | None:
         if not isinstance(s, dict):
             continue
         phase = _arc_phase(s)
-        sid = s.get("step_id")
+        m = s.get("metrics") if isinstance(s.get("metrics"), dict) else {}
+        ent = {"sid": s.get("step_id"), "ts": s.get("timestamp"),
+               "head": _arc_head(s),
+               "epoch": _arc_ts(s)}
+        for src, dst in (("prompt_tokens", "in"),
+                         ("completion_tokens", "out"),
+                         ("cached_tokens", "cached")):
+            if isinstance(m.get(src), (int, float)):
+                ent[dst] = int(m[src])
         if groups and groups[-1]["phase"] == phase:
-            groups[-1]["end"] = sid
-            groups[-1]["n"] += 1
+            groups[-1]["entries"].append(ent)
         else:
-            groups.append({"phase": phase, "start": sid, "end": sid,
-                           "n": 1, "head": _arc_head(s)})
+            groups.append({"phase": phase, "entries": [ent]})
     if not groups:
         return None
-    return {"steps": len(steps),
-            "groups": [{"span": (str(g["start"]) if g["start"] == g["end"]
-                                 else f"{g['start']}-{g['end']}"),
-                        "phase": g["phase"], "n": g["n"],
-                        "head": g["head"]} for g in groups[:40]]}
+    out = []
+    for g in groups:
+        ents = g["entries"]
+        for i, e in enumerate(ents):
+            nxt = ents[i + 1]["epoch"] if i + 1 < len(ents) else None
+            if e["epoch"] is not None and nxt is not None:
+                e["dur_s"] = round(nxt - e["epoch"])
+            e.pop("epoch", None)
+        span = (str(ents[0]["sid"]) if ents[0]["sid"] == ents[-1]["sid"]
+                else f"{ents[0]['sid']}-{ents[-1]['sid']}")
+        t0 = ents[0]["ts"]
+        tin = sum(e.get("in", 0) for e in ents) or None
+        tout = sum(e.get("out", 0) for e in ents) or None
+        tcache = sum(e.get("cached", 0) for e in ents) or None
+        out.append({"span": span, "phase": g["phase"], "n": len(ents),
+                    "head": ents[0]["head"], "t0": t0,
+                    "t1": ents[-1]["ts"], "tin": tin, "tout": tout,
+                    "tcached": tcache,
+                    "entries": [{k: v for k, v in e.items()
+                                 if v is not None} for e in ents]})
+    return {"steps": len(steps), "groups": out[:40]}
 
 
 _ARC_CACHE: dict[str, tuple[float, dict | None]] = {}
@@ -4720,6 +4753,15 @@ a { color:#58a6ff; text-decoration:none; }
 .arcphase { flex:none; width:78px; }
 .archead { color:#8b949e; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .arcrow:hover .archead { color:#e6edf3; }
+details.arcgrp > summary { display:flex; gap:8px; padding:1px 0; cursor:pointer; list-style:none; }
+details.arcgrp > summary::-webkit-details-marker { display:none; }
+details.arcgrp > summary::before { content:'▸'; color:#6e7681; flex:none; }
+details.arcgrp[open] > summary::before { content:'▾'; }
+.arcdetail { margin:2px 0 6px 18px; border-left:1px solid #21262d; padding-left:8px; }
+.arcdetail .arcrow { font-size:11px; }
+.arctime { color:#6e7681; min-width:60px; flex:none; }
+.arcdur { color:#6e7681; min-width:44px; text-align:right; flex:none; }
+.arctok { color:#6e7681; min-width:96px; text-align:right; flex:none; }
 .arc-setup, .arc-work { color:#8b949e; }
 .arc-audit { color:#79c0ff; }
 .arc-implement { color:#d2a8ff; }
@@ -4823,6 +4865,11 @@ const fmtT = t => (!t||t.prompt==null) ? '-' :
   `in ${kfmt(t.prompt)} · out ${kfmt(t.completion)}` +
   ` · cached ${kfmt(t.cached||0)}` +
   (t.llm_steps ? ` · ${t.llm_steps} turns` : '');
+// compact density: bare in/out/cached + LLM turns - order is fixed and
+// spelled out in TOK_HELP + the cell title
+const fmtTc = t => (!t||t.prompt==null) ? '-' :
+  `${kfmt(t.prompt)}/${kfmt(t.completion)}/${kfmt(t.cached||0)}` +
+  (t.llm_steps ? ` ${t.llm_steps}L` : '');
 const tokTitle = t => !t ? '' :
   `in ${t.prompt} (of which cached ${t.cached}) · out ${t.completion} · ` +
   `${t.llm_steps??'?'} LLM steps (model turns)`;
@@ -4855,7 +4902,8 @@ function setDensity(d){
   syncTopbar();
 }
 const TOK_HELP = 'tokens: in / out / cached (a share of in, never extra)' +
-  ' · turns = LLM steps; select an agent for details';
+  ' · turns = LLM steps; compact view reads "in/out/cached NL"; ' +
+  'select an agent for details';
 const tokenHelp = `<details class="tok-help"><summary aria-label="Explain tokens and cost">?</summary>` +
   `<div class="explain"><b>What the numbers mean</b><br>` +
   `<b>in</b>: all input (prompt) tokens - instructions, tools, context, ` +
@@ -4910,13 +4958,13 @@ let AGENTS = [];          // last payload, for the detail modal
 // column layout shared by every per-project table (fixed layout -> the
 // same widths line up across tables)
 const AGENT_COLS = '<colgroup>' +
-  '<col style="width:7%"><col style="width:12%"><col style="width:15%">' +
-  '<col style="width:6%"><col class="hide-s" style="width:7%">' +
+  '<col style="width:8%"><col style="width:14%">' +
+  '<col style="width:8%"><col class="hide-s" style="width:8%">' +
   '<col class="hide-s" style="width:5%"><col class="hide-s" style="width:6%">' +
-  '<col style="width:6%"><col style="width:5%">' +
-  '<col class="hide-s" style="width:7%"><col class="hide-s" style="width:5%">' +
-  '<col style="width:6%"><col class="hide-s" style="width:6%">' +
-  '<col style="width:7%">' +
+  '<col style="width:6%"><col style="width:6%">' +
+  '<col class="hide-s" style="width:11%"><col class="hide-s" style="width:5%">' +
+  '<col style="width:6%"><col class="hide-s" style="width:7%">' +
+  '<col style="width:10%">' +
   '</colgroup>';
 
 let detailIdx = null;
@@ -5056,12 +5104,27 @@ function showDetail(i){
     (a.arc && a.arc.groups && a.arc.groups.length
       ? `<h3 style="margin-top:14px">trajectory` +
         ` <span class="sub" style="margin:0">${a.arc.steps} LLM steps, ` +
-        `grouped by phase (from the session's ATIF export)</span></h3>` +
+        `grouped by phase - expand a row for per-step times & real ` +
+        `per-turn tokens</span></h3>` +
         `<div class="arc">` + a.arc.groups.map(g =>
-          `<div class="arcrow"><span class="arcspan">${esc(g.span)}` +
-          `</span><span class="arcphase arc-${esc(g.phase)}">` +
-          `${esc(g.phase)}</span><span class="archead">${esc(g.head)}` +
-          `</span></div>`).join('') + `</div>` : '');
+          `<details class="arcgrp"><summary><span class="arcspan">` +
+          `${esc(g.span)}</span><span class="arcphase arc-` +
+          `${esc(g.phase)}">${esc(g.phase)}</span>` +
+          `<span class="arctime">${loc(g.t0)}</span>` +
+          `<span class="arctok">${g.tin
+            ? kfmt(g.tin)+'/'+kfmt(g.tout||0)+'/'+kfmt(g.tcached||0)
+            : ''}</span>` +
+          `<span class="archead">${esc(g.head)}</span></summary>` +
+          `<div class="arcdetail">` + (g.entries||[]).map(e =>
+            `<div class="arcrow"><span class="arcspan">${esc(e.sid)}` +
+            `</span><span class="arctime">${loc(e.ts)}</span>` +
+            `<span class="arcdur">${e.dur_s!=null?fmtS(e.dur_s):''}` +
+            `</span><span class="arctok">${e.in!=null
+              ? kfmt(e.in)+'/'+kfmt(e.out||0)+'/'+kfmt(e.cached||0)
+              : ''}</span>` +
+            `<span class="archead" title="${esc(e.head)}">` +
+            `${esc(e.head)}</span></div>`).join('') +
+          `</div></details>`).join('') + `</div>` : '');
   if (fsel){
     const el = document.getElementById(fid);
     if (el && el.focus){ el.focus();
@@ -5593,10 +5656,11 @@ function render(d){
       `${counts||'<span class="sub">not planned</span>'}` +
       (r.plan_tokens ? `<br><span class="sub" ` +
         `title="${esc(tokTitle(r.plan_tokens))}">planner: ` +
-        `${fmtT(r.plan_tokens)}` +
+        `${density==='compact' ? fmtTc(r.plan_tokens) : fmtT(r.plan_tokens)}` +
         (r.plan_cost?` · ${fmtC(r.plan_cost)}`:'') + `</span>` : '') +
       (r.tokens ? `<br><span class="sub" ` +
-        `title="${esc(tokTitle(r.tokens))}">steps: ${fmtT(r.tokens)}` +
+        `title="${esc(tokTitle(r.tokens))}">steps: ` +
+        `${density==='compact' ? fmtTc(r.tokens) : fmtT(r.tokens)}` +
         (r.cost?` · ${fmtC(r.cost)}`:'') + `</span>` : '') +
       (runUsd!=null ? `<br><span class="sub" title="estimated self-serve ` +
         `cost, plan + steps${r.cost&&r.cost.unpriced
@@ -5633,7 +5697,7 @@ function render(d){
       `${show.length<rows.length?`, showing latest ${show.length}`:''}` +
       `</span></h3>` +
       '<div class="wrapw"><table>' + AGENT_COLS +
-      '<tr><th></th><th>step</th><th>task</th><th>run</th>' +
+      '<tr><th></th><th>step</th><th>run</th>' +
       '<th class="hide-s">model</th><th class="hide-s">effort</th>' +
       '<th class="hide-s">mode</th><th>started</th><th>elapsed</th>' +
       '<th class="hide-s" title="' + TOK_HELP + '">tokens</th>' +
@@ -5679,7 +5743,7 @@ function render(d){
              ? ` <button type="button" class="chip" data-facet="unmerged" ` +
                `style="color:#f0883e">unmerged</button>`
              : '')
-          : ''}</td><td class="wrap">${esc(a.task||'')}</td>` +
+          : ''}</td>` +
         `<td>${esc(a.run)}</td>` +
         `<td class="hide-s" title="${a.model==='adaptive'&&a.model_actual
           ?esc(`adaptive resolved to ${a.model_actual}`):''}">` +
@@ -5690,7 +5754,7 @@ function render(d){
         `<td>${loc(a.started_at)}</td>` +
         `<td data-el="${a._i}">${elapsed(a,now)}</td>` +
         `<td class="hide-s" title="${esc(tokTitle(a.tokens))}">` +
-        `${fmtT(a.tokens)}</td>` +
+        `${density==='compact' ? fmtTc(a.tokens) : fmtT(a.tokens)}</td>` +
         `<td class="hide-s" title="${esc(costTitle(a.cost))}">` +
         `${fmtC(a.cost)}</td>` +
         `<td>${loc(a.ended_at)}</td>` + sessTd +
@@ -5702,7 +5766,7 @@ function render(d){
           : `<td class="wrap">${esc(a.next||a.note||'')}</td>`) + `</tr>`;
     }
     if (rows.length > SHOW_N)
-      h += `<tr><td colspan="14"><a href="#" data-slug="${esc(slug)}">` +
+      h += `<tr><td colspan="13"><a href="#" data-slug="${esc(slug)}">` +
         (expanded[slug] ? `show latest ${SHOW_N} only` :
           `show ${rows.length - SHOW_N} older agent(s)`)+`</a></td></tr>`;
     h += '</table></div>';

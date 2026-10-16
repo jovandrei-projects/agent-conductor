@@ -20,6 +20,18 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-15 (trajectory drill-down + compact counters): each arc
+  group is now an expandable `<details>` - per-entry timestamp,
+  gap-to-next duration, and REAL per-turn in/out/cached tokens read
+  from the ATIF step `metrics` (every LLM call is metered; nothing is
+  estimated). Agents table drops the `task` column (still full in the
+  modal) and gains a compact token form `in/out/cached NL` under
+  compact density; run rows' planner:/steps: follow suit. Token
+  findings so far: `total_prompt_tokens` is the FULL context re-sent
+  per turn (cached is a share of it), so a 77-turn session sums ~11M
+  even though ~98% was cache-served - the Desktop card reports only
+  the uncached delta instead. First LLM call on a fresh agent-conductor
+  session already carries ~107k prompt tokens.
 - DONE 2026-10-15 (run-lifecycle-cleanup): finished runs auto-archive
   after `CONDUCTOR_ARCHIVE_HOURS` (default 48) - a `state["archived"]`
   stamp hides them from the default `/api/state` while files stay on

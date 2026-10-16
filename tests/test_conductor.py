@@ -1180,18 +1180,19 @@ const row={dataset:{runKey:'/first'}};
   assert.match(elem('filters').innerHTML,/first ×/);
   assert.match(elem('runs').innerHTML,/runrow selected/);
   assert.doesNotMatch(elem('runs').innerHTML,/A separate run/);
-  assert.match(elem('agents').innerHTML,/implement one/);
-  assert.doesNotMatch(elem('agents').innerHTML,/implement two/);
+  // the task column is modal-only now - rows are told apart by step name
+  assert.match(elem('agents').innerHTML,/>alpha</);
+  assert.doesNotMatch(elem('agents').innerHTML,/>beta</);
   await click({dataset:{facet:'merged'}});
   assert.match(elem('filters').innerHTML,/merged ×/);
   await click({dataset:{clearRun:''}});
   // the 'merged' tag chip still filters both tables: 'second' has no
   // merged step, so its run row hides too.
   assert.doesNotMatch(elem('runs').innerHTML,/A separate run/);
-  assert.doesNotMatch(elem('agents').innerHTML,/implement two/);
+  assert.doesNotMatch(elem('agents').innerHTML,/>beta</);
   await click({dataset:{facet:'merged'}});   // toggles the tag back off
   assert.match(elem('runs').innerHTML,/A separate run/);
-  assert.match(elem('agents').innerHTML,/implement two/);
+  assert.match(elem('agents').innerHTML,/>beta</);
   vm.runInContext('showDetail(0)',ctx);
   assert.match(elem('dbody').innerHTML,/Explain tokens and cost/);
   assert.match(elem('dbody').innerHTML,/\$0\.019/);
@@ -2280,28 +2281,33 @@ assert.match(elem('runs').innerHTML,/steps: in 1k · out 200 · cached 0 · 2 tu
 assert.match(elem('agents').innerHTML,/\$0\.12/);
 assert.match(elem('agents').innerHTML,/in 1k · out 200 · cached 0 · 2 turns/);
 assert.doesNotMatch(elem('agents').innerHTML,/1k\/200/);
+// compact density uses the bare in/out/cached + turns form instead
+assert.strictEqual(vm.runInContext(
+  "fmtTc({prompt:10000,completion:1000,cached:6000,llm_steps:2})",ctx),
+  '10k/1k/6k 2L');
 const click=async(t)=>handlers.click({target:t,preventDefault:()=>{}});
 (async()=>{
   // clicking 'running' shows ONLY running agents and ONLY their run
+  // (the task column is modal-only now - step names tell rows apart)
   await click({dataset:{st:'running'}});
-  assert.match(elem('agents').innerHTML,/work one/);
-  assert.doesNotMatch(elem('agents').innerHTML,/work two/);
-  assert.doesNotMatch(elem('agents').innerHTML,/work three/);
+  assert.match(elem('agents').innerHTML,/>alpha</);
+  assert.doesNotMatch(elem('agents').innerHTML,/>beta</);
+  assert.doesNotMatch(elem('agents').innerHTML,/>gamma</);
   assert.match(elem('runs').innerHTML,/run one/);
   assert.doesNotMatch(elem('runs').innerHTML,/run two/);
   assert.match(elem('filters').innerHTML,/chip active/);
   // clicking again returns to showing everything
   await click({dataset:{st:'running'}});
-  assert.match(elem('agents').innerHTML,/work three/);
+  assert.match(elem('agents').innerHTML,/>gamma</);
   assert.match(elem('runs').innerHTML,/run two/);
   // multi-select: done + running keeps both runs
   await click({dataset:{st:'done'}});
   await click({dataset:{st:'running'}});
-  assert.match(elem('agents').innerHTML,/work one/);
-  assert.match(elem('agents').innerHTML,/work three/);
+  assert.match(elem('agents').innerHTML,/>alpha</);
+  assert.match(elem('agents').innerHTML,/>gamma</);
   await click({dataset:{reset:''}});
   assert.match(elem('runs').innerHTML,/run two/);
-  assert.match(elem('agents').innerHTML,/work three/);
+  assert.match(elem('agents').innerHTML,/>gamma</);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
@@ -2738,6 +2744,42 @@ class LifecycleDisplayTests(unittest.TestCase):
         self.assertIn("check the run modal", arc["groups"][1]["head"])
         # empty-message step falls back to a tool-call summary
         self.assertEqual(conductor._arc_head(steps[5]), "exec")
+
+    def test_trajectory_arc_entries_carry_times_and_tokens(self):
+        """Expanded view data: per-entry timestamp, gap-to-next duration
+        and REAL per-turn metrics from ATIF (never estimates); groups
+        carry token sums + first timestamp."""
+        steps = [
+            {"step_id": 1, "source": "agent",
+             "timestamp": "2026-01-01T10:00:00+00:00",
+             "message": "audit the code",
+             "metrics": {"prompt_tokens": 1000, "completion_tokens": 50,
+                         "cached_tokens": 900}},
+            {"step_id": 2, "source": "agent",
+             "timestamp": "2026-01-01T10:01:40+00:00",
+             "message": "check one more file",
+             "metrics": {"prompt_tokens": 2000, "completion_tokens": 60,
+                         "cached_tokens": 1900}},
+            {"step_id": 3, "source": "agent",
+             "timestamp": "2026-01-01T10:02:00+00:00",
+             "message": "commit"},  # no metrics -> no token keys
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            ex = Path(td) / "s.export.json"
+            ex.write_text(json.dumps({"steps": steps}), encoding="utf-8")
+            arc = conductor.trajectory_arc(ex)
+        g1, g2 = arc["groups"]
+        self.assertEqual((g1["span"], g1["phase"]), ("1-2", "audit"))
+        self.assertEqual((g1["tin"], g1["tout"], g1["tcached"]),
+                         (3000, 110, 2800))
+        self.assertEqual(g1["t0"], "2026-01-01T10:00:00+00:00")
+        self.assertEqual(g1["t1"], "2026-01-01T10:01:40+00:00")
+        e1, e2 = g1["entries"]
+        self.assertEqual((e1["in"], e1["out"], e1["cached"]),
+                         (1000, 50, 900))
+        self.assertEqual(e1["dur_s"], 100)          # gap to entry 2
+        self.assertNotIn("dur_s", e2)               # last entry in group
+        self.assertNotIn("in", g2["entries"][0])    # no metrics -> none
 
     def test_trajectory_arc_tolerates_junk(self):
         with tempfile.TemporaryDirectory() as td:
