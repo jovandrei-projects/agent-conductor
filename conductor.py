@@ -85,6 +85,17 @@ WAIT_POLL_S = 15.0        # wait() slice between STATUS checks on the log
 # first few minutes of a step.
 SESSION_GONE_GRACE_S = 300.0
 
+# Android device ownership (see the 'devices' section): a `device`-declaring
+# step leases ONE adb serial machine-wide for its whole life - attempts,
+# interrupt respawns and the verify gate all see the same device, and a
+# busy device queues the step instead of letting two workers race it.
+DEVICE_POLL_S = 10.0        # cadence of the device-wait loop
+DEVICE_WAIT_SAVE_S = 30.0   # state.json heartbeat cadence while queued
+DEVICE_BOOT_S = 180.0       # a booted emulator gets this long to finish
+DEVICE_EMU_PORTS = range(5554, 5586, 2)   # adb emulator console ports (even)
+DEVICE_SERIAL_RE = re.compile(r"[A-Za-z0-9_.:-]+")
+DEVICE_WAIT_S = 600.0       # default give-up for a device that never appears
+
 # A finished run older than this is auto-archived: files kept on disk
 # (state, logs, ATIF exports) but hidden from the default dashboard view -
 # the 'archived' view chip (/api/state?archived=1) lists it and the run
@@ -191,6 +202,23 @@ it with additional instructions - they are appended under 'NOTE FROM \
 THE OPERATOR' below. The previous session's work is already committed \
 in this repo: inspect the recent git log and .agent_tasks state, then \
 CONTINUE from where it stopped instead of redoing finished work.
+"""
+
+# Prepended to the task body when the step owns an Android device lease -
+# the worker is told which serial it has and the lifecycle rules (the
+# conductor, not the worker, owns boot/kill; other attached devices are
+# someone else's).
+DEVICE_NOTE = """\
+NOTE FROM THE CONDUCTOR: this step owns Android device `{serial}` for its \
+whole run - a machine-wide lease no other agent can take. `ANDROID_SERIAL` \
+(and `CONDUCTOR_DEVICE_SERIAL`) is already set in your environment, so plain \
+`adb` and tools that honor it target this device automatically; prefer \
+explicit `adb -s {serial}` anyway for clarity. Other attached devices or \
+emulators belong to other workers or to the user - do NOT send them \
+commands, and never reboot, `emu kill`, taskkill or otherwise stop ANY \
+emulator or device, not even this one: the conductor owns the lifecycle \
+and tears down what it booted. If the device becomes unusable mid-step, \
+finish with STATUS: blocked and say so - do not requisition another.
 """
 
 # Closing review step appended when a request's follow-up checkbox is set -
@@ -327,6 +355,17 @@ class Step:
                                        # auto-extends; this much stdout silence
                                        # (or the 4x ceiling) ends it. 0 = hard
                                        # deadline, no extension
+    device: str | None = None          # adb serial this step must own for its
+                                       # whole run: "any" | "emulator" |
+                                       # "physical" | an exact serial.
+                                       # None = no device coordination.
+    device_wait_s: float = DEVICE_WAIT_S  # give up -> 'blocked' when NO
+                                       # matching device appears within this
+                                       # long; a merely-busy device queues
+                                       # uncapped. 0 = wait forever too.
+    device_boot: bool | None = None    # None: boot an AVD only for device=
+                                       # "emulator"; True: "any" may boot too;
+                                       # False: never boot, attached only.
 
 
 @dataclasses.dataclass
@@ -349,6 +388,27 @@ class Manifest:
 
 class ManifestError(ValueError):
     pass
+
+
+def _norm_device(val, what: str) -> str | None:
+    """Normalize a `device` manifest/project value: 'any'|'emulator'|
+    'physical'|an exact adb serial, or None when unset/off. Serials are
+    case-sensitive (handsets are e.g. RFGL11NN0QV), only the class
+    keywords are case-insensitive."""
+    if val is None or val is False:
+        return None
+    if val is True:
+        return "any"
+    s = str(val).strip()
+    if not s or s.lower() == "none":
+        return None
+    if s.lower() in ("any", "emulator", "physical"):
+        return s.lower()
+    if DEVICE_SERIAL_RE.fullmatch(s):
+        return s
+    raise ManifestError(
+        f"{what}: bad device {val!r} - expected 'any' | 'emulator' | "
+        f"'physical' | an adb serial like emulator-5554")
 
 
 def load_manifest(path: Path, text: str | None = None) -> Manifest:
@@ -429,6 +489,44 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
         if not 1 <= ma <= 10:
             raise ManifestError(
                 f"step {merged['name']!r}: max_attempts must be 1-10")
+        # Device ownership: step > [defaults] > the project's registry entry
+        # (a mobile slug may declare `device = "emulator"` once, like
+        # `verify`). A cloud step can't see local adb devices - inheriting
+        # is skipped for it, but an EXPLICIT device + cloud is a manifest
+        # bug and fails loudly.
+        device = _norm_device(merged.get("device"),
+                              f"step {merged['name']!r}")
+        pent: dict = {}
+        if (device is None or "device_wait_s" not in merged
+                or "device_boot" not in merged):
+            if registry is None:
+                try:
+                    registry = load_projects()
+                except Exception:
+                    registry = {}
+            pent = registry.get(merged["project"]) or {}
+            if device is None and not merged.get("cloud"):
+                device = _norm_device(
+                    pent.get("device"), f"project {merged['project']!r}")
+        if device and merged.get("cloud"):
+            raise ManifestError(
+                f"step {merged['name']!r}: device= targets a local adb "
+                f"serial - it makes no sense with cloud=true (a cloud "
+                f"worker cannot see this machine's devices)")
+        try:
+            raw_dws = (merged.get("device_wait_s")
+                       if "device_wait_s" in merged
+                       else pent.get("device_wait_s"))
+            device_wait_s = DEVICE_WAIT_S if raw_dws is None \
+                else float(raw_dws)
+        except (TypeError, ValueError):
+            raise ManifestError(
+                f"step {merged['name']!r}: bad device_wait_s")
+        if device_wait_s < 0:
+            raise ManifestError(
+                f"step {merged['name']!r}: device_wait_s must be >= 0")
+        dboot = merged.get("device_boot", pent.get("device_boot"))
+        device_boot = None if dboot is None else bool(dboot)
         steps.append(Step(
             name=merged["name"], project=merged["project"],
             prompt=merged.get("prompt"),
@@ -443,7 +541,9 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
             merge=merge_pol,
             effort=merged.get("effort") or None,
             merge_resolver=bool(mr), max_attempts=ma,
-            stall_min=float(merged.get("stall_min", 20))))
+            stall_min=float(merged.get("stall_min", 20)),
+            device=device, device_wait_s=device_wait_s,
+            device_boot=device_boot))
     if not steps:
         raise ManifestError("manifest has no [[step]] entries")
     max_parallel = run.get("max_parallel")
@@ -490,7 +590,10 @@ def load_projects() -> dict[str, dict]:
             merged = dict(out.get(slug, {}))
             merged.update({"path": p,
                            "cloud_ok": bool(ent.get("cloud_ok", False)),
-                           "verify": ent.get("verify")})
+                           "verify": ent.get("verify"),
+                           "device": ent.get("device"),
+                           "device_wait_s": ent.get("device_wait_s"),
+                           "device_boot": ent.get("device_boot")})
             out[slug] = merged
     return out
 
@@ -2555,6 +2658,569 @@ def _intrq_to_notes(run_dir: Path, step: str) -> str | None:
     return block
 
 
+# ---------------------------------------------------------------- devices
+# Android device ownership for `device`-declaring steps. The problem this
+# closes: adb devices are a SHARED machine resource - before this existed,
+# two concurrent mobile steps (two wave members, or two separate runs)
+# would each run `adb devices`, pick the same serial, and race (measured in
+# run artifacts: workers hardcode `adb -s emulator-5554` and one step's
+# cleanup `emu kill` would have killed a sibling's session mid-test).
+#
+# A step that declares `device` leases exactly one serial for its whole
+# life - every attempt, interrupt respawn and the verify gate see the same
+# device. The lease is a machine-global O_EXCL file in %TEMP% (same shape
+# as .git/conductor-merge.lock): it records owner+worker pids and is
+# broken only once, when BOTH are dead - a dead driver's orphaned worker
+# may still be on the device, so it keeps the lease until it also exits.
+
+def _device_dir() -> Path:
+    """Machine-global lease registry - next to the run sentinels so it
+    coordinates across runs AND checkouts (a worktree conductor and the
+    main one share one adb server). %TEMP% is also trap-5 safe."""
+    return Path(os.environ.get("CONDUCTOR_DEVICE_DIR")
+                or Path(tempfile.gettempdir()) / "agent-conductor-devices")
+
+
+def _adb_argv() -> list[str]:
+    """adb command prefix: CONDUCTOR_ADB wins, then PATH, then the standard
+    SDK locations - adb is NOT on PATH on this machine (the SDK lives under
+    %LOCALAPPDATA%\\Android\\Sdk, same place project tooling looks)."""
+    raw = os.environ.get("CONDUCTOR_ADB")
+    if raw:
+        return shlex.split(raw)
+    found = shutil.which("adb")
+    if found:
+        return [found]
+    local = os.environ.get("LOCALAPPDATA")
+    for base in (os.environ.get("ANDROID_HOME"),
+                 os.environ.get("ANDROID_SDK_ROOT"),
+                 str(Path(local) / "Android" / "Sdk") if local else None):
+        if not base:
+            continue
+        cand = Path(base) / "platform-tools" / (
+            "adb.exe" if os.name == "nt" else "adb")
+        if cand.is_file():
+            return [str(cand)]
+    return ["adb"]                    # last resort - _adb_run reports None
+
+
+def _emulator_argv() -> list[str]:
+    """emulator command prefix, same discovery order as _adb_argv."""
+    raw = os.environ.get("CONDUCTOR_EMULATOR")
+    if raw:
+        return shlex.split(raw)
+    found = shutil.which("emulator")
+    if found:
+        return [found]
+    local = os.environ.get("LOCALAPPDATA")
+    for base in (os.environ.get("ANDROID_HOME"),
+                 os.environ.get("ANDROID_SDK_ROOT"),
+                 str(Path(local) / "Android" / "Sdk") if local else None):
+        if not base:
+            continue
+        cand = Path(base) / "emulator" / (
+            "emulator.exe" if os.name == "nt" else "emulator")
+        if cand.is_file():
+            return [str(cand)]
+    return ["emulator"]
+
+
+def _adb_run(*args: str,
+             timeout: float = 15.0) -> subprocess.CompletedProcess | None:
+    """One bounded adb call; None when adb can't even be started."""
+    try:
+        return subprocess.run(
+            _adb_argv() + list(args), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
+            **hidden_subprocess_kwargs())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def adb_devices() -> list[tuple[str, str]] | None:
+    """(serial, adb-state) pairs from `adb devices`, or None when adb can't
+    run/list - callers must treat None as 'unknown', not 'none attached'.
+    Only state 'device' is usable ('offline'/'unauthorized' are not)."""
+    out = _adb_run("devices")
+    if out is None or out.returncode != 0:
+        return None
+    devs = []
+    for line in (out.stdout or "").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2:
+            devs.append((parts[0], parts[1]))
+    return devs
+
+
+def emulator_avds() -> list[str] | None:
+    """`emulator -list-avds` names, or None when no emulator binary exists
+    (which also means 'boot is unsupported on this machine')."""
+    try:
+        out = subprocess.run(
+            _emulator_argv() + ["-list-avds"], capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=15,
+            **hidden_subprocess_kwargs())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return [ln.strip() for ln in (out.stdout or "").splitlines()
+            if ln.strip() and not ln.startswith(("INFO", "WARNING"))]
+
+
+def _device_class_match(spec: str, serial: str) -> bool:
+    if spec == "any":
+        return True
+    if spec == "emulator":
+        return serial.startswith("emulator-")
+    if spec == "physical":
+        return not serial.startswith("emulator-")
+    return serial == spec
+
+
+def _device_lease_path(serial: str, devdir: Path | None = None) -> Path:
+    return (devdir or _device_dir()) / (_safe_name(serial) + ".json")
+
+
+def _device_lease_info(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8",
+                                         errors="replace"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _device_lease_live(info: dict) -> bool:
+    """A lease is held while its driver OR its recorded worker is alive.
+    Both-pids-dead is the stale test - same trust model as the merge lock,
+    with the worker pid recorded so a driver-killed mid-step doesn't free
+    a device its orphaned worker is still using."""
+    if pid_alive(info.get("owner_pid"), info.get("owner_started_at")):
+        return True
+    return pid_alive(info.get("worker_pid"), info.get("worker_started_at"))
+
+
+def _proc_image_name(pid: int) -> str | None:
+    """Best-effort image name of a pid ('emulator.exe', 'qemu-system-...') -
+    the guard that keeps a recycled pid from being killed as 'our'
+    emulator. None when undeterminable."""
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=15,
+                **hidden_subprocess_kwargs())
+            first = (out.stdout or "").strip().splitlines()
+            return first[0].split('","')[0].strip('"') or None \
+                if first and out.returncode == 0 else None
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "comm="],
+                             capture_output=True, text=True, timeout=15)
+        return (out.stdout or "").strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+_EMU_IMAGE_RE = re.compile(r"emulator|qemu", re.I)
+
+
+def _device_kill_emu(serial: str, pid: int | None, run_dir: Path) -> None:
+    """Stop exactly one conductor-booted emulator: `emu kill` on its own
+    serial (the adb server drops it cleanly), then a pid-verified taskkill
+    fallback. ONLY ever called for instances a lease proves we booted -
+    a user's emulator or device is never stopped."""
+    _adb_run("-s", serial, "emu", "kill", timeout=20)
+    if not pid:
+        return
+    deadline = time.time() + 20
+    while pid_alive(pid) and time.time() < deadline:
+        time.sleep(1)
+    if pid_alive(pid):
+        name = _proc_image_name(pid) or ""
+        if _EMU_IMAGE_RE.search(name):
+            try:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        capture_output=True, timeout=20,
+                        **hidden_subprocess_kwargs())
+                else:
+                    os.kill(pid, 15)
+            except OSError:
+                pass
+
+
+def _device_reap_stale(info: dict, serial: str, run_dir: Path) -> None:
+    """About to break a stale lease: if it records a conductor-booted
+    emulator whose pid is still up, that orphan is OURS - kill exactly
+    that instance so booted emulators don't accumulate behind a dead
+    driver. Anything not flagged `booted` is left running."""
+    booted = info.get("booted") or {}
+    pid = booted.get("emu_pid")
+    if pid and pid_alive(pid):
+        name = _proc_image_name(pid) or ""
+        if _EMU_IMAGE_RE.search(name):
+            _device_kill_emu(serial, pid, run_dir)
+            log_event(run_dir, event="device_reaped", serial=serial, pid=pid)
+
+
+class _DeviceLease:
+    """One adb serial owned machine-wide for a step's lifetime."""
+
+    def __init__(self, path: Path, serial: str, token: str, step: str,
+                 booted: dict | None = None):
+        self.path = path
+        self.serial = serial
+        self.token = token
+        self.step = step
+        self.booted = booted            # {avd, port, emu_pid} when we booted
+        self.avd_slot: _DeviceLease | None = None
+
+
+def _self_started_iso() -> str | None:
+    """This process's own creation time as an ISO stamp - written as a
+    lease's owner_started_at so the pid_alive creation-window check sees
+    'the process born at that stamp', not 'the process that reached
+    cmd_run >5s after python.exe spawned' (a slow interpreter start would
+    otherwise mark a LIVE owner dead and let a second conductor steal the
+    serial). None = undeterminable -> pure liveness, merge-lock behavior."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, os.getpid())
+        if not h:
+            return None
+        try:
+            epoch = _proc_started_epoch(h)
+        finally:
+            k32.CloseHandle(h)
+        return dt.datetime.fromtimestamp(epoch).isoformat() \
+            if epoch else None
+    except (OSError, AttributeError):
+        return None
+
+
+def _device_try_lease(serial: str, run_dir: Path, state: dict, step: Step,
+                      booted: dict | None = None) -> _DeviceLease | None:
+    """Take the machine-wide lease on `serial`; None when a live owner
+    holds it. A stale lease (owner+worker pids both dead) is reaped then
+    broken once."""
+    path = _device_lease_path(serial)
+    token = secrets.token_hex(8)
+    for _attempt in (0, 1):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            info = _device_lease_info(path)
+            if not info.get("token"):
+                # A creator is mid-write between O_EXCL and its payload, or
+                # died there: fresh empty files count as HELD, only a file
+                # that stayed broken past a grace counts as abandoned.
+                try:
+                    if time.time() - path.stat().st_mtime < 10:
+                        return None
+                except OSError:
+                    return None
+            elif _device_lease_live(info):
+                return None
+            _device_reap_stale(info, serial, run_dir)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                return None            # someone else broke it first
+            continue
+        except OSError:
+            return None
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({
+                "serial": serial, "token": token,
+                "spec": step.device, "run_dir": str(run_dir),
+                "run_key": _flag_key(run_dir), "step": step.name,
+                "owner_pid": os.getpid(),
+                "owner_started_at": _self_started_iso()
+                                    or state.get("driver_started_at")
+                                    or state.get("started_at"),
+                "worker_pid": None, "worker_started_at": None,
+                "leased_at": now_iso(), "booted": booted}))
+        return _DeviceLease(path, serial, token, step.name, booted=booted)
+    return None
+
+
+def _device_lease_set_worker(lease: _DeviceLease, pid: int) -> None:
+    """Record the spawned worker pid so a dead driver doesn't free the
+    device out from under its orphaned worker."""
+    try:
+        info = _device_lease_info(lease.path)
+        if info.get("token") != lease.token:
+            return                    # broken + re-leased by someone else
+        info["worker_pid"] = pid
+        info["worker_started_at"] = now_iso()
+        lease.path.write_text(json.dumps(info), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _device_release(lease: _DeviceLease | None, run_dir: Path) -> None:
+    """Free a step's device: a conductor-booted emulator dies FIRST (the
+    serial never re-leases mid-kill), then the leases unlink - token-checked
+    so a broken-then-reattaken file is never unlinked from under its new
+    owner."""
+    if lease is None:
+        return
+    if lease.booted:
+        _device_kill_emu(lease.serial, lease.booted.get("emu_pid"), run_dir)
+    # Logged BEFORE the unlinks so the event stream's acq>=rel ordering is
+    # the real serialization boundary - a waiter can only acquire after
+    # the serial file is gone.
+    log_event(run_dir, event="device_released", step=lease.step,
+              serial=lease.serial, booted=bool(lease.booted))
+    slot = lease.avd_slot
+    for path, token in ((lease.path, lease.token),
+                        (slot.path, slot.token) if slot else (None, None)):
+        if not path:
+            continue
+        try:
+            cur = _device_lease_info(path)
+        except OSError:
+            cur = {}
+        if cur.get("token") == token:
+            path.unlink(missing_ok=True)
+
+
+def _device_holder_desc(path: Path) -> str:
+    info = _device_lease_info(path)
+    owner = Path(info.get("run_dir") or "?").name
+    return f"{owner}/{info.get('step', '?')}"
+
+
+def _running_avd_names(attached: list[str]) -> set[str]:
+    """AVD names already running as emulator-* serials - prevents booting a
+    second instance of an AVD a user (or another conductor) already runs."""
+    names: set[str] = set()
+    for s in attached:
+        if not s.startswith("emulator-"):
+            continue
+        out = _adb_run("-s", s, "emu", "avd", "name", timeout=10)
+        if out is not None and out.returncode == 0:
+            lines = (out.stdout or "").splitlines()
+            if lines and lines[0].strip() and lines[0].strip() != "OK":
+                names.add(lines[0].strip())
+    return names
+
+
+def _free_emu_port(attached: list[str],
+                   devdir: Path | None = None) -> int | None:
+    """Lowest free even console port: unused by attached emulators AND by
+    lease files (a leased serial may be mid-boot, invisible to adb yet)."""
+    used = {int(m.group(1)) for s in attached
+            if (m := re.fullmatch(r"emulator-(\d+)", s))}
+    try:
+        for f in (devdir or _device_dir()).glob("emulator-*.json"):
+            m = re.fullmatch(r"emulator-(\d+)\.json", f.name)
+            if m:
+                used.add(int(m.group(1)))
+    except OSError:
+        pass
+    for p in DEVICE_EMU_PORTS:
+        if p not in used:
+            return p
+    return None
+
+
+def _spawn_emulator(avd: str, port: int, log_path: Path):
+    """Popen the emulator detached-ish: it must outlive this function but
+    is reaped via the lease's booted record if the driver dies."""
+    log = open(log_path, "ab")
+    return subprocess.Popen(
+        _emulator_argv() + ["-avd", avd, "-port", str(port), "-no-boot-anim"],
+        stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        env=clean_devin_env(), **hidden_subprocess_kwargs())
+
+
+def _wait_emu_boot(serial: str, proc,
+                   timeout: float = DEVICE_BOOT_S) -> bool:
+    """True once `serial` is attached AND sys.boot_completed=1."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return False
+        st = dict(adb_devices() or {}).get(serial)
+        if st == "device":
+            out = _adb_run("-s", serial, "shell", "getprop",
+                           "sys.boot_completed", timeout=10)
+            if out is not None and out.returncode == 0 \
+                    and (out.stdout or "").strip() == "1":
+                return True
+        time.sleep(3)
+    return False
+
+
+def _device_try_boot(run_dir: Path, state: dict, step: Step,
+                     tried: set[str], attached: list[str],
+                     ) -> _DeviceLease | None:
+    """Boot a free AVD into its own emulator-<port> serial and lease it -
+    the 'separate local emulator instances' path, used only where tooling
+    supports it (emulator binary + defined AVDs). An `avd-<name>` slot
+    lease keeps two conductors from booting the same image at once."""
+    avds = emulator_avds()
+    if not avds:
+        return None
+    running = _running_avd_names(attached)
+    for avd in avds:
+        if avd in tried or avd in running:
+            continue
+        slot = _device_try_lease(f"avd-{avd}", run_dir, state, step)
+        if slot is None:
+            continue                    # another conductor is booting it
+        port = _free_emu_port(attached)
+        if port is None:
+            _device_release(slot, run_dir)
+            break
+        tried.add(avd)
+        log_path = run_dir / f"{step.name}.emulator.log"
+        proc = None
+        try:
+            proc = _spawn_emulator(avd, port, log_path)
+        except OSError as exc:
+            LOG.warning("emulator boot failed for %s: %s", avd, exc)
+        serial = f"emulator-{port}"
+        if proc is not None and _wait_emu_boot(serial, proc):
+            lease = _device_try_lease(
+                serial, run_dir, state, step,
+                booted={"avd": avd, "port": port, "emu_pid": proc.pid})
+            if lease is not None:
+                lease.avd_slot = slot
+                log_event(run_dir, event="device_booted", step=step.name,
+                          avd=avd, serial=serial, port=port)
+                return lease
+            _device_kill_emu(serial, proc.pid, run_dir)   # raced away
+        elif proc is not None:
+            _device_kill_emu(serial, proc.pid, run_dir)
+        _device_release(slot, run_dir)
+    return None
+
+
+def _device_wait_acquire(step: Step, run_dir: Path, state: dict,
+                         slug: str) -> _DeviceLease | str:
+    """Block until this step owns a device lease; return it, or a terminal
+    status string ('skipped'/'blocked') already recorded in state.
+
+    Queue semantics: a busy-but-present device is waited on uncapped (it
+    frees when its step ends or its owner dies) - 'queuing when only a
+    shared device is available'. A device that isn't attached at all gets
+    device_wait_s to appear (a sibling's boot, a phone getting plugged in)
+    before the step records 'blocked'. Halt sentinels work while queued.
+    """
+    spec = step.device or "any"
+    t_wait = time.time()
+    absent_since = t_wait
+    tried_avds: set[str] = set()
+    last_note = None
+    last_save = 0.0
+    wait_logged = False
+    while True:
+        # Halt controls apply while queued too - a step that never spawned
+        # records 'skipped' exactly like the pre-spawn flag check.
+        halt = _flag_set(stop_flag(run_dir), stop_flag(run_dir, step.name),
+                         pause_flag(run_dir), drain_flag(run_dir))
+        skipped = halt is None and skip_flag(run_dir, step.name).is_file()
+        if halt is not None or skipped:
+            why = ("skipped by user (Skip step)" if skipped else
+                   "run paused" if pause_flag(run_dir).is_file() else
+                   "run drained" if drain_flag(run_dir).is_file()
+                   else "stopped by user")
+            with STATE_LOCK:
+                state["steps"].setdefault(step.name, {}).update(
+                    name=step.name, slug=slug, status="skipped",
+                    ended_at=now_iso(),
+                    note=f"{why} while waiting for a device")
+                save_state(run_dir, state)
+            log_event(run_dir, event="step_stopped", step=step.name,
+                      phase="device_wait")
+            return "skipped"
+
+        devs = adb_devices()
+        attached = sorted(s for s, st in (devs or []) if st == "device")
+        if spec in ("any", "emulator", "physical"):
+            cand = [s for s in attached if _device_class_match(spec, s)]
+        else:
+            cand = [spec] if spec in attached else []
+
+        lease = None
+        for serial in cand:
+            lease = _device_try_lease(serial, run_dir, state, step)
+            if lease is not None:
+                log_event(run_dir, event="device_acquired",
+                          step=step.name, serial=serial, spec=spec,
+                          waited_s=round(time.time() - t_wait, 1))
+                return lease
+
+        # Separate emulator instances only where tooling supports them:
+        # boot a free AVD when no attached candidate was leasable. Never
+        # while adb itself is down - a fresh emulator can't even register.
+        boot_wanted = devs is not None and (
+            (spec == "emulator" and step.device_boot is not False)
+            or (spec == "any" and step.device_boot))
+        if boot_wanted:
+            lease = _device_try_boot(run_dir, state, step, tried_avds,
+                                     attached)
+            if lease is not None:
+                log_event(run_dir, event="device_acquired",
+                          step=step.name, serial=lease.serial, spec=spec,
+                          waited_s=round(time.time() - t_wait, 1),
+                          booted=True)
+                return lease
+
+        if cand:
+            if not wait_logged:
+                wait_logged = True
+                log_event(run_dir, event="device_wait", step=step.name,
+                          spec=spec, reason="leased", candidates=cand)
+            holders = ", ".join(
+                _device_holder_desc(_device_lease_path(s)) for s in cand)
+            note = (f"waiting for Android device ({spec}): "
+                    f"{', '.join(cand)} held by {holders} - queued")
+            absent_since = time.time()      # exists, just busy: no deadline
+        else:
+            if not wait_logged:
+                wait_logged = True
+                log_event(run_dir, event="device_wait", step=step.name,
+                          spec=spec, reason="absent")
+            note = ("waiting for Android device "
+                    f"({spec}): adb unavailable"
+                    if devs is None else
+                    f"waiting for Android device ({spec}): "
+                    "no matching device attached")
+            if step.device_wait_s and \
+                    time.time() - absent_since >= step.device_wait_s:
+                msg = (f"no Android device matching {spec!r} appeared "
+                       f"within {step.device_wait_s:g}s")
+                with STATE_LOCK:
+                    state["steps"].setdefault(step.name, {}).update(
+                        name=step.name, slug=slug, status="blocked",
+                        ended_at=now_iso(), device_wait=spec, note=msg)
+                    save_state(run_dir, state)
+                log_event(run_dir, event="device_blocked",
+                          step=step.name, spec=spec,
+                          waited_s=round(time.time() - t_wait, 1))
+                return "blocked"
+
+        with STATE_LOCK:
+            rec = state["steps"].setdefault(step.name,
+                                            {"name": step.name})
+            rec.update(slug=slug, status="queued", device_wait=spec,
+                       device_waited_s=round(time.time() - t_wait, 1),
+                       note=note)
+            if note != last_note \
+                    or time.time() - last_save >= DEVICE_WAIT_SAVE_S:
+                save_state(run_dir, state)
+                last_save = time.time()
+                last_note = note
+        time.sleep(DEVICE_POLL_S)
+
+
 def wait_worker(proc, stdout_log: Path, timeout_s: float,
                 stop_flags: tuple[Path, ...] = (),
                 timeout_flag: Path | None = None,
@@ -2764,13 +3430,42 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     rnotes = _flag_text(rnote_flag(run_dir, step.name))
     body_src = _body_with_notes(body_base, rnotes)
 
+    # Android device lease: a `device`-declaring step owns exactly one adb
+    # serial for its whole life - every attempt, interrupt respawn and the
+    # verify gate see the same device, and a busy device queues the step
+    # (status 'queued') instead of racing a sibling for it. A device that
+    # never appears ends the step 'blocked' before any session spawns.
+    device_lease: _DeviceLease | None = None
+    if step.device:
+        got = _device_wait_acquire(step, run_dir, state, slug)
+        if not isinstance(got, _DeviceLease):
+            return got                # 'skipped'/'blocked' already recorded
+        device_lease = got
+    device_note = (DEVICE_NOTE.format(serial=device_lease.serial)
+                   if device_lease else "")
+    if device_lease is not None:
+        # The dashboard exposes queued steps as editable - a prompt edit,
+        # resume note or interrupt that landed DURING the device wait must
+        # still reach this dispatch exactly once, so re-fold all three.
+        intr_folded = _intrq_to_notes(run_dir, step.name) is not None \
+            or intr_folded
+        try:
+            over = prompt_flag(run_dir, step.name)
+            if over.is_file():
+                body_base = over.read_text(encoding="utf-8")
+                prompt_edited = True
+        except OSError:
+            pass
+        rnotes = _flag_text(rnote_flag(run_dir, step.name))
+        body_src = _body_with_notes(body_base, rnotes)
+
     prompt_path = run_dir / "prompts" / f"{step.name}.md"
     prompt_path.parent.mkdir(exist_ok=True)
     # Always render from body_src: it is the resolved body - manifest
     # prompt or prompt_file contents - with any dashboard prompt override
     # and resume notes already folded in.
     render_step = dataclasses.replace(
-        step, prompt=(resume_note or "") + (body_src or ""),
+        step, prompt=device_note + (resume_note or "") + (body_src or ""),
         prompt_file=None)
     prompt_path.write_text(
         render_prompt(render_step, slug, work_dir, cfg.path.parent,
@@ -2787,6 +3482,11 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                    model=step.model, mode=step.mode, cloud=step.cloud,
                    effort=step.effort, timeout_min=step.timeout_min,
                    max_attempts=step.max_attempts,
+                   device=(device_lease.serial if device_lease else None),
+                   device_spec=step.device,
+                   device_booted=(device_lease.booted.get("avd")
+                                  if device_lease and device_lease.booted
+                                  else None),
                    task=task_summary(body_src),
                    prompt=str(prompt_path), stdout_log=str(stdout_log),
                    export=str(export_path))
@@ -2802,6 +3502,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
 
     if cfg.checkpoint and do_checkpoint:
         if not is_git_repo(work_dir):
+            _device_release(device_lease, run_dir)
             with STATE_LOCK:
                 rec.update(status="failed",
                            note="not a git repo root; checkpoint required")
@@ -2809,6 +3510,14 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             return "failed"
         git_commit(work_dir, f"conductor: checkpoint before {step.name}",
                    allow_empty=True)
+
+    # The leased serial reaches the worker through adb's own ANDROID_SERIAL
+    # plus an explicit CONDUCTOR_DEVICE_SERIAL - every automation command
+    # the session runs (and the verify gate below) inherits it.
+    step_env = clean_devin_env()
+    if device_lease is not None:
+        step_env["ANDROID_SERIAL"] = device_lease.serial
+        step_env["CONDUCTOR_DEVICE_SERIAL"] = device_lease.serial
 
     t0 = time.time()
     timed_out = False
@@ -2842,7 +3551,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             export_path = run_dir / \
                 f"{step.name}.interrupt{interrupts}.export.json"
             intr_step = dataclasses.replace(
-                step, prompt=INTERRUPT_NOTE + (body_src or ""),
+                step, prompt=INTERRUPT_NOTE + device_note + (body_src or ""),
                 prompt_file=None)
             prompt_path.write_text(
                 render_prompt(intr_step, slug, work_dir, cfg.path.parent,
@@ -2864,7 +3573,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                 retry_step = dataclasses.replace(
                     step, prompt=RETRY_NOTE.format(
                         timeout=step.timeout_min, prev=attempt - 1,
-                        total=step.max_attempts) + "\n" + (body_src or ""),
+                        total=step.max_attempts) + "\n" + device_note
+                        + (body_src or ""),
                     prompt_file=None)
                 prompt_path.write_text(
                     render_prompt(retry_step, slug, work_dir,
@@ -2885,8 +3595,10 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                 proc = subprocess.Popen(cmd, cwd=str(work_dir), stdout=out,
                                         stderr=subprocess.STDOUT,
                                         stdin=subprocess.DEVNULL,
-                                        env=clean_devin_env(),
+                                        env=step_env,
                                         **hidden_subprocess_kwargs())
+                if device_lease is not None:
+                    _device_lease_set_worker(device_lease, proc.pid)
                 # Writing state.json into run_dir mid-spawn lands inside the
                 # worker's watched workspace on self-hosted runs, and the
                 # CLI's user-edit awareness ends the fresh session mid-init
@@ -3010,7 +3722,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             v = subprocess.run(step.verify, cwd=str(work_dir), shell=True,
                                capture_output=True, text=True,
                                encoding="utf-8", errors="replace",
-                               timeout=600, **hidden_subprocess_kwargs())
+                               timeout=600, env=step_env,
+                               **hidden_subprocess_kwargs())
             verify_ok = v.returncode == 0
             (run_dir / f"{step.name}.verify.log").write_text(
                 (v.stdout or "") + (v.stderr or ""), encoding="utf-8",
@@ -3031,6 +3744,12 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         intr_late = _intrq_to_notes(run_dir, step.name) is not None \
             or intr_late
         log_event(run_dir, event="step_interrupt_late", step=step.name)
+
+    # The serial frees only after worker + verify both let go of it. An
+    # exception escaping this function crashes the driver - the lease then
+    # goes stale via dead pids and is broken by the next waiter, so the
+    # explicit release path covers every status, not just success.
+    _device_release(device_lease, run_dir)
 
     if stopped:
         status = "stopped"
@@ -3822,6 +4541,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         tags = cloud + (" [worktree]" if s.worktree else "") \
             + (f" [wave {s.wave}]" if s.wave is not None else "") \
             + (" [resolver]" if s.merge_resolver else "") \
+            + (f" [device={s.device}]" if s.device else "") \
             + (" [deferred]" if s.merge == "deferred" else "")
         tries = f" x{s.max_attempts}" if s.max_attempts > 1 else ""
         print(f"  {s.name:<20} {slug:<22} model={s.model or '-':<10} "
@@ -9119,6 +9839,8 @@ def collect_dashboard(runs_dir: Path,
                     sj.parent, rec.get("name") or name).is_file(),
                 "interrupts": rec.get("interrupts"),
                 "cloud": rec.get("cloud", plan.get("cloud")),
+                "device": rec.get("device"),
+                "device_wait": rec.get("device_wait"),
                 "verify_ok": rec.get("verify_ok"),
                 "skipped_by_user": _safe_name(
                     rec.get("name") or name) in flagged,
@@ -10567,7 +11289,7 @@ function showDetail(i, keepStack){
     ['session',(a.session_id||'-')+(a.session_gone?' (deleted from sidebar)':'')],
     ['verify',a.verify_ok==null?'-':(a.verify_ok?'pass':'FAIL')],
     ['exit',a.exit_code],['work dir',a.work_dir],
-    ['branch',a.branch],
+    ['branch',a.branch],['device',a.device||'-'],
     ['merged',a.merged===true?'yes'+(a.merged_at?' @ '+a.merged_at:'')
       :a.merged],
     ['prompt file',a.prompt],['stdout',a.stdout_log],['export',a.export],

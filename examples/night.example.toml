@@ -123,3 +123,25 @@ prompt = "Pick up the next task in .agent_tasks/QUEUE.md and work it to done or 
 # project = "thermalwatch"
 # wave = 1            # runs in the same wave, in the project dir itself
 # prompt = "..."
+
+# Android device step: `device` leases ONE adb serial machine-wide for the
+# step's whole run (attempts + interrupt respawns + the verify gate). A
+# busy device queues the step until it frees; a device that never appears
+# blocks the step after device_wait_s. The worker gets ANDROID_SERIAL +
+# CONDUCTOR_DEVICE_SERIAL in its env and a device note in its prompt.
+# device + cloud is a manifest error (cloud workers can't see local adb).
+#
+# [[step]]
+# name = "on-device-acceptance"
+# project = "apartment-3d"
+# device = "emulator"      # "any" | "emulator" | "physical" | an exact
+                         # serial like "RFGL11NN0QV"; true = "any".
+                         # device = "emulator" boots a free AVD on a free
+                         # console port when none is attached and kills
+                         # exactly that instance at release.
+# device_wait_s = 600    # give up -> 'blocked' if NO matching device
+                         # appears (0 = wait forever); a busy device
+                         # queues uncapped regardless
+# device_boot = false    # never boot an AVD, attached devices only
+# prompt = "Run tools/device-accept-test.mjs against the assigned device"
+# verify = 'python -c "pass"'
