@@ -7710,5 +7710,218 @@ const body=()=>elem('dbody').innerHTML;
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class ModelComboboxTests(unittest.TestCase):
+    """Planner/Step model fields are free-text comboboxes: typing filters a
+    Recommendations group on top of a separated, scrollable All models
+    group - both fed by modelCatalog() (the same `devin models list`
+    parse). The full list stays put on zero matches, and a model present
+    in both groups is two distinct options so aria-activedescendant is
+    never ambiguous."""
+
+    def test_model_fields_render_as_comboboxes(self):
+        html = conductor._DASH_HTML
+        self.assertIn('role="combobox"', html)
+        self.assertIn('aria-autocomplete="list"', html)
+        self.assertIn('role="listbox"', html)
+        self.assertIn('aria-activedescendant', html)
+        # the shared datalist is gone; effort fields keep theirs
+        self.assertNotIn('datalist id="rq-models"', html)
+        self.assertIn('datalist id="rq-efforts"', html)
+        self.assertIn('datalist id="rq-plan_efforts"', html)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_combobox_filter_sections_keyboard_and_persistence(self):
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const handlers={}, nodes=new Map(), posts=[];
+const mkCls=init=>{const s=new Set((init||'').split(' ').filter(Boolean));
+  return {contains:c=>s.has(c),add:c=>s.add(c),remove:c=>s.delete(c),
+    toggle:(c,f)=>{const on=f===undefined?!s.has(c):f;
+      on?s.add(c):s.delete(c);return on;}};};
+const elem=id=>{
+  if(!nodes.has(id)){
+    const n={id,innerHTML:'',hidden:true,textContent:'',value:'',style:{},
+      attrs:{},dataset:{},disabled:false,scrollTop:0,classList:mkCls(''),
+      setAttribute(k,v){this.attrs[k]=String(v);},
+      getAttribute(k){return this.attrs[k];},
+      removeAttribute(k){delete this.attrs[k];},
+      querySelector:()=>null,querySelectorAll:()=>[],closest:()=>null,
+      focus(){this.focused=(this.focused||0)+1;},
+      scrollIntoView(){this.scrolled=(this.scrolled||0)+1;},
+      dispatchEvent(ev){const h=handlers[ev&&ev.type];
+        if(h)h({target:n});return true;},
+      getBoundingClientRect:()=>({left:0,top:0,bottom:0,right:0})};
+    nodes.set(id,n);}
+  return nodes.get(id);};
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const sel={isCollapsed:true,toString:()=>''};
+const window={innerWidth:1200,innerHeight:800,addEventListener:()=>{},
+  getSelection:()=>sel};
+class Event{constructor(type,init){this.type=type;Object.assign(this,init);}}
+const CATALOG={'swe-2':['high','medium','max'],
+  'gpt-6-luna':['min','low','medium','high','max'],
+  'gpt-6-astra':['low','high'],'claude-opus-5.5':['low','high','max']};
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',
+  model_options:CATALOG,agents:[],runs:[],defaults:{model:'swe-2',effort:'max'}};
+const rec={id:'r1',status:'ready',label:'x',raw:'do it',project:'p',
+  model:'swe-2',effort:'max',plan_model:'gpt-6-luna',plan_effort:'high',
+  manifest:'manifests/r1.toml',manifest_text:'[run]',stale:false};
+const fetch=async(url,opt)=>{
+  if(opt&&opt.body)posts.push({url,body:JSON.parse(opt.body)});
+  return {ok:true,json:async()=>(url.startsWith('/api/state')?data:{})};};
+const ctx=vm.createContext({document,window,fetch,Event,
+  confirm:()=>true,alert:()=>{},location:{reload:()=>{}},
+  setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+vm.runInContext('modalRequest={id:"r1",status:"ready",dirty:false,' +
+  'originalManifest:"[run]",record:'+JSON.stringify(rec)+'};' +
+  'showRequestForm('+JSON.stringify(rec)+')',ctx);
+const body=()=>elem('dbody').innerHTML;
+const mopts=html=>(html.match(/class="mopt"/g)||[]).length;
+const opt=(mi,i)=>({dataset:{mfor:mi,mi:String(i)},
+  closest:s=>s==='.mopt'?{dataset:{mfor:mi,mi:String(i)}}:null});
+const key=(t,k)=>{let pd=0;
+  handlers.keydown({target:t,key:k,preventDefault:()=>{pd++;}});
+  return pd;};
+const input=t=>handlers.input({target:t});
+(async()=>{
+  // markup: two combobox inputs, no datalist, listbox popups hidden
+  assert.equal((body().match(/role="combobox"/g)||[]).length,2);
+  assert.doesNotMatch(body(),/datalist id="rq-models"/);
+  assert.match(body(),/aria-controls="rq-model-pop"/);
+  assert.equal(elem('rq-model-pop').hidden,true);
+
+  // both fields carry the class hook + the saved values
+  const mi=elem('rq-model'), pi=elem('rq-plan_model');
+  for (const inp of [mi,pi]) inp.classList.add('mcombo-in');
+  mi.value='swe-2'; pi.value='gpt-6-luna';
+
+  // empty input: no Recommendations group, whole catalog listed once
+  mi.value='';
+  handlers.focusin({target:mi});
+  const pop=elem('rq-model-pop');
+  assert.equal(pop.hidden,false);
+  assert.equal(mi.attrs['aria-expanded'],'true');
+  assert.doesNotMatch(pop.innerHTML,/Recommendations/);
+  assert.match(pop.innerHTML,/Supported models/);
+  assert.equal(mopts(pop.innerHTML),5);          // 4 families + adaptive
+  assert.match(pop.innerHTML,/>adaptive</);      // routing mode included
+  handlers.focusout({target:mi});
+  assert.equal(pop.hidden,true);
+
+  // partial match: recs on top, separator, full list intact below
+  mi.value='swe'; input(mi);
+  assert.match(pop.innerHTML,/Recommendations/);
+  assert.match(pop.innerHTML,/All models/);
+  assert.equal(mopts(pop.innerHTML),6);          // 1 rec + 5 all
+  assert.ok(pop.innerHTML.indexOf('Recommendations') <
+            pop.innerHTML.indexOf('All models'));
+  // 'swe-2' shows in BOTH groups - distinct option ids keep
+  // aria-activedescendant unambiguous
+  const rIds=[...pop.innerHTML.matchAll(/id="(rq-model-opt-[ra]\d+)"/g)]
+    .map(m=>m[1]);
+  assert.equal(new Set(rIds).size,6);
+  // 'swe' is no exact hit -> nothing active until the first ArrowDown,
+  // which lands on the recs occurrence; the next one walks into the
+  // all-list duplicate - same value, different option id
+  assert.equal(mi.attrs['aria-activedescendant'],undefined);
+  key(mi,'ArrowDown');
+  assert.equal(mi.attrs['aria-activedescendant'],'rq-model-opt-r0');
+  key(mi,'ArrowDown');                           // off the rec, into list
+  assert.equal(mi.attrs['aria-activedescendant'],'rq-model-opt-a1');
+  key(mi,'ArrowUp');
+  assert.equal(mi.attrs['aria-activedescendant'],'rq-model-opt-r0');
+  // the two occurrences carry the same value; Enter picks the active one
+  assert.equal(vm.runInContext(
+    'mcombo(document.getElementById("rq-model")).items[0].value',ctx),
+    'swe-2');
+  key(mi,'Enter');
+  assert.equal(mi.value,'swe-2');
+  assert.equal(pop.hidden,true);
+  assert.equal(vm.runInContext('modalRequest.dirty',ctx),true);
+  // picking a real family re-synced the effort datalist for it
+  assert.match(elem('rq-efforts').innerHTML,/value="max"/);
+
+  // no match: full list still offered, free text kept
+  mi.value='zzz'; input(mi);
+  assert.match(pop.innerHTML,/no matches/);
+  assert.equal(mopts(pop.innerHTML),5);
+  assert.equal(mi.value,'zzz');
+  key(mi,'Enter');                               // nothing active -> close
+  assert.equal(pop.hidden,true);
+  assert.equal(mi.value,'zzz');                  // free text survives
+
+  // Escape closes the popup only - the modal stays up
+  handlers.focusin({target:mi});
+  assert.equal(pop.hidden,false);
+  key(mi,'Escape');
+  assert.equal(pop.hidden,true);
+  assert.equal(elem('backdrop').hidden,false);
+
+  // ArrowDown on a closed popup opens it; -1 active -> first item
+  mi.value='';
+  key(mi,'ArrowDown');
+  assert.equal(pop.hidden,false);
+  assert.equal(mi.attrs['aria-activedescendant'],'rq-model-opt-a0');
+  key(mi,'End');
+  assert.equal(mi.attrs['aria-activedescendant'],'rq-model-opt-a4');
+  // click an All-list option (flat items idx 2 = gpt-6-astra)
+  await handlers.click({target:opt('rq-model',2),preventDefault:()=>{}});
+  assert.equal(mi.value,'gpt-6-astra');
+  assert.equal(pop.hidden,true);
+  // adaptive pick disables its effort field through the shared handler
+  mi.value=''; input(mi);
+  await handlers.click({target:opt('rq-model',4),preventDefault:()=>{}});
+  assert.equal(mi.value,'adaptive');
+  assert.equal(elem('rq-effort').disabled,true);
+
+  // planner field is its own combobox with its own option ids
+  handlers.focusin({target:pi});
+  const ppop=elem('rq-plan_model-pop');
+  assert.equal(ppop.hidden,false);
+  assert.match(ppop.innerHTML,/id="rq-plan_model-opt-r0"/);
+  assert.equal(pi.attrs['aria-activedescendant'],'rq-plan_model-opt-r0');
+  pi.value='opus'; input(pi);
+  assert.match(ppop.innerHTML,/>claude-opus-5\.5</);
+  key(pi,'ArrowDown'); key(pi,'Enter');
+  assert.equal(pi.value,'claude-opus-5.5');
+  // the planner pick synced the PLANNER effort list only
+  assert.match(elem('rq-plan_efforts').innerHTML,/value="high"/);
+  assert.equal(elem('rq-effort').disabled,true);   // adaptive stays n/a
+
+  // outside click dismisses an open popup; a click on the input doesn't
+  handlers.focusin({target:mi});
+  assert.equal(pop.hidden,false);
+  await handlers.click({target:mi,preventDefault:()=>{}});
+  assert.equal(pop.hidden,false);
+  await handlers.click({target:{id:'rq-label',dataset:{},closest:()=>null},
+    preventDefault:()=>{}});
+  assert.equal(pop.hidden,true);
+
+  // persistence: both picked values land in requestFields + the save body
+  elem('rq-raw').value='do it';
+  mi.value='gpt-6-luna'; pi.value='claude-opus-5.5';
+  const f=vm.runInContext('requestFields()',ctx);
+  assert.equal(f.model,'gpt-6-luna');
+  assert.equal(f.plan_model,'claude-opus-5.5');
+  posts.length=0;
+  await vm.runInContext('requestAction("save")',ctx);
+  const saved=posts.find(p=>p.url==='/api/requests/r1/save');
+  assert.equal(saved.body.model,'gpt-6-luna');
+  assert.equal(saved.body.plan_model,'claude-opus-5.5');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
