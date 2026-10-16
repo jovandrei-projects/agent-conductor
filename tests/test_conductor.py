@@ -5950,6 +5950,115 @@ prompt = "work"
             self.assertIn(name, html)
 
 
+class PurposeMarkerTests(unittest.TestCase):
+    """A `<!-- conductor-purpose: X -->` comment at the HEAD of a
+    conductor-written task body is machine metadata (RESOLVE_BODY leads
+    with `resolve-merge`). It must reach the worker in the prompt file
+    but never render as task text - surfaces show the real body, or a
+    purpose label when no ordinary body exists."""
+
+    MARK = "<!-- conductor-purpose: resolve-merge -->"
+
+    def test_split_purpose_head_marker_and_whitespace(self):
+        self.assertEqual(
+            conductor.split_purpose(f"{self.MARK}\nreal task"),
+            ("resolve-merge", "real task"))
+        # surrounding whitespace in/around the marker is tolerated
+        self.assertEqual(
+            conductor.split_purpose(
+                "  \n<!-- conductor-purpose :  resolve-merge  -->\n\n"
+                "  body text"),
+            ("resolve-merge", "body text"))
+        self.assertEqual(
+            conductor.split_purpose("<!--conductor-purpose:x-->y"),
+            ("x", "y"))
+
+    def test_split_purpose_leaves_mentions_and_other_comments(self):
+        # mid-text the marker is a mention, not metadata (this very
+        # step's prompt names it) - nothing is stripped
+        p, body = conductor.split_purpose(
+            f"fix the {self.MARK} rendering")
+        self.assertIsNone(p)
+        self.assertIn("conductor-purpose", body)
+        p, body = conductor.split_purpose("<!-- a note --> do a thing")
+        self.assertIsNone(p)
+        self.assertEqual(body, "<!-- a note --> do a thing")
+        self.assertEqual(conductor.split_purpose("plain task"),
+                         (None, "plain task"))
+
+    def test_task_display_body_or_label(self):
+        self.assertEqual(
+            conductor.task_display(f"{self.MARK}\nresolve the conflict"),
+            "resolve the conflict")
+        # marker-only resolver task -> a clear purpose label, not a blank
+        self.assertEqual(
+            conductor.task_display(self.MARK),
+            "conductor task: merge conflict resolution")
+        self.assertEqual(
+            conductor.task_display("<!-- conductor-purpose: new-kind -->"),
+            "conductor task: new-kind")
+        self.assertEqual(conductor.task_display("do a thing"),
+                         "do a thing")
+        self.assertEqual(conductor.task_display(None), "")
+
+    def test_task_summary_marker_does_not_eat_the_budget(self):
+        body = self.MARK + "\n" + "word " * 60
+        s = conductor.task_summary(body)
+        self.assertNotIn("conductor-purpose", s)
+        self.assertTrue(s.startswith("word"))
+        self.assertEqual(len(s), 160)      # full budget of real text
+        self.assertEqual(conductor.task_summary("plain " * 60)[:160],
+                         " ".join(("plain " * 60).split())[:160])
+
+    def test_task_label_translates_marker(self):
+        rec = {"task": f"{self.MARK} do internal cleanup"}
+        self.assertEqual(conductor.task_label(rec), "do internal cleanup")
+        with tempfile.TemporaryDirectory() as td:
+            pf = Path(td) / "p.md"
+            pf.write_text("preamble\n\n## Task\n\n" + self.MARK +
+                          "\nfull body\n\n## Before you finish\n- x\n",
+                          encoding="utf-8")
+            # prompt-file path (old rec without `task`) + full mode
+            self.assertEqual(conductor.task_label({"prompt": str(pf)}),
+                             "full body")
+            self.assertEqual(
+                conductor.task_label({"prompt": str(pf)}, full=True),
+                "full body")
+
+    def test_run_records_purpose_and_clean_task(self):
+        """Dispatch path: `purpose` is the machine-readable field, `task`
+        holds display text - while the prompt file still ships the raw
+        marker to the worker."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "<!-- conductor-purpose: housekeeping -->\\nFILE.txt - tidy it"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            rd = next(runs.iterdir())
+            st = json.loads((rd / "state.json").read_text())
+            rec = st["steps"]["a"]
+            self.assertEqual(rec["purpose"], "housekeeping")
+            self.assertEqual(rec["task"], "FILE.txt - tidy it")
+            # the marker is still IN the dispatched prompt (consumers
+            # like the mock resolver key on it) - only displays strip it
+            prompt_txt = (rd / "prompts" / "a.md").read_text(
+                encoding="utf-8")
+            self.assertIn("<!-- conductor-purpose: housekeeping -->",
+                          prompt_txt)
+            d = conductor.collect_dashboard(runs, ["no-such-devin"],
+                                            base / "requests")
+            a = d["agents"][0]
+            self.assertEqual(a["purpose"], "housekeeping")
+            self.assertEqual(a["task"], "FILE.txt - tidy it")
+            self.assertEqual(a["task_full"], "FILE.txt - tidy it")
+
+
 class StepSummaryTests(unittest.TestCase):
     """GET /api/runs/<run>/steps/<step>/summary renders a markdown
     report per step (status/elapsed/tokens/trajectory/commits/stdout
@@ -6050,6 +6159,85 @@ class StepSummaryTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;", page)
         self.assertIn("&lt;tag&gt; raw", page)
         self.assertNotIn("<script>", page)
+
+    MARK = "<!-- conductor-purpose: resolve-merge -->"
+
+    def test_summary_reported_marker_becomes_purpose_not_text(self):
+        """The reported shape (resolve-task-modal-navigation): rec['task']
+        led with the raw `<!-- conductor-purpose -->` comment, which
+        rendered literally in ## Task and ate a third of the 160-char
+        budget. Now the token lands on a **purpose:** bullet and Task
+        shows the real body."""
+        task = (self.MARK + " A git merge is in progress in this repo "
+                "and needs a human-style resolution. Conductor tried to "
+                "merge branch `conductor")
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run(td, {"status": "done", "task": task})
+            md = conductor.step_summary(rd.name, "s1", runs)
+            self.assertIn("- **purpose:** `resolve-merge` "
+                          "(merge conflict resolution)", md)
+            self.assertIn("## Task\n\nA git merge is in progress "
+                          "in this repo", md)
+            self.assertNotIn("conductor-purpose", md)
+            self.assertNotIn("<!--", md)
+            page = conductor.summary_html(md, "t")
+            self.assertIn("A git merge is in progress", page)
+            self.assertNotIn("conductor-purpose", page)
+            # API behavior unchanged: the report still persists verbatim
+            # once the step is no longer live
+            self.assertEqual((rd / "s1.summary.md").read_text(
+                encoding="utf-8"), md)
+
+    def test_summary_purpose_field_without_marker_in_task(self):
+        """New records store `purpose` explicitly and `task` already
+        marker-free - the bullet renders from the field alone."""
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run(td, {
+                "status": "done", "purpose": "resolve-merge",
+                "task": "A git merge is in progress"})
+            md = conductor.step_summary(rd.name, "s1", runs)
+            self.assertIn("- **purpose:** `resolve-merge` "
+                          "(merge conflict resolution)", md)
+            self.assertIn("## Task\n\nA git merge is in progress", md)
+
+    def test_summary_marker_only_task_gets_purpose_label(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run(td, {"status": "done", "task": self.MARK})
+            md = conductor.step_summary(rd.name, "s1", runs)
+            self.assertIn("- **purpose:** `resolve-merge`", md)
+            self.assertIn("## Task\n\nconductor task: "
+                          "merge conflict resolution", md)
+            self.assertNotIn("<!--", md)
+
+    def test_summary_keeps_literal_comments_and_mentions(self):
+        """Only a head-of-body conductor-purpose marker is metadata: an
+        HTML comment inside task text (a code example) or a mid-sentence
+        marker mention stays - escaped, but never stripped."""
+        task = ("keep `<!-- html -->` comments in code samples; also fix "
+                f"the {self.MARK} marker doc")
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run(td, {"status": "done", "task": task})
+            md = conductor.step_summary(rd.name, "s1", runs)
+            self.assertNotIn("**purpose:**", md)   # mention != metadata
+            self.assertIn("`<!-- html -->`", md)          # kept verbatim
+            self.assertIn("conductor-purpose", md)         # mention kept
+            page = conductor.summary_html(md, "t")
+            self.assertIn("&lt;!-- html --&gt;", page)     # escaped, safe
+            self.assertNotIn("<!--", page)                 # never raw
+
+    def test_summary_marker_plus_injection_stays_safe(self):
+        task = self.MARK + " resolve it <script>alert(1)</script> now"
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run(td, {"status": "done", "task": task})
+            page = conductor.summary_html(
+                conductor.step_summary(rd.name, "s1", runs), "t")
+            self.assertNotIn("conductor-purpose", page)
+            self.assertIn("&lt;script&gt;", page)
+            self.assertNotIn("<script>", page)
+
+    def test_modal_purpose_row_wired(self):
+        # the marker's token reaches the modal via the 'purpose' field
+        self.assertIn("a.purpose", conductor._DASH_HTML)
 
 
 if __name__ == "__main__":

@@ -200,6 +200,68 @@ If the conflict cannot be resolved safely, leave the merge in progress
 and end with STATUS: blocked - the branch and its worktree are kept
 either way."""
 
+# Task bodies conductor writes itself (currently only RESOLVE_BODY) open
+# with a machine-readable HTML comment declaring the step's internal
+# role: `<!-- conductor-purpose: resolve-merge -->`. The marker ships IN
+# the dispatched prompt - prompt-file consumers (mock_devin's
+# resolve-merge trigger among them) rely on it - but it is metadata, not
+# task prose. Human-facing surfaces (the stored 160-char `task`, the
+# modal's task prompt, the /summary report) therefore translate it into
+# a label via the helpers below instead of rendering a raw comment.
+# The marker is honored only at the HEAD of a body: the same text
+# appearing mid-task is a mention - a task can legitimately discuss the
+# marker or carry HTML comments inside code examples - never metadata
+# to strip.
+PURPOSE_RE = re.compile(
+    r"^\s*<!--\s*conductor-purpose\s*:\s*([\w.-]+)\s*-->\s*")
+
+# Human phrasing for known purpose tokens; an unknown token displays
+# as itself.
+PURPOSE_LABELS = {"resolve-merge": "merge conflict resolution"}
+
+
+def split_purpose(text: str | None) -> tuple[str | None, str]:
+    """Split leading `<!-- conductor-purpose: X -->` markers off a task
+    body -> (first purpose token or None, remaining text)."""
+    rest = text or ""
+    purpose = None
+    while True:
+        m = PURPOSE_RE.match(rest)
+        if not m:
+            return purpose, rest
+        purpose = purpose or m.group(1)
+        rest = rest[m.end():]
+
+
+def purpose_label(purpose: str | None) -> str:
+    """Human-facing label for a conductor-purpose token."""
+    return PURPOSE_LABELS.get(purpose, purpose or "")
+
+
+def task_display(text: str | None) -> str:
+    """Human-facing rendering of a task body/summary: a leading
+    conductor-purpose marker is metadata, so the remaining body shows
+    instead - or, when the body is marker-only, a label naming the
+    internal task. Non-marker comments and mid-text mentions pass
+    through untouched."""
+    purpose, body = split_purpose(text)
+    body = body.strip()
+    if body:
+        return body
+    return f"conductor task: {purpose_label(purpose)}" if purpose else ""
+
+
+def task_summary(body: str | None, limit: int = 160) -> str:
+    """The `task` string stored on a record and shown in lists:
+    whitespace squashed + truncated, with a leading conductor-purpose
+    marker translated - so a resolver row reads as its real
+    instructions, not `<!-- ...`."""
+    purpose, disp = split_purpose(body)
+    one = " ".join(disp.split())[:limit]
+    if one or not purpose:
+        return one
+    return f"conductor task: {purpose_label(purpose)}"
+
 
 # ---------------------------------------------------------------- manifest
 
@@ -1421,6 +1483,10 @@ def step_summary_md(rec: dict, st: dict, run_name: str) -> str:
         branch_s = f"`{branch}` - " + (
             "merged" if merged else "unmerged, kept at "
             f"`{rec.get('work_dir') or rec.get('project')}`")
+    # `purpose` is recorded on dispatch; old records only have the marker
+    # embedded in `task`, so parse it back out - either way the raw
+    # comment must not render as the step's description.
+    purpose = rec.get("purpose") or split_purpose(rec.get("task"))[0]
     L = [f"# {run_name} / {name}", ""]
     L += [
         f"- **status:** {status} · **verify:** {verify_s} · "
@@ -1437,6 +1503,8 @@ def step_summary_md(rec: dict, st: dict, run_name: str) -> str:
         f"cached {_fmtK(cached_t)} · {t.get('llm_steps') or 0} turns · "
         f"est {cost_s} (full prompt sum {_fmtK(prompt_t)})",
     ]
+    if purpose:
+        L.append(f"- **purpose:** `{purpose}` ({purpose_label(purpose)})")
     if branch_s:
         L.append(f"- **branch:** {branch_s}")
     if rec.get("note"):
@@ -1445,7 +1513,7 @@ def step_summary_md(rec: dict, st: dict, run_name: str) -> str:
         L.append(f"- **worker says next:** {rec['next']}")
     L.append("")
     if rec.get("task"):
-        L += ["## Task", "", rec["task"], ""]
+        L += ["## Task", "", task_display(rec["task"]), ""]
     arc = cached_arc(rec.get("export"))
     if arc and arc.get("groups"):
         L += [f"## Trajectory ({arc['steps']} turns, times UTC)", ""]
@@ -1985,6 +2053,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     stdout_log = run_dir / f"{step.name}.stdout.log"
     export_path = run_dir / f"{step.name}.export.json"
 
+    purpose, _disp_body = split_purpose(body_src)
     with STATE_LOCK:
         rec = state["steps"].setdefault(step.name, {})
         rec.update(name=step.name, slug=slug, project=str(work_dir),
@@ -1993,9 +2062,16 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                    model=step.model, mode=step.mode, cloud=step.cloud,
                    effort=step.effort, timeout_min=step.timeout_min,
                    max_attempts=step.max_attempts,
-                   task=" ".join((body_src or "").split())[:160],
+                   task=task_summary(body_src),
                    prompt=str(prompt_path), stdout_log=str(stdout_log),
                    export=str(export_path))
+        # The purpose marker keeps its own machine-readable field now
+        # that `task` holds display text; a re-dispatch under a prompt
+        # override may legitimately drop it, so clear a stale value.
+        if purpose:
+            rec["purpose"] = purpose
+        else:
+            rec.pop("purpose", None)
         save_state(run_dir, state)
     log_event(run_dir, event="step_start", step=step.name, project=str(work_dir))
 
@@ -3816,8 +3892,8 @@ def _publish_proposal(rec: dict, text: str, requests_dir: Path,
                pending_questions=[],
                proposed_steps=[{
                    "step": s.name, "slug": s.project, "model": s.model,
-                   "effort": s.effort, "mode": s.mode, "task": " ".join(
-                       s.prompt.split())[:160], "wt": s.worktree,
+                   "effort": s.effort, "mode": s.mode,
+                   "task": task_summary(s.prompt), "wt": s.worktree,
                    "cloud": s.cloud} for s in cfg.steps])
     _save_request(rec, requests_dir)
     return dict(rec)
@@ -6138,9 +6214,11 @@ def task_label(rec: dict, full: bool = False) -> str | None:
     """What the agent was asked to do. New records store `task` directly
     (160-char summary); `full` goes back to the prompt file for the
     untruncated body the detail modal wants - falling back to the stored
-    summary when the file is gone."""
+    summary when the file is gone. Whatever the source, a leading
+    conductor-purpose marker is metadata - task_display swaps it for the
+    real body or a purpose label."""
     if rec.get("task") and not full:
-        return rec["task"]
+        return task_display(rec["task"]) or rec["task"]
     pf = rec.get("prompt")
     if not pf:
         return rec.get("task")
@@ -6157,8 +6235,8 @@ def task_label(rec: dict, full: bool = False) -> str | None:
                   text, re.S)
     body = m.group(1) if m else text
     if full:
-        return body.strip() or rec.get("task")
-    one = " ".join(body.split())
+        return task_display(body) or rec.get("task")
+    one = " ".join(task_display(body).split())
     return one[:160] or rec.get("task")
 
 
@@ -6222,7 +6300,7 @@ def proposal_agent(step: dict, rec: dict, projects: dict, key: str,
             "started_at": None, "ended_at": None, "elapsed_s": None,
             "session_id": None, "model": step.get("model"),
             "effort": step.get("effort"), "mode": step.get("mode"),
-            "task": step.get("task"), "task_full": None,
+            "task": step.get("task"), "task_full": None, "purpose": None,
             "model_actual": None, "wt": step.get("wt"),
             "timeout_min": step.get("timeout_min"),
             "attempts": None, "max_attempts": None,
@@ -6294,7 +6372,7 @@ def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
             "model_actual": e.get("model_actual"),
             "effort": e.get("effort"),
             "mode": "planner", "cloud": False, "verify_ok": None,
-            "task": task, "task_full": task,
+            "task": task, "task_full": task, "purpose": None,
             "note": note, "next": None, "exit_code": None,
             "branch": None, "merged": None,
             "tokens": e.get("tokens"), "wt": False,
@@ -6329,7 +6407,7 @@ def _manifest_pending(st: dict, projects: dict) -> list[dict]:
             wd = str(pdir)
         except ManifestError:
             slug = wd = step.project
-        task = " ".join((step.prompt or "").split())[:160]
+        task = task_summary(step.prompt)
         if not task and step.prompt_file:
             task = step.prompt_file
         out.append({"name": step.name, "slug": slug, "work_dir": wd,
@@ -6374,7 +6452,7 @@ def _pending_agent(st: dict, sd: dict, key: str, run_dir: str,
             "started_at": None, "ended_at": None, "elapsed_s": None,
             "session_id": None, "model": sd.get("model"),
             "effort": sd.get("effort"), "mode": sd.get("mode"),
-            "task": sd.get("task"), "task_full": None,
+            "task": sd.get("task"), "task_full": None, "purpose": None,
             "model_actual": None, "wt": sd.get("wt"),
             "timeout_min": sd.get("timeout_min"),
             "attempts": None, "max_attempts": None,
@@ -6484,9 +6562,11 @@ def collect_dashboard(runs_dir: Path,
             # The modal's full 'task' text: the dispatched prompt body
             # when a prompt file exists, else the manifest's untruncated
             # body (state.json's 160-char summary is only the fallback).
+            # task_display keeps a leading purpose marker out of the
+            # human-facing text in both cases.
             tfull = task_label(rec, full=True)
             if tfull == rec.get("task"):
-                tfull = mbodies.get(name) or tfull
+                tfull = task_display(mbodies.get(name)) or tfull
             worker_alive = bool(rec_pid) and pid_alive(
                 rec_pid, rec.get("started_at"))
             session_gone = bool(
@@ -6518,8 +6598,15 @@ def collect_dashboard(runs_dir: Path,
                 "model_actual": rec.get("model_actual"),
                 "mode": rec.get("mode") or plan.get("mode"),
                 "effort": effort,
-                "task": task_label(rec) or plan.get("task"),
-                "task_full": tfull or plan.get("task"),
+                "task": (task_display(task_label(rec) or plan.get("task"))
+                         or plan.get("task")),
+                "task_full": tfull or task_display(plan.get("task")),
+                # Machine-readable resolver metadata stays machine-
+                # readable even though `task`/`task_full` now carry
+                # display text; old records still hold the marker in
+                # `task`, so it is parsed back out here.
+                "purpose": rec.get("purpose") or
+                           split_purpose(rec.get("task"))[0],
                 # The edit control exists only while the step never
                 # dispatched (queued/skipped records are pre-spawn);
                 # anything that ran takes resume notes instead - the
@@ -6579,7 +6666,9 @@ def collect_dashboard(runs_dir: Path,
                     row["note"] = "Run ended before this step started"
             # Never dispatched: the prompt edit control is live, and the
             # manifest body - not the 160-char summary - is the modal's
-            # full text and the form's prefill.
+            # full text and the form's prefill. Kept literal on purpose:
+            # it is what will dispatch, and an embedded purpose marker
+            # must survive a save round-trip.
             row["task_full"] = mbodies.get(row["step"]) or row.get("task")
             row["prompt_editable"] = True
             row["notes_enabled"] = False
@@ -6692,6 +6781,7 @@ def collect_dashboard(runs_dir: Path,
                 "mode": "planner", "cloud": False, "verify_ok": None,
                 "task": "Propose a TOML runbook for: " + " ".join(
                     (rec.get("raw") or "").split())[:120],
+                "purpose": None,
                 "note": None, "next": None, "exit_code": None,
                 "branch": None, "merged": None, "tokens": None, "wt": False,
                 "cost": None,
@@ -6700,7 +6790,8 @@ def collect_dashboard(runs_dir: Path,
         pbodies = _manifest_bodies(rec)
         for i, s in enumerate(steps):
             a = proposal_agent(s, rec, projects, key, "planned")
-            a["task_full"] = pbodies.get(s["step"]) or a.get("task")
+            a["task_full"] = (task_display(pbodies.get(s["step"]))
+                              or a.get("task"))
             a["prompt_editable"] = False      # edited via the TOML review
             a["notes_enabled"] = False
             a["seq"] = i               # proposal order is its pipeline
@@ -7225,6 +7316,9 @@ function showDetail(i){
     ['branch',a.branch],['merged',a.merged],
     ['prompt file',a.prompt],['stdout',a.stdout_log],['export',a.export],
     ['state file',a.state_md]];
+  // A conductor-internal step (resolve-*) names its machine purpose - the
+  // marker itself no longer renders inside the task text.
+  if(a.purpose) kv.splice(4,0,['purpose',a.purpose]);
   // prev/next walks this step's own pipeline - sibling buttons name their
   // target, the counter gives position. Hidden for a lone/seq-less row.
   const sibs = pipeSibs(a);
