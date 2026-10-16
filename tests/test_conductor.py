@@ -6704,6 +6704,437 @@ prompt = "third"
         self.assertNotIn("Stop this agent", html)
 
 
+class InterruptInstructTests(_RunControlBase):
+    """'Interrupt + instruct': a durable intrq-* request sentinel the
+    driver polls in the same slot as a stop flag. A confirmed submission
+    kills the worker, folds the operator's text (+image refs) into the
+    rnote channel, and respawns the SAME step - never 'stopped', never a
+    retry attempt. Races resolve on the driver: a request landing after
+    turn end banks into notes instead of respawning, and a pending flag
+    survives a driver restart to apply exactly once."""
+
+    def _intrq(self, d: Path, step: str, instructions="more context",
+               attachments=None):
+        f = conductor.intrq_flag(d, step)
+        f.parent.mkdir(exist_ok=True)
+        f.write_text(json.dumps(
+            {"instructions": instructions,
+             "attachments": attachments or [],
+             "submitted_at": conductor.now_iso()}), encoding="utf-8")
+
+    def _fake_worker_popen(self):
+        """Patch subprocess.Popen so ONLY the step worker spawn is faked
+        (its cmd is the only one carrying --prompt-file) - subprocess.run
+        users like check_auth/git keep the real Popen, and no mock
+        process lingers past the test."""
+        real = conductor.subprocess.Popen
+
+        class FakeProc:
+            def __init__(self, cmd, **kwargs):
+                self.pid = None
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        def shim(cmd, **kw):
+            if isinstance(cmd, (list, tuple)) and "--prompt-file" in cmd:
+                return FakeProc(cmd, **kw)
+            return real(cmd, **kw)
+        return mock.patch.object(conductor.subprocess, "Popen", shim)
+
+    def test_interrupt_respawns_with_instructions_and_attachments(self):
+        """The end-to-end path: worker dies mid-sleep, the request folds
+        into notes exactly once, and the SAME step respawns carrying
+        INTERRUPT_NOTE + text + image paths - recorded 'done' with
+        interrupts=1, sibling steps untouched, killed work committed."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "sleep=2 then write WORK.txt"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "write OTHER.txt"
+''')
+            # the flag poll rides WAIT_POLL_S slices - shrink it so the
+            # worker is still mid-sleep when the request lands
+            with mock.patch.object(conductor, "WAIT_POLL_S", 0.5):
+                t, _ = self._start_run(m, runs)
+                run_dir = self._wait_run_dir(runs, "s1")
+                out = conductor.interrupt_step(
+                    run_dir.name, "s1",
+                    {"instructions": "also paint it blue",
+                     "attachments": [{"name": "shot.png",
+                                      "path": "C:/tmp/shot.png"}]},
+                    runs)
+                self.assertEqual(out["interrupting"], "s1")
+                t.join(timeout=60)
+            self.assertFalse(t.is_alive(), "run never finished")
+            st = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(st["steps"]["s1"]["status"], "done")
+            self.assertEqual(st["steps"]["s1"].get("interrupts"), 1)
+            # a respawn is NOT a retry: no attempt was spent
+            self.assertEqual(st["steps"]["s1"].get("attempts"), 1)
+            self.assertEqual(st["steps"]["s2"]["status"], "done")
+            # the respawn prompt carries interrupt context + the text
+            p = (run_dir / "prompts" / "s1.interrupt1.md").read_text(
+                encoding="utf-8")
+            self.assertIn("interrupted this step and resumed", p)
+            self.assertIn("also paint it blue", p)
+            self.assertIn("C:/tmp/shot.png", p)
+            self.assertIn("IMAGE ATTACHMENTS", p)
+            # the request is consumed: sentinel gone, the text lives in
+            # the notes channel exactly once
+            self.assertFalse(
+                conductor.intrq_flag(run_dir, "s1").exists())
+            notes = conductor.rnote_flag(run_dir, "s1").read_text(
+                encoding="utf-8")
+            self.assertIn("INTERRUPT", notes)
+            self.assertIn("also paint it blue", notes)
+            conductor.rnote_flag(run_dir, "s1").unlink(missing_ok=True)
+            # only the RESPAWNED worker wrote - the killed one died
+            # mid-sleep before producing its line
+            self.assertEqual(
+                len((proj / "WORK.txt").read_text().splitlines()), 1)
+            self.assertIn("interrupted and resumed",
+                          st["steps"]["s1"].get("note") or "")
+
+    def test_interrupt_endpoint_gates(self):
+        """Only a live running step on a driver that polls intrq accepts:
+        finished/dead/old-driver steps, bad payloads, and a second
+        submit while one is pending are all refused."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "work"
+''')
+            d = runs / "20260101-000000-t"
+            d.mkdir(parents=True)
+            live = {"run": "t", "manifest": str(m), "intrq": True,
+                    "started_at": conductor.now_iso(),
+                    "driver_pid": os.getpid(),
+                    "steps": {
+                        "s1": {"name": "s1", "status": "running",
+                               "started_at": conductor.now_iso(),
+                               "timeout_min": 60},
+                        "s2": {"name": "s2", "status": "done"}}}
+            (d / "state.json").write_text(json.dumps(live))
+            try:
+                out = conductor.interrupt_step(
+                    d.name, "s1", {"instructions": "go slower"}, runs)
+                self.assertEqual(out["interrupting"], "s1")
+                req = json.loads(
+                    conductor.intrq_flag(d, "s1").read_text())
+                self.assertEqual(req["instructions"], "go slower")
+                self.assertIn("submitted_at", req)
+                # a second request while one is pending is refused -
+                # the text must apply exactly once
+                with self.assertRaises(conductor.RequestError) as e:
+                    conductor.interrupt_step(
+                        d.name, "s1", {"instructions": "again"}, runs)
+                self.assertEqual(e.exception.status, 409)
+                # and the first request is untouched by the refusal
+                self.assertEqual(
+                    json.loads(conductor.intrq_flag(d, "s1").read_text())
+                    ["instructions"], "go slower")
+            finally:
+                conductor.intrq_flag(d, "s1").unlink(missing_ok=True)
+            # finished step: there is nothing to interrupt - the UI
+            # offers resume notes instead
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.interrupt_step(
+                    d.name, "s2", {"instructions": "x"}, runs)
+            self.assertEqual(e.exception.status, 409)
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.interrupt_step(
+                    d.name, "nope", {"instructions": "x"}, runs)
+            self.assertEqual(e.exception.status, 404)
+            # payload shape: instructions are required non-empty text,
+            # attachments ride the same validation as requests
+            for body in ({}, {"instructions": "   "},
+                         {"instructions": 42},
+                         {"instructions": "x" * 20001},
+                         {"instructions": "x",
+                          "attachments": [{"name": "../evil",
+                                           "path": "p"}]}):
+                with self.assertRaises(conductor.RequestError):
+                    conductor.interrupt_step(d.name, "s1", body, runs)
+            self.assertFalse(conductor.intrq_flag(d, "s1").exists())
+            # a driver that predates the feature is refused
+            live.pop("intrq")
+            (d / "state.json").write_text(json.dumps(live))
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.interrupt_step(
+                    d.name, "s1", {"instructions": "x"}, runs)
+            self.assertEqual(e.exception.status, 409)
+
+    def test_banked_request_folds_into_the_next_dispatch(self):
+        """Restart recovery: an intrq flag left pending (the driver died
+        before consuming it) applies exactly once to the step's next
+        dispatch via the notes channel - the sentinel is deleted only
+        after the notes write lands."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "work"
+''')
+            fixed = runs / "20260101-000000-t"
+
+            def _fixed_run_dir(_cfg, _runs):
+                fixed.mkdir(parents=True)
+                return fixed
+            self._intrq(fixed, "s1", "banked instructions")
+            with mock.patch.object(conductor, "new_run_dir",
+                                   side_effect=_fixed_run_dir):
+                rc = run_manifest(m, runs)
+            self.assertEqual(rc, 0)
+            st = json.loads((fixed / "state.json").read_text())
+            self.assertEqual(st["steps"]["s1"]["status"], "done")
+            p = (fixed / "prompts" / "s1.md").read_text(encoding="utf-8")
+            self.assertEqual(p.count("banked instructions"), 1)
+            self.assertIn("NOTE FROM THE OPERATOR", p)
+            self.assertIn("INTERRUPT", p)
+            self.assertFalse(conductor.intrq_flag(fixed, "s1").exists())
+            self.assertIn("banked interrupt",
+                          st["steps"]["s1"].get("note") or "")
+            conductor.rnote_flag(fixed, "s1").unlink(missing_ok=True)
+
+    def test_interrupt_after_turn_end_banks_instead_of_respawning(self):
+        """Natural-completion race: the request lands while the log
+        already carries STATUS - the step records its real end state
+        and the instructions bank into resume notes; no second worker
+        ever spawns."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "work"
+''')
+            run_dir_box: list[Path] = []
+
+            def fake_wait(proc, log, timeout_s, stop_flags=(),
+                          timeout_flag=None, stall_s=None):
+                # the turn ended, THEN the request landed - wait_worker
+                # reports stopped because the sentinel was set at wait
+                # return; run_step must see the STATUS and not respawn
+                run_dir_box.append(Path(log).parent)
+                log.write_text("STATUS: done\n", encoding="utf-8")
+                self._intrq(Path(log).parent, "s1", "too late")
+                return 0, False, False, True, 0.0
+
+            with self._fake_worker_popen(), \
+                 mock.patch.object(conductor, "session_ids",
+                                   return_value=set()), \
+                 mock.patch.object(conductor, "wait_worker", fake_wait):
+                rc = run_manifest(m, runs)
+            self.assertEqual(rc, 0)
+            run_dir = run_dir_box[0]
+            st = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(st["steps"]["s1"]["status"], "done")
+            self.assertIsNone(st["steps"]["s1"].get("interrupts"))
+            self.assertFalse(
+                (run_dir / "prompts" / "s1.interrupt1.md").exists())
+            # banked into the notes channel for the next dispatch
+            notes = conductor.rnote_flag(run_dir, "s1").read_text(
+                encoding="utf-8")
+            self.assertIn("too late", notes)
+            self.assertFalse(
+                conductor.intrq_flag(run_dir, "s1").exists())
+            self.assertIn("after the worker",
+                          st["steps"]["s1"].get("note") or "")
+            conductor.rnote_flag(run_dir, "s1").unlink(missing_ok=True)
+
+    def test_stop_beats_a_simultaneous_interrupt(self):
+        """Stop + interrupt landing together: the run-level stop stays
+        terminal ('stopped'), but the request still folds into notes so
+        a later resume carries it - nothing is dropped on the floor."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "sleep=4 then write WORK.txt"
+''')
+            run_dir_box: list[Path] = []
+
+            def fake_wait(proc, log, timeout_s, stop_flags=(),
+                          timeout_flag=None, stall_s=None):
+                # both sentinels land inside the same poll slice - the
+                # run-level stop is terminal, the request still banks
+                run_dir_box.append(Path(log).parent)
+                self._intrq(Path(log).parent, "s1", "keep")
+                conductor._flag_raise(
+                    conductor.stop_flag(Path(log).parent).name)
+                return 0, False, False, True, 0.0
+
+            with self._fake_worker_popen(), \
+                 mock.patch.object(conductor, "session_ids",
+                                   return_value=set()), \
+                 mock.patch.object(conductor, "wait_worker", fake_wait):
+                rc = run_manifest(m, runs)
+            run_dir = run_dir_box[0]
+            st = json.loads((run_dir / "state.json").read_text())
+            self.assertEqual(st["steps"]["s1"]["status"], "stopped")
+            self.assertIsNone(st["steps"]["s1"].get("interrupts"))
+            self.assertFalse(
+                (run_dir / "prompts" / "s1.interrupt1.md").exists())
+            self.assertIn("banked into resume notes",
+                          st["steps"]["s1"].get("note") or "")
+            notes = conductor.rnote_flag(run_dir, "s1").read_text(
+                encoding="utf-8")
+            self.assertIn("keep", notes)
+            conductor.rnote_flag(run_dir, "s1").unlink(missing_ok=True)
+            conductor.stop_flag(run_dir).unlink(missing_ok=True)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_interrupt_composer_open_cancel_send_and_tombstone(self):
+        """Dashboard side: the row menu offers 'Interrupt + instruct' on a
+        running task; opening shows a composer, Cancel closes it without
+        any POST, and the confirmed send hits /interrupt once with the
+        instructions + attachment refs, then shows transition progress.
+        A step that ends while the composer is open degrades to a
+        tombstone instead of re-opening editable."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, posts=[], alerts=[];
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',scrollTop:0,style:{},querySelector:()=>null,
+  querySelectorAll:()=>[]}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const sel={isCollapsed:true,toString:()=>''};
+const window={innerWidth:1200,innerHeight:800,addEventListener:()=>{},
+  getSelection:()=>sel};
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',agents:[
+  {step:'live-step',run:'live',run_dir:'/runs/live',run_key:'/runs/live',
+   slug:'p',status:'running',task:'t1'},
+  {step:'dead-step',run:'live',run_dir:'/runs/live',run_key:'/runs/live',
+   slug:'p',status:'done',task:'t2'}],runs:[
+  {run:'live',dir:'/runs/live',key:'/runs/live',counts:{running:1}}]};
+const fetch=async(url,opt)=>{
+  posts.push({url,body:opt&&opt.body?JSON.parse(opt.body):null});
+  if(url.startsWith('/api/state')) return {ok:true,json:async()=>data};
+  return {ok:true,json:async()=>({interrupting:'live-step'}),
+    text:async()=>''}; };
+const ctx=vm.createContext({document,window,fetch,confirm:()=>true,
+  alert:m=>alerts.push(m),location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const cls=c=>({contains:x=>c.split(' ').includes(x),add(){},remove(){}});
+const agenRow=i=>({cls:'agen',dataset:{i:String(i)},classList:cls('agen'),
+  isConnected:true,focus(){},matches:s=>s==='tr.agen'||s==='tr.runrow,tr.agen',
+  getBoundingClientRect:()=>({left:10,top:20,bottom:30})});
+const onRow=row=>({isContentEditable:false,dataset:{},
+  closest:sel=>{
+    if(sel==='#ctxmenu')return null;
+    if(sel.indexOf('input')===0)return null;
+    if(sel==='tr.agen')return row.cls==='agen'?row:null;
+    if(sel==='tr.runrow,tr.agen')return row;
+    return null;}});
+const rclick=t=>{let pd=0;handlers.contextmenu({target:t,clientX:60,
+  clientY:70,preventDefault:()=>{pd++;}});return pd;};
+const btn=dataset=>({id:'',dataset,disabled:false,
+  closest:sel=>{
+    if(sel==='#ctxmenu')return {inMenu:1};
+    const m=sel.match(/^\[data-([a-z-]+)\]$/);
+    if(m){const k=m[1].replace(/-([a-z])/g,(s,c)=>c.toUpperCase());
+      return k in dataset?{dataset}:null;}
+    return null;}});
+const KEY='/runs/live|live-step';
+(async()=>{
+  const m=elem('ctxmenu'), body=()=>elem('dbody').innerHTML;
+  // the running row's menu leads with 'Interrupt + instruct' + Stop -
+  // a finished step offers neither
+  assert.equal(rclick(onRow(agenRow(0))),1);
+  assert.match(m.innerHTML,/data-intr-open="\/runs\/live\|live-step"[^>]*>Interrupt \+ instruct/);
+  assert.match(m.innerHTML,/data-stop-agent="live"[^>]*>Stop this step/);
+  assert.equal(rclick(onRow(agenRow(1))),1);
+  assert.doesNotMatch(m.innerHTML,/data-intr-open|data-stop-agent/);
+  // open -> the composer section appears with the instruction textarea;
+  // composing is free - no POST happened anywhere
+  await handlers.click({target:btn({intrOpen:KEY}),
+    preventDefault:()=>{}});
+  assert.match(body(),/id="d-instr"/);
+  assert.match(body(),/Interrupt \+ resume/);
+  posts.length=0;
+  // Cancel is a pure view change: the section closes, still no POST
+  await handlers.click({target:btn({intrCancel:''}),
+    preventDefault:()=>{}});
+  assert.doesNotMatch(body(),/id="d-instr"/);
+  assert.equal(posts.length,0);
+  // reopen + send: instructions text and an attached image ride the
+  // POST body - the request went exactly once
+  await handlers.click({target:btn({intrOpen:KEY}),
+    preventDefault:()=>{}});
+  vm.runInContext('intrAttach["'+KEY+'"]=' +
+    '[{name:"shot.png",path:"C:/tmp/shot.png"}];' +
+    'intrComposerHTML(AGENTS[0])',ctx);
+  elem('d-instr').value='do X differently';
+  posts.length=0;
+  await handlers.click({target:btn({intrSend:'live',step:'live-step'}),
+    preventDefault:()=>{}});
+  const intr=posts.filter(p=>p.url.includes('/interrupt'));
+  assert.equal(intr.length,1);          // exactly once - no double submit
+  assert.equal(intr[0].url,'/api/runs/live/steps/live-step/interrupt');
+  assert.deepEqual(intr[0].body,{instructions:'do X differently',
+    attachments:[{name:'shot.png',path:'C:/tmp/shot.png'}]});
+  // post-submit the section follows the transition - the worker-stopped
+  // phase shows until the respawn counter moves
+  assert.match(body(),/Interrupt \+ instruct|resum|requested/);
+  // a pending request greys the send control - no double submit
+  data.agents[0].intr_pending=true;
+  vm.runInContext('intrSent["'+KEY+'"]=null',ctx);
+  vm.runInContext('render(lastData)',ctx);
+  assert.match(body(),/Interrupt pending/);
+  assert.match(body(),/disabled[^>]*>Interrupt pending|Interrupt pending[^<]*<\/button>/);
+  // a step that ends while the composer is open degrades to a
+  // tombstone - the textarea never comes back editable
+  data.agents[0].intr_pending=false;
+  data.agents[0].status='done';
+  vm.runInContext('render(lastData)',ctx);
+  assert.match(body(),/finished \(done\) while the composer was open/);
+  assert.doesNotMatch(body(),/<textarea id="d-instr"/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
 class PromptEditingTests(_RunControlBase):
     """Prompt edit control (pre-dispatch only) + resume notes (post-start
     follow-up) - both ride tempdir sentinels that run_step folds into
