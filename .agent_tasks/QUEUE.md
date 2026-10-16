@@ -807,3 +807,35 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   project-merge-targets, deferred-merge-controls. mobile_device.py
   post-tap stale-dump can false-timeout - bounded + fail-safe, left as
   documented limitation.
+- DONE 2026-10-16 (follow-up-plan, closing step of run
+  20261016-013719-workflow-ux-safety): reviewed the run against the
+  human's 17-item request - 14 items landed on master + verified
+  (integration-regressions: 423/423 + demo + 60/60 Playwright + deferred
+  e2e 22/22 + gen-during-merge e2e 10/10). THREE steps carry COMPLETE
+  verified work parked unmerged, all recorded `failed` without a real
+  work failure: isolate-worktree-services f071b48 (241/241 in-worktree;
+  gate hit the hard-coded 600s verify cap), project-merge-targets
+  00ec1fd (247/247; worker exited 0 with no STATUS line),
+  deferred-merge-controls 32b44b7 (258/258; same STATUS-less end).
+  Drafted manifests/workflow-ux-safety-followup.toml (plan-validated,
+  then registered via `conductor.py import` as request
+  20261016-194008-703a9675 = 'ready', source_run linked; NOT launched):
+  land-parked-branches (main-checkout merge of the 3 branches via the
+  merge verb + manual fallback + record stamping + uncapped manual
+  suite), merge-aware-checkpoints (a foreign driver's `git add -A`
+  checkpoint swept a mid-merge tree this run - merge lock covers
+  merge-vs-merge, not checkpoints), mobile-device-hardening (post-tap
+  rc=4 stale-dump flake + projects.toml `device` opt-in so leases are
+  exercised), landed-features-live-smoke (trap-5 scratch-copy serve),
+  closing follow-up-plan. Deliberately excluded: verify-timeout-config
+  (owned by run-review-ux-followup), transitively-merged record accuracy
+  (proposal-flow-fixes-followup), _flag_soon flake family
+  (proposal-ui-fixes-followup). Data observation for the reviewer: the
+  five follow-ups registered ~16:04 (owned copies manifests/
+  20261016-1604*-*.toml, committed by a8fae9e) have NO surviving request
+  records in data/requests/ and followups.index is absent - deliberate
+  discards would have left index vetoes; if not deliberate, the registry
+  lost rows. Expected permanent 'worktrees' pending on the new proposal
+  (mixed isolation the form can't express - merge step must run in the
+  checkout it merges); do NOT Apply-options it (would force worktree onto
+  the merge step) - launch via `conductor.py run` post-review.
