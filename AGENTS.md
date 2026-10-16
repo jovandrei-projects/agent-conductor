@@ -14,7 +14,11 @@ overnight without one bloated context window or per-message cost growth.
 State handoff between sessions is deliberately *not* a conversation: each
 worker reads the project's `AGENTS.md` + `.agent_tasks/` and must leave them
 current enough for the next session. The conductor only adds git checkpoints,
-a run log, verify gates, and a `STATUS:` line contract.
+a run log, verify gates, and a `STATUS:`/`NEXT:`/`OUTCOME:` report
+contract (`OUTCOME:` is the worker's own one-to-two-sentence result
+summary for the human reviewing the run - concrete accomplishments plus
+material limits, never next-step instructions or unverified success).
+
 
 `ROADMAP.md` owns the phase list and its status. `.agent_tasks/QUEUE.md` owns
 which task is next, and each `.agent_tasks/<task>/STATE.md` owns the steps of
@@ -104,7 +108,10 @@ The run records the effective cap + free RAM in `state.json`.
 
 Tracking: `state.json` is the agent registry (status, pid, started/ended,
 elapsed, session id, work dir, paths to prompt/stdout/export, `merged` +
-`merged_at` for worktree branches, and per-step
+`merged_at` for worktree branches, `outcome` - the step's newest
+`OUTCOME:` report - plus `outcomes`, the bounded history of earlier
+attempts'/dispatches' reports so a resume's fresh result never erases
+what a previous attempt finished; and per-step
 `tokens` - prompt/completion/cached sums plus LLM step count, read out of
 the ATIF export's `final_metrics` at step end; they roll up per run on the
 dashboard). The planner session also exports and its metrics accumulate on
@@ -479,10 +486,13 @@ Append as they are hit.
    2026-10-15, apartment-3d wall placement: committed dc5edab then the
    log truncated mid-sentence). `--resume` prepends the interrupted-
    state note to `failed` steps too - partial work may be committed.
-   `tail_status`/`tail_next` scan the WHOLE stdout log (once, at step
-   end) - an 8KB tail window misses a `STATUS:` that precedes a long
-   closing report. A `STATUS:` inside Markdown prose or a bullet still
-   doesn't count - the regex is anchored `^STATUS:` at column zero.
+   `tail_status`/`tail_next`/`tail_outcome` scan the WHOLE stdout log
+   (once, at step end) - an 8KB tail window misses a `STATUS:` that
+   precedes a long closing report. A `STATUS:` inside Markdown prose or
+   a bullet still doesn't count - the regex is anchored `^STATUS:` at
+   column zero. `OUTCOME:` shares the convention (column-zero, last
+   match wins, missing never fails) - it lands on `rec['outcome']` for
+   the dashboard/summary, not on `STATUS` parsing.
 7. **`os.kill(pid, 0)` is TerminateProcess on Windows.** It KILLS the
    process it probes - verified by spawning a sleeper and watching it die.
    The dashboard's liveness check used it on every `running` record per
