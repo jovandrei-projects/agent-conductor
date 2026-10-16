@@ -1219,7 +1219,9 @@ def step_summary(run_name: str, step_name: str,
         raise RequestError("Step not in this run", 404)
     md = step_summary_md({**rec, "name": rec.get("name") or step_name},
                          st, run_name)
-    if rec.get("status") not in ("running", "queued"):
+    drv = driver_alive(st)
+    if not any(step_live(r, drv)
+               for r in (st.get("steps") or {}).values()):
         try:
             (d / f"{step_name}.summary.md").write_text(md, encoding="utf-8")
         except OSError:
