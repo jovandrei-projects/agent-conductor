@@ -1531,6 +1531,270 @@ prompt = "Review the catalog tests."
         self.assertIn("selected model", rec["error"])
         self.assertFalse(list(self.manifests.iterdir()))
 
+    # ---- 'ask me questions' questionnaire flow ----------------------------
+
+    QS = [{"qid": "q0", "header": "Scope", "question": "Which projects?",
+           "options": [{"label": "proj", "description": "the catalog"},
+                       {"label": "other", "description": ""}],
+           "multi_select": False},
+          {"qid": "q1", "header": "", "question": "Any constraints?",
+           "options": [], "multi_select": False}]
+
+    def test_ask_field_is_an_opt_in_bool(self):
+        rec = self.new()
+        self.assertFalse(rec["ask"])
+        rec = conductor.create_request(
+            {"raw": "Tidy", "project": "proj", "ask": "yes"},
+            self.requests, self.runs)
+        self.assertTrue(rec["ask"])
+        rec = conductor.save_request(rec["id"], {"ask": False},
+                                     self.requests, self.manifests,
+                                     self.runs)
+        self.assertFalse(rec["ask"])
+
+    def test_questions_park_generation_until_answered(self):
+        rec = conductor.create_request(
+            {"raw": "Tidy the catalog", "project": "proj", "ask": True},
+            self.requests, self.runs)
+        calls = []
+
+        def fake(r, projects, argv, log_path=None, fix_note=None, qa=None):
+            calls.append(qa)
+            if qa is None:
+                raise conductor.PlannerQuestions(list(self.QS))
+            return self.proposal()
+
+        with mock.patch.object(conductor, "_planner_response", fake):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "questions")
+        self.assertEqual(len(rec["pending_questions"]), 2)
+        self.assertEqual(rec["qa_rounds"], 1)
+        self.assertFalse(list(self.manifests.iterdir()))   # no TOML yet
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        self.assertEqual(d["runs"][0]["stage"], "questions")
+        self.assertEqual(len(d["runs"][0]["questions"]), 2)
+
+        # first answer parks, the second triggers the refine pass
+        out = conductor.answer_request(
+            rec["id"], {"qid": "q0", "selected": ["proj"]},
+            self.requests, self.manifests, self.runs, ["devin"],
+            background=False)
+        self.assertEqual(out["status"], "questions")
+        self.assertEqual(len(out["pending_questions"]), 1)
+        with mock.patch.object(conductor, "_planner_response", fake):
+            out = conductor.answer_request(
+                rec["id"], {"qid": "q1", "skipped": True},
+                self.requests, self.manifests, self.runs, ["devin"],
+                background=False)
+        self.assertEqual(out["status"], "ready")
+        self.assertTrue(Path(out["manifest"]).is_file())
+        self.assertEqual(len(calls), 2)
+        qa = calls[1]
+        self.assertEqual([a["qid"] for a in qa], ["q0", "q1"])
+        self.assertEqual(qa[0]["answer"], ["proj"])
+        self.assertTrue(qa[1]["skipped"])
+
+    def test_answer_request_validation(self):
+        rec = conductor.create_request(
+            {"raw": "Tidy", "project": "proj", "ask": True},
+            self.requests, self.runs)
+        with mock.patch.object(
+                conductor, "_planner_response",
+                side_effect=conductor.PlannerQuestions(list(self.QS))):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        for payload, msg in (
+                ({"qid": "nope", "skipped": True}, "not pending"),
+                ({"qid": "q0"}, "or skip"),
+                ({"qid": "q0", "selected": ["bogus"]}, "Unknown option"),
+                ({"qid": "q0", "selected": ["proj", "other"]}, "single")):
+            with self.subTest(payload=payload), self.assertRaises(
+                    conductor.RequestError) as error:
+                conductor.answer_request(
+                    rec["id"], payload, self.requests, self.manifests,
+                    self.runs, ["devin"], background=False)
+            self.assertIn(msg, str(error.exception))
+        # a non-questions request rejects answers outright
+        rec2 = self.new()
+        with self.assertRaises(conductor.RequestError):
+            conductor.answer_request(rec2["id"], {"qid": "q0", "text": "x"},
+                                     self.requests, self.manifests,
+                                     self.runs, ["devin"], background=False)
+
+    def test_skip_all_refines_immediately(self):
+        rec = conductor.create_request(
+            {"raw": "Tidy", "project": "proj", "ask": True},
+            self.requests, self.runs)
+        seen = []
+
+        def fake(r, projects, argv, log_path=None, fix_note=None, qa=None):
+            seen.append(qa)
+            if qa is None:
+                raise conductor.PlannerQuestions(list(self.QS))
+            return self.proposal()
+
+        with mock.patch.object(conductor, "_planner_response", fake):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+            out = conductor.answer_request(
+                rec["id"], {"skip_all": True}, self.requests,
+                self.manifests, self.runs, ["devin"], background=False)
+        self.assertEqual(out["status"], "ready")
+        self.assertTrue(all(a["skipped"] for a in out["qa"]))
+        self.assertEqual(len(out["qa"]), 2)
+
+    def test_raw_edit_while_questions_pending_resets_to_draft(self):
+        rec = conductor.create_request(
+            {"raw": "Tidy", "project": "proj", "ask": True},
+            self.requests, self.runs)
+        with mock.patch.object(
+                conductor, "_planner_response",
+                side_effect=conductor.PlannerQuestions(list(self.QS))):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        rec = conductor.save_request(rec["id"], {"raw": "Different ask"},
+                                     self.requests, self.manifests,
+                                     self.runs)
+        self.assertEqual(rec["status"], "draft")
+        self.assertEqual(rec["pending_questions"], [])
+        self.assertEqual(rec["qa"], [])
+
+    def test_regenerate_clears_a_parked_questionnaire(self):
+        rec = conductor.create_request(
+            {"raw": "Tidy", "project": "proj", "ask": True},
+            self.requests, self.runs)
+        with mock.patch.object(
+                conductor, "_planner_response",
+                side_effect=conductor.PlannerQuestions(list(self.QS))):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        with mock.patch.object(conductor, "_planner_response",
+                               return_value=self.proposal()):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertEqual(rec["status"], "ready")
+        self.assertEqual(rec["pending_questions"], [])
+        self.assertEqual(rec["qa"], [])
+
+    def test_question_rounds_are_capped(self):
+        rec = conductor.create_request(
+            {"raw": "Tidy", "project": "proj", "ask": True},
+            self.requests, self.runs)
+        with mock.patch.object(
+                conductor, "_planner_response",
+                side_effect=conductor.PlannerQuestions(list(self.QS))):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+            # MAX_QUESTION_ROUNDS rounds of questions are tolerated; the
+            # next emission errors out instead of parking a fourth set
+            for _ in range(conductor.MAX_QUESTION_ROUNDS - 1):
+                out = conductor.answer_request(
+                    rec["id"], {"skip_all": True}, self.requests,
+                    self.manifests, self.runs, ["devin"], background=False)
+            self.assertEqual(out["status"], "questions")
+            out = conductor.answer_request(
+                rec["id"], {"skip_all": True}, self.requests,
+                self.manifests, self.runs, ["devin"], background=False)
+        self.assertEqual(out["status"], "error")
+        self.assertIn("still has questions", out["error"])
+
+    def test_planner_questions_surface_only_when_ask_checked(self):
+        qs_block = ('BEGIN_QUESTIONS\n[{"question": "Scope?", '
+                    '"options": [{"label": "A"}]}]\nEND_QUESTIONS\n'
+                    "STATUS: done\n")
+        for ask in (False, True):
+            rec = conductor.create_request(
+                {"raw": "Tidy", "project": "proj", "ask": ask},
+                self.requests, self.runs)
+
+            class FakeProc:
+                def __init__(self, cmd, **kwargs):
+                    kwargs["stdout"].write(qs_block.encode())
+                    kwargs["stdout"].flush()
+
+            with mock.patch.object(conductor.subprocess, "Popen", FakeProc), \
+                    mock.patch.object(
+                        conductor, "wait_worker",
+                        return_value=(0, False, False, False, 0.0)):
+                if ask:
+                    with self.assertRaises(conductor.PlannerQuestions) as e:
+                        conductor._planner_response(rec, {}, ["devin"])
+                    self.assertEqual(e.exception.questions[0]["question"],
+                                     "Scope?")
+                else:
+                    with self.assertRaises(conductor.RequestError) as e:
+                        conductor._planner_response(rec, {}, ["devin"])
+                    self.assertIn("no TOML", str(e.exception))
+
+    def test_extract_questions_sanitizes_planner_json(self):
+        good = ('BEGIN_QUESTIONS\n' + json.dumps(
+            [{"question": "Q?", "header": "h", "options": [
+                {"label": "A", "description": "x"}, {"nope": 1},
+                "junk", {"label": ""}], "multi_select": True},
+             {"question": ""}, "junk"]) +
+            "\nEND_QUESTIONS\n")
+        out = conductor._extract_questions(good)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["qid"], "q0")
+        self.assertEqual(out[0]["options"],
+                         [{"label": "A", "description": "x"}])
+        self.assertTrue(out[0]["multi_select"])
+        for bad in ('plain text only',
+                    'BEGIN_QUESTIONS\nnot json\nEND_QUESTIONS\n',
+                    'BEGIN_QUESTIONS\n[]\nEND_QUESTIONS\n',
+                    'BEGIN_QUESTIONS\n[{"question": ""}]\nEND_QUESTIONS\n'):
+            if bad == 'plain text only':
+                self.assertIsNone(conductor._extract_questions(bad))
+            else:
+                with self.assertRaises(conductor.RequestError):
+                    conductor._extract_questions(bad)
+
+    def test_refine_prompt_carries_the_qa_block(self):
+        rec = conductor.create_request(
+            {"raw": "Tidy", "project": "proj", "ask": True},
+            self.requests, self.runs)
+        qa = [{"qid": "q0", "question": "Scope?", "answer": ["proj"],
+               "text": "", "skipped": False},
+              {"qid": "q1", "question": "Notes?", "answer": [],
+               "text": "be gentle", "skipped": False},
+              {"qid": "q2", "question": "Why?", "answer": [], "text": "",
+               "skipped": True}]
+        seen = {}
+        proposal = self.proposal()
+
+        class FakeProc:
+            def __init__(self, cmd, **kwargs):
+                seen["prompt"] = Path(
+                    cmd[cmd.index("--prompt-file") + 1]).read_text(
+                        encoding="utf-8")
+                kwargs["stdout"].write(
+                    ("BEGIN_MANIFEST\n" + proposal +
+                     "END_MANIFEST\nSTATUS: done\n").encode())
+                kwargs["stdout"].flush()
+
+        with mock.patch.object(conductor.subprocess, "Popen", FakeProc), \
+                mock.patch.object(conductor, "wait_worker",
+                                  return_value=(0, False, False, False, 0.0)):
+            conductor._planner_response(rec, {}, ["devin"], qa=qa)
+        self.assertIn("CLARIFYING Q&A", seen["prompt"])
+        self.assertIn('chose "proj"', seen["prompt"])
+        self.assertIn('wrote "be gentle"', seen["prompt"])
+        self.assertIn("(skipped - your call)", seen["prompt"])
+        self.assertIn("BEGIN_QUESTIONS", seen["prompt"])   # ask stays open
+
     def test_unsafe_and_invalid_manifests_cannot_become_ready(self):
         rec = self.new()
         bad = (self.proposal().replace('project = "proj"',
@@ -2474,6 +2738,93 @@ assert.equal(vm.runInContext(
   "base('C:'+"+B+"+'a'+"+B+"+'dir-name')",ctx),'dir-name');
 assert.equal(vm.runInContext("base('/x/y/dir-name')",ctx),'dir-name');
 assert.equal(vm.runInContext("base('dir-name')",ctx),'dir-name');
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_planner_questionnaire_modal(self):
+        """A request parked at stage 'questions' auto-opens the
+        questionnaire modal: one question at a time, option toggles +
+        free text + Skip; each answer POSTs /answer and the next question
+        renders; the last answer closes the modal."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, posts=[];
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,
+  {innerHTML:'',hidden:true,textContent:'',value:'',focus:()=>{}});
+  return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const id='req-q1';
+const req={id,status:'questions',label:'Tidy',pending_questions:[
+  {qid:'q0',header:'Scope',question:'Which projects?',
+   options:[{label:'proj',description:'the catalog'},{label:'other'}]},
+  {qid:'q1',header:'',question:'Any constraints?',options:[]}],qa:[]};
+const state={serve_boot:'b',generated_at:'2026-10-14',agents:[],runs:[
+  {run:'Tidy',key:'request:'+id,request_id:id,stage:'questions',
+   questions:req.pending_questions.map(q=>({qid:q.qid,header:q.header,
+     question:q.question})),counts:{}}],
+  project_options:[],defaults:{model:'swe-2',effort:'max'}};
+const fetch=async(path,opt)=>{
+  if(opt&&opt.method==='POST'){
+    posts.push({path,body:JSON.parse(opt.body)});
+    const n=posts.length;
+    return {ok:true,json:async()=>({...req,
+      status:n<2?'questions':'generating',
+      pending_questions:n<2?req.pending_questions.slice(n):[],
+      qa:req.pending_questions.slice(0,n).map(q=>({qid:q.qid,
+        question:q.question,answer:[],text:'',skipped:true}))})};
+  }
+  // after the last answer the server flips to 'generating' everywhere
+  const st=posts.length<2?'questions':'generating';
+  if (path.startsWith('/api/requests/'))
+    return {ok:true,json:async()=>({...req,status:st,
+      pending_questions:req.pending_questions.slice(
+        Math.min(posts.length,2))})};
+  return {ok:true,json:async()=>({...state,
+    runs:state.runs.map(r=>({...r,stage:st,
+      questions:st==='questions'?r.questions:[]}))})};
+};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},fetch,confirm:()=>true});
+vm.runInContext(src,ctx);
+vm.runInContext('render('+JSON.stringify(state)+')',ctx);
+const click=t=>handlers.click({target:{...t,closest:()=>null},
+  preventDefault:()=>{}});
+(async()=>{
+  await new Promise(r=>setImmediate(r));   // openQuestions' fetch lands
+  await new Promise(r=>setImmediate(r));
+  const runs=elem('runs').innerHTML;
+  assert.match(runs,/Needs your answers/);
+  assert.match(runs,/waits on 2 answer/);
+  assert.equal(elem('backdrop').hidden,false);
+  assert.match(elem('dbody').innerHTML,/Planner question 1 of 2/);
+  assert.match(elem('dbody').innerHTML,/data-qopt="proj"/);
+  // pick the suggested option, then Send
+  await click({dataset:{qopt:'proj'}});
+  assert.match(elem('dbody').innerHTML,/qopt on/);
+  await click({dataset:{qsend:''}});
+  assert.equal(posts[0].path,'/api/requests/'+id+'/answer');
+  assert.equal(posts[0].body.qid,'q0');
+  assert.deepEqual(posts[0].body.selected,['proj']);
+  // second question has no options: free text or skip
+  assert.match(elem('dbody').innerHTML,/question 2 of 2/);
+  await click({dataset:{qsend:''}});   // empty -> rejected client-side
+  assert.equal(posts.length,1);
+  await click({dataset:{qskip:''}});
+  assert.equal(posts[1].body.qid,'q1');
+  assert.equal(posts[1].body.skipped,true);
+  await new Promise(r=>setImmediate(r));
+  // queue empty -> server flipped to generating -> modal closed
+  assert.equal(elem('backdrop').hidden,true);
+})().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
                            capture_output=True, text=True, encoding="utf-8",

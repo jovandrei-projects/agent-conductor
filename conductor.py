@@ -2545,6 +2545,16 @@ class RequestError(ValueError):
         self.status = status
 
 
+class PlannerQuestions(Exception):
+    """The planner chose the questionnaire path over emitting a manifest
+    (the request's 'ask me questions' box was checked). Carries the
+    sanitized question list; _finish_generation parks it on the request
+    record so the dashboard can ask the human, one modal per question."""
+    def __init__(self, questions: list[dict]):
+        super().__init__(f"planner asked {len(questions)} question(s)")
+        self.questions = questions
+
+
 def default_model_effort(today: dt.date | None = None) -> tuple[str, str]:
     return (("swe-2", "max") if (today or dt.date.today())
             <= dt.date(2026, 10, 16) else ("gpt-6-luna", "max"))
@@ -2581,7 +2591,7 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
             "raw", "label", "project", "model", "effort", "manifest",
             "followup", "on_failure", "max_attempts",
             "plan_model", "plan_effort",
-            "worktrees", "merge_resolver"}:
+            "worktrees", "merge_resolver", "ask"}:
         raise RequestError("Invalid request fields")
     model, effort = default_model_effort()
     fields = {k: (rec or {}).get(k, v) for k, v in (
@@ -2593,7 +2603,7 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
             if not isinstance(payload[key], str):
                 raise RequestError(f"{key} must be text")
             fields[key] = payload[key].strip()
-    for bkey in ("followup", "worktrees", "merge_resolver"):
+    for bkey in ("followup", "worktrees", "merge_resolver", "ask"):
         fields[bkey] = bool((rec or {}).get(bkey))
         if bkey in payload:
             v = payload[bkey]
@@ -2958,6 +2968,7 @@ def _publish_proposal(rec: dict, text: str, requests_dir: Path,
     tmp.replace(p)
     rec.update(status="ready", manifest=str(p), run=cfg.name,
                description=cfg.description.strip(), error=None, stale=False,
+               pending_questions=[],
                proposed_steps=[{
                    "step": s.name, "slug": s.project, "model": s.model,
                    "effort": s.effort, "mode": s.mode, "task": " ".join(
@@ -2975,7 +2986,8 @@ def save_request(request_id: str, payload: dict,
         _assert_unwatched(runs_dir, requests_dir, manifests_dir)
         rec = _read_request(request_id, requests_dir)
         stage = _request_status(rec, runs_dir)
-        if stage not in ("draft", "ready", "error", "launch_failed"):
+        if stage not in ("draft", "ready", "error", "launch_failed",
+                         "questions"):
             raise RequestError("This request is being processed or already run", 409)
         rec["status"] = stage
         fields = _request_fields(payload, rec)
@@ -2986,10 +2998,17 @@ def save_request(request_id: str, payload: dict,
                       ("raw", "project", "model", "effort", "followup",
                        "worktrees", "merge_resolver",
                        "on_failure", "max_attempts"))
+        raw_moved = (fields["raw"] != rec.get("raw")
+                     or fields["project"] != rec.get("project"))
         rec.update(fields)
         if "manifest" in payload:
             return _publish_proposal(rec, payload["manifest"],
                                      requests_dir, manifests_dir, runs_dir)
+        if stage == "questions" and raw_moved:
+            # The parked questionnaire was drafted against the old request
+            # text - drop it; Regenerate re-plans from the new one.
+            rec.update(status="draft", pending_questions=[], qa=[],
+                       qa_rounds=0)
         if rec.get("manifest") and changed:
             rec["stale"] = True
         _save_request(rec, requests_dir)
@@ -3008,7 +3027,8 @@ def apply_request(request_id: str, payload: dict,
         _assert_unwatched(runs_dir, requests_dir, manifests_dir)
         rec = _read_request(request_id, requests_dir)
         stage = _request_status(rec, runs_dir)
-        if stage not in ("draft", "ready", "error", "launch_failed"):
+        if stage not in ("draft", "ready", "error", "launch_failed",
+                         "questions"):
             raise RequestError("This request is being processed or already run",
                                409)
         if not rec.get("manifest"):
@@ -3055,10 +3075,62 @@ def request_details(request_id: str, requests_dir: Path = REQUESTS_DIR,
         return rec
 
 
+MAX_QUESTIONS = 8          # per questionnaire round
+MAX_QUESTION_ROUNDS = 3    # rounds of questions per generation
+
+
+def _extract_questions(text: str) -> list[dict]:
+    """Parse the planner's BEGIN_QUESTIONS/END_QUESTIONS block into the
+    sanitized list the questionnaire modal renders - the planner's JSON is
+    untrusted, so every field is re-shaped and capped. Raises RequestError
+    when a block exists but is unusable (fails closed like a bad TOML)."""
+    matches = re.findall(r"^BEGIN_QUESTIONS\s*\n(.*?)^END_QUESTIONS\s*$",
+                         text, re.M | re.S)
+    if not matches:
+        return None
+    try:
+        items = json.loads(matches[-1])
+    except ValueError as exc:
+        raise RequestError("Planner's questions were malformed "
+                           f"({exc}); try regenerating", 502) from exc
+    if not isinstance(items, list) or not items:
+        raise RequestError("Planner's questions were malformed; "
+                           "try regenerating", 502)
+    out: list[dict] = []
+    for it in items:
+        if len(out) >= MAX_QUESTIONS:
+            break
+        if not isinstance(it, dict):
+            continue
+        q = str(it.get("question") or "").strip()[:500]
+        if not q:
+            continue
+        opts = []
+        for o in it.get("options") or []:
+            if not isinstance(o, dict):
+                continue
+            lbl = str(o.get("label") or "").strip()[:80]
+            if lbl:
+                opts.append({"label": lbl,
+                             "description": str(o.get("description")
+                                                or "")[:200]})
+            if len(opts) >= 6:
+                break
+        out.append({"qid": f"q{len(out)}", "question": q,
+                    "header": str(it.get("header") or "")[:40],
+                    "options": opts,
+                    "multi_select": bool(it.get("multi_select"))})
+    if not out:
+        raise RequestError("Planner's questions were malformed; "
+                           "try regenerating", 502)
+    return out
+
+
 def _planner_response(rec: dict, projects: dict,
                       devin_argv: list[str],
                       log_path: Path | None = None,
-                      fix_note: str | None = None) -> str:
+                      fix_note: str | None = None,
+                      qa: list[dict] | None = None) -> str:
     slugs = ", ".join(sorted(projects))
     fix = (f"A previous draft of this proposal failed TOML parsing: "
            f"{fix_note}. Re-emit the full corrected TOML.\n\n"
@@ -3090,6 +3162,44 @@ def _planner_response(rec: dict, projects: dict,
                     "set merge_resolver = true in [run], so a conflicted "
                     "worktree merge is finished by a resolve-<step> "
                     "session instead of only being parked.\n\n")
+    ask_block = ""
+    if rec.get("ask"):
+        ask_block = (
+            "The human opted in to clarifying questions. ONLY if a decision "
+            "in the request genuinely changes the runbook and cannot be "
+            "sensibly inferred, you may reply with a questionnaire INSTEAD "
+            "of the manifest - otherwise go straight to the TOML. To ask, "
+            "reply with only:\n"
+            "BEGIN_QUESTIONS\n"
+            '[{"question": "full question text", "header": "short label", '
+            '"options": [{"label": "choice", "description": "why"}], '
+            '"multi_select": false}]\n'
+            "END_QUESTIONS\n"
+            "then a final STATUS: done line. A JSON array of 1-6 questions; "
+            "2-4 options each where sensible (omit options when free text "
+            "is the more natural answer); multi_select = true when several "
+            "choices may apply at once. The human can always skip a "
+            "question or write their own answer, so never ask what you can "
+            "reasonably decide yourself.\n\n")
+    qa_block = ""
+    if qa:
+        lines = []
+        for i, a in enumerate(qa, 1):
+            bits = []
+            if a.get("answer"):
+                bits.append("chose " + ", ".join(
+                    json.dumps(x) for x in a["answer"]))
+            if a.get("text"):
+                bits.append("wrote " + json.dumps(a["text"]))
+            lines.append(f"{i}. {a.get('question', '')}\n   A: "
+                         + ("; ".join(bits)
+                            if bits else "(skipped - your call)"))
+        qa_block = (
+            "CLARIFYING Q&A - the human answered your earlier questions; "
+            "let the answers steer scope, project choice and sequencing:\n"
+            + "\n".join(lines) +
+            "\nAnswer round complete - emit the manifest unless a decisive "
+            "gap still remains.\n\n")
     known_verify = {s: p["verify"] for s, p in projects.items()
                     if p.get("verify")}
     verify_hint = (f"Registered verify commands: {known_verify} - set "
@@ -3126,8 +3236,9 @@ Windows paths belong in TOML literal strings (single quotes) or use forward
 slashes - a backslash inside a double-quoted string is a TOML escape and
 breaks parsing.
 {followup}
-{isolate}{fix}HUMAN REQUEST:
+{isolate}{ask_block}{fix}HUMAN REQUEST:
 {rec['raw']}
+{qa_block}
 
 BEGIN_MANIFEST
 ...your TOML here...
@@ -3164,6 +3275,10 @@ STATUS: done
     matches = re.findall(r"^BEGIN_MANIFEST\s*\n(.*?)^END_MANIFEST\s*$",
                          text, re.M | re.S)
     if not matches:
+        # The 'ask me questions' contract: a questionnaire INSTEAD of the
+        # TOML parks the generation until the human answers (or skips).
+        if rec.get("ask") and "BEGIN_QUESTIONS" in text:
+            raise PlannerQuestions(_extract_questions(text))
         raise RequestError("Planner returned no TOML proposal; try regenerating",
                            502)
     return matches[-1].strip() + "\n"
@@ -3178,18 +3293,49 @@ def _finish_generation(request_id: str, requests_dir: Path,
         log_path = requests_dir / f"{request_id}.gen.log"
         export_path = log_path.with_suffix(".export.json")
         projects = load_projects()
-        text = _planner_response(rec, projects, devin_argv, log_path)
-        _merge_tokens(tok_plan, tail_metrics(export_path))
+        qa = rec.get("qa") or None    # set -> this pass refines on answers
         try:
-            defaults = tomllib.loads(text).get("defaults", {})
-        except tomllib.TOMLDecodeError as exc:
-            # A malformed draft (e.g. a Windows path's \U inside a double-
-            # quoted string) is trivially fixable - retry once with the
-            # parse error fed back.
             text = _planner_response(rec, projects, devin_argv, log_path,
-                                     fix_note=str(exc))
+                                     qa=qa)
             _merge_tokens(tok_plan, tail_metrics(export_path))
-            defaults = tomllib.loads(text).get("defaults", {})
+            try:
+                defaults = tomllib.loads(text).get("defaults", {})
+            except tomllib.TOMLDecodeError as exc:
+                # A malformed draft (e.g. a Windows path's \U inside a
+                # double-quoted string) is trivially fixable - retry once
+                # with the parse error fed back.
+                text = _planner_response(rec, projects, devin_argv,
+                                         log_path, fix_note=str(exc), qa=qa)
+                _merge_tokens(tok_plan, tail_metrics(export_path))
+                defaults = tomllib.loads(text).get("defaults", {})
+        except PlannerQuestions as q:
+            # The planner asked instead of drafting - park the sanitized
+            # questionnaire on the request. The dashboard poses it one
+            # modal at a time; answer_request restarts this function as the
+            # refine pass once every question has an answer or a skip.
+            _merge_tokens(tok_plan, tail_metrics(export_path))
+            _wait_writable(runs_dir, requests_dir)
+            with REQUEST_LOCK:
+                rec = _read_request(request_id, requests_dir)
+                if rec["status"] == "generating":
+                    rounds = int(rec.get("qa_rounds") or 0) + 1
+                    plan_tok = _merge_tokens(
+                        dict(rec.get("plan_tokens") or {}), tok_plan)
+                    if plan_tok:
+                        rec["plan_tokens"] = plan_tok
+                    if rounds > MAX_QUESTION_ROUNDS:
+                        rec.update(
+                            status="error", pending_questions=[],
+                            error=f"The planner still has questions after "
+                                  f"{MAX_QUESTION_ROUNDS} rounds - "
+                                  "regenerate, or make the request more "
+                                  "specific")
+                    else:
+                        rec.update(status="questions", qa_rounds=rounds,
+                                   pending_questions=q.questions,
+                                   error=None)
+                    _save_request(rec, requests_dir)
+            return
         if defaults.get("model") != rec["model"] or \
                 defaults.get("effort") != rec["effort"]:
             raise RequestError("Planner ignored the selected model or effort; "
@@ -3253,9 +3399,13 @@ def start_generation(request_id: str,
         _assert_unwatched(runs_dir, requests_dir)
         rec = _read_request(request_id, requests_dir)
         if _request_status(rec, runs_dir) not in (
-                "draft", "ready", "error", "launch_failed"):
+                "draft", "ready", "error", "launch_failed", "questions"):
             raise RequestError("Only drafts or unrun proposals can be generated", 409)
-        rec.update(status="generating", error=None, generation_started_at=now_iso())
+        # A manual (Re)generate starts planning from scratch - any parked
+        # questionnaire and its collected answers are dropped on purpose.
+        rec.update(status="generating", error=None,
+                   generation_started_at=now_iso(), pending_questions=[],
+                   qa=[], qa_rounds=0)
         _save_request(rec, requests_dir)
         _GENERATING.add(request_id)
     args = (request_id, requests_dir, manifests_dir, runs_dir,
@@ -3264,6 +3414,74 @@ def start_generation(request_id: str,
         threading.Thread(target=_finish_generation, args=args,
                          daemon=True).start()
         return rec
+    _finish_generation(*args)
+    return request_details(request_id, requests_dir, manifests_dir)
+
+
+def answer_request(request_id: str, payload: dict,
+                   requests_dir: Path = REQUESTS_DIR,
+                   manifests_dir: Path = MANIFESTS_DIR,
+                   runs_dir: Path = RUNS_DIR,
+                   devin_argv: list[str] | None = None,
+                   background: bool = True) -> dict:
+    """Record one answer (or skip_all) to the parked planner questionnaire.
+    Once pending_questions is empty the refine pass starts automatically -
+    same _finish_generation path, except rec['qa'] survives (a manual
+    Regenerate via start_generation clears it instead)."""
+    with REQUEST_LOCK:
+        _assert_unwatched(runs_dir, requests_dir)
+        rec = _read_request(request_id, requests_dir)
+        if rec.get("status") != "questions":
+            raise RequestError("This request is not waiting on answers", 409)
+        pend = list(rec.get("pending_questions") or [])
+        if not pend:
+            raise RequestError("No questions are pending", 409)
+        rec["qa"] = list(rec.get("qa") or [])
+        if payload.get("skip_all") is True:
+            for q in pend:
+                rec["qa"].append({"qid": q["qid"], "header": q["header"],
+                                  "question": q["question"], "answer": [],
+                                  "text": "", "skipped": True})
+            pend = []
+        else:
+            qid = payload.get("qid")
+            q = next((x for x in pend if x.get("qid") == qid), None)
+            if q is None:
+                raise RequestError("That question is not pending", 409)
+            skipped = bool(payload.get("skipped"))
+            sel = payload.get("selected") or []
+            if not isinstance(sel, list) or any(
+                    not isinstance(s, str) for s in sel):
+                raise RequestError("selected must be a list of labels")
+            labels = [o["label"] for o in q.get("options") or []]
+            if any(s not in labels for s in sel):
+                raise RequestError("Unknown option label")
+            if len(sel) > 1 and not q.get("multi_select"):
+                raise RequestError("This question takes a single option")
+            text = str(payload.get("text") or "").strip()[:2000]
+            if not skipped and not sel and not text:
+                raise RequestError("Pick an option, write an answer, "
+                                   "or skip")
+            rec["qa"].append({"qid": qid, "header": q["header"],
+                              "question": q["question"],
+                              "answer": [] if skipped else sel,
+                              "text": "" if skipped else text,
+                              "skipped": skipped})
+            pend = [x for x in pend if x["qid"] != qid]
+        rec["pending_questions"] = pend
+        if pend:
+            _save_request(rec, requests_dir)
+            return dict(rec)
+        rec.update(status="generating", error=None,
+                   generation_started_at=now_iso())
+        _save_request(rec, requests_dir)
+        _GENERATING.add(request_id)
+    args = (request_id, requests_dir, manifests_dir, runs_dir,
+            devin_argv or ["devin"])
+    if background:
+        threading.Thread(target=_finish_generation, args=args,
+                         daemon=True).start()
+        return dict(rec)
     _finish_generation(*args)
     return request_details(request_id, requests_dir, manifests_dir)
 
@@ -3870,7 +4088,7 @@ def discard_request(request_id: str,
         _assert_unwatched(runs_dir, requests_dir, manifests_dir)
         rec = _read_request(request_id, requests_dir)
         if _request_status(rec, runs_dir) not in (
-                "draft", "ready", "error", "launch_failed"):
+                "draft", "ready", "error", "launch_failed", "questions"):
             raise RequestError("A running or launched proposal cannot be discarded",
                                409)
         if rec.get("manifest"):
@@ -4544,6 +4762,15 @@ def collect_dashboard(runs_dir: Path,
                      "max_parallel": None,
                      "stage": stage, "error": rec.get("error"),
                      "stale": rec.get("stale"), "gen_last": gen_last,
+                     # pending questionnaire (stage 'questions'): enough for
+                     # the row chip + auto-popup signature; the modal loads
+                     # the full objects via GET /api/requests/<id>
+                     "questions": [{"qid": q.get("qid"),
+                                    "header": q.get("header"),
+                                    "question": (q.get("question")
+                                                 or "")[:160]}
+                                   for q in rec.get("pending_questions")
+                                   or []],
                      "projects": sorted({s["slug"] for s in steps})
                      or ([rec["project"]] if rec.get("project") else [])})
         if stage == "generating":
@@ -4738,6 +4965,7 @@ a { color:#58a6ff; text-decoration:none; }
   animation:pulse 1.2s ease-in-out infinite; }
 .stage.paused { color:#e3b341; border-color:#6b5a1f; background:#2a2317; }
 .stage.interrupted { color:#f0883e; border-color:#7a3d12; background:#2d1f14; }
+.stage.questions { color:#ffa657; border-color:#7a3d12; background:#2d1f14; }
 .stage.halted { color:#8b949e; }
 .stage.archived { color:#8b949e; border-color:#21262d; }
 .linkbtn { background:none; border:0; color:#58a6ff; cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
@@ -4765,6 +4993,14 @@ a { color:#58a6ff; text-decoration:none; }
 #detail .proposal-list { margin-top:12px; padding-left:20px; }
 #detail .proposal-list li { margin:8px 0; }
 #detail .proposal-list small { color:#8b949e; }
+/* questionnaire modal (planner 'ask me questions' flow) */
+.qopts { display:flex; flex-direction:column; gap:6px; margin:10px 0 4px; }
+.qopt { text-align:left; border:1px solid #30363d; border-radius:6px;
+  background:#0d1117; color:#e6edf3; padding:8px 10px; cursor:pointer;
+  font:inherit; }
+.qopt:hover { border-color:#58a6ff; }
+.qopt.on { border-color:#58a6ff; background:#1c3041; }
+.qopt .sub { display:block; margin-top:2px; }
 @media (max-width:640px) { .hide-s { display:none; } #detail { width:92vw; } #detail .field-row { grid-template-columns:1fr; } }
 </style></head><body>
 <div class="topbar">
@@ -4789,9 +5025,10 @@ const COLORS = {done:'#3fb950',partial:'#d29922',blocked:'#d29922',
 stopped:'#d29922',
 failed:'#f85149',timed_out:'#f0883e',running:'#58a6ff',queued:'#8b949e',
 waiting:'#8b949e',skipped:'#6e7681',planned:'#bc8cff',ready:'#bc8cff',
-generating:'#bc8cff',draft:'#d29922',
+generating:'#bc8cff',draft:'#d29922',questions:'#ffa657',
 launching:'#58a6ff',launch_failed:'#f85149',lost:'#6e7681'};
 const STAGES = {draft:'Draft · unsent',generating:'Preparing proposal',
+  questions:'Needs your answers',
   ready:'Ready to run',launching:'Starting run',launch_failed:'Start failed',
   error:'Planning failed'};
 const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,
@@ -4924,12 +5161,22 @@ let detailKey = null;       // run_dir|step of the open agent modal - the
                             // payload re-sorts each tick, so the index is
                             // re-resolved by key before every re-render
 let modalRequest = null;
+let modalQA = null;         // {id, rec, sel:Set, free:''} while the planner
+                            // questionnaire modal is open
+const qDismissed = new Set();   // request|qids sigs the human closed - the
+                              // auto-popup never re-nags for the same set
 const promptDrafts = {};    // key -> unsaved 'Edit prompt' text
 const notesDrafts = {};     // key -> unsaved 'resume notes' text
 const agentKey = a => (a.run_dir||'') + '|' + a.step;
+const qSig = (id, pend) => id + '|' + (pend||[]).map(q=>q.qid).join(',');
 function closeDetail(force=false){
   if (!force && modalRequest?.dirty && !confirm('Discard unsaved edits?')) return false;
-  detailIdx = null; detailKey = null; modalRequest = null;
+  // closing the questionnaire mid-way dismisses the auto-popup for THIS
+  // question set - the request's Answer button still re-opens it, and a
+  // fresh question round pops again (its qids differ)
+  if (modalQA && modalQA.rec)
+    qDismissed.add(qSig(modalQA.id, modalQA.rec.pending_questions));
+  detailIdx = null; detailKey = null; modalRequest = null; modalQA = null;
   document.getElementById('backdrop').hidden = true;
   return true;
 }
@@ -5228,7 +5475,12 @@ function showRequestForm(rec){
       `changes need regeneration).</div>`:'') +
     (stage==='generating'?`<div class="notice warn">Planning in progress. ` +
       `The previous proposal, if any, remains available if generation fails.</div>`:'') +
-    (rec.gen_tail && (stage==='generating'||stage==='error')
+    (stage==='questions'?`<div class="notice warn">The planner paused for ` +
+      `your answers before writing the TOML ` +
+      `(${(rec.pending_questions||[]).length} pending). Answer them via the ` +
+      `button below, or edit the request and Regenerate.</div>`:'') +
+    (rec.gen_tail && (stage==='generating'||stage==='error'||
+                      stage==='questions')
       ? `<label>Planner output${stage==='generating'?' (live)':''}</label>` +
         `<pre id="gtail">${esc(rec.gen_tail)}</pre>`:'') +
     (stage==='launching'||stage==='launched'?`<div class="notice">This ` +
@@ -5281,6 +5533,19 @@ function showRequestForm(rec){
       `worktree merge conflict, spawn a resolve-* session to finish the ` +
       `merge (<code>merge_resolver = true</code>) instead of only ` +
       `parking the worktree for a human</span></label>` +
+    `<label class="check"><input type="checkbox" id="rq-ask"` +
+      `${rec.ask?' checked':''}${disabled}><span>Ask me questions if ` +
+      `needed: when the planner hits a genuine ambiguity while drafting, ` +
+      `it may pause with a questionnaire (one question per dialog - ` +
+      `suggested options, free text, skip) and refine the TOML with your ` +
+      `answers. Unchecked = it decides everything itself.</span></label>` +
+    (rec.qa&&rec.qa.length?`<details class="proposal"><summary>Planner ` +
+      `Q&amp;A (${rec.qa.length}) - the answers the current draft was ` +
+      `refined with</summary><ol class="proposal-list">` +
+      rec.qa.map(a=>`<li>${esc(a.question)}<br><small>` +
+        `${esc(a.skipped?'(skipped)':
+          ((a.answer||[]).concat(a.text?[a.text]:[]).join('; ')||'-'))}` +
+        `</small></li>`).join('') + `</ol></details>`:'') +
     (steps.length?`<h3 style="margin:16px 0 0">Proposed steps (${steps.length})</h3>` +
       `<ol class="proposal-list">${steps.map(s=>`<li><b>${esc(s.step)}</b> ` +
         `<small>${esc(s.slug)} · ${esc(s.model||'-')} / ${esc(s.effort||'-')}` +
@@ -5295,6 +5560,10 @@ function showRequestForm(rec){
       `${esc(rec.manifest_text||'')}</textarea></details>`:'') +
     `<div id="form-msg" class="notice" hidden></div>` +
     `<div class="actions">` +
+    (stage==='questions'&&(rec.pending_questions||[]).length
+      ? `<button type="button" class="btn attn" ` +
+        `data-open-questions="${esc(rec.id)}">Answer questions (` +
+        `${(rec.pending_questions||[]).length})</button>`:'') +
     (editable?`<button type="button" class="btn secondary" data-action="save">` +
       `${stage==='new'||stage==='draft'?'Save draft':'Save edits'}</button>` +
       `<button type="button" class="btn${rec.stale?' attn':''}" ` +
@@ -5306,8 +5575,10 @@ function showRequestForm(rec){
         `attempts, failure policy, worktrees, resolver) without a planner ` +
         `call - request text and project changes still need Regenerate">` +
         `Apply options to TOML</button>`:''):'') +
-    (stage==='error'&&rec.manifest_text ? `<button type="button" ` +
-      `class="btn secondary" data-action="restore">Keep previous plan</button>`:'') +
+    ((stage==='error'||stage==='questions')&&rec.manifest_text
+      ? `<button type="button" class="btn secondary" data-action="restore"` +
+        ` title="republish the previous proposal and drop the pending ` +
+        `questions">Keep previous plan</button>`:'') +
     (stage==='ready'||stage==='launch_failed' ? `<button type="button" ` +
       `class="btn" data-action="run"${rec.stale?' disabled':''}>` +
       `${stage==='launch_failed'?'Retry start':'Start run'}</button>`:'') +
@@ -5344,7 +5615,7 @@ function requestFields(){
     ['raw','label','project','model','effort','on_failure',
      'plan_model','plan_effort'].map(k=>
     [k,document.getElementById(`rq-${k}`).value]));
-  for (const k of ['followup','worktrees','merge_resolver']){
+  for (const k of ['followup','worktrees','merge_resolver','ask']){
     const el=document.getElementById(`rq-${k}`);
     if (el) f[k]=el.checked;
   }
@@ -5408,6 +5679,78 @@ async function requestAction(action){
     await openRequest(rid);
   } catch(err){ formError(err.message); }
   finally { buttons.forEach(b=>b.disabled=false); }
+}
+
+// --- planner questionnaire ('ask me questions' checkbox) ---------------
+// One question per modal, mirroring the ask_question tool: suggested
+// options as toggle cards + a free-text field + Skip. Each answer POSTs
+// immediately (progress survives a closed tab); when the last pending
+// question is answered the server restarts generation as the refine pass.
+async function openQuestions(id){
+  if (modalQA && modalQA.id===id && modalQA.rec){ showQuestion(); return; }
+  modalQA={id,rec:null};                 // claim the slot during the fetch
+  let rec;
+  try { rec=await api('GET',`/api/requests/${encodeURIComponent(id)}`); }
+  catch(e){ modalQA=null; return; }
+  if (!(rec.pending_questions||[]).length){ modalQA=null;
+    openRequest(id); return; }           // answered meanwhile -> normal form
+  if (!closeDetail()){ modalQA=null; return; }
+  modalQA={id,rec,sel:new Set(),free:''};
+  showQuestion();
+  document.getElementById('backdrop').hidden=false;
+}
+function showQuestion(){
+  const rec=modalQA.rec, pend=rec.pending_questions||[], q=pend[0];
+  if (!q){ modalQA=null; closeDetail(true); refresh(); return; }
+  const done=(rec.qa||[]).length, total=done+pend.length;
+  document.getElementById('dbody').innerHTML =
+    `<h3 id="modal-title">Planner question ${done+1} of ${total}</h3>` +
+    `<div class="notice">The planner hit a decision it wants you to make ` +
+      `before writing the TOML${esc(rec.label?` - ${rec.label}`:'')}. ` +
+      `Your answers feed a second planning pass; skipping leaves the call ` +
+      `to the planner.</div>` +
+    (q.header?`<span class="stage questions">${esc(q.header)}</span>`:'') +
+    `<p style="font-size:14px;margin:12px 0 4px">${esc(q.question)}</p>` +
+    ((q.options||[]).length
+      ? `<div class="qopts">` + q.options.map(o=>
+          `<button type="button" ` +
+          `class="qopt${modalQA.sel.has(o.label)?' on':''}" ` +
+          `data-qopt="${esc(o.label)}"><b>${esc(o.label)}</b>` +
+          (o.description?`<span class="sub">${esc(o.description)}</span>`:'') +
+          `</button>`).join('') + `</div>` +
+        `<div class="sub">${q.multi_select
+          ? 'pick any that apply, or write your own below'
+          : 'pick one, or write your own below'}</div>` : '') +
+    `<input id="q-free" maxlength="2000" ` +
+      `placeholder="your own answer (optional)" value="${esc(modalQA.free)}">` +
+    `<div id="form-msg" class="notice" hidden></div>` +
+    `<div class="actions">` +
+    `<button type="button" class="btn" data-qsend>Send answer</button>` +
+    `<button type="button" class="btn secondary" data-qskip ` +
+      `title="no preference - the planner decides">Skip</button>` +
+    `<button type="button" class="btn secondary" data-qskipall ` +
+      `title="skip this and every remaining question, then generate">` +
+      `Skip all</button>` +
+    `<span class="sub">closing keeps questions pending on the request - ` +
+      `they are not lost.</span>` +
+    `</div>`;
+  const fi=document.getElementById('q-free');
+  if (fi && fi.focus) fi.focus();
+}
+async function answerQuestion(body){
+  const qbtns=document.querySelectorAll(
+    '#detail [data-qsend],#detail [data-qskip],#detail [data-qskipall]');
+  qbtns.forEach(b=>b.disabled=true);
+  try {
+    const out=await api('POST',
+      `/api/requests/${encodeURIComponent(modalQA.id)}/answer`, body);
+    if ((out.pending_questions||[]).length && out.status==='questions'){
+      modalQA.rec=out; modalQA.sel=new Set(); modalQA.free='';
+      showQuestion();
+    } else {
+      modalQA=null; closeDetail(true); await refresh();
+    }
+  } catch(err){ formError(err.message); qbtns.forEach(b=>b.disabled=false); }
 }
 
 let lastSig = null, BOOT = null;
@@ -5572,7 +5915,10 @@ function render(d){
         (r.stage==='generating'
           ? `<span class="dots"><span>.</span><span>.</span><span>.</span></span>`
           : '') + `</span>` +
-        (r.gen_last ? `<br><span class="sub">${esc(r.gen_last)}</span>` :
+        (r.stage==='questions' && (r.questions||[]).length
+          ? `<br><span class="sub">planner waits on ` +
+            `${r.questions.length} answer(s) - open to reply</span>`
+          : r.gen_last ? `<br><span class="sub">${esc(r.gen_last)}</span>` :
           r.stage==='generating'
             ? `<br><span class="sub">planner warming up - ` +
               `devin stays silent for the first minutes; watch the ` +
@@ -5723,8 +6069,19 @@ function render(d){
   }
   const modalRun = modalRequest?.id && d.runs.find(r=>r.request_id===modalRequest.id);
   const modalStage = modalRun && (modalRun.stage||'launched');
+  // an open request modal follows its stage - 'questions' swaps it for
+  // the questionnaire (the form stays reachable via the run-name click)
   if (modalStage && modalRequest.status!=='loading' && !modalRequest.dirty &&
-      modalRequest.status!==modalStage) openRequest(modalRequest.id);
+      modalRequest.status!==modalStage)
+    (modalStage==='questions' ? openQuestions : openRequest)(modalRequest.id);
+  // A planner questionnaire is blocked on a human - pop it once per
+  // question set when nothing else is modal (closing it marks the set
+  // dismissed; the request's Answer button re-opens it).
+  const qr = !modalQA && document.getElementById('backdrop').hidden &&
+    d.runs.find(r=>r.stage==='questions' && (r.questions||[]).length);
+  if (qr && !qDismissed.has(
+      qr.request_id+'|'+qr.questions.map(q=>q.qid).join(',')))
+    openQuestions(qr.request_id);
   syncTopbar();      // filter rows can wrap and change the bar height
 }
 document.addEventListener('click', async e=>{
@@ -5742,6 +6099,37 @@ document.addEventListener('click', async e=>{
   const openReqEl = t.closest && t.closest('[data-open-request]');
   if (openReqEl){
     await openRequest(openReqEl.dataset.openRequest); return; }
+  const openQEl = t.closest && t.closest('[data-open-questions]');
+  if (openQEl){
+    await openQuestions(openQEl.dataset.openQuestions); return; }
+  if (modalQA && t.dataset && t.dataset.qopt!==undefined){
+    // toggle a suggested option - single-select replaces, multi toggles;
+    // re-clicking the sole pick deselects it
+    const l=t.dataset.qopt, q=(modalQA.rec.pending_questions||[])[0];
+    if (!q) return;
+    if (q.multi_select){
+      modalQA.sel.has(l)?modalQA.sel.delete(l):modalQA.sel.add(l);
+    } else {
+      modalQA.sel = modalQA.sel.has(l) ? new Set() : new Set([l]);
+    }
+    showQuestion(); return; }
+  if (modalQA && t.dataset &&
+      (t.dataset.qsend!==undefined||t.dataset.qskip!==undefined||
+       t.dataset.qskipall!==undefined)){
+    const pend=modalQA.rec.pending_questions||[];
+    let body;
+    if (t.dataset.qskipall!==undefined) body={skip_all:true};
+    else if (t.dataset.qskip!==undefined)
+      body={qid:pend[0]&&pend[0].qid, skipped:true};
+    else {
+      const fi=document.getElementById('q-free');
+      body={qid:pend[0]&&pend[0].qid, selected:[...modalQA.sel],
+            text:(fi?fi.value:modalQA.free)||''};
+      if (!body.selected.length && !body.text.trim()){
+        formError('Pick an option, write an answer, or Skip.'); return; }
+    }
+    if (!body.skip_all && !body.qid) return;
+    await answerQuestion(body); return; }
   const runDetEl = t.closest && t.closest('[data-run-details]');
   if (runDetEl){
     showRunDetails(runDetEl.dataset.runDetails); return; }
@@ -5980,6 +6368,8 @@ document.addEventListener('click', async e=>{
   if (row) showDetail(+row.dataset.i);
 });
 document.addEventListener('input', e=>{
+  // typed questionnaire text survives an option-toggle re-render
+  if (modalQA && e.target.id==='q-free') modalQA.free=e.target.value;
   // unsaved prompt/notes text survives the 2s modal rebuild - keyed by
   // run_dir|step so a re-sorted row never inherits another step's draft
   if ((e.target.id==='d-prompt'||e.target.id==='d-rnotes')
@@ -6003,6 +6393,16 @@ document.addEventListener('input', e=>{
   }
 });
 document.addEventListener('keydown', e=>{
+  if (e.key==='Enter' && modalQA && e.target.id==='q-free'){
+    e.preventDefault();
+    const pend=(modalQA.rec.pending_questions||[]);
+    const body={qid:pend[0]&&pend[0].qid, selected:[...modalQA.sel],
+                text:e.target.value||''};
+    if (!body.selected.length && !body.text.trim())
+      { formError('Pick an option, write an answer, or Skip.'); return; }
+    if (body.qid) answerQuestion(body);
+    return;
+  }
   if ((e.key==='Enter'||e.key===' ') &&
       e.target.matches && e.target.matches('tr.runrow')){
     e.preventDefault();
@@ -6120,8 +6520,8 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 if path == "/api/requests":
                     self._json(create_request(body, requests_dir, runs_dir), 201)
                 elif (m := re.fullmatch(r"/api/requests/([^/]+)/"
-                                         r"(save|generate|run|discard|apply)",
-                                         path)):
+                                         r"(save|generate|run|discard|apply"
+                                         r"|answer)", path)):
                     request_id, action = m.groups()
                     if action == "save":
                         self._json(save_request(request_id, body, requests_dir,
@@ -6137,6 +6537,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     elif action == "apply":
                         self._json(apply_request(request_id, body, requests_dir,
                                                  manifests_dir, runs_dir))
+                    elif action == "answer":
+                        self._json(answer_request(request_id, body,
+                                                  requests_dir, manifests_dir,
+                                                  runs_dir, devin_argv))
                     else:
                         if body.get("confirm") is not True:
                             raise RequestError("Confirm discard explicitly")
