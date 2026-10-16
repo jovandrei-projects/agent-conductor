@@ -352,6 +352,14 @@ Append as they are hit.
    startup; `status`/dashboard compute the same `lost` display live.
    `sweep` refuses to write while a live step's work_dir contains
    `data/runs` - a self-hosted run in flight (trap 5).
+   - The verify/merge window: after a worker exits, the conductor spends
+     minutes in `verify` + merge while the record still says `running`
+     with a dead worker pid - it displayed `lost`, and a startup sweep
+     wrote `lost` + `ended_at` over a LIVE run (ux-controls, 2026-10-15).
+     Fix: `state.driver_pid`/`driver_started_at` records the conductor
+     itself (restamped on resume); `driver_alive` keeps such records
+     live, makes sweep skip the run entirely, and blocks resume/double
+     drivers. Without it, `effective_statuses` falls back to pid-only.
 9. **IDE env vars poison `devin` auth.** When conductor runs inside the
    Devin Desktop / VS-Code extension host (this repo's dev session is),
    inherited `ACP_BACKEND`, `WINDSURF_*`, `VSCODE_*`, `TERM_PROGRAM` make

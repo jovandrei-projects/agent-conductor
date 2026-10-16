@@ -1806,6 +1806,52 @@ class LivenessTests(unittest.TestCase):
              "b": {"status": "queued"}})
         self.assertEqual(conductor.effective_statuses(st)["b"], "queued")
 
+    def test_dead_worker_pid_stays_live_while_driver_runs(self):
+        """The verify/merge window: the worker exited but the conductor
+        is mid-finalize - driver_pid keeps 'running' alive instead of
+        flashing 'lost'. Hit live on ux-controls 2026-10-15."""
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        drv = subprocess.Popen([sys.executable, "-c",
+                                "import time;time.sleep(30)"])
+        try:
+            st = self._state(
+                {"a": {"status": "running", "pid": dead.pid,
+                       "started_at": conductor.now_iso()}},
+                driver_pid=drv.pid,
+                driver_started_at=conductor.now_iso())
+            self.assertTrue(conductor.driver_alive(st))
+            self.assertEqual(conductor.effective_statuses(st)["a"],
+                             "running")
+            # a queued sibling isn't an orphan while the driver is up
+            st["steps"]["b"] = {"status": "queued"}
+            st["ended_at"] = conductor.now_iso()  # even a ghost ended_at
+            self.assertEqual(conductor.effective_statuses(st)["b"],
+                             "queued")
+        finally:
+            drv.terminate()
+            drv.wait()
+
+    def test_dead_driver_falls_back_to_worker_liveness(self):
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        st = self._state(
+            {"a": {"status": "running", "pid": dead.pid,
+                   "started_at": conductor.now_iso()}},
+            driver_pid=dead.pid,
+            driver_started_at=conductor.now_iso())
+        self.assertFalse(conductor.driver_alive(st))
+        self.assertEqual(conductor.effective_statuses(st)["a"], "lost")
+
+    def test_old_runs_without_driver_pid_keep_old_semantics(self):
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        st = self._state(
+            {"a": {"status": "running", "pid": dead.pid,
+                   "started_at": conductor.now_iso()}})
+        self.assertFalse(conductor.driver_alive(st))
+        self.assertEqual(conductor.effective_statuses(st)["a"], "lost")
+
 
 class SweepTests(unittest.TestCase):
     def test_sweep_marks_stale_and_closes_run(self):
@@ -1867,6 +1913,36 @@ class SweepTests(unittest.TestCase):
             finally:
                 p.terminate()
                 p.wait()
+
+    def test_sweep_never_touches_a_run_whose_driver_is_alive(self):
+        """Regression: a serve-restart sweep stamped 'lost' + ended_at on
+        a LIVE run while its conductor sat in the 5min verify gate with a
+        dead worker pid (ux-controls, 2026-10-15)."""
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            rd = runs / "20990101-000000-t"
+            rd.mkdir(parents=True)
+            dead = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead.wait()
+            drv = subprocess.Popen([sys.executable, "-c",
+                                    "import time;time.sleep(30)"])
+            try:
+                (rd / "state.json").write_text(json.dumps(
+                    {"run": "t", "started_at": conductor.now_iso(),
+                     "driver_pid": drv.pid,
+                     "driver_started_at": conductor.now_iso(),
+                     "steps": {
+                         "a": {"status": "running", "pid": dead.pid,
+                               "started_at": conductor.now_iso()},
+                         "b": {"status": "queued"}}}))
+                lines = conductor.sweep_runs(runs)
+                self.assertFalse(any("lost" in l for l in lines))
+                out = json.loads((rd / "state.json").read_text())
+                self.assertEqual(out["steps"]["a"]["status"], "running")
+                self.assertNotIn("ended_at", out)
+            finally:
+                drv.terminate()
+                drv.wait()
 
 
 class StatusCommandTests(unittest.TestCase):

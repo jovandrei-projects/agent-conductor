@@ -592,18 +592,43 @@ def pid_alive(pid: int | None, since: str | None = None) -> bool:
         return False
 
 
-def step_live(rec: dict) -> bool:
+def driver_alive(state: dict) -> bool:
+    """Is the run's own conductor process still alive?
+
+    state carries driver_pid/driver_started_at since 2026-10-15. The gap
+    this closes: between worker exit and step_end the conductor spends
+    minutes in verify+merge with a 'running' record pointing at a dead
+    worker pid - the dashboard displayed 'lost', a startup sweep could
+    WRITE 'lost'/ended_at over a live run, and the resume guard could let
+    a second driver take over mid-verify. Runs recorded by older code
+    lack the field and keep worker-pid-only semantics."""
+    pid = state.get("driver_pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    return pid_alive(pid, state.get("driver_started_at")
+                     or state.get("started_at"))
+
+
+def step_live(rec: dict, driver_up: bool = False) -> bool:
     """Is a 'running' step record backed by something actually alive?
 
     Two live shapes: a live pid, or a fresh no-pid record. No-pid mid-run
     is normal - the pid is kept in memory only until the worker exits
     (trap 5) - but a no-pid 'running' record older than its own timeout
     means the conductor process died mid-step.
+
+    driver_up (the run's conductor is alive): a 'running' record stays
+    live while the driver is in the verify/merge window between worker
+    exit and step_end - the worker pid is already dead there.
     """
     if rec.get("status") != "running":
         return False
+    if rec.get("pid") and pid_alive(rec["pid"], rec.get("started_at")):
+        return True
+    if driver_up:
+        return True
     if rec.get("pid"):
-        return pid_alive(rec["pid"], rec.get("started_at"))
+        return False
     t0 = _iso_ts(rec.get("started_at"))
     if t0 is None:
         return False
@@ -616,18 +641,20 @@ def effective_statuses(state: dict) -> dict[str, str]:
 
     'running' with nothing alive behind it displays as 'lost'. 'queued' is
     'lost' when the run ended or has been quiet >10min with nothing live -
-    an orphaned queue entry can never start. ('lost' steps re-run on
-    --resume like any non-done step.)
+    an orphaned queue entry can never start. A live driver (driver_pid)
+    means neither applies - the conductor is mid-verify/merge, not dead.
+    ('lost' steps re-run on --resume like any non-done step.)
     """
     steps = state.get("steps") or {}
-    live = {n: step_live(r) for n, r in steps.items()}
+    drv = driver_alive(state)
+    live = {n: step_live(r, drv) for n, r in steps.items()}
     stamps = [_iso_ts(state.get(k)) for k in ("started_at", "ended_at")]
     stamps += [_iso_ts(r.get(k)) for r in steps.values()
                for k in ("started_at", "ended_at")]
     newest = max((t for t in stamps if t), default=None)
     quiet = time.time() - newest if newest else 0.0
-    orphaned = bool(state.get("ended_at")) \
-        or (not any(live.values()) and quiet > 600)
+    orphaned = not drv and (bool(state.get("ended_at"))
+                            or (not any(live.values()) and quiet > 600))
     out = {}
     for n, r in steps.items():
         st = r.get("status", "?")
@@ -1819,6 +1846,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         # A re-entered run is in flight again - drop the auto-archive
         # stamp so it resurfaces on the default dashboard view.
         state.pop("archived", None)
+        # The driver is THIS process now - restamp so driver_alive()
+        # tracks the resumed conductor, not the dead original.
+        state["driver_pid"] = os.getpid()
+        state["driver_started_at"] = now_iso()
         save_state(run_dir, state)
         print(f"[resume] {run_dir.name}")
         # Resume must be able to start work again: drop any stop/drain
@@ -1833,6 +1864,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                  "devin_argv": devin_argv,
                  "run_dir": str(run_dir), "max_parallel": cap,
                  "flags": "v2",
+                 "driver_pid": os.getpid(),
+                 "driver_started_at": now_iso(),
                  "free_ram_gb": free_ram_gb(), "steps": {}}
         save_state(run_dir, state)
     hub = getattr(args, "hub", True)
@@ -2200,7 +2233,7 @@ def _runs_watched(runs_dir: Path, states: list[tuple[Path, dict]]) -> bool:
     lands in the worker's watched tree (an external edit ends its session)."""
     for _sj, st in states:
         for rec in (st.get("steps") or {}).values():
-            if step_live(rec):
+            if step_live(rec, driver_alive(st)):
                 wd = rec.get("work_dir") or rec.get("project")
                 try:
                     if wd and runs_dir.resolve().is_relative_to(
@@ -2234,6 +2267,10 @@ def sweep_runs(runs_dir: Path, write: bool = True) -> list[str]:
     watched = _runs_watched(runs_dir, states)
     lines: list[str] = []
     for sj, st in states:
+        if driver_alive(st):
+            # The run's conductor is alive (possibly mid-verify/merge with
+            # a dead worker pid). Orphan-marking is for dead drivers.
+            continue
         eff = effective_statuses(st)
         steps = st.get("steps") or {}
         dirty = False
@@ -2602,7 +2639,7 @@ def _assert_unwatched(runs_dir: Path, *destinations: Path) -> None:
             continue
         for step in (st.get("steps") or {}).values():
             wd = step.get("work_dir") or step.get("project")
-            if wd and step_live(step) and any(
+            if wd and step_live(step, driver_alive(st)) and any(
                     p.resolve().is_relative_to(Path(wd).resolve())
                     for p in destinations):
                 raise RequestError("A live agent is watching this workspace; "
@@ -3305,7 +3342,7 @@ def launch_request(request_id: str,
                 st = json.loads(sj.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if any(not step.get("branch") and step_live(step) and
+            if any(not step.get("branch") and step_live(step, driver_alive(st)) and
                    Path(step.get("work_dir") or step.get("project") or "").resolve()
                    in targets for step in (st.get("steps") or {}).values()):
                 raise RequestError("A live agent already works in this project; "
@@ -3346,7 +3383,7 @@ def resume_run(name: str, runs_dir: Path = RUNS_DIR,
         st = json.loads((d / "state.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise RequestError("Cannot read run state", 500) from exc
-    if any(step_live(r) for r in (st.get("steps") or {}).values()):
+    if any(step_live(r, driver_alive(st)) for r in (st.get("steps") or {}).values()):
         raise RequestError("This run still has a live agent - wait for it "
                            "or let it die first", 409)
     pid = _RESUME_PIDS.get(name)
@@ -3410,7 +3447,7 @@ def _merge_run(name: str, runs_dir: Path,
     except (OSError, ValueError) as exc:
         raise RequestError("Cannot read run state", 500) from exc
     steps = st.get("steps") or {}
-    if any(step_live(r) for r in steps.values()):
+    if any(step_live(r, driver_alive(st)) for r in steps.values()):
         raise RequestError("This run still has a live agent - wait for it "
                            "or let it die first", 409)
     pid = _RESUME_PIDS.get(name)
@@ -3528,7 +3565,7 @@ def stop_step(run_name: str, step_name: str,
         raise RequestError("Step not in this run", 404)
     if rec.get("status") not in ("running", "queued"):
         raise RequestError(f"Step is {rec.get('status')}, not running", 409)
-    if rec.get("status") == "running" and not step_live(rec):
+    if rec.get("status") == "running" and not step_live(rec, driver_alive(st)):
         raise RequestError("This step is already dead (its record is "
                            "stale - sweep will mark it lost)", 409)
     for f in stop_flags_for(d, st, step_name):
@@ -3630,7 +3667,7 @@ def stop_run(run_name: str, body: dict,
             for f in drain_flags_for(d, st):
                 _flag_raise(f.name)
         live = [n for n, r in (st.get("steps") or {}).items()
-                if r.get("status") == "running" and step_live(r)]
+                if r.get("status") == "running" and step_live(r, driver_alive(st))]
         return {"pausing": live}
     if body.get("drain"):
         for f in drain_flags_for(d, st):
@@ -3639,7 +3676,7 @@ def stop_run(run_name: str, body: dict,
     for f in stop_flags_for(d, st):
         _flag_raise(f.name)
     live = [n for n, r in (st.get("steps") or {}).items()
-            if r.get("status") == "running" and step_live(r)]
+            if r.get("status") == "running" and step_live(r, driver_alive(st))]
     for n in live:                       # immediate kill, not just the poll
         _kill_pid((st["steps"][n]).get("pid"),
                   st["steps"][n].get("started_at"))
@@ -3658,7 +3695,7 @@ def set_run_archived(run_name: str, body: dict,
     d, st = _run_dir_checked(run_name, runs_dir)
     archived = body.get("archived") is not False    # default: archive
     if archived and any(
-            step_live(r) for r in (st.get("steps") or {}).values()):
+            step_live(r, driver_alive(st)) for r in (st.get("steps") or {}).values()):
         raise RequestError("This run still has a live agent - wait for it "
                            "or let it die first", 409)
     _assert_unwatched(runs_dir, d)
@@ -3683,7 +3720,7 @@ def delete_run(run_name: str, body: dict,
     if body.get("confirm") is not True:
         raise RequestError("Confirm delete explicitly")
     d, st = _run_dir_checked(run_name, runs_dir)
-    if any(step_live(r) for r in (st.get("steps") or {}).values()):
+    if any(step_live(r, driver_alive(st)) for r in (st.get("steps") or {}).values()):
         raise RequestError("This run still has a live agent - wait for it "
                            "or let it die first", 409)
     pid = _RESUME_PIDS.get(run_name)
@@ -4079,7 +4116,7 @@ def live_sessions_by_dir(runs_dir: Path,
             continue
         for rec in (st.get("steps") or {}).values():
             wd = rec.get("work_dir") or rec.get("project")
-            if wd and (rec.get("session_id") or step_live(rec)) \
+            if wd and (rec.get("session_id") or step_live(rec, driver_alive(st))) \
                     and Path(wd).is_dir():
                 dirs.add(wd)
     out = {d: session_activity(devin_argv, Path(d)) for d in dirs}
@@ -4371,7 +4408,7 @@ def collect_dashboard(runs_dir: Path,
                 "status": status, "started_at": rec.get("started_at"),
                 "ended_at": rec.get("ended_at"),
                 "elapsed_s": rec.get("elapsed_s"),
-                "alive": step_live(rec),
+                "alive": step_live(rec, driver_alive(st)),
                 "pid": rec.get("pid"), "session_id": rec.get("session_id"),
                 "model": model,
                 "model_actual": rec.get("model_actual"),

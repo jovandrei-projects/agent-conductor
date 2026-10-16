@@ -126,3 +126,15 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   the row still filters. Resume now pops stale 'aborted'/'ended_at' from
   state.json - a finished-then-resumed run no longer shows the 'Paused
   by user' notice forever.
+- DONE 2026-10-15: Task-modal trajectory arc - `trajectory_arc` condenses
+  a finished step's ATIF export (agent messages -> tool-call summaries)
+  into phase-grouped spans (setup/audit/implement/test/docs/commit),
+  rendered after the stdout tail. Retroactive for every past run.
+- DONE 2026-10-15 (verify/merge-window false 'lost'): worker exits ->
+  conductor runs ~5min verify+merge while the record still says 'running'
+  on a dead worker pid -> dashboard flashed 'lost'/'interrupted-resume
+  ready', and a serve-startup sweep stamped 'lost'+ended_at on a LIVE
+  run. Fix: state.json now carries driver_pid/driver_started_at (the
+  conductor's own pid, restamped on resume); driver_alive keeps the
+  step live, sweep skips live-driver runs, and resume/archive/delete
+  correctly refuse mid-verify. Old runs lack the field -> old semantics.
