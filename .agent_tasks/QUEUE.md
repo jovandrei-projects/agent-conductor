@@ -24,6 +24,28 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (full-trajectory-view, wave step of run
+  20261016-013719-workflow-ux-safety): arc entries in the task modal are
+  now nested `<details class="arcent">` that expand to the step's FULL
+  retained text - the arc's 110-char `head` was truncation at
+  `trajectory_arc()`, not a CSS ellipsis, so expansion lazy-fetches
+  `GET /api/runs/<r>/steps/<s>/trajectory` (and
+  `/api/requests/<id>/trajectory` for the planner session), which
+  re-reads the step's ATIF export for message, reasoning_content,
+  tool-call args (rendered `key: value` so multiline edit payloads stay
+  literal), and tool results paired by source_call_id (orphan results
+  still surface as `extra_obs`). Header gains Expand all / Collapse
+  all; `trajOpen` (agent-keyed Sets) keeps open groups+entries across
+  the 2s modal rebuild - which previously collapsed even groups - and
+  `trajDetail` caches detail by export-path+mtime (resume rewrites
+  refetch). Per-entry Copy ships verbatim `arcPlainText`, never HTML.
+  `.arcpre` wraps long lines + stays selectable; a live in-modal text
+  selection pauses the tick rebuild (`modalSelActive`). 200k/field cap
+  is recorded as `trunc` and labeled; mock/step-less exports 404 with
+  the reason - nothing is fabricated from the head. Groups past the
+  40-group cap announce their count. `/api/state` stays compact (only
+  arc.em + groups_total added). 272/272 mock tests + demo green; 8 new
+  TrajectoryDetailTests incl. node-harness expand/copy/run-switch/XSS.
 - DONE 2026-10-16 (modal-detail-navigation, wave step of run
   20261016-013719-workflow-ux-safety): the task modal's 'Session summary'
   no longer opens a separate browser window - it renders the report inside
