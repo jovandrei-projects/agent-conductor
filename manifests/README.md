@@ -22,7 +22,8 @@ Inside the manifest, each `[[step]]` names a `project` slug from
 WHERE the worker session runs - the worker's working directory is the
 target project, and it reads THAT project's `AGENTS.md` + `.agent_tasks/`
 per the preamble. conductor's own rules only impose the session contract:
-commit work, update the project's `.agent_tasks`, end with `STATUS:`.
+commit work, update the project's `.agent_tasks`, end with the
+`STATUS:`/`NEXT:`/`OUTCOME:` report lines.
 
 ## Writing one
 

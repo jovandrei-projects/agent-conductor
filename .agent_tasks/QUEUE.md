@@ -490,3 +490,19 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   conductor's own pid, restamped on resume); driver_alive keeps the
   step live, sweep skips live-driver runs, and resume/archive/delete
   correctly refuse mid-verify. Old runs lack the field -> old semantics.
+- DONE 2026-10-16 (task-outcome-summary, wave step of run
+  20261016-100852-run-review-ux): the worker report gains a third contract
+  line OUTCOME: - the human-facing one-to-two-sentence summary of what
+  THAT step actually did (concrete results + material limits), printed
+  beside STATUS:/NEXT: at column zero, last-match whole-log parse
+  (tail_outcome, 300-char cap, missing never fails). Persisted as
+  rec['outcome'] (newest) + rec['outcomes'] (bounded attempt/dispatch
+  history, so a resume's fresh result replaces the display without
+  erasing earlier accomplishments; a dispatch reporting nothing keeps
+  the last real one). Surfaced as the task modal's outcome row (+earlier
+  rows, honest muted 'not reported' for records that predate the
+  contract - NEXT: is a handoff, never a stand-in), the agents-table
+  result column (outcome leads, conductor note drops to a .sub line),
+  summary-md bullets, cmd_status, and the follow-up plan's review
+  sources. mock_devin prints it (outcome=/nooutcome/status= keywords);
+  12 new tests, 307/307 + demo green.
