@@ -3107,6 +3107,294 @@ const open=step=>vm.runInContext(
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class ProposalFlowIntegrationTests(unittest.TestCase):
+    """The three proposal-flow changes exercised as ONE sequence:
+    prepare -> Stop while preparing -> inputs editable again -> add info
+    -> prepare again -> the completed create-proposal session stays on
+    the plan's related list -> Start runs the real step 1 (never a
+    generation replay). Plus the regression that used to break it: a
+    stop landing in the same wall-clock second as generation start
+    slipped _disk_untouched's updated_at check and let the killed
+    attempt's TOML publish over the restored record."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.proj = make_project(self.base)
+        self.runs = self.base / "runs"
+        self.requests = self.base / "requests"
+        self.manifests = self.base / "manifests"
+        self.manifests.mkdir()
+        patch = mock.patch.object(conductor, "load_projects", return_value={
+            "proj": {"path": self.proj, "cloud_ok": False}})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def proposal(self, description="Tidy the catalog"):
+        return f'''[run]
+name = "catalog-cleanup"
+description = "{description}"
+on_failure = "continue"
+checkpoint = true
+
+[defaults]
+project = "proj"
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+max_attempts = 3
+
+[[step]]
+name = "organize"
+prompt = "Organize the catalog and verify results."
+'''
+
+    def new(self):
+        return conductor.create_request(
+            {"raw": "Please tidy the catalog carefully", "project": "proj",
+             "model": "swe-2", "effort": "max"}, self.requests, self.runs)
+
+    def cleanup_flag(self, rid):
+        flag = conductor.gen_stop_flag(rid)
+        self.addCleanup(lambda: flag.unlink(missing_ok=True))
+        return flag
+
+    def wait_attempts(self, n=0, timeout=10):
+        deadline = time.time() + timeout
+        while len(conductor._GENERATING) != n and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(conductor._GENERATING), n)
+
+    def wait_calls(self, calls, n, timeout=10):
+        deadline = time.time() + timeout
+        while len(calls) < n and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(calls), n)
+
+    def planner_popen(self, calls, proposal, emit_from=2):
+        """--prompt-file spawns get a FakeProc that writes the ATIF export
+        (session id like the real CLI stamps) and, from call `emit_from`,
+        the manifest; every other spawn (taskkill, git, devin list probes)
+        is a real process."""
+        real_popen = subprocess.Popen
+
+        class FakeProc:
+            def __init__(self, cmd, **kwargs):
+                self.pid = 1
+                self._dead = False
+                self._done = False
+                calls.append(self)
+                n = len(calls)
+                exp = Path(cmd[cmd.index("--export") + 1])
+                exp.write_text(json.dumps(
+                    {"session_id": f"sess-plan-{n}",
+                     "final_metrics": {"total_prompt_tokens": 10}}))
+                if n >= emit_from:
+                    kwargs["stdout"].write((
+                        "BEGIN_MANIFEST\n" + proposal +
+                        "END_MANIFEST\nSTATUS: done\n").encode())
+                    kwargs["stdout"].flush()
+                    self._done = True
+
+            def poll(self):
+                return 0 if (self._dead or self._done) else None
+
+            def wait(self, timeout=None):
+                if self._dead or self._done:
+                    return 0
+                raise subprocess.TimeoutExpired("planner", timeout or 0)
+
+            def kill(self):
+                self._dead = True
+
+        def popen_router(cmd, **kwargs):
+            if isinstance(cmd, list) and "--prompt-file" in cmd:
+                return FakeProc(cmd, **kwargs)
+            return real_popen(cmd, **kwargs)
+        return popen_router
+
+    def stop_aware_wait(self, proc, log, timeout_s, stop_flags=(),
+                        timeout_flag=None, stall_s=None):
+        """wait_worker stand-in that honors the stopgen sentinel like the
+        real one: flag -> kill the proc -> stopped=True."""
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if stop_flags and conductor._flag_set(*stop_flags):
+                proc.kill()
+                return proc.wait(), False, False, True, 0.0
+            rc = proc.poll()
+            if rc is not None:
+                return rc, False, False, False, 0.0
+            time.sleep(0.01)
+        return 0, False, False, False, 0.0
+
+    def test_stop_edit_reprepare_retain_then_launch_runs_step1(self):
+        """The full user-facing sequence across all three changes."""
+        rec = self.new()
+        self.cleanup_flag(rec["id"])
+        calls = []
+        proposal = self.proposal("Tidy and test the catalog")
+
+        with mock.patch.object(conductor.subprocess, "Popen",
+                               self.planner_popen(calls, proposal)), \
+                mock.patch.object(conductor, "session_ids",
+                                  return_value=set()), \
+                mock.patch.object(conductor, "wait_worker",
+                                  self.stop_aware_wait):
+            # 1. prepare a proposal (attempt 1 blocks on the stop sentinel)
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs, ["devin"])
+            self.wait_calls(calls, 1)
+            # 2. stop while preparing -> previous inputs editable at once:
+            #    the record reads 'draft' immediately even though the
+            #    attempt is still unwinding (stale 'generating' overlay is
+            #    dropped, not just out-voted later)
+            out = conductor.stop_generation(rec["id"], self.requests,
+                                            self.runs)
+            self.assertEqual(out["status"], "draft")
+            now = conductor.request_details(rec["id"], self.requests,
+                                            self.manifests, self.runs)
+            self.assertEqual(now["status"], "draft")
+            # 3. add information while attempt 1 is still unwinding
+            out = conductor.save_request(
+                rec["id"],
+                {"raw": "Please tidy the catalog carefully AND run tests"},
+                self.requests, self.manifests, self.runs)
+            self.assertEqual(out["status"], "draft")
+            self.wait_attempts()
+            # the stopped attempt is banked as preparation history, and
+            # its late exit could not clobber the edited record
+            rec = conductor.request_details(rec["id"], self.requests,
+                                            self.manifests, self.runs)
+            self.assertEqual(rec["status"], "draft")
+            self.assertIsNone(rec["manifest"])
+            self.assertFalse(list(self.manifests.iterdir()))
+            self.assertEqual(
+                rec["raw"], "Please tidy the catalog carefully AND run tests")
+            self.assertEqual(len(rec["plan_sessions"]), 1)
+            self.assertEqual(rec["plan_sessions"][0]["status"], "stopped")
+            self.assertEqual(rec["plan_sessions"][0]["session_id"],
+                             "sess-plan-1")
+            # 4. prepare again - the edited text is what gets planned
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs,
+                                       ["devin"], background=False)
+
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests, self.runs)
+        self.assertEqual(rec["status"], "ready")
+        self.assertEqual(rec["description"], "Tidy and test the catalog")
+        # 5. reload persistence: a fresh read from disk keeps BOTH
+        #    attempts, producer = the second (completed) session
+        on_disk = json.loads(conductor._request_path(
+            rec["id"], self.requests).read_text(encoding="utf-8"))
+        self.assertEqual(len(on_disk["plan_sessions"]), 2)
+        old, new = on_disk["plan_sessions"]
+        self.assertEqual((old["status"], old["session_id"]),
+                         ("stopped", "sess-plan-1"))
+        self.assertEqual((new["status"], new["session_id"]),
+                         ("done", "sess-plan-2"))
+        self.assertEqual(on_disk["plan_gen_id"], new["gen_id"])
+        # 6. the completed create-proposal session is on the plan's related
+        #    list, as step 0 - the stopped attempt keeps its own row
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        by_step = {a["step"]: a for a in d["agents"]}
+        self.assertEqual(by_step["plan-proposal"]["session_id"],
+                         "sess-plan-2")
+        self.assertEqual(by_step["plan-proposal"]["seq"], -1)
+        self.assertEqual(by_step["plan-proposal-1"]["status"], "stopped")
+        self.assertEqual(by_step["plan-proposal-1"]["session_id"],
+                         "sess-plan-1")
+        self.assertIsNone(by_step["plan-proposal"]["run_dir"])
+        # 7. start the plan - the run executes the real step 1; proposal
+        #    generation is never replayed (still exactly 2 planner spawns)
+        args = argparse.Namespace(manifest=rec["manifest"], resume=None,
+                                  devin=MOCK, runs_dir=str(self.runs),
+                                  request_id=rec["id"], hub=False,
+                                  keep_awake=False)
+        self.assertEqual(conductor.cmd_run(args), 0)
+        self.assertEqual(len(calls), 2)
+        run_dir = next(self.runs.glob("*/state.json"))
+        st = json.loads(run_dir.read_text(encoding="utf-8"))
+        self.assertEqual(set(st["steps"]), {"organize"})
+        self.assertEqual(st["steps"]["organize"]["status"], "done")
+        # the launched run's task list still shows the preparation row
+        d = conductor.collect_dashboard(self.runs, ["no-such-devin"],
+                                        self.requests)
+        by_step = {a["step"]: a for a in d["agents"]
+                   if a["run_key"] == f"request:{rec['id']}"}
+        self.assertEqual(by_step["organize"]["status"], "done")
+        self.assertEqual(by_step["plan-proposal"]["session_id"],
+                         "sess-plan-2")
+        self.assertEqual(by_step["plan-proposal-1"]["status"], "stopped")
+
+    def test_same_second_stop_cannot_publish_late_toml(self):
+        """Regression: _disk_untouched compared only updated_at, a
+        SECOND-granularity stamp - a stop_generation restore landing in
+        the same second as generation start passed the gate and the
+        killed attempt's TOML published over the restored record. With
+        now_iso pinned to one value the write is indistinguishable by
+        updated_at alone; the mtime_ns + generation_stopped_at compares
+        still catch it."""
+        gate = threading.Event()
+
+        def fake(r, projects, argv, log_path=None, fix_note=None,
+                 qa=None):
+            gate.wait(30)
+            return self.proposal("late TOML from a stopped attempt")
+
+        frozen = "2026-10-16T03:00:00"
+        # Frozen from request creation on: file updated_at, job.json's
+        # base_updated_at and the stop's rewrite all carry the same
+        # timestamp - the old updated_at-only gate's blind spot.
+        with mock.patch.object(conductor, "now_iso",
+                               return_value=frozen), \
+                mock.patch.object(conductor, "_planner_response", fake):
+            rec = self.new()
+            self.cleanup_flag(rec["id"])
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs, ["devin"])
+            spool = conductor._spool_dir(rec["id"])
+            deadline = time.time() + 10
+            while not (spool / "job.json").is_file() \
+                    and time.time() < deadline:
+                time.sleep(0.02)
+            job = conductor._job_meta(spool)
+            self.assertEqual(job.get("base_updated_at"), frozen)
+            out = conductor.stop_generation(rec["id"], self.requests,
+                                            self.runs)
+            self.assertEqual(out["status"], "draft")
+            gate.set()
+            self.wait_attempts()
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests, self.runs)
+        self.assertEqual(rec["status"], "draft")
+        self.assertIsNone(rec["manifest"])
+        self.assertFalse(list(self.manifests.iterdir()))
+
+    def test_disk_untouched_gate_unit(self):
+        """Unit-pins the hardened gate: identical updated_at, but a stop
+        stamp / mtime change / outright rewrite all count as touched."""
+        rec = self.new()
+        path = conductor._request_path(rec["id"], self.requests)
+        base = conductor._read_request_file(rec["id"], self.requests)
+        job = {"base_updated_at": base["updated_at"],
+               "base_stopped_at": None,
+               "base_mtime_ns": path.stat().st_mtime_ns}
+        self.assertTrue(conductor._disk_untouched(
+            rec["id"], self.requests, job))
+        frozen = base["updated_at"]          # same-second collision
+        with mock.patch.object(conductor, "now_iso", return_value=frozen):
+            stop = dict(base)
+            stop["status"] = "draft"
+            stop["generation_stopped_at"] = frozen
+            conductor._save_request(stop, self.requests)
+        self.assertFalse(conductor._disk_untouched(
+            rec["id"], self.requests, job))
+
+
 class BackgroundProcessTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows console flags")
     def test_periodic_dashboard_probes_are_headless(self):

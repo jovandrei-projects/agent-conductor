@@ -4300,6 +4300,10 @@ def _drain_generating(rid: str, overlay: dict, spool: Path,
             # attempt being drained - a Regenerate may have claimed it.
             if (cur or overlay).get("gen_id") == gid:
                 cur = dict(cur or overlay)
+                sid = tail_session_id(spool / "gen.export.json")
+                _record_plan_attempt(cur, _plan_attempt_entry(
+                    cur, gid, [sid] if sid else [], "failed", None,
+                    f"Recovered draft failed to publish: {exc}"[:160]))
                 cur.update(
                     status="error",
                     error=f"Recovered draft failed to publish: {exc}"[:300])
@@ -4315,6 +4319,10 @@ def _drain_generating(rid: str, overlay: dict, spool: Path,
     if overlay.get("status") == "generating" and \
             (_spool_rec(rid) or {}).get("gen_id") == gid:
         overlay = dict(overlay)
+        sid = tail_session_id(spool / "gen.export.json")
+        _record_plan_attempt(overlay, _plan_attempt_entry(
+            overlay, gid, [sid] if sid else [], "failed", None,
+            "interrupted by a server restart"))
         overlay.update(
             status="error",
             error="Planning was interrupted by a server restart - the "
@@ -4473,15 +4481,13 @@ def stop_generation(request_id: str,
             raise RequestError(
                 "This request is not preparing a proposal", 409)
         _flag_raise(gen_stop_flag(request_id).name)
-        rec["status"] = "ready" if rec.get("manifest") else "draft"
-        rec["error"] = None
-        rec["generation_stopped_at"] = now_iso()
-        _save_request(rec, requests_dir)
-        # Drop the parked spool overlay too: it still says 'generating'
-        # and outranks the file for every _read_request caller, so the
-        # restored stage would stay invisible (and the stopped attempt's
-        # draft publishable by a drain) until the spool was cleaned.
-        # Only an overlay owned by THIS attempt is touched - a newer
+        # Drop the parked spool overlay BEFORE restoring the file: it
+        # still says 'generating' and outranks the file for every
+        # _read_request caller, so the restored stage would stay
+        # invisible (and the stopped attempt's draft publishable by a
+        # drain) until the spool was cleaned. Delete first so a crash
+        # mid-stop can't leave the stale overlay masking the file. Only
+        # an overlay owned by THIS attempt is touched - a newer
         # generation's overlay is that attempt's problem.
         spool_overlay = _spool_rec(request_id)
         if (spool_overlay or {}).get("gen_id") == rec.get("gen_id"):
@@ -4490,6 +4496,10 @@ def stop_generation(request_id: str,
                     missing_ok=True)
             except OSError:
                 pass
+        rec["status"] = "ready" if rec.get("manifest") else "draft"
+        rec["error"] = None
+        rec["generation_stopped_at"] = now_iso()
+        _save_request(rec, requests_dir)
         proc = _GEN_PROCS.get(request_id)
     if proc is not None:
         kill_tree(proc)
@@ -6065,20 +6075,30 @@ body.compact td br { display:none; }
    planner:/steps:/est token lines in a run's steps cell are meant to
    render there (fmtTc is their compact form). The <br> that stacks
    them at full density hides in compact, so block gives each label
-   its own line. .rlabels needs no rules - it is a plain block box
-   keeping the run row's chips on their own line under the name in
-   both densities (a <br> would disappear in compact and let them
-   clip inline after the name). */
+   its own line. .rlabels is a plain block box keeping the run row's
+   chips on their own line under the name in both densities (a <br>
+   would disappear in compact and let them clip inline after the
+   name); its one rule is below. */
 .toksub { color:#8b949e; font-size:12px; }
 body.compact td .toksub { display:block; }
+/* Chips on the .rlabels line must never clip invisibly at the td edge:
+   compact squeezes td.wrap to nowrap, which pins every chip to one line -
+   a pill starting mid-line can shrink to max-width:100% yet still
+   overflow past the cell. Normal whitespace lets a following chip wrap
+   to its own line inside the label block instead (harmless at full
+   density, where td.wrap already wraps). */
+.rlabels { white-space:normal; }
 /* .genline: a proposal row's compact live-output line - display:none at
    full density (the .sub line under the stage chip shows the same
-   gen_last there), inline on the row's one line under compact, ellipsized
-   by the td. .fresh flashes it on new output - the same animation the
-   agent result cells use, on the .sub line too. */
+   gen_last there). Under compact it is one nowrap ellipsized line: as an
+   inline-block with max-width it keeps its own line when the .rlabels
+   wrap puts it after a chip, and ellipsizes at the cell edge rather
+   than clipping. .fresh flashes it on new output - the same animation
+   the agent result cells use, on the .sub line too. */
 .genline { display:none; }
-body.compact td .genline { display:inline; color:#8b949e;
-  font-size:12px; margin-left:6px; }
+body.compact td .genline { display:inline-block; max-width:100%;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  vertical-align:bottom; color:#8b949e; font-size:12px; margin-left:6px; }
 .genline.fresh, td .sub.fresh { animation:fresh 1.2s ease-out; }
 .counts span { background:#161b22; border-radius:8px; padding:1px 8px; margin-right:5px; font-size:12px; }
 a { color:#58a6ff; text-decoration:none; }
