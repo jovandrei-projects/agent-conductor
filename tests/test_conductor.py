@@ -7710,5 +7710,376 @@ const body=()=>elem('dbody').innerHTML;
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class OutcomeSummaryTests(unittest.TestCase):
+    """The worker report's third contract line: OUTCOME: - a human-facing
+    one-to-two-sentence summary of what the step actually did. Parsed like
+    NEXT:, persisted as rec['outcome'] (newest) plus rec['outcomes']
+    (earlier attempts/dispatches), and surfaced in the task modal, the
+    agents-table result column, the /summary report and `status`."""
+
+    def test_preamble_contract_requires_all_three_lines(self):
+        for line in ("STATUS: done | partial | blocked",
+                     "NEXT: <one line",
+                     "OUTCOME: <"):
+            self.assertIn(line, conductor.PREAMBLE)
+
+    def test_tail_outcome_parsing(self):
+        """Last match wins, the whole log is scanned (a long closing
+        report must not hide it), and missing/garbage input is None."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "s.log"
+            self.assertIsNone(conductor.tail_outcome(log))   # no file
+            log.write_text("no report here\n", encoding="utf-8")
+            self.assertIsNone(conductor.tail_outcome(log))
+            log.write_text(
+                "OUTCOME: first draft landed\n" + "x" * 20000 +
+                "\nOUTCOME:  finished all of it; verify red on flakes  \n"
+                "more closing prose\n", encoding="utf-8")
+            self.assertEqual(conductor.tail_outcome(log),
+                             "finished all of it; verify red on flakes")
+            log.write_text("OUTCOME: " + "y" * 500 + "\n",
+                           encoding="utf-8")
+            self.assertEqual(len(conductor.tail_outcome(log)), 300)
+            # anchored at column zero like STATUS/NEXT: prose and markdown
+            # bullets mentioning the token are not reports
+            log.write_text("the fix: OUTCOME: faked in a sentence\n"
+                           "- OUTCOME: faked in a bullet\n",
+                           encoding="utf-8")
+            self.assertIsNone(conductor.tail_outcome(log))
+
+    def test_record_outcome_history_dedupes_and_preserves(self):
+        rec = {}
+        conductor._record_outcome(rec, "first attempt: parser only",
+                                  status="timed_out", attempt=1)
+        conductor._record_outcome(rec, "finished; suite green",
+                                  status="done", attempt=2)
+        self.assertEqual(rec["outcome"], "finished; suite green")
+        self.assertEqual([e["outcome"] for e in rec["outcomes"]],
+                         ["first attempt: parser only",
+                          "finished; suite green"])
+        self.assertEqual(rec["outcomes"][0]["status"], "timed_out")
+        # a verbatim re-report re-stamps instead of duplicating
+        conductor._record_outcome(rec, "finished; suite green",
+                                  status="done", attempt=3)
+        self.assertEqual(len(rec["outcomes"]), 2)
+        # a dispatch that reports nothing keeps the last real summary
+        conductor._record_outcome(rec, None, status="failed", attempt=4)
+        self.assertEqual(rec["outcome"], "finished; suite green")
+        self.assertEqual(len(rec["outcomes"]), 2)
+
+    def test_mock_run_records_outcome_and_keeps_status_next(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "work"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            run_dir = next(runs.iterdir())
+            state = json.loads((run_dir / "state.json").read_text())
+            rec = state["steps"]["one"]
+            self.assertEqual(rec["status"], "done")
+            self.assertEqual(rec["outcome"],
+                             "appended a work line to WORK.txt (mock)")
+            self.assertEqual(len(rec["outcomes"]), 1)
+            self.assertEqual(rec["outcomes"][0]["status"], "done")
+            self.assertEqual(rec["outcomes"][0]["attempt"], 1)
+            self.assertEqual(rec["next"], "nothing - mock")   # unchanged
+            # and it reaches the dashboard payload
+            d = conductor.collect_dashboard(runs)
+            a = d["agents"][0]
+            self.assertEqual(a["outcome"], rec["outcome"])
+            self.assertEqual(a["outcomes"], rec["outcomes"])
+            self.assertEqual(a["next"], "nothing - mock")
+
+    def test_outcome_attributed_to_its_own_step(self):
+        """Each step's report lands on ITS record - a wave can't leak one
+        step's summary onto a sibling's row."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "alpha"
+project = "{proj.as_posix()}"
+prompt = "work A\\noutcome=alpha did the parser; tests pending"
+
+[[step]]
+name = "beta"
+project = "{proj.as_posix()}"
+prompt = "work B\\noutcome=beta wrote the docs only"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            state = json.loads(
+                (next(runs.iterdir()) / "state.json").read_text())
+            self.assertEqual(state["steps"]["alpha"]["outcome"],
+                             "alpha did the parser; tests pending")
+            self.assertEqual(state["steps"]["beta"]["outcome"],
+                             "beta wrote the docs only")
+            d = conductor.collect_dashboard(runs)
+            by_step = {a["step"]: a for a in d["agents"]}
+            self.assertEqual(by_step["alpha"]["outcome"],
+                             "alpha did the parser; tests pending")
+            self.assertEqual(by_step["beta"]["outcome"],
+                             "beta wrote the docs only")
+
+    def test_partial_status_keeps_its_outcome(self):
+        """A partial report is exactly what the line is for: concrete
+        progress + the named limit, not a green-looking 'done'."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "work\\nstatus=partial\\noutcome=parser landed; the edge cases are still untested"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            rec = json.loads((next(runs.iterdir()) /
+                              "state.json").read_text())["steps"]["one"]
+            self.assertEqual(rec["status"], "partial")
+            self.assertEqual(
+                rec["outcome"],
+                "parser landed; the edge cases are still untested")
+
+    def test_missing_outcome_stays_honest_everywhere(self):
+        """No OUTCOME: line -> nothing is invented: the record, the
+        payload and the summary report all just say nothing was reported
+        (NEXT:/notes are never substituted for it)."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "work\\nnooutcome"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            state = json.loads(
+                (next(runs.iterdir()) / "state.json").read_text())
+            rec = state["steps"]["one"]
+            self.assertEqual(rec["status"], "done")
+            self.assertIsNone(rec.get("outcome"))
+            self.assertIsNone(rec.get("outcomes"))
+            self.assertEqual(rec["next"], "nothing - mock")
+            d = conductor.collect_dashboard(runs)
+            self.assertIsNone(d["agents"][0]["outcome"])
+            md = conductor.step_summary_md({**rec, "name": "one"},
+                                         state, "t")
+            self.assertNotIn("**outcome:**", md)
+            self.assertNotIn("**earlier outcome**", md)
+
+    def test_resume_updates_outcome_and_keeps_earlier(self):
+        """A resumed step's fresh report replaces the displayed outcome;
+        the first attempt's accomplishment stays in the history."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "work\\noutcome=first pass: parser landed, tests pending"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            run_dir = next(runs.iterdir())
+            state = json.loads((run_dir / "state.json").read_text())
+            state["steps"]["one"]["status"] = "failed"   # force a re-run
+            (run_dir / "state.json").write_text(json.dumps(state))
+            # same manifest file, refreshed report text for the resume
+            m.write_text(f'''[run]
+name = "t"
+
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "work\\noutcome=second pass: tests landed too"
+''')
+            self.assertEqual(run_manifest(m, runs, resume=str(run_dir)), 0)
+            rec = json.loads((run_dir / "state.json").read_text()
+                             )["steps"]["one"]
+            self.assertEqual(rec["outcome"],
+                             "second pass: tests landed too")
+            self.assertEqual(
+                [e["outcome"] for e in rec["outcomes"]],
+                ["first pass: parser landed, tests pending",
+                 "second pass: tests landed too"])
+
+    def test_merge_notes_never_clobber_outcome(self):
+        rec = {"status": "done"}
+        conductor._record_outcome(rec, "landed the feature",
+                                  status="done", attempt=1)
+        conductor._append_note(rec, "merge skipped: staged verify red")
+        conductor._append_note(rec, "merge still conflicts; resolve the "
+                                    "kept worktree by hand")
+        self.assertEqual(rec["outcome"], "landed the feature")
+        self.assertIn("merge skipped", rec["note"])
+        self.assertEqual(len(rec["outcomes"]), 1)
+
+    def test_retry_attempts_keep_each_outcome(self):
+        """max_attempts retries: the timed-out attempt's report and the
+        winning attempt's report are BOTH kept, newest displayed."""
+        calls = {"n": 0}
+
+        class FakeProc:
+            pid = 4242
+
+            def __init__(self, *a, **kw):
+                self._out = kw["stdout"]
+                self.killed = False
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    # attempt 1 reports an outcome but never STATUS ->
+                    # killed at the timeout floor
+                    self._out.write(b"OUTCOME: first try got the "
+                                    b"scaffold only\n")
+                    self._out.flush()
+                else:
+                    self._out.write(b"OUTCOME: feature complete, "
+                                    b"suite green\nSTATUS: done\n"
+                                    b"NEXT: none\n")
+                    self._out.flush()
+
+            def wait(self, timeout=None):
+                if calls["n"] > 1 or self.killed:
+                    return 0
+                raise subprocess.TimeoutExpired("devin", timeout)
+
+            def poll(self):
+                return 0 if self.killed else None
+
+            def kill(self):
+                self.killed = True
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            run_dir = base / "runs" / "r1"
+            (run_dir / "prompts").mkdir(parents=True)
+            cfg = conductor.load_manifest(write_manifest(base, f'''
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "p"
+timeout_min = 0.001
+max_attempts = 2
+'''))
+            state = {"run": "t", "run_dir": str(run_dir), "steps": {}}
+            with mock.patch.object(conductor.subprocess, "Popen",
+                                   FakeProc), \
+                    mock.patch.object(conductor, "kill_tree",
+                                      lambda p: p.kill()), \
+                    mock.patch.object(conductor, "session_ids",
+                                      lambda *a, **k: set()), \
+                    mock.patch.object(conductor, "is_git_repo",
+                                      lambda p: True), \
+                    mock.patch.object(conductor, "git_commit",
+                                      lambda *a, **k: True), \
+                    mock.patch.object(conductor, "git_dirty",
+                                      lambda p: False), \
+                    mock.patch.object(conductor, "WAIT_POLL_S", 0.01):
+                st = conductor.run_step(cfg.steps[0], "s", proj, cfg,
+                                        run_dir, ["devin"], state)
+            self.assertEqual(st, "done")
+            rec = state["steps"]["a"]
+            self.assertEqual(rec["attempts"], 2)
+            self.assertEqual(rec["outcome"],
+                             "feature complete, suite green")
+            self.assertEqual(
+                [(e["attempt"], e["status"]) for e in rec["outcomes"]],
+                [(1, "timed_out"), (2, "done")])
+
+    def test_outcome_in_summary_report(self):
+        rec = {"status": "done", "task": "t",
+               "outcome": "landed the thing",
+               "outcomes": [
+                   {"outcome": "early draft", "attempt": 1,
+                    "status": "timed_out",
+                    "ended_at": "2026-10-16T01:00:00"},
+                   {"outcome": "landed the thing", "attempt": 2,
+                    "status": "done",
+                    "ended_at": "2026-10-16T02:00:00"}],
+               "note": "n", "next": "watch it",
+               "tokens": {}}
+        md = conductor.step_summary_md(rec, {"steps": {"s": rec}}, "r")
+        self.assertIn("- **outcome:** landed the thing", md)
+        self.assertIn("- **earlier outcome** (attempt 1, timed_out): "
+                      "early draft", md)
+        self.assertIn("- **worker says next:** watch it", md)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_outcome_in_modal_and_result_column_js(self):
+        """Modal gets an 'outcome' row (honest muted state when absent,
+        'earlier' rows for prior attempts) and the agents-table result
+        column leads with it - everything escaped, NEXT stays its own
+        row under its own name."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,textContent:''}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  activeElement:null,addEventListener:(e,h)=>{handlers[e]=h;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',agents:[
+  {step:'one',run:'r',run_dir:'/r',slug:'p',status:'done',task:'t1',
+   outcome:'landed the <img src=x onerror=alert(1)> parser; tests pending',
+   outcomes:[{outcome:'first try: scaffold only',attempt:1,
+              status:'timed_out',ended_at:'2026-10-16T01:00:00'},
+             {outcome:'landed the <img src=x onerror=alert(1)> parser; tests pending',
+              attempt:2,status:'done',ended_at:'2026-10-16T02:00:00'}],
+   note:'retried after timeout', next:'re-run the flaky suite'},
+  {step:'two',run:'r',run_dir:'/r',slug:'p',status:'done',task:'t2',
+   note:'verify gate is red'},
+  {step:'three',run:'r',run_dir:'/r',slug:'p',status:'running',task:'t3',
+   tail_last:'still working'}],
+ runs:[{run:'r',dir:'/r',counts:{done:2,running:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const agents=elem('agents').innerHTML;
+// result column: outcome leads, conductor note survives on a sub line,
+// worker text is always escaped, no outcome falls back to the note
+assert.match(agents,/<th title="the worker-reported OUTCOME: summary/);
+assert.match(agents,/landed the &lt;img src=x onerror=alert\(1\)&gt; parser; tests pending/);
+assert.doesNotMatch(agents,/<img src=x onerror/);
+assert.match(agents,/<span class="sub">retried after timeout<\/span>/);
+assert.match(agents,/>verify gate is red</);
+assert.match(agents,/still working/);
+const open=step=>vm.runInContext(
+  'showDetail(AGENTS.findIndex(a=>a.step==='+JSON.stringify(step)+'))',ctx);
+(async()=>{
+  await open('one');
+  const b=()=>elem('dbody').innerHTML;
+  assert.match(b(),/<div class="k">outcome<\/div>/);
+  assert.match(b(),/landed the &lt;img src=x onerror=alert\(1\)&gt; parser; tests pending/);
+  assert.doesNotMatch(b(),/<img src=x onerror/);
+  assert.match(b(),/<div class="k">earlier<\/div><div class="wrap">attempt 1 \(timed_out, 2026-10-16T01:00\): first try: scaffold only<\/div>/);
+  assert.match(b(),/<div class="k">next<\/div><div class="wrap">re-run the flaky suite<\/div>/);
+  assert.match(b(),/<div class="k">note<\/div><div class="wrap">retried after timeout<\/div>/);
+  assert.doesNotMatch(b(),/<div class="k">result<\/div>/);
+  await open('two');
+  assert.match(b(),/<div class="k">outcome<\/div><div class="wrap"><span class="sub">not reported/);
+  assert.match(b(),/predates the OUTCOME: line or ended before printing it/);
+  assert.doesNotMatch(b(),/<div class="k">earlier<\/div>/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

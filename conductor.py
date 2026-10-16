@@ -60,6 +60,7 @@ LOG = logging.getLogger("conductor")
 STATE_LOCK = threading.RLock()
 STATUS_RE = re.compile(r"^STATUS:\s*([A-Za-z_-]+)", re.M)
 NEXT_RE = re.compile(r"^NEXT:\s*(.+)", re.M)
+OUTCOME_RE = re.compile(r"^OUTCOME:\s*(.+)", re.M)
 SESSION_URL_RE = re.compile(
     r"app\.devin\.ai/sessions/([A-Za-z0-9_-]+)|(devin-[0-9a-f]{32})")
 VALID_MODES = {"normal", "accept-edits", "smart", "bypass", "dangerous",
@@ -120,13 +121,17 @@ conversation has no history beyond them.
 - Kill any servers/watchers you spawned (vite, `npm run dev`, playwright)
   BEFORE printing STATUS - a live child keeps this CLI process from
   exiting and your step gets killed at the timeout regardless.
-- End your final message with exactly these two lines, at the start of
-  their own lines, as the LAST thing you print. They are read by a
+- End your final message with exactly these three lines, each at the
+  start of its own line, as the LAST thing you print. They are read by a
   machine parsing your stdout - writing STATUS inside STATE.md, a commit
   message, or a Markdown bullet does NOT count and marks the step failed:
 
 STATUS: done | partial | blocked
 NEXT: <one line - what the next session should do first>
+OUTCOME: <one or two sentences for the human reviewing this run - what
+THIS step actually accomplished and its material limits (partial work, a
+red verify gate, tests still pending). Not next-step instructions, not
+sibling-task progress, and never a success you did not verify.>
 """
 
 # Prepended to the task body on retry attempts (max_attempts > 1): the
@@ -171,7 +176,7 @@ FOLLOWUP_STEP = '''
 name = "follow-up-plan"
 project = "{slug}"
 timeout_min = 30
-prompt = 'This run just ended. Review what it accomplished against the request it ran from: per-step logs, STATUS/NEXT lines and notes are under {runs} (the newest dir ending in -{run}), and progress files live under this project .agent_tasks/. Then write a NEW conductor TOML manifest proposing ONLY the still-unfinished or newly discovered work, saved as {manifests}/{run}-followup.toml. Do not implement or launch that manifest - a human reviews it first.'
+prompt = 'This run just ended. Review what it accomplished against the request it ran from: per-step logs, STATUS/NEXT/OUTCOME lines and notes are under {runs} (the newest dir ending in -{run}), and progress files live under this project .agent_tasks/. Then write a NEW conductor TOML manifest proposing ONLY the still-unfinished or newly discovered work, saved as {manifests}/{run}-followup.toml. Do not implement or launch that manifest - a human reviews it first.'
 '''
 
 RESOLVE_BODY = """\
@@ -1205,6 +1210,23 @@ def tail_next(stdout_log: Path) -> str | None:
     return found[-1].strip()[:300] if found else None
 
 
+def tail_outcome(stdout_log: Path) -> str | None:
+    """The worker's OUTCOME: line - the human-facing one-to-two-sentence
+    summary of what the step ACTUALLY accomplished (concrete results plus
+    material limits like partial work or a red verify), written for the
+    person reviewing the run rather than for the next session. Whole-file
+    like tail_status: the closing report can push it past any fixed tail
+    window. None when the step predates the contract or ended before its
+    report - callers must show that honestly, never substitute the NEXT:
+    handoff or a log tail."""
+    try:
+        data = stdout_log.read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return None
+    found = OUTCOME_RE.findall(data)
+    return found[-1].strip()[:300] if found else None
+
+
 def tail_session_ref(stdout_log: Path) -> str | None:
     """Cloud sessions never show up in `devin list` (they live server-side);
     the CLI prints an app.devin.ai session URL to stdout instead."""
@@ -1645,6 +1667,13 @@ def step_summary_md(rec: dict, st: dict, run_name: str) -> str:
         L.append(f"- **purpose:** `{purpose}` ({purpose_label(purpose)})")
     if branch_s:
         L.append(f"- **branch:** {branch_s}")
+    if rec.get("outcome"):
+        L.append(f"- **outcome:** {rec['outcome']}")
+        for e in [x for x in rec.get("outcomes") or []
+                  if x.get("outcome") and x.get("outcome") != rec["outcome"]]:
+            L.append(f"- **earlier outcome** (attempt "
+                     f"{e.get('attempt') or '?'}, "
+                     f"{e.get('status') or '?'}): {e.get('outcome')}")
     if rec.get("note"):
         L.append(f"- **note:** {rec['note']}")
     if rec.get("next"):
@@ -1994,6 +2023,39 @@ def _append_note(rec: dict, text: str) -> None:
     rec["note"] = (rec["note"] + "; " + text) if rec.get("note") else text
 
 
+# Bound on the per-step outcome history kept in state.json - enough to
+# keep earlier attempts' accomplishments across retries/resumes without
+# letting a repeatedly resumed step grow the record forever.
+OUTCOME_HISTORY_MAX = 8
+
+
+def _record_outcome(rec: dict, outcome: str | None, *, status: str,
+                    attempt: int | None = None) -> None:
+    """Persist a worker-reported OUTCOME line on the step record.
+
+    rec['outcome'] always points at the NEWEST report - the current
+    result - while rec['outcomes'] keeps each distinct earlier report
+    with the attempt and time that produced it, so a resume's fresher
+    outcome never erases what a previous attempt finished. Re-reporting
+    the last recorded text just re-stamps that entry (a re-parse of the
+    same dispatch, or a legitimately identical report); a call with no
+    outcome leaves the prior one in place - a stale-but-real summary
+    beats none.
+    """
+    if not outcome:
+        return
+    hist = rec.setdefault("outcomes", [])
+    ent = {"outcome": outcome, "ended_at": now_iso(), "status": status}
+    if attempt is not None:
+        ent["attempt"] = attempt
+    if hist and hist[-1].get("outcome") == outcome:
+        hist[-1].update(ent)
+    else:
+        hist.append(ent)
+        del hist[:-OUTCOME_HISTORY_MAX]
+    rec["outcome"] = outcome
+
+
 def _flag_raise(name: str) -> None:
     """Write a stop/drain sentinel. Best-effort: a mkdir/write failure only
     delays the stop by one poll, so callers don't crash on it."""
@@ -2288,6 +2350,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     new_sessions: set[str] = set()
     all_sessions: set[str] = set()
     tok_acc: dict[str, int] = {}
+    attempt_outcomes: list[tuple[int, str]] = []
     attempt = 0
     while True:
         attempt += 1
@@ -2372,6 +2435,9 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         new_sessions = (session_ids(devin_argv, work_dir) or set()) - before
         all_sessions |= new_sessions
         status_line = tail_status(stdout_log)
+        attempt_outcome = tail_outcome(stdout_log)
+        if attempt_outcome:
+            attempt_outcomes.append((attempt, attempt_outcome))
         _merge_tokens(tok_acc, tail_metrics(export_path))
         # Commit each attempt's product BEFORE deciding to retry - the next
         # session resumes from committed state, not the working tree.
@@ -2459,6 +2525,17 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                          "prompt")
         if notes:
             rec["note"] = "; ".join(notes)
+        # The newest OUTCOME report wins rec['outcome']; every earlier one
+        # (a timed-out attempt that still reported, or a previous
+        # dispatch's) stays in rec['outcomes'] - a resume's fresh result
+        # never erases what earlier attempts finished. Only attempts that
+        # end by timeout can precede the last, hence their status label.
+        for i, (att, oc) in enumerate(attempt_outcomes):
+            _record_outcome(
+                rec, oc,
+                status=status if i == len(attempt_outcomes) - 1
+                else "timed_out",
+                attempt=att)
         rec.update(status=status, ended_at=now_iso(), status_line=status_line,
                    verify_ok=verify_ok, next=tail_next(stdout_log),
                    timeout_extended_s=round(ext_s) if ext_s > 1 else None,
@@ -3156,6 +3233,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"  {eff.get(name, '?'):>9}  {name:<20} {span or 0:>7.0f}s  "
               f"ended={rec.get('ended_at') or '-'}  "
               f"session={sess}  verify={rec.get('verify_ok')}")
+        if rec.get("outcome"):
+            print(f"             outcome: {rec['outcome']}")
         if rec.get("note"):
             print(f"             note: {rec['note']}")
         if sess not in (None, "-") and not str(sess).startswith("mock"):
@@ -6730,7 +6809,7 @@ def proposal_agent(step: dict, rec: dict, projects: dict, key: str,
             "attempts": None, "max_attempts": None,
             "merged": None, "cloud": step.get("cloud"), "tokens": None,
             "cost": None,
-            "alive": False,
+            "alive": False, "outcome": None, "outcomes": None,
             "note": "Run ended before this step started" if status == "skipped"
             else None}
 
@@ -6798,6 +6877,7 @@ def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
             "mode": "planner", "cloud": False, "verify_ok": None,
             "task": task, "task_full": task, "purpose": None,
             "note": note, "next": None, "exit_code": None,
+            "outcome": None, "outcomes": None,
             "branch": None, "merged": None,
             "tokens": e.get("tokens"), "wt": False,
             "cost": estimate_cost(e.get("tokens"), e.get("model"),
@@ -6881,7 +6961,8 @@ def _pending_agent(st: dict, sd: dict, key: str, run_dir: str,
             "timeout_min": sd.get("timeout_min"),
             "attempts": None, "max_attempts": None,
             "merged": None, "cloud": sd.get("cloud"), "tokens": None,
-            "cost": None, "alive": False, "note": None}
+            "cost": None, "alive": False, "outcome": None,
+            "outcomes": None, "note": None}
 
 
 def collect_dashboard(runs_dir: Path,
@@ -7050,6 +7131,10 @@ def collect_dashboard(runs_dir: Path,
                 "skipped_by_user": _safe_name(
                     rec.get("name") or name) in flagged,
                 "note": rec.get("note"), "next": rec.get("next"),
+                # rec['outcome'] is the step's own newest report;
+                # rec['outcomes'] keeps the earlier attempts it replaced
+                "outcome": rec.get("outcome"),
+                "outcomes": rec.get("outcomes"),
                 "session_gone": session_gone,
                 "exit_code": rec.get("exit_code"),
                 "status_line": rec.get("status_line"),
@@ -7215,6 +7300,7 @@ def collect_dashboard(runs_dir: Path,
                     (rec.get("raw") or "").split())[:120],
                 "purpose": None,
                 "note": None, "next": None, "exit_code": None,
+                "outcome": None, "outcomes": None,
                 "branch": None, "merged": None, "tokens": None, "wt": False,
                 "cost": None,
                 "stdout_log": str(log_p) if log_p.is_file() else None,
@@ -8087,7 +8173,15 @@ function showDetail(i, keepStack){
     ['status',a.status+(a.status==='failed'&&a.exit_code===0&&
       a.status_line==null?' - ended without the STATUS: line':'')],
     ['task prompt',a.task_full||a.task],
-    ['result',a.next],['note',a.note],['log tail',a.tail_last],
+    // The worker-reported OUTCOME: line - the human-facing "what it did".
+    // Honest empty state for records that predate the contract or ended
+    // before the report; the NEXT: line is a handoff, never a stand-in.
+    ['outcome',a.outcome],
+    ...((a.outcomes||[]).filter(e=>e&&e.outcome&&e.outcome!==a.outcome)
+      .map(e=>['earlier',`attempt ${e.attempt||'?'} (${e.status||'?'}` +
+        `${e.ended_at?', '+String(e.ended_at).slice(0,16):''}): ` +
+        `${e.outcome}`])),
+    ['next',a.next],['note',a.note],['log tail',a.tail_last],
     ['model',(a.model||'-')+(a.effort?' (effort '+a.effort+')':'')+
       (a.model_actual?' → '+a.model_actual:'')],
     ['mode',(a.mode||'-')+(a.cloud?' cloud':'')],
@@ -8130,7 +8224,11 @@ function showDetail(i, keepStack){
     navBar +
     `<h3 id="modal-title">${esc(a.slug)} / ${esc(a.step)}</h3><div class="kv">` +
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">` +
-      (k==='task prompt' ? `<pre>${esc(v??'-')}</pre>` : esc(v??'-')) +
+      (k==='task prompt' ? `<pre>${esc(v??'-')}</pre>`
+        : k==='outcome' && !v
+        ? `<span class="sub">not reported - the step predates the ` +
+          `OUTCOME: line or ended before printing it</span>`
+        : esc(v??'-')) +
       (k==='tokens'?tokenHelp:'') + '</div>').join('') +
     `</div>` +
     (a.run_dir
@@ -9452,7 +9550,10 @@ function render(d){
       '<th class="hide-s" title="estimated cost at self-serve rates ' +
       '(docs.devin.ai/desktop/chat/models), recomputed as the rate ' +
       'table updates">est $</th>' +
-      '<th>ended</th><th class="hide-s">session</th><th>note</th></tr>';
+      '<th>ended</th><th class="hide-s">session</th>' +
+      '<th title="the worker-reported OUTCOME: summary once the step ' +
+      'ends; the live log tail while it runs; the conductor note when ' +
+      'no outcome was reported">result</th></tr>';
     for (const a of show){
       const c = COLORS[a.status]||'#8b949e';
       const pulse = a.status==='running' ? ' run' : '';
@@ -9522,7 +9623,15 @@ function render(d){
             `title="${esc(a.tail_last||'')}">${esc(a.tail_last||'')}` +
             `<span class="dots"><span>.</span><span>.</span><span>.</span>` +
             `</span></td>`
-          : `<td class="wrap">${esc(a.note||'-')}</td>`) + `</tr>`;
+          : `<td class="wrap">` +
+            // finished step: the worker-reported OUTCOME leads (what it
+            // actually did); the conductor's diagnostic note drops to a
+            // second .sub line - steps that never reported keep the note
+            // as the cell text, as before
+            (a.outcome ? esc(a.outcome) : esc(a.note||'-')) +
+            (a.outcome && a.note
+              ? `<br><span class="sub">${esc(a.note)}</span>` : '') +
+            `</td>`) + `</tr>`;
     }
     if (rows.length > SHOW_N)
       h += `<tr><td colspan="13"><a href="#" data-slug="${esc(slug)}">` +

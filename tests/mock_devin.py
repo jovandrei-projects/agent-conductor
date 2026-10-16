@@ -27,6 +27,12 @@ Prompt keywords (deterministic work shapes for the merge matrix):
                     every file holding <<<<<<< markers as ours-then-theirs
                     without markers, `git add -A`, `git commit --no-edit`.
                     Exercises conductor's merge_resolver path for real.
+    outcome=<text>  print `OUTCOME: <text>` instead of the default - the
+                    worker's human-facing result report
+    nooutcome       print no OUTCOME line at all - a step that predates
+                    the contract or ended before its report
+    status=<word>   report `STATUS: <word>` (partial/blocked) instead of
+                    done - pairs with outcome= for partial-outcome shapes
 """
 import json
 import os
@@ -155,7 +161,15 @@ def main() -> int:
 
     print(f"mock worker ran: prompt={len(body)} chars model={model} "
           f"cloud={cloud} session={sid}")
-    print("STATUS: done")
+    # The report contract, same shape a real worker's final message takes:
+    # OUTCOME is the human-facing result line, STATUS/NEXT the machine
+    # handoff. `outcome=`/`nooutcome`/`status=` keywords drive fixtures.
+    if "nooutcome" not in body:
+        om = re.search(r"(?:^|\n)outcome=(.+)", body)
+        print("OUTCOME: " + (om.group(1).strip() if om else
+              f"appended a work line to {work.name} (mock)"))
+    sm = re.search(r"(?:^|\n)status=([A-Za-z_-]+)", body)
+    print(f"STATUS: {sm.group(1) if sm else 'done'}")
     print("NEXT: nothing - mock")
     return 0
 
@@ -199,6 +213,7 @@ def resolve_merge(cwd: Path, sid: str, export: str | None) -> int:
             json.dumps({"mock": True, "session": sid, "resolver": True}),
             encoding="utf-8")
     print(f"mock resolver ran: {len(unmerged)} file(s) resolved session={sid}")
+    print("OUTCOME: resolved merge conflicts (mock)")
     print("STATUS: done")
     print("NEXT: merge resolved - mock")
     return 0
