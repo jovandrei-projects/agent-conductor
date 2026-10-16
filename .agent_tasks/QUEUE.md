@@ -24,6 +24,23 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-16 (request-image-picker, wave step of run
+  20261016-013719-workflow-ux-safety): the request form's "Attach images"
+  hint gains a paperclip button - an icon-sized .btn.secondary look
+  carrying an inline SVG stroke glyph (aria-label + title, global
+  focus-visible ring covers it; no emoji). It drives a hidden
+  `<input type="file" id="rq-file" accept="image/*" multiple>` via a
+  delegated `[data-attach-pick]` click (attachTarget()-gated like the
+  drop/paste listeners), and a document-level `change` listener feeds
+  the selection into the SAME attachFiles upload path - POST
+  /api/attachments, thumbnail strip, caret path insert, dirty mark,
+  refreshPending. Cancel delivers no files and changes nothing; the
+  input value resets after each pick so re-choosing the same file still
+  fires change; name-dedupe matches drop/paste. The strip got
+  aria-live=polite + aria-label. Non-editable stages render neither the
+  button nor the input. 295/295 mock tests + demo green; new
+  node-harness test covers markup/aria, picker click, cancel no-op,
+  invalid type, select+dedupe, draft reopen, and remove.
 - DONE 2026-10-16 (proposal-action-state, wave step of run
   20261016-013719-workflow-ux-safety): proposal staleness is a computed
   field-vs-baseline diff, not a latched `stale` flag
