@@ -1726,6 +1726,10 @@ def resolve_merge_conflict(step: Step, slug: str, repo_dir: Path,
     if git_dirty(repo_dir):
         LOG.warning("%s: main checkout dirty; not spawning a merge resolver",
                     step.name)
+        rec = state["steps"].get(step.name, {})
+        _append_note(rec, "merge resolver refused: main checkout dirty "
+                          "(trap 10/11 - clean it, then resume)")
+        save_state(run_dir, state)
         return False
     r = _git(repo_dir, "merge", "--no-edit", branch)
     if r.returncode == 0:                    # raced clean after all
@@ -4857,24 +4861,26 @@ const fmtS = s => { if(s==null) return '-';
 const kfmt = n => n==null?'-':(n>=1000
   ? (n/1000).toFixed(n>=100000?0:1).replace(/\.0$/,'')+'k' : String(n));
 // tokens render as labeled fields so every counter names itself:
-// in = all input (prompt) tokens, out = completion, cached = the share
-// of `in` served from cache (a part of it, never added on top - always
-// shown so no value can hide), turns = LLM steps/model turns, which are
-// NOT manifest steps (the counts chips count those).
+// in = BILLED input (full prompt minus the cached share - same number
+// Devin Desktop's card reports), out = completion, cached = the share
+// of the prompt served from cache (always shown so no value can hide),
+// turns = LLM steps/model turns, NOT manifest steps. Full prompt per
+// turn = in + cached (the tooltip carries it).
+const billed = t => t && t.prompt!=null
+  ? Math.max(t.prompt-(t.cached||0),0) : null;
 const fmtT = t => (!t||t.prompt==null) ? '-' :
-  `in ${kfmt(t.prompt)} · out ${kfmt(t.completion)}` +
+  `in ${kfmt(billed(t))} · out ${kfmt(t.completion)}` +
   ` · cached ${kfmt(t.cached||0)}` +
   (t.llm_steps ? ` · ${t.llm_steps} turns` : '');
 // compact density: bare in/out/cached + LLM turns - order is fixed and
 // spelled out in TOK_HELP + the cell title
 const fmtTc = t => (!t||t.prompt==null) ? '-' :
-  `${kfmt(t.prompt)}/${kfmt(t.completion)}/${kfmt(t.cached||0)}` +
+  `${kfmt(billed(t))}/${kfmt(t.completion)}/${kfmt(t.cached||0)}` +
   (t.llm_steps ? ` ${t.llm_steps}L` : '');
 const tokTitle = t => !t ? '' :
-  `in ${t.prompt} (of which cached ${t.cached}) · out ${t.completion} · ` +
-  `${t.llm_steps??'?'} LLM steps (model turns)` +
-  (t.prompt!=null&&t.cached!=null
-    ? ` · billed input (in-cached) = ${t.prompt-t.cached}` : '');
+  `billed in ${t.prompt-(t.cached||0)} ` +
+  `(full prompt ${t.prompt}, of which cached ${t.cached}) · ` +
+  `out ${t.completion} · ${t.llm_steps??'?'} LLM steps (model turns)`;
 const fmtC = c => !c ? '-' : c.usd==null ? 'n/a' :
   '$'+(c.usd===0 ? '0' : c.usd<0.01 ? c.usd.toFixed(4) : c.usd.toFixed(2));
 const costTitle = c => !c ? 'no token data yet' :
@@ -4903,17 +4909,19 @@ function setDensity(d){
     : []).forEach(b=>b.classList.toggle('on', b.dataset.density===d));
   syncTopbar();
 }
-const TOK_HELP = 'tokens: in / out / cached (a share of in, never extra)' +
-  ' · turns = LLM steps; compact view reads "in/out/cached NL"; ' +
-  'select an agent for details';
+const TOK_HELP = 'tokens: in (billed, uncached) / out / cached ' +
+  '(cache-served share) · turns = LLM steps; compact view reads ' +
+  '"in/out/cached NL"; select an agent for details';
 const tokenHelp = `<details class="tok-help"><summary aria-label="Explain tokens and cost">?</summary>` +
   `<div class="explain"><b>What the numbers mean</b><br>` +
-  `<b>in</b>: all input (prompt) tokens - instructions, tools, context, ` +
-  `history.<br>` +
+  `<b>in</b>: uncached input tokens - the part billed at the input ` +
+  `rate, same number Devin Desktop's card reports. The raw export ` +
+  `counts the WHOLE prompt each turn (in + cached); the cell tooltip ` +
+  `still shows it.<br>` +
   `<b>out</b>: output (completion) tokens.<br>` +
-  `<b>cached</b>: the part of <b>in</b> served from cache - a share of ` +
-  `it, never added on top. <b>Billed input = in - cached</b>; ` +
-  `Desktop's card shows only that remainder.<br>` +
+  `<b>cached</b>: the share of the prompt served from cache - billed ` +
+  `at the (cheaper) cache-read rate, never added on top of ` +
+  `<b>in</b>.<br>` +
   `<b>turns</b>: LLM steps - model turns, not manifest steps. ` +
   `<b>M</b> in prices means one million tokens.<br><br>` +
   `<b>Estimated cost</b> = (prompt - cached) × input rate + ` +
@@ -5114,16 +5122,21 @@ function showDetail(i){
           `${esc(g.span)}</span><span class="arcphase arc-` +
           `${esc(g.phase)}">${esc(g.phase)}</span>` +
           `<span class="arctime">${loc(g.t0)}</span>` +
-          `<span class="arctok">${g.tin
-            ? kfmt(g.tin)+'/'+kfmt(g.tout||0)+'/'+kfmt(g.tcached||0)
+          `<span class="arctok" title="billed in / out / cached ` +
+          `(per-turn ATIF metrics, not estimates)">${g.tin!=null
+            ? kfmt(Math.max(g.tin-(g.tcached||0),0))+'/'+
+              kfmt(g.tout||0)+'/'+kfmt(g.tcached||0)
             : ''}</span>` +
           `<span class="archead">${esc(g.head)}</span></summary>` +
           `<div class="arcdetail">` + (g.entries||[]).map(e =>
             `<div class="arcrow"><span class="arcspan">${esc(e.sid)}` +
             `</span><span class="arctime">${loc(e.ts)}</span>` +
             `<span class="arcdur">${e.dur_s!=null?fmtS(e.dur_s):''}` +
-            `</span><span class="arctok">${e.in!=null
-              ? kfmt(e.in)+'/'+kfmt(e.out||0)+'/'+kfmt(e.cached||0)
+            `</span><span class="arctok" title="billed in / out / ` +
+            `cached (full prompt = in+cached: ${e.in||'-'})">` +
+            `${e.in!=null
+              ? kfmt(Math.max(e.in-(e.cached||0),0))+'/'+
+                kfmt(e.out||0)+'/'+kfmt(e.cached||0)
               : ''}</span>` +
             `<span class="archead" title="${esc(e.head)}">` +
             `${esc(e.head)}</span></div>`).join('') +
@@ -5707,7 +5720,7 @@ function render(d){
       '<th class="hide-s" title="estimated cost at self-serve rates ' +
       '(docs.devin.ai/desktop/chat/models), recomputed as the rate ' +
       'table updates">est $</th>' +
-      '<th>ended</th><th class="hide-s">session</th><th>result</th></tr>';
+      '<th>ended</th><th class="hide-s">session</th><th>note</th></tr>';
     for (const a of show){
       const c = COLORS[a.status]||'#8b949e';
       const pulse = a.status==='running' ? ' run' : '';
@@ -5766,7 +5779,7 @@ function render(d){
             `title="${esc(a.tail_last||'')}">${esc(a.tail_last||'')}` +
             `<span class="dots"><span>.</span><span>.</span><span>.</span>` +
             `</span></td>`
-          : `<td class="wrap">${esc(a.next||a.note||'')}</td>`) + `</tr>`;
+          : `<td class="wrap">${esc(a.note||a.next||'')}</td>`) + `</tr>`;
     }
     if (rows.length > SHOW_N)
       h += `<tr><td colspan="13"><a href="#" data-slug="${esc(slug)}">` +
