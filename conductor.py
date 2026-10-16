@@ -7820,7 +7820,10 @@ th { position:sticky; top:var(--topbar-h,110px); z-index:7;
 td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 td.wrap { white-space:normal; color:#8b949e; font-size:12px; }
 td.step { white-space:normal; }  /* wt/merged chips wrap under a long name */
-tr.agen, tr.runrow { cursor:pointer; }
+/* tr.agen is not clickable as a row anymore - its named controls (step
+   name -> details, run name -> filter) carry pointer cursors themselves,
+   so the row does not advertise a click that does nothing. */
+tr.runrow { cursor:pointer; }
 tr.runrow:hover td { background:#172532; }
 tr.runrow.selected td { background:#1c3041; }
 tr.runrow.selected td:first-child { box-shadow:inset 3px 0 #58a6ff; }
@@ -7832,6 +7835,14 @@ tr.agen td { transition:background .12s; }
 tr.agen:hover td { background:#26405a; }
 tr.hl td { background:#1c2833; }
 tr.agen.hl:hover td { background:#2a4a68; }
+/* .dsel marks the row whose details are on screen - the open task modal's
+   agent row, an open run/request/questionnaire/summary modal's run row. It
+   is independent of the pointer (hover no longer erases it) and distinct
+   from .selected (the run filter) and .hl (run-group hover): a filtered
+   run row keeps .selected while a task modal marks a task row .dsel. */
+tr.dsel td { background:#1c3041; }
+tr.dsel td:first-child { box-shadow:inset 3px 0 #58a6ff; }
+tr.agen.dsel:hover td, tr.runrow.dsel:hover td { background:#2a4a68; }
 .gone { opacity:.45; text-decoration:line-through; }
 td.res { color:#8b949e; font-size:12px; }
 td.res.fresh { animation:fresh 1.2s ease-out; }
@@ -7841,7 +7852,7 @@ td.res.fresh { animation:fresh 1.2s ease-out; }
 .chip.active { background:#1c3041; border-color:#58a6ff; }
 button.chip { background:transparent; font:inherit; color:inherit; }
 button.chip.active { background:#1c3041; }
-button.chip:focus-visible, button:focus-visible, tr.runrow:focus-visible { outline:2px solid #58a6ff; outline-offset:2px; }
+button.chip:focus-visible, button:focus-visible, tr.runrow:focus-visible, tr.agen:focus-visible { outline:2px solid #58a6ff; outline-offset:2px; }
 .filter-group { display:inline-block; margin:0 14px 5px 0; }
 .filter-label { color:#8b949e; margin-right:6px; }
 .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
@@ -8419,6 +8430,7 @@ function closeDetail(force=false, keepStack=false){
   runModalKey = null; summaryView = null;
   if (!keepStack){ modalHist.length = 0; modalScroll = null; }
   document.getElementById('backdrop').hidden = true;
+  applySel();        // every row mark clears with the dialog it belongs to
   return true;
 }
 // The steps of one run (or proposal) ARE the pipeline - collect_dashboard
@@ -8545,6 +8557,7 @@ async function openSummary(key, push=true){
                                          // a Back restore carries its own
   renderSummaryFrame(a, null, null);       // loading frame, nav works already
   document.getElementById('backdrop').hidden=false;
+  applySel();          // the summary view keeps the task's row marked
   let frag=null, err=null;
   if (!a.run_dir){
     err='No session summary for this step yet - it has not run.';
@@ -8617,6 +8630,7 @@ async function openRunSummary(key, push=true){
     (modalHist.length?`<div class="dnav">${backBtnHTML()}</div>`:'') +
     head + `<div class="notice">Loading summary&hellip;</div>` + link;
   document.getElementById('backdrop').hidden=false;
+  applySel();          // the run summary keeps the run's row marked
   let frag=null, err=null;
   try{
     const res=await fetch('/api/runs/'+encodeURIComponent(base(r.dir))+
@@ -8880,6 +8894,7 @@ function showDetail(i, keepStack){
   }
   applyModalScroll();
   document.getElementById('backdrop').hidden = false;
+  applySel();        // mark this task's row while its modal is open
 }
 
 // One source for "which lifecycle controls apply to this run right now" -
@@ -9013,6 +9028,7 @@ function showRunDetails(key, keepStack){
     '</div>';
   applyModalScroll();
   document.getElementById('backdrop').hidden = false;
+  applySel();        // mark this run's row while its modal is open
 }
 // --- row context menus -------------------------------------------------
 // Right-click (or Shift+F10 / Menu key on a focused row) opens a small
@@ -9096,7 +9112,7 @@ function ctxRunItems(r){
 function ctxAgentItems(a){
   const key = agentKey(a), it = [];
   it.push({label:'Open details', attrs:ctxAttrs({'agent-detail':key}),
-    title:'task details - same as clicking the row'});
+    title:'task details - same as the step name'});
   if (a.run_dir)
     it.push({label:'Session summary', attrs:ctxAttrs({'summary':key}),
       title:'the end-of-session report for this step, opened in this ' +
@@ -9710,6 +9726,7 @@ async function openRequest(id, keepStack){
     (modalHist.length ? `<div class="dnav">${backBtnHTML()}</div>` : '') +
     '<h3 id="modal-title">Loading request…</h3>';
   document.getElementById('backdrop').hidden = false;
+  applySel();          // the request's run row stays marked while open
   try {
     const rec=await api('GET',`/api/requests/${encodeURIComponent(id)}`);
     if (!modalRequest || modalRequest.id!==id || modalRequest.dirty) return;
@@ -9827,6 +9844,7 @@ async function openQuestions(id){
   modalQA={id,rec,sel:new Set(),free:''};
   showQuestion();
   document.getElementById('backdrop').hidden=false;
+  applySel();          // the questionnaire's request row stays marked
 }
 function showQuestion(){
   const rec=modalQA.rec, pend=rec.pending_questions||[], q=pend[0];
@@ -10189,8 +10207,10 @@ function render(d){
           `title="live session (inferred - recorded at step end)">` +
           `${esc(sess)}…</td>`
         : `<td class="hide-s"${sess==='…'?' title="recorded when the step ends"':''}>${esc(sess)}</td>`;
+      const aRk = a.run_key||a.run_dir||'';
       h += `<tr class="agen" data-i="${a._i}" ` +
-        `data-run-key="${esc(a.run_key||a.run_dir||'')}" tabindex="0" ` +
+        `data-run-key="${esc(aRk)}" data-akey="${esc(agentKey(a))}" ` +
+        `tabindex="0" ` +
         `aria-haspopup="menu" aria-label="task ${esc(a.step)}">` +
         `<td><span class="dot${pulse}" style="background:${c}" ` +
         `title="${a.status}${a.alive?' (pid '+a.pid+')':''}"></span>` +
@@ -10209,7 +10229,13 @@ function render(d){
         (a.timeout_ext_s ? `<span class="sub" title="stayed active ` +
           `${fmtS(a.timeout_ext_s)} past the timeout floor"> +ext</span>`
           : '') + `</td>` +
-        `<td class="step"><span>${esc(a.step)}</span>${a.wt
+        // the step name is the task-modal affordance - a real button, so
+        // keyboard activation is free; a bare row click no longer opens it.
+        // data-agent-detail keys by agentKey, not row index, so a re-sorted
+        // table can't open the wrong task.
+        `<td class="step"><button type="button" class="linkbtn step-name" ` +
+        `data-agent-detail="${esc(agentKey(a))}" ` +
+        `title="open task details">${esc(a.step)}</button>${a.wt
           ? ` <button type="button" class="chip" data-facet="wt" ` +
             `style="color:#58a6ff" title="${esc(a.branch||'worktree')}">wt</button>` +
             (a.merged===true
@@ -10222,7 +10248,18 @@ function render(d){
                `style="color:#f0883e">unmerged</button>`
              : '')
           : ''}</td>` +
-        `<td>${esc(a.run)}</td>` +
+        // the run name applies the existing run filter (same path as the
+        // run modal's 'Show only this run' and the row menu's 'Filter by
+        // this item') instead of opening the modal. run_key is the stable
+        // identity - a request-backed run's key survives its dir changing;
+        // a task with no run association keeps plain text: there is no
+        // filter target to apply.
+        `<td>${aRk && a.run!=null && a.run!==''
+          ? `<button type="button" class="linkbtn run-link" ` +
+            `data-filter-run="${esc(aRk)}" ` +
+            `title="show only run ${esc(a.run)} and its tasks">` +
+            `${esc(a.run)}</button>`
+          : esc(a.run||'-')}</td>` +
         `<td class="hide-s" title="${a.model==='adaptive'&&a.model_actual
           ?esc(`adaptive resolved to ${a.model_actual}`):''}">` +
         `${esc(a.model||'-')}${a.model==='adaptive'&&a.model_actual
@@ -10261,6 +10298,7 @@ function render(d){
     `<span class="sub">${scope.length?'no agents match these filters':
       selectedRun?'no steps yet; generate the proposal to preview agents':'no agents yet'}</span>`;
   applyHl();
+  applySel();          // re-mark the open modal's row on the fresh DOM
   streamGenTail();
   if (detailIdx != null && !document.getElementById('backdrop').hidden){
     // agent rows re-sort as steps start/finish - keep the modal (and
@@ -10704,8 +10742,12 @@ document.addEventListener('click', async e=>{
     } catch(err){ alert('Summarize failed: '+err.message);
       t.disabled=false; t.textContent='Generate LLM summary'; }
     return; }
-  if (t.dataset && t.dataset.filterRun){
-    selectedRun=t.dataset.filterRun;
+  // closest(), not t.dataset - like the other attr dispatches: the task
+  // table's run-name button wraps the label text, and a click landing on
+  // inner markup must still find the attr rather than bubble to the row
+  const filtEl = t.closest && t.closest('[data-filter-run]');
+  if (filtEl){
+    selectedRun=filtEl.dataset.filterRun;
     closeDetail(true); if (lastData) render(lastData); return; }
   if (t.dataset && t.dataset.clearRun!==undefined){
     selectedRun=null; if (lastData) render(lastData); return; }
@@ -10762,8 +10804,11 @@ document.addEventListener('click', async e=>{
     if (lastData) render(lastData);
     return;
   }
-  const row = t.closest && t.closest('tr.agen');
-  if (row) showDetail(+row.dataset.i);
+  // no tr.agen catch-all on purpose: a bare click on a task row does
+  // nothing now - the named controls (step name -> task modal via
+  // data-agent-detail, run name -> run filter via data-filter-run, the
+  // facet chips) are the row's only actions, so text selection and
+  // misclicks can't pop a modal.
 });
 // <details> toggling: 'toggle' does not bubble, so this runs in the
 // CAPTURE phase to catch arc group/entry flips. Persisted in trajOpen
@@ -10993,6 +11038,34 @@ function applyHl(){
   document.querySelectorAll('tr[data-run-key]').forEach(x=>
     x.classList.toggle('hl', x.dataset.runKey===selectedRun ||
       !!hoverRun && x.dataset.runKey===hoverRun));
+}
+// .dsel marks the row whose details are on screen: the open task modal's
+// agent row, an open run-details/request/questionnaire modal's run row, a
+// summary view's subject row. Rows are keyed by agentKey ('a:') or runKey
+// ('r:') - never a row index - so a re-sort, a filter or the 2s refresh
+// can't paint the wrong row; a sibling nav moves the mark because
+// detailKey itself moved, and closing the dialog clears it via closeDetail.
+function selKeys(){
+  const s = new Set();
+  if (detailKey!=null) s.add('a:'+detailKey);
+  if (summaryView){
+    const k = String(summaryView.key);
+    s.add(k.startsWith('run|') ? 'r:'+k.slice(4) : 'a:'+k);
+  }
+  if (runModalKey) s.add('r:'+runModalKey);
+  if (modalRequest && modalRequest.id)
+    s.add('r:request:'+modalRequest.id);
+  if (modalQA && modalQA.id) s.add('r:request:'+modalQA.id);
+  return s;
+}
+function applySel(){
+  const want = selKeys();
+  document.querySelectorAll('tr.runrow[data-run-key],tr.agen[data-akey]')
+    .forEach(x=>{
+      const agen = x.classList && x.classList.contains('agen');
+      x.classList.toggle('dsel',
+        want.has((agen?'a:':'r:') + (agen?x.dataset.akey:x.dataset.runKey)));
+    });
 }
 document.addEventListener('mouseover', e=>{
   // hovering a model option tracks it as the active descendant - the
