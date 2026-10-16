@@ -1,6 +1,6 @@
 # Task: isolate-proposal-planning
 
-**Status:** in progress
+**Status:** done
 **Started:** 2026-10-16   **Last touched:** 2026-10-16
 
 ## Objective
@@ -99,9 +99,10 @@ survive cancellation/retry/server restart.
 
 ## Where it stopped
 
-All code + tests landed and verified. Remaining: commit (2 logical
-groups: conductor.py isolation, then tests/docs), update QUEUE.md +
-efficiency_stats.md, final status.
+DONE - merged to master. The branch was committed in-worktree; the merge
+into the main checkout was handled by resolve-isolate-proposal-planning
+(merge c2a8c6c, ownership-gate fix 400124b). 224/224 mock tests green on
+the merged tree. Nothing left in this task.
 
 ## Deferred or blocked
 

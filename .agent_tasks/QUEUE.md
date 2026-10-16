@@ -79,7 +79,17 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   Planner runs in its own process group; drain_planner_spool replays
   spooled state at serve startup and on a throttled poll (publish draft,
   extract from a finished log, or error with artifacts preserved).
-  215/215 mock tests + demo green.
+  215/215 mock tests + demo green. UPDATE 2026-10-16: merged via
+  resolve-isolate-proposal-planning (merge c2a8c6c + fix 400124b;
+  224/224 green). Two cross-run race findings: a concurrent run's
+  abort_own_merge killed the first in-progress merge mid-resolution
+  (re-merged cleanly), and a foreign driver's `git add -A` checkpoint
+  committed the second merge under a 'checkpoint' message - merges are
+  NOT protected from concurrent runs in the same checkout. The merge
+  itself was semantic: stop-proposal's gen_id attempt scoping now
+  composes with the spool - job.json carries gen_id, _publish_from_spool
+  /_flush_spool take an ownership guard, drain skips spools whose gen_id
+  is live, and _save_draft can't resurrect a stopped attempt's overlay.
 - DONE 2026-10-15 (follow-up-plan, closing step of run
   20261015-182057-ux-controls): reviewed the run - 6/8 steps merged
   clean; `image-attachments` + `task-modal-navigation` were done work
