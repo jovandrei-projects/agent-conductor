@@ -13344,7 +13344,9 @@ body.compact td .genline { display:inline-block; max-width:100%;
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   vertical-align:bottom; color:#8b949e; font-size:12px; margin-left:6px; }
 .genline.fresh, td .sub.fresh { animation:fresh 1.2s ease-out; }
-.counts span { background:#161b22; border-radius:8px; padding:1px 8px; margin-right:5px; font-size:12px; }
+.counts span, .counts .rchip { background:#161b22; border-radius:8px; padding:1px 8px; margin-right:5px; font-size:12px; }
+.counts .rchip { border:0; font-family:inherit; cursor:pointer; }
+.counts .rchip:hover { background:#1c3041; }
 a { color:#58a6ff; text-decoration:none; }
 [hidden] { display:none !important; }
 #backdrop { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:50; }
@@ -17313,7 +17315,7 @@ function render(d){
         'cumulative driver execution time'}">${runElapsed(r,now)}</td>` +
       `<td class="counts">` +
       `${counts||'<span class="toksub">not planned</span>'}` +
-      (unrev ? `<button type="button" class="chip" ` +
+      (unrev ? `<button type="button" class="rchip" ` +
         `data-facet="unreviewed" style="color:#39c5cf" ` +
         `title="${unrev} task(s) finished but not marked reviewed` +
         ` - click to filter">${unrev} unreviewed</button>` : '') +

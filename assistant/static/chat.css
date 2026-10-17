@@ -83,7 +83,7 @@
 #aichat .ai-sub .ai-usage { flex: none; max-width: none; }
 #aichat .ai-name {
   background: transparent; border: 0; color: #e6edf3; font: inherit;
-  font-weight: 600; font-size: 13px; padding: 2px 4px; border-radius: 5px;
+  font-weight: 600; font-size: 11px; padding: 2px 4px; border-radius: 5px;
   cursor: pointer; max-width: 45%; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }

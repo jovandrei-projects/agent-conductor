@@ -285,7 +285,8 @@ function msgHtml(m) {
   var snap = thaw(m.settings_json);
   var meta = '';
   if (m.role === 'user') {
-    meta = '<span class="aim-ctxm" title="' + esc(ctxLabel(env)) +
+    meta = (m.pending ? '<span class="aim-st">sending\u2026</span>' : '') +
+      '<span class="aim-ctxm" title="' + esc(ctxLabel(env)) +
       '">' + esc(ctxLabel(env)) + '</span>';
   } else {
     var st = xa ? xa.status : m.status;
@@ -303,10 +304,11 @@ function msgHtml(m) {
     /* the reply badge shows THIS turn's recorded snapshot (never the
        current settings); model_label from the exchange is the fallback
        for rows that predate snapshot storage */
-    var blabel = snap.model ? settingsLabel(snap)
-      : (xa && (xa.model_label || xa.model_uid)) || 'model unknown';
+    var blabel = snap.model ||
+      (xa && (xa.model_label || xa.model_uid)) || 'model unknown';
     meta += '<button type="button" class="aim-modelb" data-ai-set ' +
-      'title="model this answer ran on - click to open settings">' +
+      'title="' + esc((snap.model ? settingsLabel(snap) + ' - ' : '') +
+      'model this answer ran on - click to open settings') + '">' +
       esc(blabel) + '</button>' +
       (snap.readonly === false
         ? ' <span class="aim-st err" title="this answer ran with ' +
@@ -726,8 +728,9 @@ function paint() {
     var snap = S.conv
       ? { model: S.conv.model, effort: S.conv.effort, fast: S.conv.fast }
       : (S.defaults || {});
-    nameEl.textContent = settingsLabel(snap);
-    nameEl.title = 'assistant settings - model, effort, fast, read-only';
+    nameEl.textContent = snap.model || 'default';
+    nameEl.title = 'assistant settings - ' + settingsLabel(snap) +
+      ' - model, effort, fast, read-only';
   }
   var pill = byId('ai-state');
   if (pill) {
@@ -747,10 +750,12 @@ function paint() {
     if (sum) {
       sum.textContent = tot.exchanges
         ? 'tok ' + fmtTok((tot.prompt_t || 0) + (tot.completion_t || 0))
+          + (tot.cached_t ? ' \u00b7 cached ' + fmtTok(tot.cached_t) : '')
           + (tot.usd != null ? ' \u00b7 ~' + fmtUsd(tot.usd) : '')
         : '';
       sum.title = 'conversation usage: ' + fmtTok(tot.prompt_t) +
-        ' in / ' + fmtTok(tot.completion_t) + ' out' +
+        ' in (' + fmtTok(tot.cached_t || 0) + ' cached) / ' +
+        fmtTok(tot.completion_t) + ' out' +
         (tot.unpriced
           ? ' - ' + tot.unpriced + ' exchange(s) unpriced' : '');
     }
@@ -1066,9 +1071,15 @@ async function send() {
   setSendState();
   note('');
   statusLine('Sending');
+  /* optimistic bubble: the user sees their message at once - the conv
+     create + message POST round-trips below can take seconds */
+  var cmid = uid('m'), optId = 'local-' + cmid;
+  S.msgs.push({id: optId, role: 'user', text: text,
+    client_msg_id: cmid, pending: true});
+  S.pinBottom = true;
+  paint();
   try {
     var conv = await ensureConv();
-    var cmid = uid('m');
     var out = await aapi('POST',
       '/conversations/' + encodeURIComponent(conv.id) + '/messages',
       { text: text, client_msg_id: cmid, client_ctx: curCtx(),
@@ -1083,6 +1094,9 @@ async function send() {
        conv switch during the POST must not inject foreign messages */
     var sameConv = S.conv && S.conv.id === conv.id;
     if (sameConv) {
+      /* swap the optimistic placeholder for the persisted row - the
+         client_msg_id dedupe below must see the real message */
+      S.msgs = S.msgs.filter(function (o) { return o.id !== optId; });
       [um, am].forEach(function (m) {
         if (m && !S.msgs.some(function (o) {
           return o.id === m.id ||
@@ -1103,6 +1117,8 @@ async function send() {
     if (x && !TERMINAL[x.status]) pollX(x.id);
     else { loadConvs(); refreshUsage().then(paint); }
   } catch (e) {
+    S.msgs = S.msgs.filter(function (o) { return o.id !== optId; });
+    paint();
     note('Send failed: ' + (e.message || e));
     statusLine('Send failed');
   } finally {
@@ -2027,12 +2043,10 @@ function bind() {
     var ud = byId('ai-usage');
     if (ud && ud.open && !(t && t.closest && t.closest('#ai-usage')))
       ud.open = false;
-    /* the floating history panel dismisses the same way - but not when
-       the click is its own header toggle or inside the panel */
-    if (S.rail && t && t.closest &&
-        !t.closest('#ai-rail') && !t.closest('#ai-hist')) {
-      S.rail = false; paint();
-    }
+    /* the history rail is NOT light-dismissed: only the header's
+       hamburger toggles it (a clicked-inside element may be detached by
+       the rail's own repaint before this delegated listener runs, so a
+       closest() guard here can never be trusted anyway) */
   });
   var rail = byId('ai-rail');
   if (rail) {
