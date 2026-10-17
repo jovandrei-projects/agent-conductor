@@ -1,0 +1,112 @@
+# Proposal: faster assistant responses via an in-process transport.
+#
+# Motivation (observed): every dashboard chat exchange spawns a full
+# `devin --print` subprocess (assistant/providers/devin_print.py) - CLI
+# init, auth/env setup, model round-trip, ATIF export, process exit -
+# and there is no streaming on that transport, so even trivial
+# read-only questions ("how many runs are there?") pay the full session
+# spin-up. Replies should land in seconds, not tens of seconds.
+#
+# This proposal adds a SECOND transport alongside the verified
+# devin --print baseline, selected per conversation. devin --print
+# remains the fallback path and the only transport allowed to propose
+# mutating actions - the new transport is read-only by construction
+# (it carries no tool execution channel at all).
+#
+# The two candidate designs, ranked by preference:
+#   A) direct HTTP: an in-process provider that talks to the same model
+#      backend the CLI uses, reusing the CLI's stored credentials -
+#      no subprocess at all, streaming possible.
+#   B) warm session: a long-lived interactive `devin` session per
+#      conversation, fed via resume instead of a fresh --print spawn -
+#      keeps the CLI sandbox story, removes most per-message init.
+# Step 1 investigates which is actually viable; later steps implement
+# whichever the design record selects (or B explicitly if A is blocked).
+
+[run]
+name = "assistant-fast-transport"
+description = "Investigate and implement a faster assistant transport (direct in-process provider or persistent warm session) so simple dashboard questions answer in seconds, with the CLI path kept as fallback and read-only guarantees preserved by construction."
+summarize = true
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 90
+max_attempts = 3
+verify = "python run_tests.py --jobs 8"
+
+[[step]]
+name = "transport-investigation"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Investigate and decide the faster assistant transport for this codebase. This is a DESIGN step - docs and a decision record only, no behavior changes to conductor.py, assistant/, or the dashboard.
+
+Read assistant/DESIGN.md, assistant/runtime.py, assistant/providers/devin_print.py, assistant/providers/__init__.py (the ProviderAdapter contract and PollResult seams), assistant/http_api.py, and assistant/static/chat.js to understand exactly how exchanges are dispatched, polled, cancelled, priced, and rendered today.
+
+Then answer these questions from evidence in this environment, never assumptions:
+- How does the `devin` CLI authenticate and where does it store credentials (config dir, env vars, keychain)? Would an in-process HTTP provider be able to reuse them safely, or is the credential opaque/locked to the CLI?
+- Is there a reachable model API the dashboard's model uids (e.g. gpt-6-luna, gpt-6-astra, swe-2) can be addressed through directly? Check for documented endpoints and what `devin list`/`devin models` exposes. Do NOT probe production endpoints beyond what the CLI itself does - inspecting config files, CLI help output, and docs is enough.
+- Does that channel report usage (prompt/completion/cached tokens) in a form the existing per-exchange delta accounting can consume, and can it stream partial text?
+- If direct HTTP is blocked (opaque auth, no usable endpoint, no usage reporting), design the warm-session alternative concretely: one long-lived interactive devin process per conversation, prompt delivery via resume semantics, lifecycle (idle reap, crash recovery, orphaned-session registration so `conductor.py sessions` hygiene still applies).
+
+Deliverable: a decision record appended to assistant/DESIGN.md (or a new doc it links) naming the chosen transport, the rejected alternative and why, plus the exact adapter contract: send/poll/collect mapping, progressive-text channel, usage-counter mapping (prompt_t/completion_t/cached_t/llm_steps), attachment handling or its explicit refusal, cancel/timeout semantics, the read-only guarantee (no tool channel = no mutations), credential handling that never writes secrets to the repo, and a fallback-to-CLI story when the fast transport fails to initialize. Include a risk list (auth expiry, session staleness, rate limits) with mitigations.
+
+Update .agent_tasks/QUEUE.md and STATE.md per AGENTS.md conventions. Gate: the doc exists, is specific to the findings above, and the test suite stays green.
+'''
+
+[[step]]
+name = "provider-adapter"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Implement the transport adapter chosen by the transport-investigation step's decision record in assistant/DESIGN.md (or the doc it links). If that step ran, follow its contract exactly; if it did not run or reached no decision, implement the warm-session variant (persistent interactive devin process per conversation, fed via resume) rather than guessing at direct HTTP.
+
+Create the new adapter module under assistant/providers/ implementing the same ProviderAdapter seams devin_print.py uses (spawn/send/poll/collect seam injection, PollResult process-exit truth, per-request accounting). Requirements:
+- Reuse the injected seams (env, spawn, kill_tree, pid_alive, hidden_subprocess_kwargs) so tests can drive it with fakes - never import conductor directly.
+- Progressive text: surface partial replies through the existing poll channel at least as well as devin_print (stdout tail / export tail); if the chosen transport can stream, stream.
+- Usage accounting must stay cumulative-per-dispatch and feed the same prompt_t/completion_t/cached_t/llm_steps fields so exchange deltas and the usage chip keep working unchanged.
+- Cancel and timeout must terminate the underlying session/process cleanly; an abandoned warm session must be reaped or adoptable, never leaked.
+- The adapter carries no mutation/tool channel - read-only is structural, not a flag.
+- Auth/credentials: reuse whatever the design record specified; on credential failure surface a clear error that lets the runtime fall back to the CLI transport.
+- Attachments: support them if the transport does; otherwise produce the same explicit refusal style devin_print uses for unsupported inputs.
+
+Add focused tests mirroring the existing provider adapter tests (fake binary / fake transport seams): dispatch, partial text, usage deltas, cancel, timeout, crash recovery, and credential-failure fallback signaling. Keep the verify gate green.
+'''
+
+[[step]]
+name = "runtime-and-settings"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Wire the new transport adapter into the assistant runtime. Read the step-2 implementation and the ProviderAdapter usage in assistant/runtime.py and assistant/http_api.py first.
+
+- Add a per-conversation transport field with a settings-level default, persisted like the existing model/effort/fast/readonly snapshot (frozen per exchange so later setting edits never rewrite history).
+- Selection rules: the fast transport handles read-only conversations; when it fails to initialize (credential error, unreachable endpoint, spawn failure) the exchange must fall back to the devin --print transport automatically and record that fallback on the exchange row - never fail the user's question for a transport problem.
+- Read-only enforcement: the new transport is inherently read-only (no tool channel). If a conversation requests mutations while on the fast transport, the runtime must route that exchange through the CLI transport instead, and the action-proposal flow must be unchanged - never bypass the whitelist.
+- Resume/session semantics per the design record (message-list replay for direct HTTP, or session-id reuse for warm sessions); preserve the provider_session_id bookkeeping the UI shows in the usage details.
+- Existing conversations keep working: rows without a transport field behave exactly as today (CLI transport).
+- Extend the exchanges/state payloads minimally so the client can tell which transport answered (for the UI chip in the next step).
+
+Add tests for transport selection, automatic CLI fallback, read-only routing, snapshot freezing, and back-compat with pre-transport records. Keep the gate green.
+'''
+
+[[step]]
+name = "chat-ui-and-verification"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Finish the fast-transport feature in the dashboard chat client and verify end to end. Read the runtime wiring from the previous step first.
+
+- assistant/static/chat.js + chat.css: surface the transport choice in the assistant settings dialog (default from server settings, per-conversation override), show a small unobtrusive indicator of which transport answered on each reply (tooltip is fine), and keep the existing usage/sources/action chrome working for both transports.
+- If the transport streams partial replies, render them progressively (the existing pollX loop already repaints on exchange updates - reuse it); otherwise the queued/answering status line must still appear promptly.
+- Failed-send and optimistic-bubble behavior must work identically on both transports.
+- Update assistant/DESIGN.md and AGENTS.md: transport selection, fallback rules, capability boundaries, and the operational notes (credential expiry symptoms, warm-session cleanup).
+- Extend the test suites (tests/test_assistant_ui.py harness patterns and conductor tests as applicable) for the settings control, the transport indicator, fallback display, and any changed rendering.
+
+Run the full verification gate and confirm no regressions.
+'''
