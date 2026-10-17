@@ -3845,6 +3845,64 @@ def _proc_image_name(pid: int) -> str | None:
         return None
 
 
+_PROC_CMD_CACHE: dict[tuple, dict | None] = {}
+_PROC_CMD_CACHE_MAX = 512      # drop-all bound; keys are (pid, started_at)
+
+
+def _query_proc_table(pids: list[int]) -> dict[int, dict]:
+    """{pid: {ppid, cmd}} for the given pids - ONE subprocess per batch
+    (the /api/state poll cannot afford a powershell per holder). Dead or
+    unreadable pids are simply absent."""
+    try:
+        if os.name == "nt":
+            flt = " OR ".join(f"ProcessId={p}" for p in pids)
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process -Filter "
+                 f"\"{flt}\" | Select-Object ProcessId,ParentProcessId,"
+                 "CommandLine | ConvertTo-Json -Compress"],
+                capture_output=True, text=True, timeout=15,
+                **hidden_subprocess_kwargs())
+            if out.returncode != 0 or not (out.stdout or "").strip():
+                return {}
+            data = json.loads(out.stdout)
+            rows = data if isinstance(data, list) else [data]
+            return {int(r["ProcessId"]):
+                    {"ppid": r.get("ParentProcessId"),
+                     "cmd": r.get("CommandLine") or ""}
+                    for r in rows if r.get("ProcessId")}
+        out = subprocess.run(
+            ["ps", "-o", "pid=,ppid=,args=", "-p",
+             ",".join(str(p) for p in pids)],
+            capture_output=True, text=True, timeout=15)
+        res: dict[int, dict] = {}
+        for ln in (out.stdout or "").splitlines():
+            f = ln.strip().split(None, 2)
+            if len(f) >= 2 and f[0].isdigit():
+                res[int(f[0])] = {
+                    "ppid": int(f[1]) if f[1].isdigit() else None,
+                    "cmd": f[2] if len(f) > 2 else ""}
+        return res
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+
+
+def _proc_cmd_table(keys: list[tuple[int | None, str | None]]
+                    ) -> dict[tuple, dict | None]:
+    """Cached _query_proc_table keyed by (pid, process-start): a process's
+    cmdline never changes, and a miss stays a miss until the pid is
+    recycled - which lands on a different key."""
+    uniq = [k for k in dict.fromkeys(keys) if k[0]]
+    want = [k for k in uniq if k not in _PROC_CMD_CACHE]
+    if want:
+        if len(_PROC_CMD_CACHE) > _PROC_CMD_CACHE_MAX:
+            _PROC_CMD_CACHE.clear()
+        got = _query_proc_table([k[0] for k in want])
+        for k in want:
+            _PROC_CMD_CACHE[k] = got.get(k[0])
+    return {k: _PROC_CMD_CACHE.get(k) for k in uniq}
+
+
 _EMU_IMAGE_RE = re.compile(r"emulator|qemu", re.I)
 
 
@@ -4804,16 +4862,42 @@ def sweep_agent_slots(slot_dir: Path | None = None) -> list[str]:
 
 def _slots_view(slot_dir: Path | None = None) -> dict:
     """The /api/state pool summary: how many machine-wide agent slots are
-    held right now and by whom (run:step names only - never task text)."""
+    held right now and by whom. Beyond run:step names (never task text)
+    each holder carries the lease's full run_dir plus owner/worker pids
+    with best-effort cmdlines - and the owner's parent - so the pool
+    modal can identify a holder no served run claims (test/demo runs
+    under a temp runs-dir, deleted run dirs, orphaned workers)."""
     holders = _slot_holders(slot_dir)
+    proc = _proc_cmd_table(
+        [(h.get("owner_pid"), h.get("owner_started_at"))
+         for h in holders]
+        + [(h.get("worker_pid"), h.get("worker_started_at"))
+           for h in holders])
+    pproc = _proc_cmd_table(list({
+        (v["ppid"], None) for v in proc.values()
+        if v and v.get("ppid")}))
+    out = []
+    for h in holders:
+        o = proc.get((h.get("owner_pid"),
+                      h.get("owner_started_at"))) or {}
+        w = proc.get((h.get("worker_pid"),
+                      h.get("worker_started_at"))) or {}
+        p = pproc.get((o.get("ppid"), None)) or {}
+        out.append({
+            "run": h.get("run"),
+            "run_dir": Path(h["run_dir"]).name if h.get("run_dir")
+                       else None,
+            "run_dir_full": h.get("run_dir"),
+            "step": h.get("step"), "slot": h.get("slot"),
+            "leased_at": h.get("leased_at"),
+            "owner_pid": h.get("owner_pid"),
+            "owner_cmd": o.get("cmd") or None,
+            "owner_ppid": o.get("ppid"),
+            "owner_pcmd": p.get("cmd") or None,
+            "worker_pid": h.get("worker_pid"),
+            "worker_cmd": w.get("cmd") or None})
     return {"cap": agent_slot_cap(), "in_use": len(holders),
-            "holders": [{"run": h.get("run"),
-                         "run_dir": Path(h["run_dir"]).name
-                         if h.get("run_dir") else None,
-                         "step": h.get("step"),
-                         "slot": h.get("slot"),
-                         "leased_at": h.get("leased_at")}
-                        for h in holders]}
+            "holders": out}
 
 
 def _agent_slot_acquire(step: Step, run_dir: Path, state: dict,
@@ -17432,16 +17516,35 @@ function poolHtml(d){
       `</div>` : '';
   const findA = h => h.run_dir==null ? null
     : AGENTS.find(x=>x.step===h.step && base(x.run_dir||'')===h.run_dir);
-  // a lease can outlive its dashboard row (dead driver, orphaned worker
-  // still running) - such holders show 'leased' instead of a live status
+  // a lease can outlive its dashboard row - a test/demo run under a temp
+  // runs-dir, a different --runs-dir, a deleted run dir, an orphaned
+  // worker whose driver died. Those show 'untracked' and the held-by
+  // column's owner/parent/worker pids + cmdlines identify the process.
+  const trunc = (s,n) => (s||'').length>n
+    ? esc(s.slice(0,n))+'&hellip;' : esc(s||'');
+  const holdCell = h => {
+    if (!h.owner_pid && !h.worker_pid) return '&hellip;';
+    const ln = (lbl,pid,cmd) => `<div title="${esc(cmd||'')}">` +
+      `<span class="sub">${lbl} </span>${pid}` +
+      `${cmd?` &middot; ${trunc(cmd,52)}`:''}</div>`;
+    return (h.owner_pid ? ln('owner',h.owner_pid,h.owner_cmd) : '') +
+      (h.owner_ppid ? ln('parent',h.owner_ppid,h.owner_pcmd) : '') +
+      (h.worker_pid ? ln('worker',h.worker_pid,h.worker_cmd) : '');
+  };
+  let untrackedN = 0;
   const holdRows = (sp.holders||[]).map(h=>{
     const a = findA(h);
+    if (!a) untrackedN++;
     const runCell = a
       ? `<button type="button" class="linkbtn" ` +
         `data-run-details="${esc(a.run_key||a.run_dir)}" ` +
         `title="open this run's details">${esc(a.run||h.run||h.run_dir)}` +
         `</button>`
-      : esc(h.run||h.run_dir||'(claiming)');
+      : `<div title="${esc(h.run_dir_full||'')}">` +
+        `${esc(h.run||h.run_dir||'(claiming)')}</div>` +
+        (h.run_dir && h.run_dir!==(h.run||'')
+          ? `<div class="sub" title="${esc(h.run_dir_full||'')}">` +
+            `${esc(h.run_dir)}</div>` : '');
     const stepCell = a
       ? `<button type="button" class="linkbtn" ` +
         `data-agent-detail="${esc(agentKey(a))}" ` +
@@ -17450,10 +17553,12 @@ function poolHtml(d){
     const stCell = a
       ? `<span class="stc st-${STCLASS[a.status]||'other'}">` +
         `${esc(a.status)}</span>`
-      : `<span class="stc st-other">leased</span>`;
+      : `<span class="stc st-other" title="a live process holds this ` +
+        `slot but no run in this dashboard's list claims it - see the ` +
+        `held-by column for who it is">untracked</span>`;
     return `<tr><td>${h.slot!=null?h.slot:'&hellip;'}</td>` +
       `<td class="wrap">${runCell}</td><td class="wrap">${stepCell}</td>` +
-      `<td>${stCell}</td>` +
+      `<td>${stCell}</td><td class="wrap">${holdCell(h)}</td>` +
       `<td>${a?elapsed(a,now):'-'}</td>` +
       `<td title="${esc(h.leased_at||'')}">` +
       `${h.leased_at?loc(h.leased_at):'-'}</td></tr>`;
@@ -17517,8 +17622,19 @@ function poolHtml(d){
     `<h3 style="margin-top:16px">holding a slot</h3>` +
     (holdRows
       ? `<div class="wrapw"><table class="pooltab"><tr><th>slot</th>` +
-        `<th>run</th><th>step</th><th>status</th><th>elapsed</th>` +
-        `<th>leased</th></tr>${holdRows}</table></div>`
+        `<th>run</th><th>step</th><th>status</th>` +
+        `<th title="the processes behind the lease: owner = the ` +
+        `conductor driver (or test) that claimed the slot, parent = ` +
+        `what spawned it, worker = the devin session">held by</th>` +
+        `<th>elapsed</th>` +
+        `<th>leased</th></tr>${holdRows}</table></div>` +
+        (untrackedN
+          ? `<div class="sub" style="margin-top:6px"><b>untracked</b>` +
+            ` = a live process holds the slot but no run in this ` +
+            `dashboard's list claims it - typically a test/demo run ` +
+            `(its runs-dir sits under %TEMP%), a different --runs-dir, ` +
+            `a deleted run dir, or an orphaned worker whose driver ` +
+            `died. The held-by cmdlines say who it is.</div>` : '')
       : `<div class="sub">idle - no agent holds a slot right now.</div>`) +
     (waiters.length
       ? `<h3 style="margin-top:16px">queued for a slot</h3>` +

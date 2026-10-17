@@ -118,6 +118,11 @@ steps hold NO slot so the pool always drains. Slot events
 dashboard topbar's `agents N/M` button opens the pool modal (live
 holder/queued breakdown, cap stepper + Apply, never-kills warning), and
 `sweep_agent_slots` (sweep + serve startup) reclaims dead-owner leases.
+Each modal holder row carries the lease's owner/parent/worker pids +
+best-effort cmdlines (`_proc_cmd_table`, cached by pid+start) and its
+full run_dir, so a holder no served run claims - a `run_tests.py` shard
+is the usual case; run dirs under %TEMP% are the tell - shows
+`untracked` instead of a live status instead of being a bare name.
 Note `slot_wait` stays stamped on a record after the lease lands - only
 `status='queued'` means still waiting.
 Parallel sessions get a PARALLEL_NOTE prompt block: share the box, own

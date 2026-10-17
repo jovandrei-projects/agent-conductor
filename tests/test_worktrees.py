@@ -2782,6 +2782,44 @@ class AgentSlotPoolTests(unittest.TestCase):
             self.assertEqual(state["steps"]["s1"]["status"], "skipped")
             conductor._slot_release(held, run_dir)
 
+    def test_slots_view_reports_holder_processes(self):
+        """_slots_view enriches each live holder with the lease's full
+        run_dir and owner/worker pid + cmdline (and the owner's parent) -
+        the pool modal's 'untracked' rows (test runs, orphaned workers)
+        identify themselves instead of being a bare name."""
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td) / "slots"
+            run_dir, state = self._mk(Path(td))
+            step = conductor.Step(name="s1", project="x", prompt="p")
+            conductor._slot_try_lease(1, run_dir, state, step, sd)
+            (h,) = conductor._slots_view(sd)["holders"]
+            self.assertEqual(h["owner_pid"], os.getpid())
+            self.assertEqual(h["run_dir"], run_dir.name)
+            self.assertEqual(h["run_dir_full"], str(run_dir))
+            self.assertEqual(h["slot"], 1)
+            self.assertIn("worker_cmd", h)
+            # best-effort: our own cmdline + parent are resolvable
+            if h["owner_cmd"]:
+                self.assertIn("python", h["owner_cmd"].lower())
+                self.assertTrue(h["owner_ppid"])
+            # second view call hits the cache - same table object
+            self.assertIs(conductor._proc_cmd_table(
+                [(os.getpid(), None)])[(os.getpid(), None)],
+                conductor._proc_cmd_table(
+                    [(os.getpid(), None)])[(os.getpid(), None)])
+
+    def test_query_proc_table_returns_cmd_and_ppid(self):
+        """The batched lookup reports this process's cmdline + parent;
+        a dead pid is absent rather than an error."""
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        got = conductor._query_proc_table([os.getpid(), dead.pid])
+        self.assertNotIn(dead.pid, got)
+        me = got.get(os.getpid())
+        if me is not None:                 # lookup is best-effort
+            self.assertTrue(me["ppid"])
+            self.assertIn("python", me["cmd"].lower())
+
 
 class DependsOnTests(unittest.TestCase):
     """[[step]] depends_on: schema + validation (names, self, cycles,
