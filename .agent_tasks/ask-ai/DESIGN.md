@@ -656,7 +656,8 @@ where evidence lives" the user asked for): dashboard section map, modal
 kinds, status vocabulary, sentinel/flag concepts, run-dir layout,
 "STATUS/NEXT/OUTCOME contract", verify/merge vocabulary, where logs/
 summaries/prompts live by convention. Written ONCE as
-`assistant/host_conductor_static.md` (adapter-owned), injected per
+`assistant_host/host_conductor_static.md` (adapter-owned - shipped),
+exposed via `conductor_adapters.static_preamble()` and injected per
 session start.
 
 ### 6.6 Retrieval adapter (bounded, authorized, cited)
@@ -669,10 +670,13 @@ subject keywords over task text + outcome + note + report heads);
 body, request record fields, trajectory arc heads. Budgets: <=12
 sources, <=64KB total, sensitive-field filter (never dump env,
 credentials, full raw logs without request), dedupe by identity.
-Sources return `{kind:'agent'|'run'|'summary'|'request'|'request-summary',
-key, label, nav}` where `nav` is the host descriptor the client turns
-into a citation chip (showDetail/openRunDetails/openSummary/
-openRequest - all exist). Content treated as untrusted evidence: never
+Sources return `{kind:'agent'|'run'|'summary'|'run-summary'|'request'|
+'log', key, label, nav}` where `nav = {view, key}` is the host
+descriptor the client turns into a citation chip (showDetail /
+openRunDetails / openSummary / openRunSummary / openRequest - all
+exist; `log` rides the agent view's own key since the task modal is
+the log's home). Implemented: see `assistant_host/retrieval.py`.
+Content treated as untrusted evidence: never
 copied into system role, marked as quoted material in the prompt
 assembly (prompt-injection posture in 6.8).
 

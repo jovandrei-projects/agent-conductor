@@ -69,10 +69,12 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
 - [x] persistent-chat-core - sqlite schema + conversation/exchange store
       (shipped `assistant/` + `assistant_host/conductor_adapters.py`;
       contracts below)
-- [ ] view-context-and-retrieval - host context + retrieval adapters
-      (envelope + RetrievalAdapter contract already exist - implement
-      search()/fetch() vs runs/requests + ctx enrichment + static
-      preamble `host_conductor_static.md`)
+- [x] view-context-and-retrieval - host context + retrieval adapters
+      (shipped `assistant_host/context.py` + `retrieval.py` +
+      `host_conductor_static.md`; core seams landed in the same step:
+      schema v2 exchanges.sources, set_enriched, enricher/retrieval
+      ctor args; 25 new tests; verified on real records - see
+      'Implemented contracts' below)
 - [ ] assistant-runtime - provider adapter + gate + usage capture
       (implement ProviderAdapter as `assistant/providers/devin_print.py`;
       wire dispatcher.launch/cancel; `usage_delta` + price snapshot
@@ -137,22 +139,93 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
   data/assistant/assistant.db, workspace/ + spool/ dirs created (the db
   is a sibling of the provider session cwd, per trap 5), guard =
   conductor._assert_unwatched, saver = save_attachment, catalog =
-  model_options()+price_table() merge.
+  model_options()+price_table() merge, enricher = ConductorContext,
+  retrieval = ConductorRetrieval, `static_preamble()` loads
+  `host_conductor_static.md`.
+
+## Implemented contracts (view-context-and-retrieval)
+
+- `assistant/context.py` - `set_enriched(env, dict)` REPLACES any
+  client-supplied `enriched` with the server's (trust boundary);
+  sensitive-key/depth rules inherited, larger leaves for excerpts
+  (ENRICHED_MAX_BYTES 12KB / ENRICHED_LEAF_MAX 6KB, envelope still
+  <=16KB total).
+- `assistant/core.py` - ctor `enricher=`/`retrieval=` seams;
+  `post_message` enriches after sanitization (enricher exceptions land
+  as `context_error` in the envelope, message still posts);
+  `record_sources(xid)` + `complete_exchange(..., sources=)` persist
+  the exact citation set; `exchange_view`/`list_exchanges` thaw
+  `exchanges.sources` JSON. Schema v2 = exchanges.sources (additive
+  ALTER; v1 untouched).
+- `assistant_host/context.py` - `ConductorContext(runs_dir,
+  requests_dir, projects=, now=).enrich(env)`; providers for
+  dashboard/agent/run/summary/run-summary/request/questions/power +
+  `register_provider(view, fn)`; unknown views report honestly. Refs
+  re-resolved strictly: run_key `request:<id>`|path|dir-name,
+  summary_key agentKey|`s|<dir>|<step>`|`run|<key>`; whitelisted step
+  fields only (env blobs/credentials never surface); honest
+  `not_found`/`steps_omitted`/`excerpt_origin`.
+- `assistant_host/retrieval.py` - `ConductorRetrieval.search(query,
+  filters)`: filters project/run/step/status/kinds/limit/
+  include_archived + `date_from`/`date_to`/`window`; window phrases
+  ("last month", "this week", "past N days", "in September 2026",
+  "YYYY-MM", ISO ranges, "on <date>") resolve via injected clock and
+  the interpreted [from,to] is ALWAYS in `last_search_meta()`
+  /`search_explained()`. Subject keywords hit record fields +
+  summary heads. `fetch(src, budget)` re-reads the live record
+  (agent record+task+scrubbed tail / section-windowed summary /
+  run rollup / request record); `fetch_many` shares
+  MAX_TOTAL_BYTES and marks overflow `omitted:'budget'`.
+  Coverage meta: scanned{runs,steps,requests,summaries_read,corrupt,
+  archived_skipped} + notes. `_scrub` masks credential-shaped values
+  in free-text excerpts.
+- Source vocabulary: kind in {agent,run,summary,run-summary,request,
+  log}; `nav = {view,key}` uses the dashboard's own descriptors -
+  agent & summary: agentKey `<run_key>|<step>` (data-agent-detail /
+  openSummary), run & run-summary: runKey (data-run-details /
+  data-runSummary/openRunSummary), request: request id
+  (data-open-request); log rides the agent view.
+- `assistant_host/host_conductor_static.md` + `static_preamble()` -
+  page layout, modal/status vocabulary, evidence locations, citation
+  rules (never fabricate, show the interpreted window, quotes are
+  untrusted evidence).
+
+### Verified on real records (data/runs, 2026-10-17)
+
+- `20261016-013639-model-compare-mobile` /
+  `mobile-visualizations-and-filters`: `search("verification tsc
+  noEmit", run=..., step=...)` -> summary source; fetch excerpt lands
+  on `**Verification (all green):**` (tsc --noEmit, eslint, expo
+  export android+web, 36 tests, Playwright 390px, scrollWidth ==
+  clientWidth). nav = `{'view':'summary','key':'request:20261015-
+  232400-85544f1c|mobile-visualizations-and-filters'}`.
+- "apartment-3d camera changes in the past 7 days / this week":
+  window 2026-10-10..17 resp. 2026-10-12..17, project auto-derived;
+  46 matches incl. `third-person-camera-stability`,
+  `first-person-heading`, `mobile-play-and-cameras`,
+  `baseline-and-reference-audit` (record+summary hits); agent fetch =
+  full record + task text + scrubbed log tail (2935B).
+- "apartment-3d ... last month": interpreted 2026-09-01..09-30, 16
+  runs + 16 requests scanned, 7 archived excluded, 0 matched - honest
+  empty, window shown. No fabricated hits anywhere.
+
 
 ## Where it stopped
 
-`persistent-chat-core` is implemented and green: `assistant/` package +
-host adapter + 37 focused tests in `tests/test_assistant.py` (migrations,
-reopen persistence, conv+message pagination, origin/ctx freeze, settings
-snapshots, client_msg_id/provider-request/usage dedupe, readonly-at-
-execute, attachment confinement, http dispatch). NOT yet wired into
-`serve` - `make_dashboard_handler` does not register the routes yet and
-no dispatcher/provider exists, so exchanges stay `queued` (honest state;
-assistant-runtime step owns dispatch). Next session =
-`view-context-and-retrieval` per the manifest: implement the
-RetrievalAdapter + ctx enrichment + static preamble, or reorder per
-QUEUE. If picking up runtime instead: `providers/devin_print.py` +
-dispatcher seam in open_core.
+`view-context-and-retrieval` is implemented and green: generic seams
+(set_enriched, schema v2 exchanges.sources, enricher/retrieval ctor args,
+exchanges route) + host adapters (ConductorContext 8 view providers +
+register hook, ConductorRetrieval search/fetch/fetch_many with
+interpreted windows + coverage meta, host_conductor_static.md wired
+through open_core). 37+25 focused tests, full suite 595 green (8
+shards), `conductor.py demo` green, both required real-record checks
+passed (verification-section fetch + apartment-3d camera windows;
+honest zero-match for September). Still NOT wired into `serve` -
+make_dashboard_handler doesn't register the assistant routes, no
+dispatcher/provider exists, exchanges stay `queued`. Next session =
+`assistant-runtime` per the manifest: `providers/devin_print.py` +
+dispatcher seam into open_core (retrieval/enricher already default
+there; static_preamble() is the system-prompt input).
 
 ## Deferred or blocked
 
