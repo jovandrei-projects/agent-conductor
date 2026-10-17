@@ -35,7 +35,7 @@ sys.path.insert(0, str(HERE))   # sibling helper module test_conductor
 
 import conductor  # noqa: E402
 from test_conductor import MOCK, git, make_project, write_manifest, \
-    run_manifest  # noqa: E402
+    run_manifest, slow  # noqa: E402
 
 
 def state_of(runs_dir: Path) -> dict:
@@ -756,7 +756,72 @@ prompt = "first"
             self.assertEqual(out["conflicted"], [])
             self.assertEqual(out["skipped"], [])
 
+    def test_merge_run_start_detaches_a_real_merge(self):
+        """The dashboard endpoint spawns `conductor.py merge` detached: the
+        request returns a pid at once, a second click 409s while the child
+        runs, the child's claim names a live pid, and the merge lands even
+        if this (the 'server') process did nothing but wait."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "stuck"
+project = "{proj.as_posix()}"
+prompt = "sleep_after=30 write A.txt"
+worktree = true
+timeout_min = 0.02
+''')
+            self.assertEqual(run_manifest(m, runs), 1)
+            st, rd = state_of(runs)
+            self.assertEqual(st["steps"]["stuck"]["status"], "timed_out")
+            out = conductor.merge_run_start(rd.name, runs,
+                                            shlex.split(MOCK))
+            self.assertEqual(out["merging"], rd.name)
+            pid = out["pid"]
+            self.assertTrue(conductor.pid_alive(pid))
+            self.assertEqual(conductor._MERGE_PIDS.get(rd.name), pid)
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.merge_run_start(rd.name, runs,
+                                          shlex.split(MOCK))
+            self.assertEqual(e.exception.status, 409)
+            try:
+                deadline = time.time() + 120
+                while conductor.pid_alive(pid) and time.time() < deadline:
+                    time.sleep(0.2)
+                self.assertFalse(conductor.pid_alive(pid),
+                                 "detached merge never finished")
+            finally:
+                conductor._MERGE_PIDS.pop(rd.name, None)
+            st, _ = state_of(runs)
+            self.assertTrue(st["steps"]["stuck"]["merged"])
+            self.assertTrue((proj / "A.txt").is_file())
+            self.assertFalse(
+                (rd / "merge.launch.log").read_text().strip() == "")
 
+    def test_merge_run_start_refuses_when_nothing_pending(self):
+        """A run with nothing to merge answers the empty result in-line -
+        no child is spawned."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            _, rd = state_of(runs)
+            out = conductor.merge_run_start(rd.name, runs, ["devin"])
+            self.assertEqual(out["merged"], [])
+            self.assertNotIn("merging", out)
+            self.assertIsNone(conductor._MERGE_PIDS.get(rd.name))
+
+
+@slow
 class ManualMergeGuardTests(unittest.TestCase):
     """'Merge pending branches' must stay out of a run that is still
     executing: the pending branches ARE the run's live work surface, so a
@@ -1080,6 +1145,7 @@ timeout_min = 0.02
                 drv.wait()
 
 
+@slow
 class StopControlTests(unittest.TestCase):
     """Dashboard stop controls: tempdir sentinels (never inside run_dir -
     trap 5) polled by wait_worker + the wave loop. Per-step stop, run stop,
@@ -1491,6 +1557,7 @@ class TimeoutOverrideTests(unittest.TestCase):
                     missing_ok=True)
 
 
+@slow
 class DeferredMergeTests(unittest.TestCase):
     """merge="deferred": worktree isolation WITHOUT the automatic merge-back.
 
@@ -2103,6 +2170,7 @@ def add_branch(proj: Path, name: str, commits: dict[str, str] | None = None):
     return main
 
 
+@slow
 class MergeTargetTests(unittest.TestCase):
     """merge_target: a worktree step's branch is created from and merged
     back into an explicitly chosen local branch, not blindly into whatever

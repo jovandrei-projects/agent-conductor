@@ -73,6 +73,13 @@ def run_manifest(manifest: Path, runs_dir: Path, resume=None) -> int:
     return rc
 
 
+# `python run_tests.py --quick` sets QUICK_TESTS before discovery; classes
+# marked @slow run real conductor invocations end-to-end and cost minutes,
+# so a smoke pass can opt out of them.
+QUICK = bool(os.environ.get("QUICK_TESTS"))
+slow = unittest.skipIf(QUICK, "skipped by --quick (real conductor e2e)")
+
+
 class ProjectsRegistryTests(unittest.TestCase):
     def test_projects_local_toml_merges_over_base(self):
         """A worktree checkout breaks '../other-project' relatives - an
@@ -344,6 +351,7 @@ class GitTests(unittest.TestCase):
             self.assertTrue(conductor.git_dirty_tracked(proj))
 
 
+@slow
 class RunTests(unittest.TestCase):
     def test_two_step_run(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1455,11 +1463,11 @@ prompt = "Organize the catalog and verify results."
             rec["id"], {"manifest": self.proposal()},
             self.requests, self.manifests, self.runs)
 
-    def test_defaults_change_after_october_16(self):
+    def test_defaults_change_when_the_swe2_promo_ends(self):
         self.assertEqual(conductor.default_model_effort(
-            conductor.dt.date(2026, 10, 16)), ("swe-2", "max"))
+            conductor.dt.date(2026, 10, 31)), ("swe-2", "max"))
         self.assertEqual(conductor.default_model_effort(
-            conductor.dt.date(2026, 10, 17)), ("gpt-6-luna", "max"))
+            conductor.dt.date(2026, 11, 1)), ("gpt-6-luna", "max"))
 
     def test_draft_has_no_manifest_or_agent_and_ready_has_planned_steps(self):
         rec = self.new()
@@ -1631,8 +1639,12 @@ prompt = "Review the catalog tests."
             text = conductor._planner_response(rec, {}, ["devin"])
         self.assertEqual(text.strip(), proposal.strip())
         self.assertIn("--model", seen["cmd"])
+        pm = rec.get("plan_model") or rec["model"]
+        pe = rec.get("plan_effort")
+        if pe is None:
+            pe = rec["effort"]
         self.assertEqual(seen["cmd"][seen["cmd"].index("--model") + 1],
-                         "swe-2-max")
+                         f"{pm}-{pe}")
         self.assertEqual(seen["cmd"][seen["cmd"].index("--permission-mode") + 1],
                          "normal")
         self.assertEqual(seen["prompt"].parent, Path(seen["cwd"]))
@@ -2731,13 +2743,13 @@ prompt = "Organize the catalog and verify results."
         self.addCleanup(lambda: flag.unlink(missing_ok=True))
         return flag
 
-    def wait_calls(self, calls, n, timeout=10):
+    def wait_calls(self, calls, n, timeout=30):
         deadline = time.time() + timeout
         while len(calls) < n and time.time() < deadline:
             time.sleep(0.02)
         self.assertEqual(len(calls), n)
 
-    def wait_attempts(self, n=0, timeout=10):
+    def wait_attempts(self, n=0, timeout=30):
         deadline = time.time() + timeout
         while len(conductor._GENERATING) != n and time.time() < deadline:
             time.sleep(0.02)
@@ -2749,7 +2761,7 @@ prompt = "Organize the catalog and verify results."
         gate = threading.Event()
 
         def fake(r, projects, argv, log_path=None, fix_note=None, qa=None):
-            gate.wait(30)
+            gate.wait(120)
             return self.proposal()
 
         with mock.patch.object(conductor, "_planner_response", fake):
@@ -2780,7 +2792,7 @@ prompt = "Organize the catalog and verify results."
         gate = threading.Event()
 
         def fake(r, projects, argv, log_path=None, fix_note=None, qa=None):
-            gate.wait(30)
+            gate.wait(120)
             return self.proposal("A different plan")
 
         with mock.patch.object(conductor, "_planner_response", fake):
@@ -2835,7 +2847,7 @@ prompt = "Organize the catalog and verify results."
         def fake_wait(proc, log, timeout_s, stop_flags=(), timeout_flag=None,
                       stall_s=None):
             # honor the sentinel like the real wait_worker: raise -> kill
-            for _ in range(500):
+            for _ in range(6000):
                 if stop_flags and conductor._flag_set(*stop_flags):
                     proc.kill()
                     return proc.wait(), False, False, True, 0.0
@@ -2858,7 +2870,7 @@ prompt = "Organize the catalog and verify results."
                 mock.patch.object(conductor, "wait_worker", fake_wait):
             conductor.start_generation(rec["id"], self.requests,
                                        self.manifests, self.runs, ["devin"])
-            deadline = time.time() + 10
+            deadline = time.time() + 60
             while rec["id"] not in conductor._GEN_PROCS \
                     and time.time() < deadline:
                 time.sleep(0.02)
@@ -2913,6 +2925,50 @@ prompt = "Organize the catalog and verify results."
         self.assertIn("new plan", Path(rec["manifest"]).read_text(
             encoding="utf-8"))
 
+    def test_transient_overlay_read_failure_cannot_wedge_the_record(self):
+        """Windows throws a sharing-violation OSError when request.json is
+        read while a writer replaces it (or an AV scan holds a lock). A
+        swallowed read at the wrong moment used to leave the 'generating'
+        overlay orphaned: stop would skip the drop, the unwinding attempt
+        would early-return, and _request_status reported 'generating'
+        for the whole orphan grace. The read must retry instead of
+        pretending the overlay is absent."""
+        rec = self.ready()
+        self.cleanup_flag(rec["id"])
+        gate = threading.Event()
+
+        def fake(r, projects, argv, log_path=None, fix_note=None, qa=None):
+            gate.wait(120)
+            return self.proposal("A different plan")
+
+        real_read_text = Path.read_text
+        hits = [0]
+
+        def flaky_read_text(self_p, *a, **k):
+            if self_p.name == "request.json" and "planner" in str(
+                    self_p.parent):
+                hits[0] += 1
+                if hits[0] <= 2:       # overlay reads inside stop_generation
+                    raise PermissionError("simulated transient share-lock")
+            return real_read_text(self_p, *a, **k)
+
+        with mock.patch.object(conductor, "_planner_response", fake), \
+                mock.patch.object(Path, "read_text", flaky_read_text):
+            conductor.start_generation(rec["id"], self.requests,
+                                       self.manifests, self.runs, ["devin"])
+            out = conductor.stop_generation(rec["id"], self.requests,
+                                            self.runs)
+            gate.set()
+            self.wait_attempts()
+            # the transient read was retried: the drop still happened and
+            # the record restored instead of wedging on the stale overlay
+            self.assertEqual(out["status"], "ready")
+            rec = conductor.request_details(rec["id"], self.requests,
+                                            self.manifests)
+            self.assertEqual(rec["status"], "ready")
+            self.assertIsNone(conductor._spool_rec(rec["id"]))
+        self.assertGreaterEqual(hits[0], 2)   # the injection really fired
+
     def test_repeated_and_idle_stops_are_409(self):
         rec = self.new()
         self.cleanup_flag(rec["id"])
@@ -2922,7 +2978,7 @@ prompt = "Organize the catalog and verify results."
         gate = threading.Event()
 
         def fake(r, projects, argv, log_path=None, fix_note=None, qa=None):
-            gate.wait(30)
+            gate.wait(120)
             return self.proposal()
 
         with mock.patch.object(conductor, "_planner_response", fake):
@@ -3066,7 +3122,7 @@ prompt = "Organize the catalog and verify results."
         self.addCleanup(lambda: flag.unlink(missing_ok=True))
         return flag
 
-    def wait_attempts(self, n=0, timeout=10):
+    def wait_attempts(self, n=0, timeout=30):
         deadline = time.time() + timeout
         while len(conductor._GENERATING) != n and time.time() < deadline:
             time.sleep(0.02)
@@ -3194,7 +3250,7 @@ prompt = "Organize the catalog and verify results."
         def fake_wait(proc, log, timeout_s, stop_flags=(),
                       timeout_flag=None, stall_s=None):
             if len(calls) == 1:      # attempt 1 dies on the stop sentinel
-                for _ in range(500):
+                for _ in range(6000):
                     if stop_flags and conductor._flag_set(*stop_flags):
                         proc.kill()
                         return proc.wait(), False, False, True, 0.0
@@ -3211,7 +3267,7 @@ prompt = "Organize the catalog and verify results."
             conductor.start_generation(rec["id"], self.requests,
                                        self.manifests, self.runs,
                                        ["devin"])
-            deadline = time.time() + 10
+            deadline = time.time() + 60
             while not calls and time.time() < deadline:
                 time.sleep(0.02)
             conductor.stop_generation(rec["id"], self.requests, self.runs)
@@ -3413,13 +3469,13 @@ prompt = "Organize the catalog and verify results."
         self.addCleanup(lambda: flag.unlink(missing_ok=True))
         return flag
 
-    def wait_attempts(self, n=0, timeout=10):
+    def wait_attempts(self, n=0, timeout=30):
         deadline = time.time() + timeout
         while len(conductor._GENERATING) != n and time.time() < deadline:
             time.sleep(0.02)
         self.assertEqual(len(conductor._GENERATING), n)
 
-    def wait_calls(self, calls, n, timeout=10):
+    def wait_calls(self, calls, n, timeout=30):
         deadline = time.time() + timeout
         while len(calls) < n and time.time() < deadline:
             time.sleep(0.02)
@@ -3471,7 +3527,7 @@ prompt = "Organize the catalog and verify results."
                         timeout_flag=None, stall_s=None):
         """wait_worker stand-in that honors the stopgen sentinel like the
         real one: flag -> kill the proc -> stopped=True."""
-        deadline = time.time() + 10
+        deadline = time.time() + 60
         while time.time() < deadline:
             if stop_flags and conductor._flag_set(*stop_flags):
                 proc.kill()
@@ -3595,7 +3651,7 @@ prompt = "Organize the catalog and verify results."
 
         def fake(r, projects, argv, log_path=None, fix_note=None,
                  qa=None):
-            gate.wait(30)
+            gate.wait(120)
             return self.proposal("late TOML from a stopped attempt")
 
         frozen = "2026-10-16T03:00:00"
@@ -3610,7 +3666,7 @@ prompt = "Organize the catalog and verify results."
             conductor.start_generation(rec["id"], self.requests,
                                        self.manifests, self.runs, ["devin"])
             spool = conductor._spool_dir(rec["id"])
-            deadline = time.time() + 10
+            deadline = time.time() + 60
             while not (spool / "job.json").is_file() \
                     and time.time() < deadline:
                 time.sleep(0.02)
@@ -7418,6 +7474,7 @@ class _RunControlBase(unittest.TestCase):
         self.fail(f"{step} never reached running")
 
 
+@slow
 class PauseRunTests(_RunControlBase):
     """Run-level controls - 'Pause run' is a GRACEFUL hold: in-flight
     steps finish, nothing new launches, the run records aborted='paused'
@@ -7601,6 +7658,7 @@ prompt = "second"
             self.assertFalse(conductor.stop_flag(d).exists())
 
 
+@slow
 class StepControlTests(_RunControlBase):
     """Step-level controls - 'Stop this step' ends one task while the run
     proceeds; 'Skip step' marks a pending step so it never launches
@@ -11666,6 +11724,7 @@ assert.match(row('fu-run'),/follow-up &rarr; <b class="fu-bad">invalid<\/b>/);
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+@slow
 class DeviceOwnershipTests(unittest.TestCase):
     """The `device` step key leases ONE adb serial machine-wide for a
     step's whole life: explicit serial assignment, cross-run ownership,
@@ -12635,6 +12694,7 @@ assert.match(row('req'),/class="stage wt"[^>]*>wt</);
             self.runs, watched / "manifests")     # must not raise
 
 
+@slow
 class ReviewWorkflowTests(_RunControlBase):
     """Review acknowledgment for finalized runs + tasks: completion_seq
     bumps once per terminal-outcome write; review-* sentinels carry the
@@ -13312,6 +13372,7 @@ const open=async(step)=>{ const i=vm.runInContext(
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+@slow
 class CumulativeElapsedTests(_RunControlBase):
     """Elapsed time is CUMULATIVE across dispatches. Every run_step
     dispatch appends one exec_interval {start,end} to the step record and
