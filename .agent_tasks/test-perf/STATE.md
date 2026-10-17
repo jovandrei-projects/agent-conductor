@@ -44,11 +44,18 @@ mid-merge resolver (the original MERGE_HEAD wedge incident).
         the test could raise the stop flag -> the real 409 flake
         signature. Deadlines raised (poll 5s->60s, stop_aware_wait
         10s->60s, gates 30s->120s, wait_* 10s->30s).
-- [ ] Full `--jobs 8` gate + merge back to main.
+- [x] Full `--jobs 8` gate + merge back to main.
 
 ## Where it stopped
 
-Fixes verified: StopProposal+ProposalFlow 11/11; MergeRunTests+
-FollowupDiscovery 22/22; transient-read regression test added.
-Parallel quick run: 6 shards ~2.5min, only failure was the fake-Popen
-prune bug (fixed). Full `--jobs 8` run in flight.
+DONE + merged to master (merge 3c07546, fixups 7efe369). Final gate:
+full `--jobs 8` in the worktree = 511/511, slowest shard 463s (~7.7min
+wall vs ~15min serial; `--quick --jobs 6` ~= 2min). Post-merge quick
+shard found two issues, both fixed in 7efe369: a native `alert()` in the
+new merge note (main's power-menu commit requires themed `showAlert`,
+test asserts none), and the pricing-fetch daemon writing pricing.json
+into a tempdir mid-cleanup - now suppressed by seeding `_PRICE_TRIED` at
+test-module import (pricing tests re-arm it explicitly). Merged classes
+re-verified green: PowerDialogTests + FollowupDiscoveryTests +
+PricingTests; RequestWorkflowTests + StopProposalTests +
+ProposalFlowIntegrationTests 48/48.

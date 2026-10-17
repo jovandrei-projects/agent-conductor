@@ -1131,3 +1131,15 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   run wt 4/5 follow-up', worktrees framed with the mixed tooltip, note
   says 'mixed' not 'changed', Apply+Start both enabled, merge_target
   empty with 'master' implied (no phantom 'main').
+- DONE 2026-10-17 (test-perf, merge 3c07546 + fixups 7efe369): suite
+  profiled - 15min serial is real e2e work, not a stalled process.
+  `--quick` now honors @slow (~6min) and `run_tests.py --jobs N` shards
+  by class (~7.7min full, ~2min quick at -j8/-j6; per-shard planner
+  spools via new CONDUCTOR_PLANNER_SPOOL). swe-2 default extended to the
+  11/01 promo end. Dashboard merge detached (`merge_run_start` +
+  `_MERGE_PIDS`) so a hub taskkill /T can no longer orphan a resolver -
+  the original MERGE_HEAD wedge vector. Dropped-Popen ResourceWarning
+  fixed via _DETACHED_PROCS. StopProposal flake family closed:
+  transient overlay reads retry, dead attempts can't leave a
+  'generating' overlay, test-fake deadlines no longer self-fire under
+  CPU starvation. Full --jobs 8 = 511/511 in the worktree.
