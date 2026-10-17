@@ -6363,7 +6363,7 @@ def save_attachment(data: bytes,
             f"{sig[0]}")
     p = attachments_dir / name
     p.write_bytes(bytes(data))
-    return {"name": name, "path": str(p.resolve())}
+    return {"name": name, "path": str(p.resolve()), "ctype": sig[1]}
 
 
 def read_attachment(name: str,
@@ -6398,7 +6398,16 @@ def _attachment_fields(value) -> list[dict]:
         name, path = str(a.get("name") or ""), str(a.get("path") or "")
         if not ATTACH_NAME_RE.fullmatch(name) or not 1 <= len(path) <= 600:
             raise RequestError("Invalid attachment")
-        out.append({"name": name, "path": path})
+        ent = {"name": name, "path": path}
+        # save_attachment's POST row carries the magic-sniffed type -
+        # keep it when the client echoes the row back; the record then
+        # round-trips byte-for-byte and the assistant's stored
+        # attachment refs agree (it never becomes a served header -
+        # GET /api/attachments re-sniffs)
+        ctype = str(a.get("ctype") or "")
+        if ctype.startswith("image/") and len(ctype) <= 64:
+            ent["ctype"] = ctype
+        out.append(ent)
     return out
 
 
@@ -12405,6 +12414,9 @@ _DASH_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>agent-conductor</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2313161f'/%3E%3Cline x1='13' y1='19' x2='49' y2='7' stroke='%23e6edf3' stroke-width='2.6' stroke-linecap='round'/%3E%3Ccircle cx='13' cy='19' r='3' fill='%23e6edf3'/%3E%3Ccircle cx='12' cy='37' r='3' fill='%2358a6ff'/%3E%3Crect x='8.5' y='41' width='7' height='11' rx='2' fill='%2358a6ff'/%3E%3Ccircle cx='23.5' cy='31' r='3' fill='%23bc8cff'/%3E%3Crect x='20' y='35' width='7' height='17' rx='2' fill='%23bc8cff'/%3E%3Ccircle cx='35' cy='26' r='3' fill='%23d29922'/%3E%3Crect x='31.5' y='30' width='7' height='22' rx='2' fill='%23d29922'/%3E%3Ccircle cx='46.5' cy='34' r='3' fill='%233fb950'/%3E%3Crect x='43' y='38' width='7' height='14' rx='2' fill='%233fb950'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/api/assistant/static/chat.css">
+<script src="/api/assistant/static/md.js"></script>
+<script src="/api/assistant/static/chat.js" defer></script>
 <style>
 :root { color-scheme: dark; }
 body { background:#0d1117; color:#e6edf3; font:14px/1.45 ui-monospace,Consolas,monospace; margin:0; padding:16px; }
@@ -12545,7 +12557,7 @@ a { color:#58a6ff; text-decoration:none; }
 /* margin-bottom buys real clearance: a sticky first-child with the
    -18px top pull leaves the next line tucked ~6px under the bar's
    bottom edge in Chrome, so the nominal gap must exceed that drift */
-#detail .dnav { position:sticky; top:0; z-index:6; display:flex; align-items:center; gap:10px; margin:-18px -22px 26px; padding:7px 56px 7px 22px; background:#161b22; border-bottom:1px solid #30363d; border-radius:9px 9px 0 0; }
+#detail .dnav { position:sticky; top:0; z-index:6; display:flex; align-items:center; gap:10px; margin:-18px -22px 26px; padding:7px 140px 7px 22px; background:#161b22; border-bottom:1px solid #30363d; border-radius:9px 9px 0 0; }
 #detail .dnav-btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; min-width:38px; max-width:40%; background:#21262d; border:1px solid #30363d; color:#e6edf3; border-radius:6px; padding:4px 10px; font:inherit; font-size:12px; cursor:pointer; }
 #detail .dnav-btn.nav { min-width:130px; }
 #detail .dnav-btn span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -12851,7 +12863,7 @@ tr.ctxanchor td { background:#1c3041; }
 <div id="trashwrap" hidden></div>
 <h2>agents by project</h2><div id="agents"></div>
 <div id="ctxmenu" role="menu" aria-label="row actions" hidden></div>
-<div id="backdrop" hidden><div id="detail" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button type="button" class="x" id="dx">Close ×</button><div id="dbody"></div></div></div>
+<div id="backdrop" hidden><div id="detail" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button type="button" class="x" id="dx">Close ×</button><button type="button" id="dask" data-ask-ai hidden aria-label="Ask AI about this view" title="Ask AI about this view"><span class="ai-spark" aria-hidden="true">&#x2726;</span>Ask AI</button><div id="dbody"></div></div></div>
 <div id="askwrap" hidden><div id="askbox" role="alertdialog" aria-modal="true"><div id="asktitle"></div><div id="askmsg"></div><div id="askbtns" class="actions"></div></div></div>
 <div id="powerwrap" hidden><div id="powerbox" role="dialog" aria-modal="true"><h3>Dashboard power</h3><div id="pwbody"></div><div class="actions"><button type="button" class="btn secondary" id="pw-cancel">Cancel</button><button type="button" class="btn danger" id="pw-stop">Stop</button><button type="button" class="btn" id="pw-restart">Restart</button></div><div class="sub" id="pwstat"></div></div></div>
 <script>
@@ -17633,7 +17645,37 @@ function applySel(){
         want.has((agen?'a:':'r:') + k));
       x.classList.toggle('dlinked', !agen && link.has('r:'+k));
     });
+  // the assistant's "next question" view chip follows modal navigation;
+  // applySel fires on every open/close/re-render so the chip never polls
+  if (globalThis.aiSync){ try{ globalThis.aiSync(); }catch(e){} }
 }
+// --- assistant surface bridge ----------------------------------------
+// The chat client (assistant/static/chat.js) reads which view is on
+// screen through aiView() - the let-globals above are not reachable from
+// outside this script, so this is the one sanctioned channel (globalThis
+// instead of window keeps the vm test contexts working too). A citation
+// click calls back through aiNav, which reuses the same openers the
+// dashboard's own buttons use; the chat itself lives outside #detail.
+globalThis.aiView = () => ({
+  detailKey,
+  summaryView: summaryView && {key: summaryView.key},
+  runModalKey,
+  modalRequest: modalRequest && {id: modalRequest.id,
+    status: modalRequest.status},
+  modalQA: modalQA && {id: modalQA.id},
+  power: !document.getElementById('powerwrap').hidden,
+  only: [...only], facets: [...facets], projs: [...projs],
+  selectedRun,
+  agents: AGENTS
+});
+globalThis.aiNav = {
+  agent(k){ const j = AGENTS.findIndex(x=>agentKey(x)===k);
+    if (j>=0){ showDetail(j); return true; } return false; },
+  summary(k){ openSummary(k); return true; },
+  runSummary(k){ openRunSummary(k); return true; },
+  run(k){ showRunDetails(k); return true; },
+  request(id){ openRequest(id); return true; }
+};
 document.addEventListener('mouseover', e=>{
   // hovering a model option tracks it as the active descendant - the
   // mouse and Arrow keys then agree on what Enter would pick
@@ -17665,6 +17707,27 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
     requests_dir = requests_dir or runs_dir.parent / "requests"
     attachments_dir = attachments_dir or runs_dir.parent / "attachments"
     trash_dir = trash_dir or runs_dir.parent / "trash"
+
+    # The assistant surface: one lazily-opened host runtime per serve
+    # process. Errors are cached - a broken provider init degrades to a
+    # 503 payload on /api/assistant/*, never a dead dashboard.
+    _assist = {"core": None, "runtime": None, "err": None}
+
+    def assistant_open():
+        with STATE_LOCK:
+            if _assist["core"] is None and _assist["err"] is None:
+                try:
+                    from assistant_host.conductor_adapters import (
+                        open_runtime)
+                    core, rt = open_runtime(
+                        data_dir=runs_dir.parent / "assistant",
+                        runs_dir=runs_dir, requests_dir=requests_dir,
+                        devin_argv=devin_argv)
+                    _assist.update(core=core, runtime=rt)
+                except Exception as exc:                # noqa: BLE001
+                    LOG.exception("assistant runtime init failed")
+                    _assist["err"] = f"{type(exc).__name__}: {exc}"
+        return _assist["core"], _assist["err"]
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def _send(self, body: bytes, ctype: str, status: int = 200) -> None:
@@ -17708,6 +17771,87 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 if isinstance(exc, RequestError):
                     raise
                 raise RequestError("Invalid JSON request body") from exc
+
+        # The chat client's own assets ship with the assistant package
+        # and are served verbatim - whitelisted names only, and NO core
+        # dependency: a broken provider init must not take the UI shell
+        # down with it (the panel then renders 'assistant unavailable').
+        _AI_STATIC = {"chat.js": "text/javascript; charset=utf-8",
+                      "md.js": "text/javascript; charset=utf-8",
+                      "chat.css": "text/css; charset=utf-8"}
+        _AI_STATIC_DIR = Path(__file__).resolve().parent / \
+            "assistant" / "static"
+
+        def _assistant_static(self, path: str) -> None:
+            name = path.rsplit("/", 1)[-1]
+            ctype = self._AI_STATIC.get(name)
+            if ctype is None:
+                raise RequestError("Not found", 404)
+            try:
+                data = (self._AI_STATIC_DIR / name).read_bytes()
+            except OSError:
+                raise RequestError("Not found", 404)
+            self._send(data, ctype)
+
+        def _assistant(self, method: str, path: str) -> None:
+            """Route /api/assistant/* into the chat core's route table.
+            POSTs pass the RAW body through - the attachments route takes
+            an image body, everything else is JSON parsed by dispatch.
+            GET attachments/<id> is the ONE binary route: it mirrors
+            /api/attachments/<name> (bytes + sniffed ctype) but the
+            authorization boundary is the assistant's attachment row -
+            core.read_upload, never a client-supplied path."""
+            from assistant import http_api
+            from assistant.core import AssistantError
+            core, err = assistant_open()
+            if core is None:
+                self._json({"error": f"assistant unavailable: {err}"},
+                           503)
+                return
+            if method == "GET":
+                m = re.fullmatch(
+                    r"/api/assistant/attachments/([^/?]+)", path)
+                if m:
+                    try:
+                        data, ctype = core.read_upload(
+                            urllib.parse.unquote(m[1]))
+                    except AssistantError as exc:
+                        self._json({"error": str(exc)}, exc.status)
+                        return
+                    self._send(data, ctype)
+                    return
+            raw = b""
+            if method != "GET":
+                try:
+                    size = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    raise RequestError("Missing request body")
+                # the upload route alone gets the image-size allowance -
+                # JSON POSTs stay at the dashboard's usual cap
+                cap = (ATTACH_MAX_BYTES if path.endswith("/attachments")
+                       else 524288)
+                if not 0 <= size <= cap:
+                    raise RequestError("Request body is too large", 413)
+                raw = self.rfile.read(size)
+            status, body = http_api.dispatch(
+                core, method, path, body=raw,
+                query=urllib.parse.parse_qs(
+                    urllib.parse.urlsplit(self.path).query))
+            self._json(body, status)
+
+        def do_PUT(self) -> None:                    # noqa: N802 - stdlib name
+            path = urllib.parse.urlsplit(self.path).path
+            try:
+                self._check_origin()
+                if path.startswith("/api/assistant/"):
+                    self._assistant("PUT", path)
+                    return
+                self.send_error(404)
+            except RequestError as exc:
+                self._json({"error": str(exc)}, exc.status)
+            except Exception:
+                LOG.exception("dashboard PUT failed")
+                self._json({"error": "Dashboard request failed"}, 500)
 
         def do_GET(self) -> None:                    # noqa: N802 - stdlib name
             path = urllib.parse.urlsplit(self.path).path
@@ -17806,6 +17950,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 elif path in ("/", "/index.html"):
                     self._send(_DASH_HTML.encode("utf-8"),
                                "text/html; charset=utf-8")
+                elif path.startswith("/api/assistant/static/"):
+                    self._assistant_static(path)
+                elif path.startswith("/api/assistant/"):
+                    self._assistant("GET", path)
                 else:
                     self.send_error(404)
             except RequestError as exc:
@@ -17818,6 +17966,9 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
             path = urllib.parse.urlsplit(self.path).path
             try:
                 self._check_origin()
+                if path.startswith("/api/assistant/"):
+                    self._assistant("POST", path)
+                    return
                 if path == "/api/attachments":
                     # Raw image bytes (screenshot paste / file drop), NOT the
                     # JSON envelope _body() expects. data/attachments can sit
@@ -17983,6 +18134,18 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
         def log_message(self, fmt: str, *a) -> None:
             LOG.debug("http %s", fmt % a)
 
+    def assistant_close() -> None:
+        """Release the lazily-opened assistant runtime (sqlite handles
+        matter on Windows; also the seam serve shutdown/tests use)."""
+        core = _assist.get("core")
+        if core is not None:
+            try:
+                core.store.close()
+            except Exception:                  # noqa: BLE001
+                pass
+            _assist["core"] = _assist["runtime"] = None
+
+    Handler.assistant_close = staticmethod(assistant_close)
     return Handler
 
 
