@@ -3737,6 +3737,27 @@ class LivenessTests(unittest.TestCase):
         self.assertFalse(conductor.driver_alive(st))
         self.assertEqual(conductor.effective_statuses(st)["a"], "lost")
 
+    def test_superseded_resolver_when_parent_merged(self):
+        """A resolve-<step> record is moot once its parent's branch
+        landed: non-done resolver outcomes display 'superseded', a done
+        resolver keeps its status, an orphaned resolver keeps its own
+        status, and the overlay never mutates the stored record."""
+        st = self._state({
+            "one": {"status": "done", "merged": True},
+            "resolve-one": {"status": "failed"},
+            "two": {"status": "done", "merged": False},
+            "resolve-two": {"status": "failed"},
+            "three": {"status": "done", "merged": True},
+            "resolve-three": {"status": "done"},
+            "resolve-orphan": {"status": "lost"},
+        })
+        eff = conductor.effective_statuses(st)
+        self.assertEqual(eff["resolve-one"], "superseded")
+        self.assertEqual(eff["resolve-two"], "failed")
+        self.assertEqual(eff["resolve-three"], "done")
+        self.assertEqual(eff["resolve-orphan"], "lost")
+        self.assertEqual(st["steps"]["resolve-one"]["status"], "failed")
+
 
 class SweepTests(unittest.TestCase):
     def test_sweep_marks_stale_and_closes_run(self):

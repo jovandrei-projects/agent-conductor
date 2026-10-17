@@ -957,6 +957,16 @@ def effective_statuses(state: dict) -> dict[str, str]:
             out[n] = "lost"
         else:
             out[n] = st
+    # A resolve-<step> record exists only to finish its parent's merge -
+    # once that branch has landed (merged=True) a failed/lost resolver is
+    # bookkeeping, not work still owed: it displays 'superseded' instead
+    # of failing forever (and no longer keeps the Resume button alive).
+    for n in out:
+        if (out[n] not in ("done", "superseded") and
+                n.startswith("resolve-") and
+                (steps.get(n[len("resolve-"):]) or {}).get("merged")
+                is True):
+            out[n] = "superseded"
     return out
 
 
@@ -2825,7 +2835,7 @@ _ST_CLASS = {
     "failed": "st-bad", "timed_out": "st-bad", "lost": "st-bad",
     "blocked": "st-bad",
     "stopped": "st-warn", "partial": "st-warn", "queued": "st-warn",
-    "running": "st-run", "skipped": "st-other",
+    "running": "st-run", "skipped": "st-other", "superseded": "st-other",
 }
 
 
@@ -10877,7 +10887,7 @@ _STATUS_COLOR = {"done": "#3fb950", "partial": "#d29922", "blocked": "#d29922",
                  "planned": "#bc8cff", "ready": "#bc8cff",
                  "generating": "#bc8cff", "draft": "#d29922",
                  "launching": "#58a6ff", "launch_failed": "#f85149",
-                 "lost": "#6e7681"}
+                 "lost": "#6e7681", "superseded": "#8b949e"}
 
 _AUTH_CACHE = [0.0, "unknown"]        # [checked_at, label]
 _SESS_CACHE = [0.0, {}]               # [checked_at, {work_dir: set|None}]
@@ -12609,6 +12619,7 @@ failed:'#f85149',timed_out:'#f0883e',running:'#58a6ff',queued:'#8b949e',
 waiting:'#8b949e',skipped:'#6e7681',planned:'#bc8cff',ready:'#bc8cff',
 generating:'#bc8cff',draft:'#d29922',questions:'#ffa657',
 launching:'#58a6ff',launch_failed:'#f85149',lost:'#6e7681',
+superseded:'#8b949e',
 empty:'#8b949e',missing:'#f0883e'};
 const STAGES = {draft:'Draft · unsent',generating:'Preparing proposal',
   questions:'Needs your answers',
@@ -12755,7 +12766,8 @@ const prevTail = {};      // run|step -> last tail_last shown; a change
 const SHOW_N = 10;
 let runsShown = SHOW_N;   // visible run-table rows; active runs never hide
 const ORDER = ['running','queued','waiting','planned','done','partial',
-               'blocked','stopped','timed_out','failed','skipped','lost'];
+               'blocked','stopped','timed_out','failed','skipped','lost',
+               'superseded'];
 const FACETS = ['wt','merged','unmerged','deferred'];
 const matchesFacet = (a,f) => f==='wt' ? a.wt :
   f==='merged' ? a.merged===true :
@@ -13256,6 +13268,37 @@ function navStep(d){
       const d = document.getElementById('detail');
       if (d) d.scrollTop = 0;      // land on the task top, not mid-scroll
     }
+  }
+}
+// The run modal's prev/next walks exactly the visible RUNS table: same
+// run/status/facet filters, same active-then-finished ordering, same
+// runsShown cap - arrowing can never land on a row the table isn't
+// showing.
+const runSibs = () => {
+  const d = lastData;
+  if (!d) return [];
+  const matchAgent = a => (!only.size||only.has(a.status)) &&
+    [...facets].every(f=>matchesFacet(a,f));
+  const allRuns = d.runs
+    .filter(r=>!selectedRun||runKey(r)===selectedRun)
+    .filter(r=>{
+      if (!only.size && !facets.size) return true;
+      const kids = d.agents.filter(
+        a=>(a.run_key||a.run_dir)===runKey(r));
+      return kids.length ? kids.some(matchAgent) : false;
+    });
+  const act = allRuns.filter(r=>!r.ended_at);
+  return act.concat(allRuns.filter(r=>r.ended_at)
+    .slice(0, Math.max(runsShown - act.length, 0)));
+};
+function navRun(dir){
+  const sibs = runSibs();
+  const pos = sibs.findIndex(r=>runKey(r)===runModalKey);
+  const b = pos>=0 && sibs[pos+dir];
+  if (b){
+    showRunDetails(runKey(b), true);   // sibling nav keeps the Back stack
+    const d = document.getElementById('detail');
+    if (d) d.scrollTop = 0;            // land on the run top, not mid-scroll
   }
 }
 // --- modal history (Back) ----------------------------------------------
@@ -13956,10 +13999,14 @@ function runCtl(r){
   // actions that are unsafe mid-run (manual merge); the POST re-checks
   // server-side so a stale page cannot slip through.
   const executing = !!r.executing || !!liveSteps.length;
+  // 'superseded' counts as settled like 'done': it only ever labels an
+  // aux resolve-* record whose parent's merge already landed, so it must
+  // never keep Resume/interrupted offers alive on its own
+  const unfinished = cks.some(s=>s!=='done' && s!=='superseded');
   return {key, liveSteps, executing,
     canResume: !!(cks.length &&
       !cks.some(s=>['running','queued'].includes(s)) &&
-      cks.some(s=>s!=='done')),
+      unfinished),
     // worktree branches that never landed (conflict parked the worktree, or
     // the conductor died between the wave and the merge) - mergeable once
     // the run has actually stopped or finished
@@ -13969,7 +14016,7 @@ function runCtl(r){
     // 'paused' means someone clicked Pause run (a graceful hold); a run
     // with no ended_at and nothing live means the conductor itself died.
     interrupted: !r.ended_at && !r.aborted && !liveSteps.length &&
-      cks.some(s=>s!=='done')};
+      unfinished};
 }
 function showRunDetails(key, keepStack){
   const r = lastData?.runs.find(x=>runKey(x)===key);
@@ -14200,8 +14247,28 @@ function showRunDetails(key, keepStack){
     ? `<div class="notice warn">Interrupted - the conductor process is ` +
       `gone (crash or machine restart). Resume picks up unfinished ` +
       `steps from committed state.</div>` : '';
+  // prev/next walks the visible RUNS table (runSibs), sibling-style:
+  // buttons name their target run, the counter gives position, and the
+  // walk never stacks history entries (Back still works once)
+  const rsibs = runSibs();
+  const rpos = rsibs.findIndex(x=>runKey(x)===key);
+  const rnavBtn = (b,dir)=> b
+    ? `<button type="button" class="dnav-btn nav" ` +
+      `data-nav-run="${esc(runKey(b))}" title="${esc(b.run)}">` +
+      (dir<0 ? `&larr; <span>${esc(b.run)}</span>`
+             : `<span>${esc(b.run)}</span> &rarr;`) + `</button>`
+    : `<button type="button" class="dnav-btn nav" disabled>` +
+      (dir<0 ? '&larr;' : '&rarr;') + `</button>`;
+  const navBar = (rpos>=0 && rsibs.length>1)
+    ? `<div class="dnav"><span class="dnav-l">${backBtnHTML()}</span>` +
+      `<span class="dnav-pos">run ${rpos+1} of ${rsibs.length}</span>` +
+      `<span class="dnav-r">${rnavBtn(rsibs[rpos-1],-1)}` +
+      `${rnavBtn(rsibs[rpos+1],1)}</span></div>`
+    : (modalHist.length
+       ? `<div class="dnav"><span class="dnav-l">${backBtnHTML()}` +
+         `</span></div>` : '');
   document.getElementById('dbody').innerHTML =
-    (modalHist.length ? `<div class="dnav"><span class="dnav-l">${backBtnHTML()}</span></div>` : '') +
+    navBar +
     `<h3 id="modal-title">${esc(r.run)}</h3>` +
     (r.stage ? `<span class="stage ${esc(r.stage)}">${esc(STAGES[r.stage]||r.stage)}</span>` : '') +
     notice +
@@ -15605,7 +15672,7 @@ function render(d){
     if (live) return `<span class="stage live" ` +
       `title="a step in this run is live - click the name for controls">` +
       `running</span>`;
-    const left = Object.keys(c).some(s=>s!=='done');
+    const left = Object.keys(c).some(s=>s!=='done' && s!=='superseded');
     if (!left) return '';
     if (r.aborted==='paused')
       return `<span class="stage paused" title="deliberate hold after ` +
@@ -16187,6 +16254,14 @@ document.addEventListener('click', async e=>{
       const d = document.getElementById('detail');
       if (d) d.scrollTop = 0;
     }
+    return; }
+  // run modal's own prev/next - sibling semantics: the Back stack is
+  // kept, not grown
+  const nrunEl = t.closest && t.closest('[data-nav-run]');
+  if (nrunEl){
+    showRunDetails(nrunEl.dataset.navRun, true);
+    const d = document.getElementById('detail');
+    if (d) d.scrollTop = 0;
     return; }
   // context-menu task entries - keyed by agentKey so a re-sorted table
   // can't open the wrong row (same keying the modal refresh uses)
@@ -16920,16 +16995,19 @@ document.addEventListener('keydown', e=>{
     e.preventDefault();
     showDetail(+e.target.dataset.i);
   }
-  // Left/Right walks the open task's (or open summary's) pipeline - same
-  // chain as the .dnav arrows - but never while typing in a form field.
+  // Left/Right walks the open task's (or open summary's, or open run's)
+  // chain - same links as the .dnav arrows - but never while typing in
+  // a form field.
   if ((e.key==='ArrowLeft'||e.key==='ArrowRight') &&
-      (detailKey!=null || summaryView) &&
+      (detailKey!=null || summaryView || runModalKey!=null) &&
       !document.getElementById('backdrop').hidden){
     const ae = document.activeElement;
     if (!(ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName||''))){
       e.preventDefault();
       const dir = e.key==='ArrowLeft'?-1:1;
-      if (summaryView) summaryNav(dir); else navStep(dir);
+      if (summaryView) summaryNav(dir);
+      else if (detailKey!=null) navStep(dir);
+      else navRun(dir);
       return;
     }
   }
