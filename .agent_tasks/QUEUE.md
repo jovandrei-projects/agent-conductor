@@ -27,6 +27,31 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-17 (parallel-run-slot-pool + request-form defaults,
+  user-requested batch): `[run] parallel = true` schedules all ordinary
+  steps into one shared pool (follow-up-plan stays last; `wave=` rejected
+  as redundant; same-project members must be worktree'd - enforced at
+  apply by turning worktree on, at load by a manifest error). A
+  machine-global AGENT SLOT POOL (O_EXCL leases in
+  `%TEMP%/agent-conductor-slots`, `CONDUCTOR_MAX_AGENTS` default 4..8 by
+  cpu_count) sits under `run.max_parallel`: the first N steps on the
+  machine win slots, everyone else waits `queued` with `slot_wait` +
+  wait-time + holder names, holding no device/port until they win.
+  Workers get a PARALLEL_NOTE block (share the box, own your leases,
+  blocked > racing for an exclusive resource). Run-path merges now QUEUE
+  on the repo lock instead of failing (`merge_queue` pid + wait secs +
+  note, halt sentinels bail it out; dashboard/deferred entries stay
+  fail-fast 409). Dashboard: meta line shows `slots N/M` + queued count,
+  agent rows carry slot_wait/merge_queue, request form gained a
+  'Run all steps in parallel' checkbox (selecting it force-selects
+  worktrees), and the merge-resolver checkbox is disabled unless
+  worktrees is on (its state is remembered under the grey-out).
+  Follow-up pairs now cross-highlight on hover both ways. New-request
+  defaults are worktrees+resolver ON, parallel OFF. Trials: 4-step
+  sequential run 29s vs parallel run 12.7s on the same mock projects;
+  cross-run contention verified with CONDUCTOR_MAX_AGENTS=3 (second
+  manifest queued ~5s on a busy box, then completed). ~10 new
+  ParallelPoolTests/AgentSlotPoolTests/apply+harness tests.
 - DONE 2026-10-17 (resolve-obs-merge-telemetry, merge resolution): unioned
   `obs-merge-telemetry` onto master (merge 89c7b3a) - the dashboard
   power/themed-dialogs batch meets deferred-merge-controls. conductor.py

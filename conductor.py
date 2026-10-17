@@ -239,6 +239,26 @@ call is scoped to `{serial}` and bounded; a bare `location.reload()` on \
 a possibly-dirty page without this helper is the trap.
 """
 
+# Rendered into the prompt's service-note slot when this step runs
+# alongside other agents - sibling pool members of a parallel run or wave,
+# a merge resolver working next to live steps, or just other runs holding
+# machine slots. The rules are the same either way: own your checkout,
+# own your leases, never fight a peer over a shared resource.
+PARALLEL_NOTE = """\
+NOTE FROM THE CONDUCTOR: other agent sessions are running in parallel on \
+this machine right now - sibling steps of this run in their own \
+worktrees, merge resolvers, or entirely separate runs. Share the box: \
+work only inside your own checkout, bind listeners only to your leased \
+port, and use only your leased Android device. For any other shared \
+resource - fixed ports (adb forward, CDP), temp files, container or \
+service names, external accounts - pick unique names or ephemeral free \
+ports instead of assuming ownership, and never kill, stop or reconfigure \
+a process, server, emulator or session you did not spawn: it belongs to \
+a peer or to the user. If the work genuinely cannot proceed without an \
+exclusive resource that is held, end with STATUS: blocked saying which \
+one - a later resume retries when the pool frees up.
+"""
+
 # Closing review step appended when a request's follow-up checkbox is set -
 # the planner is told to write it, and _publish_proposal appends this block
 # itself when the planner forgot, so the checkbox is a guarantee.
@@ -398,6 +418,9 @@ class Manifest:
     preamble: str | None
     max_hours: float | None            # wall-clock cap for the whole run
     max_parallel: int | None           # cap on concurrent agents; None = auto
+    parallel: bool                     # every step is pool-scheduled at once
+                                       # (one shared wave); a trailing
+                                       # follow-up-plan step still runs last
     merge_resolver: bool               # run-wide default for step.merge_resolver
     merge_policy: str                  # run-wide default for step.merge
     merge_target: str | None           # run-wide default for step.merge_target
@@ -597,6 +620,12 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
         max_parallel = int(max_parallel)
         if max_parallel < 1:
             raise ManifestError("run.max_parallel must be >= 1")
+    parallel = bool(run.get("parallel", False))
+    if parallel and any(s.wave is not None for s in steps):
+        raise ManifestError(
+            "run.parallel already makes every step concurrent - the "
+            "wave= grouping keys are redundant (drop them or drop "
+            "parallel)")
     sz = run.get("summarize")
     if sz is True:
         summarize = ""                  # on, CLI default model
@@ -615,7 +644,7 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
     return Manifest(path=path, name=name, on_failure=on_failure,
                     checkpoint=bool(run.get("checkpoint", True)),
                     preamble=preamble, max_hours=run.get("max_hours"),
-                    max_parallel=max_parallel,
+                    max_parallel=max_parallel, parallel=parallel,
                     merge_resolver=bool(run.get("merge_resolver", False)),
                     merge_policy=run_merge, merge_target=run_mt,
                     steps=steps, description=description,
@@ -691,6 +720,21 @@ def group_waves(resolved: list[tuple[Path, str, Step]]) -> list[list]:
     if cur:
         groups.append(cur)
     return groups
+
+
+def plan_groups(resolved: list[tuple[Path, str, Step]],
+                cfg: "Manifest") -> list[list]:
+    """Execution groups, in order. Under `[run] parallel = true` every
+    step joins one shared pool scheduled as slots free (explicit wave=
+    keys are rejected at manifest load - they would be redundant), except
+    a 'follow-up-plan' step: it reviews what the run produced, so it
+    always waits in its own last group for the pool to drain. Otherwise
+    adjacent same-wave steps group and everything else is sequential."""
+    if not cfg.parallel:
+        return group_waves(resolved)
+    tail = [it for it in resolved if it[2].name == "follow-up-plan"]
+    pool = [it for it in resolved if it[2].name != "follow-up-plan"]
+    return [g for g in (pool, tail) if g]
 
 
 def validate_groups(groups: list[list]) -> None:
@@ -4345,6 +4389,280 @@ def _service_note(work_dir: Path, repo_dir: Path,
     return ("\n" + "\n\n".join(parts) + "\n") if parts else ""
 
 
+# --------------------------------------------------------- agent slot pool
+# run.max_parallel bounds ONE manifest; the slot pool bounds the MACHINE -
+# the same O_EXCL lease pattern as devices/ports, machine-global so N
+# concurrent runs (dashboard launches, CLI runs, worktree drivers) share
+# one ceiling instead of multiplying load. Every dispatched step holds one
+# slot for its whole run_step() life - attempts and interrupt respawns
+# included - and a merge-resolver session (spawned via run_step) counts
+# too. A step that finds no free slot waits as 'queued' holding NOTHING -
+# queued workers never block a running one, so the pool always drains.
+
+DEFAULT_AGENT_CAP = 8     # this box already runs 4 sessions comfortably;
+                          # 8 is the accepted default ceiling
+SLOT_POLL_S = 5.0         # cadence of the slot-wait loop
+SLOT_WAIT_SAVE_S = 30.0   # state.json heartbeat cadence while queued
+
+
+def _slot_dir() -> Path:
+    """Machine-global agent-slot registry - %TEMP% like the other leases
+    (trap-5 safe, shared across checkouts and runs)."""
+    return Path(os.environ.get("CONDUCTOR_SLOT_DIR")
+                or Path(tempfile.gettempdir()) / "agent-conductor-slots")
+
+
+def agent_slot_cap() -> int:
+    """Machine-wide concurrent-agent ceiling. CONDUCTOR_MAX_AGENTS wins;
+    otherwise 4..8 scaled to the box (never below 4 - four parallel
+    sessions are proven fine on this machine)."""
+    raw = os.environ.get("CONDUCTOR_MAX_AGENTS")
+    if raw:
+        try:
+            n = int(raw)
+            if n >= 1:
+                return n
+        except ValueError:
+            pass
+    return max(4, min(DEFAULT_AGENT_CAP, os.cpu_count() or 8))
+
+
+def _slot_info(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8",
+                                         errors="replace"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _slot_live(info: dict) -> bool:
+    """Same trust model as device leases: a slot is held while its driver
+    OR its recorded worker is alive - a dead driver's orphaned worker is
+    still a running agent and keeps the slot until it exits."""
+    if not info.get("token"):
+        return False
+    if pid_alive(info.get("owner_pid"), info.get("owner_started_at")):
+        return True
+    return pid_alive(info.get("worker_pid"), info.get("worker_started_at"))
+
+
+def _slot_holders(slot_dir: Path | None = None) -> list[dict]:
+    """Live lease payloads (a lease still being written counts as held)."""
+    sd = slot_dir or _slot_dir()
+    out: list[dict] = []
+    try:
+        files = sorted(sd.glob("slot-*.json"))
+    except OSError:
+        return out
+    for f in files:
+        info = _slot_info(f)
+        if not info.get("token"):
+            try:
+                if time.time() - f.stat().st_mtime < LEASE_CLAIM_GRACE_S:
+                    out.append({"holder": "claiming"})
+            except OSError:
+                pass
+            continue
+        if _slot_live(info):
+            out.append(info)
+    return out
+
+
+def _slot_holder_desc(info: dict) -> str:
+    owner = Path(info.get("run_dir") or "?").name
+    return f"{owner}/{info.get('step', '?')}"
+
+
+@dataclasses.dataclass
+class _AgentSlot:
+    path: Path
+    token: str
+    step: str
+    index: int
+
+
+def _slot_try_lease(i: int, run_dir: Path, state: dict, step: Step,
+                    slot_dir: Path | None = None) -> _AgentSlot | None:
+    """Take agent slot i; None when a live owner holds it. A stale lease
+    (owner+worker pids both dead) is broken once and retaken."""
+    sd = slot_dir or _slot_dir()
+    path = sd / f"slot-{i}.json"
+    token = secrets.token_hex(8)
+    for _attempt in (0, 1):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            info = _slot_info(path)
+            if not info.get("token"):
+                # mid-claim window (O_EXCL create before the payload
+                # write) counts as held for a grace period, same as the
+                # device leases
+                try:
+                    if time.time() - path.stat().st_mtime < \
+                            LEASE_CLAIM_GRACE_S:
+                        return None
+                except OSError:
+                    return None
+            elif _slot_live(info):
+                return None
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                return None            # someone else broke it first
+            continue
+        except OSError:
+            return None
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({
+                "slot": i, "token": token,
+                "run_dir": str(run_dir), "run_key": _flag_key(run_dir),
+                "run": state.get("run"), "step": step.name,
+                "owner_pid": os.getpid(),
+                "owner_started_at": _self_started_iso()
+                                    or state.get("driver_started_at")
+                                    or state.get("started_at"),
+                "worker_pid": None, "worker_started_at": None,
+                "leased_at": now_iso()}))
+        return _AgentSlot(path, token, step.name, i)
+    return None
+
+
+def _slot_set_worker(slot: _AgentSlot, pid: int) -> None:
+    """Record the spawned worker pid so a dead driver doesn't free the
+    slot out from under its orphaned session."""
+    try:
+        info = _slot_info(slot.path)
+        if info.get("token") != slot.token:
+            return                    # broken + re-leased by someone else
+        info["worker_pid"] = pid
+        info["worker_started_at"] = now_iso()
+        slot.path.write_text(json.dumps(info), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _slot_release(slot: _AgentSlot | None, run_dir: Path) -> None:
+    if slot is None:
+        return
+    try:
+        log_event(run_dir, event="slot_released", step=slot.step,
+                  slot=slot.index)
+    except OSError:
+        pass                 # run dir gone mid-teardown: the lease
+    try:                     # unlink below is the part that matters
+        if _slot_info(slot.path).get("token") == slot.token:
+            slot.path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def sweep_agent_slots(slot_dir: Path | None = None) -> list[str]:
+    """Reclaim slot files whose owner AND worker are both dead (a crashed
+    conductor would otherwise cap the pool forever)."""
+    sd = slot_dir or _slot_dir()
+    out: list[str] = []
+    try:
+        files = sorted(sd.glob("slot-*.json"))
+    except OSError:
+        return out
+    for f in files:
+        info = _slot_info(f)
+        if not info.get("token"):
+            try:
+                if time.time() - f.stat().st_mtime < LEASE_CLAIM_GRACE_S:
+                    continue
+            except OSError:
+                continue
+        elif _slot_live(info):
+            continue
+        try:
+            f.unlink()
+            out.append(f"agent slot {f.name} reclaimed (dead owner)")
+        except OSError:
+            pass
+    return out
+
+
+def _slots_view(slot_dir: Path | None = None) -> dict:
+    """The /api/state pool summary: how many machine-wide agent slots are
+    held right now and by whom (run:step names only - never task text)."""
+    holders = _slot_holders(slot_dir)
+    return {"cap": agent_slot_cap(), "in_use": len(holders),
+            "holders": [{"run": h.get("run"),
+                         "run_dir": Path(h["run_dir"]).name
+                         if h.get("run_dir") else None,
+                         "step": h.get("step")}
+                        for h in holders]}
+
+
+def _agent_slot_acquire(step: Step, run_dir: Path, state: dict,
+                        slug: str,
+                        slot_dir: Path | None = None) -> _AgentSlot | str:
+    """Block until this step owns a machine-wide agent slot; return the
+    lease, or a terminal 'skipped' already recorded in state.
+
+    Queue semantics: the wait is uncapped because it can never deadlock -
+    a waiting step holds no slot, and every holder is a worker bounded by
+    its own timeout. Halt/skip sentinels work while queued. The step
+    record carries slot_wait=True + a note naming the holders so the
+    dashboard queue shows who's ahead."""
+    cap = agent_slot_cap()
+    t_wait = time.time()
+    last_save = 0.0
+    last_note = None
+    wait_logged = False
+    while True:
+        halt = _flag_set(stop_flag(run_dir), stop_flag(run_dir, step.name),
+                         pause_flag(run_dir), drain_flag(run_dir))
+        skipped = halt is None and skip_flag(run_dir, step.name).is_file()
+        if halt is not None or skipped:
+            why = ("skipped by user (Skip step)" if skipped else
+                   "run paused" if pause_flag(run_dir).is_file() else
+                   "run drained" if drain_flag(run_dir).is_file()
+                   else "stopped by user")
+            with STATE_LOCK:
+                state["steps"].setdefault(step.name, {}).update(
+                    name=step.name, slug=slug, status="skipped",
+                    ended_at=now_iso(), slot_wait=None,
+                    note=f"{why} while queued for an agent slot")
+                save_state(run_dir, state)
+            log_event(run_dir, event="step_stopped", step=step.name,
+                      phase="slot_wait")
+            return "skipped"
+
+        for i in range(1, cap + 1):
+            slot = _slot_try_lease(i, run_dir, state, step, slot_dir)
+            if slot is not None:
+                log_event(run_dir, event="slot_acquired", step=step.name,
+                          slot=i,
+                          waited_s=round(time.time() - t_wait, 1))
+                return slot
+
+        holders = _slot_holders(slot_dir)
+        who = ", ".join(_slot_holder_desc(h) for h in holders[:4])
+        if len(holders) > 4:
+            who += f", +{len(holders) - 4} more"
+        note = (f"queued for an agent slot: {len(holders)}/{cap} in use"
+                + (f" ({who})" if who else ""))
+        if not wait_logged:
+            wait_logged = True
+            log_event(run_dir, event="slot_wait", step=step.name,
+                      in_use=len(holders), cap=cap)
+        with STATE_LOCK:
+            rec = state["steps"].setdefault(step.name,
+                                            {"name": step.name})
+            rec.update(slug=slug, status="queued", slot_wait=True,
+                       slot_waited_s=round(time.time() - t_wait, 1),
+                       note=note)
+            if note != last_note \
+                    or time.time() - last_save >= SLOT_WAIT_SAVE_S:
+                save_state(run_dir, state)
+                last_save = time.time()
+                last_note = note
+        time.sleep(SLOT_POLL_S)
+
+
 def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
              run_dir: Path, devin_argv: list[str], state: dict,
              do_checkpoint: bool = True, branch: str | None = None,
@@ -4490,6 +4808,36 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         rnotes = _flag_text(rnote_flag(run_dir, step.name))
         body_src = _body_with_notes(body_base, rnotes)
 
+    # Machine-wide agent slot: the pool bounds concurrent sessions across
+    # ALL runs, not just this manifest's max_parallel. Acquired after the
+    # device lease - a device-waiter hasn't spawned a session, so it must
+    # not count against the agent pool (the slot is the compute claim);
+    # a slot-waiter keeps its device, it's committed to run next. A 'skip'
+    # landing mid-queue releases the device before returning.
+    agent_slot = _agent_slot_acquire(step, run_dir, state, slug)
+    if not isinstance(agent_slot, _AgentSlot):
+        _device_release(device_lease, run_dir)
+        return agent_slot          # 'skipped' recorded while queued
+    # The slot wait is over - re-fold prompt overrides/notes/interrupts
+    # that landed while queued, exactly like the device-wait refold above.
+    intr_folded = _intrq_to_notes(run_dir, step.name) is not None \
+        or intr_folded
+    try:
+        over = prompt_flag(run_dir, step.name)
+        if over.is_file():
+            body_base = over.read_text(encoding="utf-8")
+            prompt_edited = True
+    except OSError:
+        pass
+    rnotes = _flag_text(rnote_flag(run_dir, step.name))
+    body_src = _body_with_notes(body_base, rnotes)
+    # Other live slot holders mean sibling sessions ARE running right now
+    # (this run's pool members, other runs, resolvers) - the worker gets
+    # the shared-machine rules then.
+    parallel_note = PARALLEL_NOTE if (
+        cfg.parallel or step.wave is not None or len(_slot_holders()) > 1
+        or step.name.startswith("resolve-")) else ""
+
     repo_dir = repo_dir or work_dir
     # Lease this step's worker a distinct loopback port BEFORE the prompt
     # is rendered (the lease note rides inside it). Worktree or not, a
@@ -4505,7 +4853,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             LOG.warning("no free service port for %s (range %d-%d "
                         "exhausted)", step.name, SERVICE_PORT_MIN,
                         SERVICE_PORT_MAX)
-    service_note = _service_note(work_dir, repo_dir, service_port)
+    service_note = _service_note(work_dir, repo_dir, service_port) \
+        + parallel_note
 
     prompt_path = run_dir / "prompts" / f"{step.name}.md"
     prompt_path.parent.mkdir(exist_ok=True)
@@ -4566,6 +4915,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     if cfg.checkpoint and do_checkpoint:
         if not is_git_repo(work_dir):
             _device_release(device_lease, run_dir)
+            _slot_release(agent_slot, run_dir)
             with STATE_LOCK:
                 _iv_close(rec, now_iso(), current=cur_iv,
                           run_dir=run_dir)
@@ -4690,6 +5040,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                                         **hidden_subprocess_kwargs())
                 if device_lease is not None:
                     _device_lease_set_worker(device_lease, proc.pid)
+                _slot_set_worker(agent_slot, proc.pid)
                 # Writing state.json into run_dir mid-spawn lands inside the
                 # worker's watched workspace on self-hosted runs, and the
                 # CLI's user-edit awareness ends the fresh session mid-init
@@ -4859,11 +5210,13 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     else:
         status = "done"
 
-    # The worker is dead and the step is decided - drop the port lease.
+    # The worker is dead and the step is decided - drop the port lease
+    # and the machine-wide agent slot.
     # A False probe means a listener outlived the worker's process tree:
     # record it for review but never kill by port - the bound port does
     # not prove which process owns it.
     port_freed = release_service_port(service_port)
+    _slot_release(agent_slot, run_dir)
 
     with STATE_LOCK:
         rec["session_id"] = (sorted(new_sessions)[-1] if new_sessions
@@ -5137,10 +5490,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                 for s in cfg.steps]
     # Validate before any run state exists: a bad wave or merge target must
     # not leave a state.json the dashboard will show as "running" forever.
-    groups = group_waves(resolved)
+    groups = plan_groups(resolved, cfg)
     validate_groups(groups)
     validate_merge_targets(resolved)
     cap = effective_max_parallel(cfg, getattr(args, "max_parallel", None))
+    agent_cap = agent_slot_cap()
 
     if getattr(args, "keep_awake", True):
         keep_awake()
@@ -5225,6 +5579,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                  "started_at": run_start, "devin": " ".join(devin_argv),
                  "devin_argv": devin_argv,
                  "run_dir": str(run_dir), "max_parallel": cap,
+                 "parallel": cfg.parallel, "agent_cap": agent_cap,
                  "flags": "v2", "intrq": True,
                  "summarize_model": cfg.summarize,
                  "driver_pid": os.getpid(),
@@ -5371,7 +5726,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                     via_resolver = False
                     merr = None
                     try:
-                        with _RepoMergeLock(project_dir):
+                        with _RepoMergeLock(
+                                project_dir,
+                                wait=(state, run_dir, prior)):
                             abort_own_merge(project_dir)
                             ok, loc, merr = merge_step_branch(
                                 project_dir, wt, prior["branch"], tgt, mwt)
@@ -5626,7 +5983,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                     via_resolver = False
                     merr = None
                     try:
-                        with _RepoMergeLock(repo_dir):
+                        with _RepoMergeLock(
+                                repo_dir, wait=(state, run_dir, rec)):
                             ok, loc, merr = merge_step_branch(
                                 repo_dir, work_dir, branch, tgt,
                                 merge_wt_for(work_dir))
@@ -5774,11 +6132,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
     projects = load_projects()
     resolved = [(*resolve_project(s, projects, manifest_path.parent), s)
                 for s in cfg.steps]
-    validate_groups(group_waves(resolved))
+    validate_groups(plan_groups(resolved, cfg))
     validate_merge_targets(resolved)
     print(f"run {cfg.name!r}: {len(cfg.steps)} steps, on_failure={cfg.on_failure}, "
-          f"checkpoint={cfg.checkpoint}, "
-          f"max_parallel={effective_max_parallel(cfg)}")
+          f"checkpoint={cfg.checkpoint}, parallel={cfg.parallel}, "
+          f"max_parallel={effective_max_parallel(cfg)}"
+          f" (machine pool {agent_slot_cap()})")
     for pdir, slug, s in resolved:
         cloud = " [cloud]" if s.cloud else ""
         if s.cloud:
@@ -5982,6 +6341,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
                             getattr(args, "keep_hours", 48.0))
     lines += [f"followup: {ln}" for ln in discover_followups(runs_dir)]
     lines += sweep_service_ports()
+    lines += sweep_agent_slots()
     print("\n".join(lines) if lines else "nothing stale")
     return 0
 
@@ -6408,7 +6768,7 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
             "followup", "on_failure", "max_attempts",
             "plan_model", "plan_effort", "merge_target",
             "worktrees", "merge_resolver", "merge", "summarize", "ask",
-            "attachments"}:
+            "parallel", "attachments"}:
         raise RequestError("Invalid request fields")
     model, effort = default_model_effort()
     fields = {k: (rec or {}).get(k, v) for k, v in (
@@ -6422,7 +6782,7 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
                 raise RequestError(f"{key} must be text")
             fields[key] = payload[key].strip()
     for bkey in ("followup", "worktrees", "merge_resolver", "summarize",
-                 "ask"):
+                 "ask", "parallel"):
         fields[bkey] = bool((rec or {}).get(bkey))
         if bkey in payload:
             v = payload[bkey]
@@ -6657,9 +7017,9 @@ def validate_proposal(text: str, manifests_dir: Path = MANIFESTS_DIR) -> Manifes
                                           project_dir, step.merge_target)
                 if terr:
                     raise RequestError(terr)
-        validate_groups(group_waves([
+        validate_groups(plan_groups([
             (*resolve_project(s, projects, manifests_dir), s)
-            for s in cfg.steps]))
+            for s in cfg.steps], cfg))
         return cfg
     except (tomllib.TOMLDecodeError, ManifestError, TypeError, KeyError,
             AttributeError) as exc:
@@ -6738,7 +7098,7 @@ def _wave_worktree_required(cfg: Manifest, manifests_dir: Path) -> set[str]:
         except ManifestError:
             resolved.append((Path(s.project), s.project, s))
     need: set[str] = set()
-    for members in group_waves(resolved):
+    for members in plan_groups(resolved, cfg):
         by_dir: dict[str, list[Step]] = {}
         for pdir, _slug, s in members:
             by_dir.setdefault(str(pdir), []).append(s)
@@ -6805,6 +7165,26 @@ def _apply_fields_to_toml(text: str, fields: dict,
     if "merge_resolver" in fields:
         _toml_set(lines, *ensure("run"), "merge_resolver",
                   "true" if fields["merge_resolver"] else "false")
+    if "parallel" in fields:
+        _toml_set(lines, *ensure("run"), "parallel",
+                  "true" if fields["parallel"] else "false")
+        if fields["parallel"]:
+            # parallel replaces wave grouping entirely - wave= keys on
+            # steps would fail manifest validation, so they are stripped
+            # (the pool supersedes them), and non-cloud steps take
+            # worktree isolation the same way merge=deferred implies it.
+            drop_wave = sorted((i for k, s, e in _toml_tables(lines)
+                               if k == "step"
+                               for i, key in _toml_keys(lines, s, e)
+                               if key == "wave"), reverse=True)
+            for i in drop_wave:
+                del lines[i]
+            for s in cfg.steps:
+                if s.cloud:
+                    continue
+                ss, se = step_sect(s.name)
+                if ss is not None:
+                    _toml_set(lines, ss, se, "worktree", "true")
     if fields.get("merge") in ("auto", "deferred"):
         _toml_set(lines, *ensure("run"), "merge",
                   json.dumps(fields["merge"]))
@@ -6827,6 +7207,7 @@ def _apply_fields_to_toml(text: str, fields: dict,
             s.name for s in cfg.steps
             if s.worktree
             or (fields.get("worktrees") and not s.cloud)
+            or (fields.get("parallel") and not s.cloud)
             or s.name in _wave_worktree_required(cfg, manifests_dir)}
         rs, re_ = sect("run")
         if mt_proj:
@@ -6882,6 +7263,11 @@ def _apply_fields_to_toml(text: str, fields: dict,
     if "worktrees" in fields:
         want = bool(fields["worktrees"])
         required = _wave_worktree_required(cfg, manifests_dir)
+        if fields.get("parallel"):
+            # parallel was applied above: every non-cloud step just took
+            # worktree = true and same-project siblings REQUIRE it - an
+            # unchecked worktrees box must not strip what parallel needs
+            required |= {s.name for s in cfg.steps if not s.cloud}
         cloud_steps = {s.name for s in cfg.steps if s.cloud}
         for s in cfg.steps:
             ss, se = step_sect(s.name)
@@ -6916,7 +7302,7 @@ def _apply_fields_to_toml(text: str, fields: dict,
             # the step list was parsed before this append, so the worktree
             # pass above never saw the new section - a checked box must
             # reach it or the result is a mixed state the form can't say
-            if fields.get("worktrees"):
+            if fields.get("worktrees") or fields.get("parallel"):
                 _toml_set(lines, *step_sect("follow-up-plan"),
                           "worktree", "true")
         elif not fields["followup"] and ss is not None:
@@ -6943,6 +7329,8 @@ def _guarantee_isolation(text: str, rec: dict,
         fields["merge"] = "deferred"
     if rec.get("summarize"):
         fields["summarize"] = True
+    if rec.get("parallel"):
+        fields["parallel"] = True
     if rec.get("merge_target"):
         fields["merge_target"] = rec["merge_target"]
         fields["project"] = rec.get("project") or ""
@@ -6968,7 +7356,7 @@ def _guarantee_isolation(text: str, rec: dict,
 GEN_INPUT_FIELDS = ("raw", "project", "attachments")
 OPTION_FIELDS = ("model", "effort", "on_failure", "max_attempts",
                  "worktrees", "merge_resolver", "merge", "followup",
-                 "merge_target")
+                 "merge_target", "parallel")
 
 
 def _att_key(lst) -> list:
@@ -7036,6 +7424,7 @@ def _manifest_options(text: str, manifests_dir: Path) -> dict:
             "max_attempts": attempts, "worktrees": wt,
             "merge_resolver": bool(run.get("merge_resolver", False)),
             "merge": mg,
+            "parallel": bool(run.get("parallel", False)),
             "followup": any(s.name == "follow-up-plan" for s in cfg.steps),
             "merge_target": mt}
 
@@ -7082,6 +7471,7 @@ def _pending_actions(rec: dict) -> dict:
                 "worktrees": bool(rec.get("worktrees")),
                 "merge_resolver": bool(rec.get("merge_resolver")),
                 "merge": rec.get("merge") or "auto",
+                "parallel": bool(rec.get("parallel")),
                 "followup": bool(rec.get("followup")),
                 "merge_target": (rec.get("merge_target") or "").strip()}
         for key, value in form.items():
@@ -7475,7 +7865,7 @@ def _followup_rec_base(source: Path | None, run_ctx: dict | None) -> dict:
             "project": "", "attachments": [], "model": "", "effort": "",
             "on_failure": "continue", "max_attempts": 1,
             "followup": False, "worktrees": False, "merge_resolver": False,
-            "summarize": False, "ask": False,
+            "summarize": False, "ask": False, "parallel": False,
             "imported": "followup",
             "source_run": run_ctx.get("dir"),
             "source_run_key": (f"request:{run_ctx.get('request')}"
@@ -7543,6 +7933,7 @@ def _followup_apply(rec: dict, text: str, manifests_dir: Path,
             max_attempts=opts.get("max_attempts") or 1,
             worktrees=bool(opts.get("worktrees")),
             merge_resolver=bool(opts.get("merge_resolver")),
+            parallel=bool(opts.get("parallel")),
             followup=bool(opts.get("followup")),
             summarize=cfg.summarize is not None,
             proposed_steps=[{
@@ -8113,6 +8504,18 @@ def _planner_response(rec: dict, projects: dict,
                     "set merge_resolver = true in [run], so a conflicted "
                     "worktree merge is finished by a resolve-<step> "
                     "session instead of only being parked.\n\n")
+    if rec.get("parallel"):
+        isolate += ("The human asked for fully parallel execution: set "
+                    "parallel = true under [run] - every [[step]] then "
+                    "schedules concurrently, bounded by the machine-wide "
+                    "agent slot pool, and merges still serialize per repo "
+                    "after the pool drains. With parallel set do NOT use "
+                    "wave = keys (they are redundant and fail validation), "
+                    "give every non-cloud [[step]] worktree = true, and "
+                    "write each prompt so steps own distinct files or "
+                    "areas - parallel worktrees that edit the same lines "
+                    "conflict at merge time. A closing 'follow-up-plan' "
+                    "step still runs last, after the pool drains.\n\n")
     if (rec.get("merge_target") or "").strip():
         mt = rec["merge_target"].strip()
         scope = (f"the [[step]]s on project {rec['project']!r}"
@@ -9302,6 +9705,9 @@ def _claim_run_merge(run_dir: Path, by: str) -> Path:
                        "cannot be read", 409)
 
 
+MERGE_LOCK_POLL_S = 2.0      # cadence of the queued-for-merge wait
+
+
 class _RepoMergeLock:
     """Serialize merge operations on one repo across conductor PROCESSES.
 
@@ -9311,18 +9717,45 @@ class _RepoMergeLock:
     the holder's pid + timestamp; a lock left by a dead process is broken
     once and retaken. `.git` is never a watched work tree, so this cannot
     trip a live worker's user-edit awareness (trap 5).
+
+    wait=(state, run_dir, rec) turns the fail-fast into a merge QUEUE:
+    the caller polls until the holder's pid dies or the lock frees - a
+    resolver session can hold it for a whole step timeout, so there is no
+    cap, but halt sentinels (stop/drain/pause) bail out with RequestError
+    so a queued merge never ignores a Stop click. While queued the step
+    record carries merge_queue=<holder pid> and a note saying who is
+    ahead; both clear when the lock lands or the wait ends.
     """
 
-    def __init__(self, repo_dir: Path):
+    def __init__(self, repo_dir: Path,
+                 wait: tuple[dict, Path, dict] | None = None):
         self.repo_dir = repo_dir
+        self.wait = wait
         self.path: Path | None = None
+
+    def _note_queue(self, who: str | None, waited_s: float = 0.0) -> None:
+        state, run_dir, rec = self.wait or (None, None, None)
+        if rec is None:
+            return
+        with STATE_LOCK:
+            if who is None:
+                rec.pop("merge_queue", None)
+            else:
+                rec["merge_queue"] = who
+                rec["merge_waited_s"] = round(waited_s, 1)
+                _append_note(rec, f"queued for the repo merge lock "
+                                  f"(holder {who})")
+            if run_dir is not None and state is not None:
+                save_state(run_dir, state)
 
     def __enter__(self):
         gd = _git_dir(self.repo_dir)
         if gd is None:
             raise RequestError(f"not a git repo: {self.repo_dir}", 500)
         self.path = gd / "conductor-merge.lock"
-        for _attempt in (0, 1):
+        t_wait = time.time()
+        noted = False
+        while True:
             try:
                 fd = os.open(self.path,
                              os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -9335,16 +9768,35 @@ class _RepoMergeLock:
                 # plain liveness, no since-window: a long-running serve
                 # process legitimately takes locks far after its start
                 if pid_alive(info.get("pid")):
-                    raise RequestError(
-                        f"another merge is already operating on "
-                        f"{self.repo_dir} (pid {info.get('pid')})", 409)
-                self.path.unlink(missing_ok=True)   # stale lock: break once
+                    if self.wait is None:
+                        raise RequestError(
+                            f"another merge is already operating on "
+                            f"{self.repo_dir} (pid {info.get('pid')})", 409)
+                    _state, run_dir, _rec = self.wait
+                    if not noted:
+                        noted = True
+                        self._note_queue(
+                            f"pid {info.get('pid')}",
+                            time.time() - t_wait)
+                        if run_dir is not None:
+                            log_event(run_dir, event="merge_wait",
+                                      holder=info.get("pid"))
+                    if run_dir is not None and _flag_set(
+                            stop_flag(run_dir), pause_flag(run_dir),
+                            drain_flag(run_dir)) is not None:
+                        self._note_queue(None)
+                        raise RequestError(
+                            "run halted while queued for the repo merge "
+                            "lock", 409)
+                    time.sleep(MERGE_LOCK_POLL_S)
+                    continue
+                self.path.unlink(missing_ok=True)  # stale lock: break once
                 continue
             with os.fdopen(fd, "w") as f:
                 f.write(json.dumps({"pid": os.getpid(), "at": now_iso()}))
+            if noted:
+                self._note_queue(None)
             return self
-        raise RequestError(
-            f"another merge is already operating on {self.repo_dir}", 409)
 
     def __exit__(self, *exc) -> None:
         if self.path is not None:
@@ -12071,6 +12523,9 @@ def collect_dashboard(runs_dir: Path,
                 "cloud": rec.get("cloud", plan.get("cloud")),
                 "device": rec.get("device"),
                 "device_wait": rec.get("device_wait"),
+                "slot_wait": rec.get("slot_wait"),
+                "slot_waited_s": rec.get("slot_waited_s"),
+                "merge_queue": rec.get("merge_queue"),
                 "verify_ok": rec.get("verify_ok"),
                 "skipped_by_user": _safe_name(
                     rec.get("name") or name) in flagged,
@@ -12383,6 +12838,7 @@ def collect_dashboard(runs_dir: Path,
     return {"generated_at": now_iso(), "serve_boot": SERVE_BOOT,
             "cpu_count": os.cpu_count(),
             "free_ram_gb": free_ram_gb(), "runs": runs, "agents": agents,
+            "slot_pool": _slots_view(),
             "archived_runs": archived_runs,
             "trash_count": len(trash_ids), "trash_ids": trash_ids,
             "trash": (list_trash(trash_dir, requests_dir)
@@ -12395,7 +12851,13 @@ def collect_dashboard(runs_dir: Path,
                                 timespec="seconds")
                             if _PRICE_CACHE["fetched"] else None),
                         "source": _PRICE_CACHE["source"]},
-            "defaults": dict(zip(("model", "effort"), default_model_effort())),
+            "defaults": {**dict(zip(("model", "effort"),
+                                    default_model_effort())),
+                         # isolation + the resolver are the sane default:
+                         # steps merge back cleanly and conflicts resolve
+                         # themselves; unchecking is the deliberate choice
+                         "worktrees": True, "merge_resolver": True,
+                         "parallel": False},
             "model_options": model_options(devin_argv or ["devin"]),
             "auth": auth_status(devin_argv or ["devin"])}
 
@@ -15101,9 +15563,15 @@ function mpopPick(inp,idx){
 // coupling forced it (a deliberate checked state is never undone).
 function syncMergeTiming(){
   const m=document.getElementById('rq-merge'),
-        wt=document.getElementById('rq-worktrees');
+        wt=document.getElementById('rq-worktrees'),
+        mr=document.getElementById('rq-merge_resolver'),
+        pa=document.getElementById('rq-parallel');
   if(!m||!wt) return;
-  if(m.value==='deferred'){
+  // held merges AND parallel scheduling both imply worktree isolation -
+  // while either is on the box stays checked and locked, and the FORCED
+  // marker undoes the check only if we put it there
+  const forced = m.value==='deferred' || !!(pa&&pa.checked);
+  if(forced){
     if(!wt.disabled && !wt.checked && wt.dataset) wt.dataset.forced='1';
     wt.checked=true; wt.disabled=true;
   } else {
@@ -15111,10 +15579,24 @@ function syncMergeTiming(){
     if(wt.dataset && wt.dataset.forced){
       wt.checked=false; delete wt.dataset.forced; }
   }
+  // merge_resolver only resolves worktree merges: with isolation off it
+  // can never fire, so it locks off - remembering its tick (dataset.was)
+  // so re-checking worktrees restores it rather than forcing a choice
+  if(mr){
+    if(!wt.checked){
+      if(mr.checked && mr.dataset) mr.dataset.was='1';
+      mr.checked=false; mr.disabled=true;
+    } else {
+      mr.disabled=!!m.disabled;
+      if(mr.dataset && mr.dataset.was){ mr.checked=true;
+        delete mr.dataset.was; }
+    }
+  }
 }
 function openNew(){
   if (!closeThen(closeDetail(), openNew)) return;
-  const defaults=lastData?.defaults||{model:'swe-2',effort:'max'};
+  const defaults=lastData?.defaults||{model:'swe-2',effort:'max',
+    worktrees:true,merge_resolver:true};
   modalRequest={id:null,status:'new',dirty:false,originalManifest:''};
   showRequestForm({status:'new',raw:'',label:'',project:'',...defaults});
 }
@@ -15264,6 +15746,15 @@ function showRequestForm(rec){
       `worktree merge conflict, spawn a resolve-* session to finish the ` +
       `merge (<code>merge_resolver = true</code>) instead of only ` +
       `parking the worktree for a human</span></label>` +
+    `<label class="check"><input type="checkbox" id="rq-parallel"` +
+      `${rec.parallel?' checked':''}${disabled}><span>Run the steps in ` +
+      `parallel (<code>parallel = true</code>): every step schedules at ` +
+      `once, bounded by the machine-wide agent slot pool it shares with ` +
+      `other runs - queued steps wait for a free slot, and merges still ` +
+      `serialize per repo after the pool drains. Workers are told they ` +
+      `share the machine and must not fight over shared resources. Needs ` +
+      `worktree isolation (forced on while ticked); a closing ` +
+      `follow-up-plan step still runs last</span></label>` +
     `<label class="check"><input type="checkbox" id="rq-summarize"` +
       `${rec.summarize?' checked':''}${disabled}><span>When the run ends, ` +
       `spawn one small session that writes an executive summary ` +
@@ -15368,7 +15859,7 @@ function showRequestForm(rec){
 // pre-baseline records, unexpressible for a mixed worktree state).
 const GEN_KEYS=['raw','project','attachments'];
 const OPT_KEYS=['model','effort','on_failure','max_attempts','worktrees',
-  'merge_resolver','merge','followup','merge_target'];
+  'merge_resolver','merge','followup','merge_target','parallel'];
 // mirrors conductor._MIXED_OPTS - keys whose manifest baseline may
 // legitimately be null because the TOML carries a per-step mix
 const MIXED_KEYS=new Set(['worktrees','merge','merge_target']);
@@ -15377,6 +15868,7 @@ const PEND_LABEL={raw:'request text',project:'target project',
   model:'step model',effort:'step effort',on_failure:'failure policy',
   max_attempts:'attempts/step',worktrees:'worktrees',
   merge_resolver:'merge resolver',merge:'merge timing',
+  parallel:'parallel scheduling',
   followup:'follow-up step',
   merge_target:'merge target',manifest:'the proposal TOML'};
 const pendName=k=>PEND_LABEL[k]||k;
@@ -15477,6 +15969,7 @@ const PEND_EL={raw:'rq-raw',project:'rq-project',attachments:'rq-attach',
   model:'rq-model',effort:'rq-effort',on_failure:'rq-on_failure',
   max_attempts:'rq-attempts',worktrees:'rq-worktrees',
   merge_resolver:'rq-merge_resolver',merge:'rq-merge',
+  parallel:'rq-parallel',
   followup:'rq-followup',merge_target:'rq-merge_target',
   manifest:'rq-manifest'};
 function refreshPending(){
@@ -15785,7 +16278,7 @@ function requestFields(){
     [k,document.getElementById(`rq-${k}`).value]));
   if (!f.merge) f.merge='auto';   // an unread select reads as the default
   for (const k of ['followup','worktrees','merge_resolver','summarize',
-                   'ask']){
+                   'ask','parallel']){
     const el=document.getElementById(`rq-${k}`);
     if (el) f[k]=el.checked;
   }
@@ -16010,6 +16503,13 @@ function render(d){
   const planned = d.agents.filter(a=>a.status==='planned').length;
   document.getElementById('meta').innerHTML =
     `${d.agents.length-planned} agents | ${planned} planned | ${live.length} running | ` +
+    (d.slot_pool ? `<b title="machine-wide agent slots (CONDUCTOR_MAX_AGENTS` +
+      `, default ${d.slot_pool.cap}); queued = steps holding no slot yet"` +
+      `>slots ${d.slot_pool.in_use}/${d.slot_pool.cap}</b>` +
+      (d.slot_pool.in_use>=d.slot_pool.cap
+        ? ` <span style="color:#d29922">queued: ` +
+          `${d.agents.filter(a=>a.slot_wait).length}</span>` : '') +
+      ` | ` : '') +
     `cpu ${d.cpu_count||'?'} cores | free ram ${d.free_ram_gb||'?'} GB | ` +
     `refreshed ${loc(d.generated_at)}` +
     (d.pricing && d.pricing.models
@@ -17339,7 +17839,8 @@ document.addEventListener('input', e=>{
     if (msg) msg.hidden=true;
     // syncEffort may rewrite the effort input when its model changed -
     // run it first so the pending diff sees the settled value
-    if (e.target.id==='rq-merge') syncMergeTiming();
+    if (e.target.id==='rq-merge' || e.target.id==='rq-worktrees' ||
+        e.target.id==='rq-parallel') syncMergeTiming();
     if (e.target.id==='rq-model' || e.target.id==='rq-plan_model'){
       syncEffort(e.target,
                  e.target.id==='rq-model'?'rq-effort':'rq-plan_effort',
@@ -17556,13 +18057,37 @@ document.addEventListener('keydown', e=>{
     if (!document.getElementById('backdrop').hidden) closeDetail();
   }
 });
-// hovering a run row highlights its agent rows across all project tables.
+// hovering a run row highlights its agent rows across all project tables,
+// plus the OTHER half of a follow-up pair: a run that produced a follow-up
+// proposal highlights that request row (or the run it launched), and a
+// follow-up request/run row highlights the run that drafted it.
 // hoverRun persists across the 2s re-render so the highlight doesn't flicker.
 let hoverRun = null;
+function hoverLinked(){
+  const s = new Set();
+  if (!hoverRun) return s;
+  const rows = (lastData && lastData.runs) || [];
+  const row = rows.find(x=>runKey(x)===hoverRun);
+  const fs = row && row.followup_src;
+  if (fs && (fs.key || fs.run)) s.add(fs.key || fs.run);
+  const fq = row && row.followup;
+  if (fq && fq.request) s.add('request:'+fq.request);
+  for (const r2 of rows){
+    const f2 = r2.followup_src;
+    if (f2 && (f2.key || f2.run) === hoverRun) s.add(runKey(r2));
+    const q2 = r2.followup;
+    if (q2 && q2.request && ('request:'+q2.request) === hoverRun)
+      s.add(runKey(r2));
+  }
+  s.delete(hoverRun);
+  return s;
+}
 function applyHl(){
+  const link = hoverLinked();
   document.querySelectorAll('tr[data-run-key]').forEach(x=>
     x.classList.toggle('hl', x.dataset.runKey===selectedRun ||
-      !!hoverRun && x.dataset.runKey===hoverRun));
+      !!hoverRun && (x.dataset.runKey===hoverRun ||
+                     link.has(x.dataset.runKey))));
 }
 // .dsel marks the row whose details are on screen: the open task modal's
 // agent row, an open run-details/request/questionnaire modal's run row, a
@@ -17997,6 +18522,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     for line in sweep_sessions(runs_dir, devin_argv):
         print(f"sweep: {line}")
     for line in sweep_service_ports():
+        print(f"sweep: {line}")
+    for line in sweep_agent_slots():
         print(f"sweep: {line}")
     # A restarted serve adopts generations whose owner died: the spool
     # replays deferred publishes and lands parked questions/errors.

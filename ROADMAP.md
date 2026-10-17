@@ -25,6 +25,7 @@ One phase at a time, in order. Mark items `[x]` as they land.
 - [x] hub.db: one task row per run, live-updated per step (`--no-hub` opts out)
 - [x] Cloud-session ref capture: `app.devin.ai/sessions/...` parsed from stdout (cloud sessions don't show in `devin list`)
 - [x] `run.max_parallel` resource cap (default ~1 per 4 cores, max 4; wave members queue past the cap) + `--max-parallel` override; effective cap + free RAM recorded per run
+- [x] `[run] parallel = true` - all steps in one shared pool (follow-up-plan last); machine-global agent slot pool (`CONDUCTOR_MAX_AGENTS` default 4-8, `%TEMP%/agent-conductor-slots`) queues steps across runs; run-path merges queue on the repo lock; `PARALLEL_NOTE` teaches workers to share the box; dashboard shows `slots N/M` + queued
 - [x] Agent registry: each step record in `state.json` carries pid, work_dir, branch, started_at/ended_at/elapsed_s, session id, output paths - the durable session-work record
 - [x] `conductor.py serve` dashboard on `127.0.0.1:8773`: every agent + run, live elapsed, status colors, `/api/state` JSON
 - [x] Live `devin -p` smoke test - first authed runs died in 0.1-3s (rc 0, no STATUS); root-caused 2026-10-13: conductor's mid-spawn `save_state` wrote into the worker's watched cwd and the CLI's user-edit awareness killed the session (trap 5). Fixed + verified: `20261013-093553-smoke` ran readme 56.6s / sanity 96.6s, both `STATUS: done`, README.md + commits landed

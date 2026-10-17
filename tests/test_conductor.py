@@ -6120,6 +6120,64 @@ worktree = true
             conductor.load_manifest(Path(out["manifest"])).steps[0].merge,
             "auto")
 
+    def test_apply_parallel_writes_flag_worktrees_and_drops_waves(self):
+        """parallel = true is a run key: applying it writes [run], forces
+        worktree on every non-cloud step, and strips redundant wave=
+        keys (which would fail manifest validation)."""
+        text = self.proposal('''
+wave = 1
+''') + '''
+[[step]]
+name = "second"
+prompt = "More work"
+'''
+        rec = conductor.create_request(
+            {"raw": "x", "project": "proj"}, self.requests, self.runs)
+        rec = conductor.save_request(rec["id"], {"manifest": text},
+                                     self.requests, self.manifests,
+                                     self.runs)
+        out = conductor.apply_request(rec["id"], {"parallel": True},
+                                      self.requests, self.manifests,
+                                      self.runs)
+        body = Path(out["manifest"]).read_text(encoding="utf-8")
+        self.assertIn("parallel = true", body)
+        self.assertNotIn("wave =", body)
+        cfg = conductor.load_manifest(Path(out["manifest"]))
+        self.assertTrue(cfg.parallel)
+        self.assertTrue(all(s.worktree for s in cfg.steps))
+
+    def test_apply_parallel_off_writes_false(self):
+        rec = self.ready()
+        conductor.apply_request(rec["id"], {"parallel": True},
+                                self.requests, self.manifests, self.runs)
+        out = conductor.apply_request(rec["id"], {"parallel": False},
+                                      self.requests, self.manifests,
+                                      self.runs)
+        body = Path(out["manifest"]).read_text(encoding="utf-8")
+        self.assertIn("parallel = false", body)
+        self.assertFalse(
+            conductor.load_manifest(Path(out["manifest"])).parallel)
+
+    def test_apply_parallel_still_worktrees_when_box_unchecked(self):
+        """An inconsistent payload (parallel on, worktrees off) must not
+        strip the isolation parallel needs - the flag wins."""
+        text = self.proposal() + '''
+[[step]]
+name = "second"
+prompt = "More work"
+'''
+        rec = conductor.create_request(
+            {"raw": "x", "project": "proj"}, self.requests, self.runs)
+        rec = conductor.save_request(rec["id"], {"manifest": text},
+                                     self.requests, self.manifests,
+                                     self.runs)
+        out = conductor.apply_request(
+            rec["id"], {"parallel": True, "worktrees": False},
+            self.requests, self.manifests, self.runs)
+        cfg = conductor.load_manifest(Path(out["manifest"]))
+        self.assertTrue(cfg.parallel)
+        self.assertTrue(all(s.worktree for s in cfg.steps))
+
 
 class PendingMergeViewTests(unittest.TestCase):
     """collect_dashboard's pending-merge payload: what the run modal's
@@ -6301,6 +6359,80 @@ vm.runInContext('showRequestForm({status:"ready",id:"r1",merge:"deferred",' +
   'worktrees:true,raw:"x",proposed_steps:[],manifest:"m.toml"})',ctx);
 assert.match(elem('dbody').innerHTML,
   /<option value="deferred" selected>/);
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_request_form_isolation_defaults_and_interlocks(self):
+        """New proposals default worktrees + merge_resolver ON and parallel
+        OFF; merge_resolver only resolves worktree merges, so unchecking
+        worktrees greys + clears it (and re-checking restores it); ticking
+        parallel forces + greys worktrees like held merges do."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',value:'',checked:false,disabled:false,title:'',
+  dataset:{},classList:{add(){},remove(){},toggle(){}}});
+  return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,fn)=>{handlers[ev]=fn;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},fetch:async()=>({ok:true,json:async()=>({})}),
+  confirm:()=>true,alert:()=>{}});
+vm.runInContext(src,ctx);
+const d={serve_boot:'b',generated_at:'x',agents:[],runs:[],
+  project_options:[{slug:'p',cloud_ok:false}],
+  defaults:{model:'swe-2',effort:'max',worktrees:true,
+    merge_resolver:true,parallel:false}};
+vm.runInContext('render('+JSON.stringify(d)+')',ctx);
+vm.runInContext('openNew()',ctx);
+// defaults land in the rendered form: isolation + resolver ticked,
+// parallel unticked
+const html=elem('dbody').innerHTML;
+assert.match(html,/id="rq-worktrees" checked/);
+assert.match(html,/id="rq-merge_resolver" checked/);
+assert.match(html,/id="rq-parallel"(?! checked)/);
+assert.match(html,/Run the steps in \s*parallel/);
+// stub DOM: set the browser-truth control state, then fire the handler
+const wt=elem('rq-worktrees'), mr=elem('rq-merge_resolver'),
+      pa=elem('rq-parallel'), m=elem('rq-merge');
+wt.checked=true; mr.checked=true; m.value='auto';
+// worktrees off -> resolver clears and greys (it only resolves wt merges)
+wt.checked=false;
+handlers.input({target:{id:'rq-worktrees'}});
+assert.equal(mr.checked,false);
+assert.equal(mr.disabled,true);
+// worktrees back on -> the remembered tick restores, box re-enables
+wt.checked=true;
+handlers.input({target:{id:'rq-worktrees'}});
+assert.equal(mr.disabled,false);
+assert.equal(mr.checked,true);
+// ticking parallel forces worktrees checked + locked
+pa.checked=true;
+handlers.input({target:{id:'rq-parallel'}});
+assert.equal(wt.checked,true);
+assert.equal(wt.disabled,true);
+// unticking parallel releases the FORCED check only when we placed it
+wt.checked=false; wt.disabled=false; delete wt.dataset.forced;
+pa.checked=true; handlers.input({target:{id:'rq-parallel'}});
+assert.equal(wt.checked,true);
+pa.checked=false; handlers.input({target:{id:'rq-parallel'}});
+assert.equal(wt.checked,false);
+assert.equal(wt.disabled,false);
+// parallel + requestFields
+pa.checked=true;
+handlers.input({target:{id:'rq-parallel'}});
+let f=vm.runInContext('requestFields()',ctx);
+assert.equal(f.parallel,true);
+assert.equal(f.worktrees,true);
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
                            capture_output=True, text=True, encoding="utf-8",
@@ -7512,7 +7644,10 @@ class _RunControlBase(unittest.TestCase):
             dirs = [d for d in runs.glob("*/state.json")] \
                 if runs.exists() else []
             for d in dirs:
-                st = json.loads(d.read_text())
+                try:
+                    st = json.loads(d.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue  # writer is mid-replace; next poll sees it
                 if (st.get("steps") or {}).get(step, {}).get(
                         "status") == "running":
                     return d.parent
