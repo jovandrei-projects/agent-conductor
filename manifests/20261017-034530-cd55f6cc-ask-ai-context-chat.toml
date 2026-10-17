@@ -1,0 +1,199 @@
+[run]
+summarize = true
+name = "dashboard-ask-ai"
+description = "Build a reusable dashboard AI assistant with view-aware context, persistent conversations, images and dictation, configurable models, guarded actions, and transparent usage costs."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 75
+max_attempts = 3
+verify = "python run_tests.py"
+
+[[step]]
+name = "research-and-design"
+project = "agent-conductor"
+worktree = true
+timeout_min = 45
+prompt = '''
+Investigate the existing dashboard, its shared and custom modals, navigation, persistence, agent/provider integrations, authorization, project registry, run reports, logs, and tests. Read project instructions and inspect C:/Projects/agent-conductor/data/attachments/20261017-034141-9004b812.png as the user's example of where AI is expected to be used. Do not assume a frontend framework, database, provider API, or existing feature.
+
+Research public examples of well-designed embedded AI assistants and maintained libraries that could supply chat rendering, streaming, attachments, or dictation. Compare fit, accessibility, licensing, maintenance, and dependency cost against the existing stack. Prefer reuse over rebuilding, but do not introduce a new framework solely for this feature. Any proposed new dependency should use a vetted version published at least seven days earlier.
+
+Check the actual availability, canonical identifier, vision support, effort controls, fast-mode behavior, and published pricing for the user's requested gpt-6luna configuration. Record supported alternatives and unknowns without inventing capabilities or prices. The requested product assistant settings are separate from the conductor worker model.
+
+Define an implementation-ready design covering a launcher on the dashboard and every application modal; one persistent, expandable chat surface; conversation history; compact current-view context; source links; images; dictation; model settings; read-only enforcement; controlled actions; and per-exchange/session usage. Use an extraction-ready assistant module with explicit host adapters for context, navigation, persistence, providers, and actions. Keep implementation in agent-conductor rather than creating an unregistered project.
+
+Record findings, reference URLs, acceptance criteria, proposed module boundaries, modal coverage, integration contracts, and blockers using the project's .agent_tasks conventions. Identify already-satisfied requirements so later steps can validate rather than duplicate them. This step is investigation and design only. Finish with STATUS/NEXT.
+'''
+
+[[step]]
+name = "persistent-chat-core"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Implement the reusable conversation core and durable storage using the research findings and existing project conventions. Inspect prior .agent_tasks findings first; validate existing functionality rather than replacing it. If essential design or infrastructure prerequisites are missing, report the specific blocker instead of inventing a parallel subsystem.
+
+Separate generic assistant concepts from conductor-specific data and routing. Provide persistence and application interfaces for creating conversations, listing history, reopening a session, appending exchanges, and restoring the last active conversation. Persist the originating dashboard/window identity, stable source identifiers, timestamps, per-turn context references, model/effort/fast-mode settings, completion state, attachment references, usage records, and action audit references. Preserve complete stored history even when only a bounded portion is supplied to a model.
+
+Reuse the existing database and migration conventions when suitable; otherwise select a minimal durable database consistent with the research. Do not treat browser-only storage as the source of truth for chat history. Use additive migrations and preserve existing data.
+
+Make writes retry-safe so resumed requests cannot duplicate messages, exchanges, or usage records. Scope sessions and resources to the application's existing user/workspace authorization boundary. Keep credentials and unnecessary raw log contents out of persisted chat metadata.
+
+Add focused tests for migrations, persistence across reload/restart, history pagination, origin/context relationships, settings snapshots, and duplicate-request handling. Record the implemented contracts, verification results, and remaining integration needs in .agent_tasks with STATUS/NEXT.
+'''
+
+[[step]]
+name = "view-context-and-retrieval"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Implement the conductor host adapter for compact view context, source retrieval, and navigable citations using the conversation contracts already available. Check preceding handoffs and report missing prerequisites rather than fabricating data or interfaces.
+
+Define a bounded context envelope for the active dashboard or modal: view type and title, relevant project/run/step identifiers, active filters, selected report sections or text, visible structured data, and concise descriptions of field meanings and available workflows. Support shared and custom modal providers. Preserve conversation origin and immutable per-turn provenance while allowing later questions to use the newly active view.
+
+Implement authorized, on-demand retrieval of relevant summaries, task records, and log excerpts through the real project registry and discovered storage formats. Search and filter by project, dates, run, step, and subject before retrieving excerpts. Do not load entire repositories or all logs into prompts. Apply explicit size limits, pagination, source deduplication, sensitive-field filtering, and honest reporting when coverage is incomplete. Treat report and log contents as untrusted evidence, not instructions.
+
+Return stable source references and host navigation descriptors that can open the corresponding dashboard modal without losing the conversation. Provide concise, maintainable context about page design, flows, report terminology, and where supporting evidence lives.
+
+Test the supplied report example, 20261016-013639-model-compare-mobile / mobile-visualizations-and-filters, including locating its verification section. Also test a date-bounded query for apartment-3d tasks involving camera changes, returning specific steps and relevant evidence. Use real records only if present; otherwise use clearly identified test fixtures. Show the interpreted date range and never claim nonexistent matches.
+
+Record retrieval boundaries, source contracts, test results, and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "assistant-runtime"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Implement the server-side conversational runtime and provider adapter on the established persistence and context interfaces. Reuse the project's actual authenticated agent/provider integration where appropriate. Consult project-documented configuration locations for credentials; never print or copy credential values into tracked files, prompts, or handoff notes.
+
+Set the product's initial preference to gpt-6luna, low thinking, and fast mode, resolving the actual identifier and supported controls from verified provider information. Do not confuse this preference with the manifest's swe-2 worker configuration. Never silently substitute a model or pretend unsupported settings work. If unavailable, expose a clear explanation and verified alternatives for explicit user selection. Validate model, effort, fast-mode, and vision compatibility on the server.
+
+Support multi-turn replies, streaming where available, cancellation, bounded context selection, partial responses, provider failures, and retry-safe persistence. Keep full history in storage while constructing a compact request from relevant history, current-view context, and targeted retrieval. Summaries must preserve provenance and must not turn untrusted content into privileged instructions.
+
+Provide read-only retrieval and safe deterministic calculation capabilities without arbitrary shell execution or unrestricted evaluation. Answer ordinary questions directly; use source retrieval only as needed. Support structured tables and source-linked explanations. Establish a trusted server-side capability gate that defaults new sessions to read-only and cannot be changed by model output or retrieved text.
+
+Capture provider request identifiers, actual model/settings, reported token/cache usage, internal request boundaries, and completion states for later accounting. Represent unavailable usage as unknown rather than zero.
+
+Test provider adaptation, settings validation, context bounds, streaming failures, cancellation, retries, and read-only capability enforcement with controlled fixtures. Record STATUS/NEXT, including any real authentication or provider limitation; do not substitute a fake successful integration.
+'''
+
+[[step]]
+name = "persistent-chat-interface"
+project = "agent-conductor"
+worktree = true
+timeout_min = 105
+prompt = '''
+Build the assistant interface using the researched design and implemented backend contracts. Review predecessor results and verify any already-completed portions before editing. Inspect C:/Projects/agent-conductor/data/attachments/20261017-034141-9004b812.png for the example modal and visual context.
+
+Add an accessible Ask AI symbol launcher to the main dashboard and every application modal, covering shared primitives and custom exceptions. Favor a subtle lower-right floating control where ergonomic, but prioritize contrast, discoverability, and unobstructed content over literal transparency. Avoid duplicate launchers or recursively opening separate assistants.
+
+Host one durable chat surface outside individual modal lifecycles. It must open near the lower right, expand to a larger workspace, minimize, and remain available with the same active conversation and draft while users navigate between modals or return to the dashboard. Restore the last conversation after reload. Provide a conversation-history area on the right where space allows, with a responsive alternative on smaller screens.
+
+Show which current view the next question will use, while keeping earlier exchanges associated with their original sources. Make citations open the appropriate modal without resetting chat. Render back-and-forth messages, code, and tables safely using the established stack; do not execute arbitrary HTML from responses.
+
+Clicking the displayed agent name must open a settings modal with supported model, effort, fast-mode, and read-only controls, capability explanations, and price information when available. Read-only is on for new sessions; show the current permission state clearly. Preserve settings per exchange so later changes do not relabel previous replies.
+
+Handle nested dialogs, focus restoration, keyboard navigation, screen readers, loading/error states, and responsive layouts. Ensure users can actually interact with chat while a source modal is open. Add UI tests for modal coverage, navigation persistence, history restoration, settings changes, and citation navigation. Record STATUS/NEXT.
+'''
+
+[[step]]
+name = "images-and-dictation"
+project = "agent-conductor"
+worktree = true
+timeout_min = 75
+prompt = '''
+Complete image and voice input in the existing assistant composer, adapting to the actual runtime and UI contracts. Validate any implemented support first and report genuine prerequisites rather than creating an unrelated upload or speech subsystem.
+
+Support user-initiated clipboard image paste and image-file attachment, with previews, removal before sending, clear upload state, and durable association with the correct message and conversation. Preserve ordinary text pasting. Validate formats, actual content types, sizes, and counts on the server; protect attachment access using the application's authorization boundary. Do not place raw image payloads in diagnostic logs or expose arbitrary filesystem paths.
+
+Deliver attached images through the provider's verified multimodal interface. If the selected model cannot process them, explain the limitation and offer a compatible model selection rather than silently discarding the images. Reopened conversations must retain their image references and accessible previews.
+
+Implement explicit start/stop dictation into the editable textbox with microphone permission handling and a visible recording state. Do not automatically send dictated text. Feature-detect browser speech support and use a suitable existing/configured speech integration where a fallback is needed. Disclose external audio processing, avoid retaining raw recordings by default, and never present a nonfunctional microphone button as working support.
+
+Test clipboard and file inputs, invalid/oversized images, unsupported model capabilities, persistence, microphone denial, unsupported browsers, transcript editing, and cleanup when the composer closes or navigation changes. Use controlled speech/provider fixtures where hardware or credentials are unavailable and document what still requires a live check. Record STATUS/NEXT.
+'''
+
+[[step]]
+name = "guarded-dashboard-actions"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Implement the assistant's explicitly enabled dashboard action mode on top of the existing server-side permission gate. Read the prior contracts and current dashboard mechanisms; expose only verified application operations, not invented commands.
+
+Read-only mode must allow questions, authorized retrieval, calculations, tables, source links, and textual suggestions while denying persisted dashboard mutations and execution triggers. Enforce this on the server for every tool call, not just by hiding UI controls. Model output, log contents, attachments, and stored conversation text must never grant permissions. Recheck permission immediately before mutation so switching back to read-only invalidates pending write capabilities.
+
+When the user explicitly disables read-only, support structured, narrowly scoped tools for the mechanisms actually present: creating bug-fix proposals, editing existing proposals, marking items reviewed or unreviewed, archive tasks, to batch edits on tasks, do batch edits on runs, and other relevant dashboard triggers identified in the research. Keep task identification and navigation linked to stable project/run/step records. Reuse existing validation and authorization rather than bypassing them.
+
+For actions that launch work, execute a proposal, cause external effects, or are destructive or irreversible, require a separate explicit confirmation showing the exact target and effect. Turning off read-only is not blanket confirmation. Never expose arbitrary shell commands, unrestricted code evaluation, or direct repository editing as a general chat tool.
+
+Record proposed actions, confirmations, attempts, results, and failures with the conversation. Make mutations retry-safe, show actionable feedback, and refresh affected views without losing chat.
+
+Test forged tool calls, prompt injection through retrieved evidence, permission changes during a turn, wrong-target operations, duplicate submissions, confirmation rejection, successful authorized mutations, and error recovery. Exercise triggers only with isolated fixtures or dry-run facilities; do not start real user runs during implementation tests. Record STATUS/NEXT.
+'''
+
+[[step]]
+name = "usage-and-price-visibility"
+project = "agent-conductor"
+worktree = true
+timeout_min = 75
+prompt = '''
+Implement complete usage accounting and its chat/settings presentation using persisted provider usage records. Verify prior work and fill actual gaps rather than building a second accounting system.
+
+Show input tokens, output tokens, cache usage, model, relevant settings, and price for each prompt/exchange, with expandable internal request or tool-step details and a grand total for the conversation. Include billable retries, failed or cancelled requests, context summarization, and multimodal processing when the provider reports them. Preserve accounting across reloads and model changes.
+
+Normalize provider-specific cache fields carefully: distinguish cached tokens from total input tokens and cache writes where applicable, and do not double-count usage or prices. Deduplicate by stable request identity. Preserve historical pricing inputs so later price updates do not silently rewrite past costs.
+
+Use verified pricing sources and supported billing semantics, including fast-mode or image charges when applicable. Show currency, pricing date/source, and whether a value is reported, calculated, estimated, or unknown. Never turn missing usage into zero cost or imply an estimate is an invoice.
+
+Add concise usage visibility to each chat window with an accessible detailed breakdown. In model settings, make price and capability trade-offs understandable before selection without automatically changing to a more expensive model.
+
+Test aggregation across multiple models, cache accounting, duplicate callbacks, retries, cancellations, missing usage, price changes, and session reopening. Record pricing sources, limitations, verification results, and STATUS/NEXT.
+'''
+
+[[step]]
+name = "integration-and-design-review"
+project = "agent-conductor"
+worktree = true
+timeout_min = 105
+prompt = '''
+Review the assembled assistant against the human request, fix integration defects within this feature, and refine its visual and ergonomic quality. Consult preceding .agent_tasks findings and distinguish completed, blocked, and unverified work. Do not hide missing prerequisites behind mock production behavior.
+
+Run python run_tests.py and the relevant lint, type-check, build, and browser tests actually documented or discovered in this project. Add focused regression coverage where necessary. Use isolated data for mutations; do not launch real conductor runs or alter unrelated project records.
+
+Exercise the dashboard and all discovered modal variants: opening, minimizing and expanding chat; navigating while retaining the conversation and draft; starting and reopening sessions; current-view context changes; source links; settings; attachments; dictation; and usage history. Inspect the real browser UI against the researched design principles and C:/Projects/agent-conductor/data/attachments/20261017-034141-9004b812.png. Refine spacing, hierarchy, contrast, layering, keyboard behavior, responsive layouts, and conversation-history usability within the existing visual language.
+
+Verify that a question about "`tsc --noEmit` clean, `eslint` clean (only a generated-file warning)" receives a clear explanation that --noEmit is a TypeScript compiler flag preventing emitted files while checks run. Distinguish what the report states from what supporting logs actually establish. Verify the apartment-3d camera-change query returns specific dated steps, evidence, and working modal links, or an honest no-results/partial-coverage explanation.
+
+Review authorization, read-only bypass resistance, action confirmations, untrusted retrieved content, rendered-message safety, attachment access, bounded retrieval, durable history, and accounting correctness. Confirm the reusable assistant core is separated from conductor-specific adapters.
+
+Use deterministic fixtures for routine tests. If an already-authorized live provider trial is available, keep it small and record actual cost and findings; otherwise explicitly mark live model, vision, and speech checks unverified. Assess whether the requested low-effort configuration handles representative questions adequately, and recommend alternatives only with evidence and price trade-offs, never an automatic upgrade.
+
+Record an evidence-backed acceptance checklist, test results, remaining defects or blockers, and STATUS/NEXT in .agent_tasks.
+'''
+
+[[step]]
+name = "follow-up-plan"
+project = "agent-conductor"
+worktree = true
+timeout_min = 25
+prompt = '''
+Review what this run actually accomplished against the complete human request. This is a review and proposal-writing step only; do not implement additional features or launch another run.
+
+Read per-step logs, STATUS/NEXT lines, and notes under C:/Projects/agent-conductor/data/runs in the newest directory whose name ends in dashboard-ask-ai, confirming that it belongs to this run. Also review the involved project's .agent_tasks files and the resulting code/test evidence. Account for failed steps, unmerged or parked worktrees, skipped redundant work, unavailable provider capabilities, and checks that were never performed. Do not treat an optimistic status line as proof of completion.
+
+Write a NEW conductor TOML manifest proposing only evidence-backed unfinished requirements or newly discovered work needed to satisfy the request. Save it as C:/Projects/agent-conductor/manifests/dashboard-ask-ai-followup.toml using forward slashes. Give proposed steps concrete scopes, prerequisites, and acceptance criteria; do not repeat completed implementation work or expand into unrelated projects.
+
+Use the actual supported conductor schema, registered project slugs, local worktree isolation, automatic merge resolution, retry settings, and applicable verification commands. Keep credentials and private payloads out of the manifest, referring to project configuration and source records instead. If no actionable work remains, make that explicit and do not invent implementation steps.
+
+Validate the TOML and supported schema without executing the proposal. Do not overwrite an unrelated pre-existing manifest; report a path collision if necessary. Finish with STATUS/NEXT identifying the saved proposal and any blockers. The human will review and launch any follow-up separately.
+'''
