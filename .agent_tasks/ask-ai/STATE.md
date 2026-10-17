@@ -99,6 +99,33 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
 - [x] integration-and-design-review
 - [ ] follow-up-plan
 
+### Fast transport (run 20261017-164321-assistant-fast-transport)
+
+- [x] transport-investigation - DESIGN step, no code. Decision record:
+      `assistant/TRANSPORT.md` - CHOSEN warm ACP session pool
+      (`devin acp` stdio JSON-RPC, one long-lived child per active
+      conversation, session/new + session/load resume, set_mode ask
+      read-only gate, set_config_option model mid-session switch,
+      session/cancel notification, native image blocks, streamed
+      agent_message_chunk deltas, per-turn usage incl.
+      cachedRead/WriteTokens); REJECTED direct HTTP to
+      server.codeium.com ApiServerService (undocumented Connect-RPC,
+      reverse-engineered schema) and api.devin.ai v3 REST (cloud
+      sessions, different credential, no uid vocabulary). `devin -p`
+      stays fallback + only transport for non-readonly convs.
+      Verified live on 3000.6.2: initialize, session/new, prompt x N,
+      ask-mode write refusal, read-tool file access, image-block
+      answer, cancel->stopReason cancelled, cross-process
+      session/load with history, session/list + `devin list` parity,
+      per-turn usage fields, supportsImages flags.
+- [ ] provider-adapter - implement `assistant/providers/devin_acp.py`
+      per TRANSPORT.md's exact contract (injected seams, raw_metrics
+      cumulative bridge, llm_steps unreported, warm-pool lifecycle)
+- [ ] runtime-and-settings - per-conversation transport field,
+      fallback recording, read-only routing, back-compat
+- [ ] chat-ui-and-verification - settings control + transport
+      indicator, end-to-end verify
+
 ## Implemented contracts (persistent-chat-core)
 
 - `assistant/` package, stdlib-only, never imports conductor. Host seams
@@ -676,7 +703,14 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
 
 ## Where it stopped
 
-`integration-and-design-review` is done: the assembled branch was
+`transport-investigation` (step 1 of the assistant-fast-transport
+follow-up run) is done: the transport is DECIDED - warm ACP session
+pool (`devin acp`), with `devin -p` kept as fallback. The full
+adapter contract + risk table is `assistant/TRANSPORT.md`; the next
+manifest step (`provider-adapter`) implements it exactly. Earlier
+phase summary kept below.
+
+`integration-and-design-review` was done: the assembled branch was
 audited end-to-end, a dozen real defects fixed, verified against a
 live provider on isolated fixture data, browser-exercised
 (46 deterministic checks), and security-reviewed. Findings below;
@@ -838,11 +872,18 @@ then `follow-up-plan`.
 
 ## Deferred or blocked
 
-- ACP `session/new` stalls (missing session-db migration in devin
-  3000.6.2) - blocks true token streaming; `-p -r` baseline carries the
-  feature. Re-check after a `devin update`.
-- Whether the serve process should host a long-lived acp server child vs
-  per-exchange `devin -p` spawns - DESIGN.md recommends per-exchange.
+- ~~ACP `session/new` stalls (missing session-db migration in devin
+  3000.6.2) - blocks true token streaming~~ **RESOLVED 2026-10-17** -
+  the migration error is tolerated on this build; the full ACP
+  lifecycle verified live (session/new, prompt+image, set_mode ask,
+  set_config_option model, cancel notification, cross-process
+  session/load, session/list, `devin list` parity). Decision record:
+  `assistant/TRANSPORT.md` (see 'Fast transport' section below).
+- ~~Whether the serve process should host a long-lived acp server
+  child vs per-exchange `devin -p` spawns~~ DECIDED 2026-10-17 -
+  warm ACP: one `devin acp` child per ACTIVE conversation, pooled,
+  idle-reaped at 30min (`assistant/TRANSPORT.md` 'Warm-pool
+  lifecycle').
 - The default seeded `fast=true` is a preference: dispatch re-verifies
   per family (swe-2 has no fast variant; resolution errors name verified
   alternatives, e.g. `gpt-6-luna-<effort>-priority`).
