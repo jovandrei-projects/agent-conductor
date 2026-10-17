@@ -3216,11 +3216,11 @@ name = "organize"
 prompt = "Organize the catalog and verify results."
 '''
 
-    def new(self):
+    def new(self, **fields):
         return conductor.create_request(
             {"raw": "Please tidy the catalog carefully", "project": "proj",
              "model": "swe-2", "effort": "max",
-             "plan_model": "swe-2", "plan_effort": "max"},
+             "plan_model": "swe-2", "plan_effort": "max", **fields},
             self.requests, self.runs)
 
     def cleanup_flag(self, rid):
@@ -3271,7 +3271,8 @@ prompt = "Organize the catalog and verify results."
         return popen_router
 
     def test_published_plan_keeps_planner_session_as_step0(self):
-        rec = self.new()
+        raw = "Please tidy " + "every shelf in " * 12 + "the catalog"
+        rec = self.new(raw=raw)
         calls = []
         with mock.patch.object(conductor.subprocess, "Popen",
                                self.planner_popen(calls)), \
@@ -3311,6 +3312,15 @@ prompt = "Organize the catalog and verify results."
         self.assertIsNone(prep["run_dir"])        # history, not work
         self.assertIn("prepared this plan", prep["note"])
         self.assertFalse(prep["prompt_editable"])
+        # the row label stays clipped but the modal's task prompt gets
+        # the request text whole - the planner row has no prompt file to
+        # fall back on, so task_full must carry it
+        self.assertTrue(prep["task"].endswith("...") or
+                        len(prep["task"]) <= 120 + len(
+                            "Propose a TOML runbook for: "))
+        self.assertEqual(prep["task_full"],
+                         "Propose a TOML runbook for: " + raw)
+        self.assertGreater(len(prep["task_full"]), len(prep["task"]))
         self.assertEqual(set(by_step) - {"plan-proposal"}, {"organize"})
         self.assertEqual(by_step["organize"]["status"], "planned")
         self.assertEqual(by_step["organize"]["seq"], 0)
@@ -3457,13 +3467,18 @@ prompt = "Organize the catalog and verify results."
         run = next(r for r in d["runs"] if r.get("request_id") == rec["id"])
         self.assertEqual(run["counts"], {"done": 1})
         # resume sees only manifest steps - prep history is never
-        # selected as runnable work
+        # selected as runnable work. driver_alive is patched out: the
+        # in-process cmd_run stamps this test pid as driver_pid, and on
+        # a fast machine the pid-reuse guard's 5s window cannot tell it
+        # from a just-spawned driver ('still has a live conductor').
         args2 = argparse.Namespace(manifest=rec["manifest"],
                                    resume=str(run_dir.parent), devin=MOCK,
                                    runs_dir=str(self.runs),
                                    request_id=rec["id"], hub=False,
                                    keep_awake=False)
-        self.assertEqual(conductor.cmd_run(args2), 0)
+        with mock.patch.object(conductor, "driver_alive",
+                               return_value=False):
+            self.assertEqual(conductor.cmd_run(args2), 0)
         self.assertEqual(len(calls), 1)
         st2 = json.loads(run_dir.read_text(encoding="utf-8"))
         self.assertEqual(set(st2["steps"]), {"organize"})

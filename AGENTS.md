@@ -666,7 +666,9 @@ them), and `rec.prompt_edited` + a `note` record when an override was
 dispatched. The modal's `task prompt` row shows the full body
 (`prompts/*.md` once dispatched, the manifest body while pending - the
 160-char `task` is only a fallback), and `prompt file` is the on-disk
-path. Rows stay glued to their agent across re-sorts via a run_dir|step
+path. The planner history row (plan-proposal) has no prompt file, so
+its `task_full` carries the full "Propose a TOML runbook for: <raw>"
+text directly - `task` stays the clipped row label. Rows stay glued to their agent across re-sorts via a run_dir|step
 key, and unsaved form drafts survive the 2s modal rebuild.
 
 **Interrupt + instruct** (`POST .../steps/<step>/interrupt`

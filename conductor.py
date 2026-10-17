@@ -11994,6 +11994,10 @@ def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
     export_path = log_path.with_suffix(".export.json")
     task = "Propose a TOML runbook for: " + " ".join(
         (rec.get("raw") or "").split())[:120]
+    # the modal's prompt box wants the whole ask - the row label is the
+    # clipped version, task_full carries the raw request verbatim
+    raw_full = (rec.get("raw") or "").strip()
+    task_full = "Propose a TOML runbook for: " + raw_full if raw_full else None
     out = []
     for i, e in enumerate(entries):
         produced = bool(e.get("gen_id")) and e.get("gen_id") == producer
@@ -12030,7 +12034,7 @@ def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
             "model_actual": e.get("model_actual"),
             "effort": e.get("effort"),
             "mode": "planner", "cloud": False, "verify_ok": None,
-            "task": task, "task_full": task, "purpose": None,
+            "task": task, "task_full": task_full, "purpose": None,
             "note": note, "next": None, "exit_code": None,
             "outcome": None, "outcomes": None,
             "branch": None, "merged": None,
@@ -12866,6 +12870,9 @@ def collect_dashboard(runs_dir: Path,
                 "mode": "planner", "cloud": False, "verify_ok": None,
                 "task": "Propose a TOML runbook for: " + " ".join(
                     (rec.get("raw") or "").split())[:120],
+                "task_full": ("Propose a TOML runbook for: "
+                              + (rec.get("raw") or "").strip()
+                              if (rec.get("raw") or "").strip() else None),
                 "purpose": None,
                 "note": None, "next": None, "exit_code": None,
                 "outcome": None, "outcomes": None,
