@@ -96,9 +96,10 @@ class StoreMigrationTests(unittest.TestCase):
                 (2, []),                 # exchanges.sources (applied too)
                 (3, []),                 # exchanges.requests (applied too)
                 (4, []),                 # actions.explain (applied too)
-                (5, ["ALTER TABLE conversations ADD COLUMN note TEXT"]),
+                (5, []),                 # transport columns (applied too)
+                (6, ["ALTER TABLE conversations ADD COLUMN note TEXT"]),
             ])
-            self.assertEqual(st.user_version(), 5)
+            self.assertEqual(st.user_version(), 6)
             row = st.query_one("SELECT * FROM conversations")
             self.assertEqual(row["title"], "t")
             self.assertIn("note", row)   # new column, old row intact
@@ -1163,6 +1164,32 @@ class HttpApiTests(unittest.TestCase):
             code, m = http_api.dispatch(c, "GET", "/api/assistant/models")
             self.assertEqual(m["models"][0]["uid"],
                              "gpt-6-luna-low-priority")
+            c.close()
+
+    def test_settings_transport_field(self):
+        """The transport setting: a defaults-level value, per-conv
+        override, the live transports vocabulary, and validation."""
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            code, s = http_api.dispatch(c, "GET", "/api/assistant/settings")
+            self.assertIn(s["defaults"]["transport"], ("cli", "fast"))
+            self.assertEqual(
+                [t["id"] for t in s["transports"]], ["cli", "fast"])
+            code, s = self.post(c, "/api/assistant/settings",
+                                {"transport": "cli"})
+            self.assertEqual(s["defaults"]["transport"], "cli")
+            # an unknown value is rejected, not silently stored
+            code, s = self.post(c, "/api/assistant/settings",
+                                {"transport": "carrier-pigeon"})
+            self.assertEqual(code, 400)
+            code, cv = self.post(c, "/api/assistant/conversations",
+                                 {"origin": {"view": "dashboard"},
+                                  "settings": {"transport": "fast"}})
+            self.assertEqual(cv["transport"], "fast")
+            code, cv2 = self.post(
+                c, f"/api/assistant/conversations/{cv['id']}/settings",
+                {"transport": "cli"})
+            self.assertEqual(cv2["transport"], "cli")
             c.close()
 
     def test_attachment_upload_route(self):

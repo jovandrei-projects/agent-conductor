@@ -69,6 +69,26 @@ def usage_delta(prev: dict | None, cur: dict | None) -> UsageDelta:
         llm_steps=d("total_steps"))
 
 
+# Transport registry for additional provider adapters (the "fast"
+# transport and any future ones). An adapter module registers itself with
+# register_transport() at import time; the host wiring also auto-discovers
+# concrete ProviderAdapter subclasses in this package when nothing was
+# registered - the registry keeps that discovery name-free.
+_REGISTERED_TRANSPORTS: dict = {}
+
+
+def register_transport(name: str, factory) -> None:
+    """Register `factory` (a class or zero-seam-matched callable) under a
+    transport id such as "fast". Called by adapter modules at import; the
+    host instantiates through `registered_transports()`."""
+    _REGISTERED_TRANSPORTS[str(name)] = factory
+
+
+def registered_transports() -> dict:
+    """transport id -> adapter class/factory, copy."""
+    return dict(_REGISTERED_TRANSPORTS)
+
+
 class ProviderAdapter(ABC):
     """The `devin_print` adapter (assistant-runtime step) and the future
     `devin_acp` adapter both implement this."""

@@ -24,7 +24,8 @@ DEFAULT_MODEL = "gpt-6-luna"
 DEFAULT_EFFORT = "low"
 DEFAULT_FAST = True
 DEFAULT_SETTINGS = {"model": DEFAULT_MODEL, "effort": DEFAULT_EFFORT,
-                    "fast": DEFAULT_FAST, "readonly": True}
+                    "fast": DEFAULT_FAST, "readonly": True,
+                    "transport": "fast"}
 
 # Effort ladder seen in the catalog (used only to RECOGNIZE an effort
 # segment in a suffix, never to restrict - unknown ones pass through).

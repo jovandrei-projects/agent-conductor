@@ -22,7 +22,7 @@ import threading
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Chat entity ids look like the project's request ids with a short type
 # prefix: ``msg-20261017-051359-1ab2c3d4``. The regex is the authorization
@@ -168,12 +168,27 @@ _SCHEMA_V3 = ["ALTER TABLE exchanges ADD COLUMN requests TEXT"]
 # exact target and effect. Audit data like the other JSON columns.
 _SCHEMA_V4 = ["ALTER TABLE actions ADD COLUMN explain TEXT"]
 
+# Schema v5: the fast-transport feature's columns.
+# - conversations.transport: the per-conversation provider preference
+#   ('cli' | 'fast'); NULL on rows that predate the feature - they keep
+#   behaving exactly as before (CLI transport).
+# - exchanges.transport: the transport that actually ANSWERED the
+#   exchange ('cli' | 'fast'); NULL until a dispatch begins.
+# - exchanges.fallback: JSON {from, to, reason} recorded when the
+#   exchange was routed off its requested transport (unavailable
+#   adapter, read-only-off conversation, or a transport init failure) -
+#   the audit trail for 'which transport answered and why'.
+_SCHEMA_V5 = ["ALTER TABLE conversations ADD COLUMN transport TEXT",
+              "ALTER TABLE exchanges ADD COLUMN transport TEXT",
+              "ALTER TABLE exchanges ADD COLUMN fallback TEXT"]
+
 # Ordered additive migrations: (new user_version, statements). v1 is the
 # baseline above; append (N, [...]) for the next change - never edit v1/v2.
 MIGRATIONS: tuple[tuple[int, list[str]], ...] = ((1, _SCHEMA_V1),
                                                (2, _SCHEMA_V2),
                                                (3, _SCHEMA_V3),
-                                               (4, _SCHEMA_V4))
+                                               (4, _SCHEMA_V4),
+                                               (5, _SCHEMA_V5))
 
 
 def _row(r: sqlite3.Row | None) -> dict | None:
@@ -258,10 +273,10 @@ class Store:
         conn.execute(
             "INSERT INTO conversations(id, client_ref, title, origin_view,"
             " created_at, updated_at, last_active_at, model, effort, fast,"
-            " readonly, provider_session_id)"
+            " readonly, provider_session_id, transport)"
             " VALUES(:id,:client_ref,:title,:origin_view,:created_at,"
             " :updated_at,:last_active_at,:model,:effort,:fast,:readonly,"
-            " :provider_session_id)", rec)
+            " :provider_session_id,:transport)", rec)
         return rec
 
     def get_conversation(self, conv_id: str) -> dict | None:

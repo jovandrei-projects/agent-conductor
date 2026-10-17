@@ -29,6 +29,31 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-17 (runtime-and-settings, wave step of run
+  20261017-164321-assistant-fast-transport): per-conversation
+  `transport` setting (`cli`|`fast`, settings-level default
+  `default.transport`, seeded `fast`) frozen into each message's
+  settings_json like model/effort/fast/readonly; schema v5 adds
+  `conversations.transport`, `exchanges.transport`,
+  `exchanges.fallback` (NULL = pre-feature row = cli). The runtime
+  takes a `providers={name: adapter}` map beside the baseline CLI
+  provider and selects per exchange from the frozen snapshot: fast is
+  a read-only lane - a `readonly=false` conversation asking for fast is
+  answered by CLI, and attachments route through CLI unless the adapter
+  declares image support. Init-class fast failures (send() raise or a
+  first-hop error before any answer) re-dispatch the question on CLI
+  with `{from,to,reason}` persisted in `exchanges.fallback` and the
+  failed hop recorded in `requests[]` - a transport problem never fails
+  the user's question, while an error after an answer stays honestly
+  `partial`. Sessions are namespaced per transport (`_session_for`
+  matches model_uid AND transport), reconcile adopts on the transport
+  recorded on the row, and `GET /api/assistant/settings` exposes a
+  `transports` availability list. Host wiring discovers the fast
+  adapter at `open_runtime` via the provider registry / module
+  conventions (`_fast_provider`, constructible with declared seams only)
+  - the sibling `provider-adapter` step lands the concrete adapter.
+  17 new tests; ask-ai/STATE.md 'Implemented contracts
+  (fast-transport runtime + settings)'.
 - DONE 2026-10-17 (follow-up-plan, closing step of run
   20261017-051357-dashboard-ask-ai): reviewed the run against the
   request (ask-ai assistant). ALL NINE feature steps did real,

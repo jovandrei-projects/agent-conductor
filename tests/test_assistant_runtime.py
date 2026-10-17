@@ -1060,6 +1060,359 @@ class RuntimeTests(unittest.TestCase):
             st.close()
 
 
+# -------------------------------------------------- transports
+#
+# The 'fast' transport lane: a second ProviderAdapter registered under
+# providers={"fast": ...}. Selection is per-exchange from the FROZEN
+# message snapshot; a read-only-off conversation or an init-level
+# failure re-routes to the CLI provider with the reroute recorded on
+# the exchange row.
+
+class FastProvider(ScriptedProvider):
+    """The fast transport, scriptable like ScriptedProvider; distinct
+    instance so tests can tell which lane answered."""
+    pass
+
+
+def fast_conv(core, **extra):
+    return core.create_conversation({"view": "dashboard"},
+                                    settings={"transport": "fast",
+                                              **extra})
+
+
+class TransportTests(unittest.TestCase):
+    def _open(self, td, cli=None, fast=None, **kw):
+        cli = cli or ScriptedProvider()
+        rt_kw = dict(kw)
+        if fast is not None:
+            rt_kw["providers"] = {"fast": fast}
+        return make_runtime(td, cli, **rt_kw)
+
+    def test_fast_transport_answers_readonly_conversation(self):
+        with tempfile.TemporaryDirectory() as td:
+            fast, cli = FastProvider(), ScriptedProvider()
+            core, rt = self._open(td, cli=cli, fast=fast)
+            cv = fast_conv(core)
+            self.assertEqual(cv["transport"], "fast")
+            x = wait_x(core, ask(core, cv, "hi")["exchange"]["id"])
+            self.assertEqual(x["status"], "done")
+            self.assertEqual(x["transport"], "fast")
+            self.assertIsNone(x["fallback"])
+            self.assertEqual(len(fast.sends), 1)
+            self.assertEqual(len(cli.sends), 0)
+            v = core.exchange_view(x["id"])
+            self.assertEqual(v["text"], "ok answer")
+            self.assertEqual(v["requests"][0]["transport"], "fast")
+            core.close()
+
+    def test_cli_conversation_never_touches_fast(self):
+        with tempfile.TemporaryDirectory() as td:
+            fast, cli = FastProvider(), ScriptedProvider()
+            core, rt = self._open(td, cli=cli, fast=fast)
+            cv = core.create_conversation(
+                {"view": "dashboard"}, settings={"transport": "cli"})
+            x = wait_x(core, ask(core, cv, "hi")["exchange"]["id"])
+            self.assertEqual(x["transport"], "cli")
+            self.assertEqual(len(cli.sends), 1)
+            self.assertEqual(len(fast.sends), 0)
+            core.close()
+
+    def test_pre_transport_rows_stay_on_cli(self):
+        """A conversation row written before the transport column existed
+        (NULL) dispatches on the CLI provider exactly as before."""
+        with tempfile.TemporaryDirectory() as td:
+            fast, cli = FastProvider(), ScriptedProvider()
+            core, rt = self._open(td, cli=cli, fast=fast)
+            cv = fast_conv(core)
+            # simulate the pre-feature row (NULL column)
+            core.store.execute(
+                "UPDATE conversations SET transport=NULL WHERE id=?",
+                (cv["id"],))
+            # and a pre-feature message snapshot carries no key at all -
+            # it must resolve to the CLI lane too
+            self.assertEqual(
+                rt._select_transport({}, [])[0], "cli")
+            x = wait_x(core, ask(core, cv, "hi")["exchange"]["id"])
+            self.assertEqual(x["status"], "done")
+            self.assertEqual(x["transport"], "cli")
+            self.assertIsNone(x["fallback"])
+            self.assertEqual(len(cli.sends), 1)
+            self.assertEqual(len(fast.sends), 0)
+            # and the read payload still reports a usable transport
+            self.assertEqual(core.get_conversation(cv["id"])
+                             ["transport"], "cli")
+            core.close()
+
+    def test_readonly_off_routes_to_cli_with_reason(self):
+        """A mutation-capable conversation asking for 'fast' is answered
+        by the CLI transport - the fast lane is structurally read-only
+        and the action flow is never bypassed."""
+        with tempfile.TemporaryDirectory() as td:
+            fast, cli = FastProvider(), ScriptedProvider()
+            core, rt = self._open(td, cli=cli, fast=fast)
+            cv = fast_conv(core, readonly=False)
+            x = wait_x(core, ask(core, cv, "stop run r1")
+                       ["exchange"]["id"])
+            self.assertEqual(x["status"], "done")
+            self.assertEqual(x["transport"], "cli")
+            self.assertEqual(len(cli.sends), 1)
+            self.assertEqual(len(fast.sends), 0)
+            fb = core.exchange_view(x["id"])["fallback"]
+            self.assertEqual(fb["from"], "fast")
+            self.assertEqual(fb["to"], "cli")
+            self.assertIn("read-only", fb["reason"])
+            core.close()
+
+    def test_proposed_action_flow_unchanged_on_cli_routing(self):
+        """readonly-off on 'fast' -> CLI transport, and a fenced
+        proposed_action in the reply still lands as an action row via
+        the normal whitelist path (never executed inline)."""
+        with tempfile.TemporaryDirectory() as td:
+            fast, cli = FastProvider(), ScriptedProvider(
+                lambda rec: [PollResult(
+                    done=True, text="I can stop it.\n```proposed_action\n"
+                    '{"kind": "stop_run", "params": {"run": "r1"},'
+                    ' "explain": "user asked"}\n```',
+                    session_id=rec["handle"].session_id)])
+            core, rt = self._open(td, cli=cli, fast=fast,
+                                  actions=FakeActions())
+            cv = fast_conv(core, readonly=False)
+            x = wait_x(core, ask(core, cv, "please stop run r1")
+                       ["exchange"]["id"])
+            self.assertEqual(x["transport"], "cli")
+            acts = core.list_actions(cv["id"])
+            self.assertEqual(len(acts), 1)
+            self.assertEqual(acts[0]["kind"], "stop_run")
+            self.assertEqual(acts[0]["state"], "proposed")
+            core.close()
+
+    def test_fast_send_failure_falls_back_to_cli(self):
+        """spawn/init failure on the fast transport (credential error,
+        unreachable endpoint, spawn raise) -> CLI answers; the failed
+        attempt and the reroute are recorded, the question is never
+        failed."""
+        class Boom(FastProvider):
+            def send(self, *a, **kw):
+                raise RuntimeError("endpoint unreachable")
+
+        with tempfile.TemporaryDirectory() as td:
+            fast, cli = Boom(), ScriptedProvider()
+            core, rt = self._open(td, cli=cli, fast=fast)
+            cv = fast_conv(core)
+            x = wait_x(core, ask(core, cv, "hi")["exchange"]["id"])
+            self.assertEqual(x["status"], "done")
+            self.assertEqual(x["transport"], "cli")
+            self.assertEqual(x["provider_session_id"], "sess-1")
+            v = core.exchange_view(x["id"])
+            self.assertEqual(v["text"], "ok answer")
+            fb = v["fallback"]
+            self.assertEqual(fb["from"], "fast")
+            self.assertEqual(fb["to"], "cli")
+            self.assertIn("endpoint unreachable", fb["reason"])
+            reqs = v["requests"]
+            self.assertEqual(len(reqs), 2)
+            self.assertEqual(reqs[0]["transport"], "fast")
+            self.assertIn("init failed", reqs[0]["error"])
+            self.assertIsNone(reqs[0]["usage"])
+            self.assertEqual(reqs[1]["transport"], "cli")
+            self.assertEqual(reqs[1]["kind"], "fresh")
+            core.close()
+
+    def test_fast_first_hop_error_falls_back_to_cli(self):
+        """The provider spawned but the turn died without an answer
+        (auth/credential rejection surfaces as a terminal error) -> the
+        CLI lane answers the same question."""
+        with tempfile.TemporaryDirectory() as td:
+            fast = FastProvider(lambda rec: [PollResult(
+                done=True, error="401 not authenticated",
+                session_id=rec["handle"].session_id)])
+            cli = ScriptedProvider()
+            core, rt = self._open(td, cli=cli, fast=fast)
+            cv = fast_conv(core)
+            x = wait_x(core, ask(core, cv, "hi")["exchange"]["id"])
+            self.assertEqual(x["status"], "done")
+            self.assertEqual(x["transport"], "cli")
+            v = core.exchange_view(x["id"])
+            self.assertEqual(v["text"], "ok answer")
+            self.assertIn("401", v["fallback"]["reason"])
+            reqs = v["requests"]
+            self.assertEqual([r["transport"] for r in reqs],
+                             ["fast", "cli"])
+            core.close()
+
+    def test_fast_error_with_answer_is_not_retried(self):
+        """A fast turn that produced an answer and then errored is a
+        REAL failure, not an init problem - it stays 'partial' on the
+        fast transport rather than silently re-asking elsewhere."""
+        with tempfile.TemporaryDirectory() as td:
+            fast = FastProvider(lambda rec: [PollResult(
+                done=True, text="half an answer",
+                error="connection dropped mid-stream",
+                session_id=rec["handle"].session_id,
+                raw_metrics={"total_prompt_tokens": 12})])
+            cli = ScriptedProvider()
+            core, rt = self._open(td, cli=cli, fast=fast)
+            cv = fast_conv(core)
+            x = wait_x(core, ask(core, cv, "hi")["exchange"]["id"])
+            self.assertEqual(x["status"], "partial")
+            self.assertEqual(x["transport"], "fast")
+            self.assertIsNone(x["fallback"])
+            self.assertEqual(len(cli.sends), 0)
+            core.close()
+
+    def test_no_fast_adapter_falls_back(self):
+        """settings ask for 'fast' but no adapter is wired - the CLI
+        answers with the unavailability recorded."""
+        with tempfile.TemporaryDirectory() as td:
+            cli = ScriptedProvider()
+            core, rt = self._open(td, cli=cli)      # no fast registered
+            cv = fast_conv(core)
+            x = wait_x(core, ask(core, cv, "hi")["exchange"]["id"])
+            self.assertEqual(x["status"], "done")
+            self.assertEqual(x["transport"], "cli")
+            fb = core.exchange_view(x["id"])["fallback"]
+            self.assertEqual(fb["from"], "fast")
+            self.assertIn("not wired", fb["reason"])
+            self.assertEqual(len(cli.sends), 1)
+            core.close()
+
+    def test_transport_snapshot_frozen_per_message(self):
+        """Later settings edits never rewrite an exchange's recorded
+        transport/snapshot - the message row keeps what it ran under."""
+        with tempfile.TemporaryDirectory() as td:
+            fast, cli = FastProvider(), ScriptedProvider()
+            core, rt = self._open(td, cli=cli, fast=fast)
+            cv = fast_conv(core)
+            r = ask(core, cv, "hi")
+            x = wait_x(core, r["exchange"]["id"])
+            self.assertEqual(x["transport"], "fast")
+            # later edits: switch the conversation back to cli
+            core.update_settings(cv["id"], {"transport": "cli"})
+            msgs = core.list_messages(cv["id"])["items"]
+            snap = json.loads(msgs[0]["settings_json"])
+            self.assertEqual(snap["transport"], "fast")
+            still = core.exchange_view(x["id"])
+            self.assertEqual(still["transport"], "fast")
+            # and the NEXT message runs under the new selection
+            x2 = wait_x(core, ask(core, cv, "again")
+                        ["exchange"]["id"])
+            self.assertEqual(x2["transport"], "cli")
+            core.close()
+
+    def test_per_message_transport_override(self):
+        """A message-level settings patch can pin the transport for that
+        exchange (same snap mechanics as model/effort)."""
+        with tempfile.TemporaryDirectory() as td:
+            fast, cli = FastProvider(), ScriptedProvider()
+            core, rt = self._open(td, cli=cli, fast=fast)
+            cv = core.create_conversation({"view": "dashboard"},
+                                          settings={"transport": "cli"})
+            x = wait_x(core, ask(core, cv, "hi",
+                                 settings={"transport": "fast"})
+                       ["exchange"]["id"])
+            self.assertEqual(x["transport"], "fast")
+            self.assertEqual(len(fast.sends), 1)
+            core.close()
+
+    def test_fast_session_ids_do_not_leak_into_cli(self):
+        """provider_session_id namespaces are per-transport: after a fast
+        turn, a cli exchange must NOT be offered the fast session id."""
+        with tempfile.TemporaryDirectory() as td:
+            fast, cli = FastProvider(), ScriptedProvider()
+            core, rt = self._open(td, cli=cli, fast=fast)
+            cv = fast_conv(core)
+            x1 = wait_x(core, ask(core, cv, "hi")["exchange"]["id"])
+            self.assertEqual(x1["provider_session_id"], "sess-1")
+            self.assertEqual(
+                core.get_conversation(cv["id"])["provider_session_id"],
+                "sess-1")
+            # flip the conversation to cli - the 'sess-1' fast session
+            # must NOT be resumed on the CLI transport
+            core.update_settings(cv["id"], {"transport": "cli"})
+            cli.sessions_v = {"cli-sess-9"}          # unrelated listing
+            wait_x(core, ask(core, cv, "again")["exchange"]["id"])
+            self.assertIsNone(cli.sends[-1]["session_id"])
+            self.assertEqual(len(fast.sends), 1)
+            core.close()
+
+    def test_fast_sessions_resume_within_fast(self):
+        """Two fast turns reuse the fast provider session exactly like
+        the CLI lane's -r behavior."""
+        with tempfile.TemporaryDirectory() as td:
+            fast, cli = FastProvider(), ScriptedProvider()
+            core, rt = self._open(td, cli=cli, fast=fast)
+            cv = fast_conv(core)
+            x1 = wait_x(core, ask(core, cv, "one")["exchange"]["id"])
+            fast.sessions_v = {x1["provider_session_id"]}
+            wait_x(core, ask(core, cv, "two")["exchange"]["id"])
+            self.assertEqual(fast.sends[1]["session_id"],
+                             x1["provider_session_id"])
+            core.close()
+
+    def test_reconcile_adopts_on_recorded_transport(self):
+        """A running exchange row stamped 'fast' re-adopts through the
+        fast adapter's attach() - not blindly through the CLI provider."""
+        with tempfile.TemporaryDirectory() as td:
+            fast, cli = FastProvider(), ScriptedProvider()
+            core, rt = self._open(td, cli=cli, fast=fast)
+            cv = fast_conv(core)
+            # plant a crashed-serve orphan: user+assistant messages and a
+            # 'running' exchange dispatched under the fast transport
+            now = core.store.iso()
+            for mid, role in (("msg-20000101-000000-aa11", "user"),
+                              ("msg-20000101-000000-bb22", "assistant")):
+                core.store.execute(
+                    "INSERT INTO messages(id, conversation_id, role,"
+                    " text, status, settings_json, ctx_ref, attachments,"
+                    " created_at) VALUES(?, ?, ?, 'hi', 'pending',"
+                    " '{}', NULL, '[]', ?)", (mid, cv["id"], role, now))
+            xid = "xch-20000101-000000-cc33"
+            core.store.execute(
+                "INSERT INTO exchanges(id, conversation_id, user_msg_id,"
+                " assistant_msg_id, status, transport, pid,"
+                " provider_session_id, prompt_path, export_path,"
+                " started_at) VALUES(?, ?,"
+                " 'msg-20000101-000000-aa11', 'msg-20000101-000000-bb22',"
+                " 'running', 'fast', 4321, 'fs-9', 'p.md', 'e.json', ?)",
+                (xid, cv["id"], now))
+            fast.alive_pids.add(4321)
+            rearmed = rt.reconcile()
+            self.assertIn(xid, rearmed)
+            x = wait_x(core, xid)
+            self.assertEqual(fast.attached, [xid])   # fast adapter owns it
+            self.assertEqual(cli.attached, [])
+            core.close()
+
+    def test_invalid_transport_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            core, rt = self._open(td, cli=ScriptedProvider())
+            cv = core.create_conversation({"view": "dashboard"})
+            with self.assertRaises(AssistantError):
+                core.update_settings(cv["id"], {"transport": "pigeon"})
+            with self.assertRaises(AssistantError):
+                core.set_defaults({"transport": "pigeon"})
+            ok = core.update_settings(cv["id"], {"transport": "fast"})
+            self.assertEqual(ok["transport"], "fast")
+            core.close()
+
+    def test_transport_status_reports_wiring(self):
+        with tempfile.TemporaryDirectory() as td:
+            fast, cli = FastProvider(), ScriptedProvider()
+            core, rt = self._open(td, cli=cli, fast=fast)
+            opts = core.transport_options()
+            by_id = {t["id"]: t for t in opts}
+            self.assertTrue(by_id["cli"]["available"])
+            self.assertTrue(by_id["fast"]["available"])
+            # a runtime with no fast adapter reports it unavailable
+            cli_only = ScriptedProvider()
+            core2, rt2 = self._open(td, cli=cli_only)
+            self.assertFalse(
+                {t["id"]: t for t in core2.transport_options()}
+                ["fast"]["available"])
+            core.close()
+            core2.close()
+
+
 # ------------------------------------- DevinPrintProvider subprocess
 
 class DevinPrintAdapterTests(unittest.TestCase):

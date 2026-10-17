@@ -832,6 +832,104 @@ standard-vs-fast comparison and fetched-date provenance pre-selection.
 flight. Remaining per the manifest: `integration-and-design-review`,
 then `follow-up-plan`.
 
+## Where it stopped
+
+`runtime-and-settings` (wave step of run 20261017-164321-assistant-fast-
+transport): the per-conversation `transport` setting, the fast-readonly
+routing rule, and the automatic CLI fallback are implemented on the
+runtime/settings layer; the sibling `provider-adapter` step supplies the
+concrete fast adapter - this branch wires its discovery but does not
+merge it. Contract + schema v5 documented below; new `TransportTests`
+(16) cover selection, read-only routing, init-failure fallback,
+snapshot freezing, back-compat NULL rows, per-transport session namespacing
+and reconcile adoption. Full suite run recorded in this file's log.
+
+## Implemented contracts (fast-transport runtime + settings)
+
+- Schema v5 (additive `ALTER`s, `PRAGMA user_version=5`):
+  `conversations.transport TEXT NULL`, `exchanges.transport TEXT NULL`,
+  `exchanges.fallback TEXT NULL`. NULL everywhere means "pre-feature row"
+  and reads/dispatches as `cli` - no backfill, old rows keep working.
+- `assistant/providers/__init__.py` - transport registry:
+  `register_transport(name, factory)` + `registered_transports()`;
+  `devin_print` registers `"cli"`. Adapters arriving from the sibling
+  provider-adapter branch register at import - no hardcoded module name.
+- `assistant/core.py` - `TRANSPORTS = ("cli","fast")`,
+  `DEFAULT_TRANSPORT = "fast"`; `_clean_settings` validates/normalizes
+  transport (unknown -> AssistantError 400); `defaults()`/`set_defaults()`
+  carry `default.transport`; `create_conversation`/`update_settings`
+  persist it; `post_message` freezes `"transport": conv.get("transport")
+  or "cli"` into the per-message `settings_json` snapshot alongside
+  model/effort/fast/readonly (per-message override accepted, `readonly`
+  stays conversation-owned); `begin_exchange`/`note_dispatch` take
+  `transport`+`fallback` kwargs and stamp the row; `transport_options()`
+  asks the dispatcher for `transport_status()` and falls back to
+  cli-available/fast-unavailable when none is bound;
+  `exchange_view`/`list_exchanges` thaw `fallback` JSON like sources.
+- `assistant/runtime.py` - `AssistantRuntime(..., providers=None)`:
+  `self._providers` always has `"cli"` (positional provider), extra
+  transports land by name; `self.provider` stays the CLI baseline.
+  `_select_transport(snap, attachments)` runs per exchange from the
+  FROZEN snapshot: NULL/missing/`"cli"` -> CLI; `"fast"` ->
+  the registered fast adapter when present and `readonly` is true and
+  the adapter carries image support when attachments exist - else CLI
+  with a `{from,to,reason}` note persisted on `exchanges.fallback`.
+  A `readonly=false` conversation asking for fast is answered by CLI -
+  the fast lane is structurally read-only and the action whitelist is
+  never bypassed. Init-class failures on hop 1 (send() raising - spawn
+  failure/credential/endpoint - or a terminal error with no answer text)
+  re-dispatch through `_to_cli()` onto a CLI session compatible with the
+  conversation (`_session_for` now checks `model_uid` AND `transport`,
+  so fast session ids never resume on the CLI lane and vice-versa) and
+  stamp `fallback={from:fast,to:cli,reason}`; a failed first hop is also
+  appended to `exchanges.requests` with `transport:"fast"`, `usage:None`
+  so the usage details show the spent attempt honestly. An error AFTER
+  text landed is a real failure, not an init problem - it stays
+  `partial` on the fast transport (never silently re-asked). Adopted
+  reconcile jobs re-dispatch on the transport recorded on the row even
+  if settings moved since. `_Job.adapter` tracks the live provider so
+  `_poll`/`cancel` use the answering transport. `transport_status()`
+  -> per-transport `{id,name,available,note}` for the settings payload.
+- `assistant/http_api.py` - `GET /api/assistant/settings` payload gains
+  `transports: [{id,name,available,note}]` beside `defaults`.
+- `assistant_host/conductor_adapters.py` - `open_runtime(...,
+  providers=, fast_provider=)`: tests inject transports directly; on the
+  default provider path `_fast_provider()` best-effort discovers a fast
+  adapter - imports `assistant.providers/*` modules besides
+  `devin_print`, honors `register_transport` entries other than `cli`,
+  falls back to a module-level `build()/create()/provider` factory or a
+  concrete `ProviderAdapter` subclass, constructing with only the seams
+  it declares (argv/env/spawn_kwargs/kill/alive/workspace/spool/data
+  dirs/now/log). Every failure degrades to None -> runtime routes fast
+  conversations onto CLI with the reroute recorded.
+- `assistant_host/modelpick.py` - `DEFAULT_SETTINGS` gains
+  `transport: "fast"` so fresh installs seed the preferred lane;
+  resolution still routes by capability per exchange.
+
+### Tests (TransportTests, 16)
+
+- fast lane answers a readonly conv on the fast adapter (exchange +
+  per-request `transport` stamps, cli untouched); explicit `cli` and
+  legacy NULL rows never touch fast; `readonly=false` + `transport=fast`
+  lands on CLI with a recorded reason and the proposed-action flow
+  lands its action row unchanged (whitelist intact); fast send() raise
+  and hop-1 error both re-dispatch on CLI (`requests[]` carries the
+  failed fast hop, `fallback` object thawed on the view); a mid-answer
+  fast error stays `partial` on fast (no silent re-ask); no adapter
+  wired -> CLI answers with 'not wired' reason; the per-message
+  snapshot stays `fast` after the conv settings flip to `cli`
+  (frozen-per-exchange); fast session ids never leak into the CLI lane
+  and fast resume works inside the lane; a planted `running`/`fast`
+  exchange re-adopts through `attach()` on the fast adapter, not the
+  CLI; unknown transport values 400 on conv + defaults paths;
+  `transport_status()` reports wiring honestly.
+- `tests/test_assistant.py` `test_settings_transport_field`: GET
+  settings returns `defaults.transport` + `transports` vocabulary;
+  POST rejects an unknown transport (400), accepts `cli`/`fast` on
+  defaults, conv create, and conv settings update.
+- `tests/test_assistant.py` demo migration bumped to v6 (v5 is the real
+  transport schema now).
+
 ## Deferred or blocked
 
 - ACP `session/new` stalls (missing session-db migration in devin
