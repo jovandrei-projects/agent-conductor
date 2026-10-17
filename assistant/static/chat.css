@@ -436,7 +436,9 @@
 #ai-rail .ai-conv:hover { background: #161b22; }
 #ai-rail .ai-conv:focus-visible { background: #161b22;
   outline: 2px solid #58a6ff; }
-#ai-rail .ai-conv.on { background: #1c3041; color: #e6edf3;
+/* .on is set on the ROW div (ai-conv-row), not the button - style the
+   button inside it */
+#ai-rail .ai-conv-row.on .ai-conv { background: #1c3041; color: #e6edf3;
   box-shadow: inset 3px 0 0 #58a6ff; }
 #ai-rail .ai-conv .t { display: block; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
