@@ -18499,6 +18499,24 @@ tick();
 </script></body></html>"""
 
 
+def _serve_power(server, act) -> dict:
+    """Stop/Restart the dashboard itself - shared by the /api/serve/power
+    endpoint and the assistant's serve_power action. The response is
+    flushed before the shutdown timer fires; restart spawns the detached
+    replacement first so the gap is just the bind handoff (--wait-port)."""
+    act = str(act or "")
+    if act not in ("stop", "restart"):
+        raise RequestError("action must be 'stop' or 'restart'")
+    if act == "restart":
+        sargs = getattr(server, "serve_args", None)
+        if sargs is None:
+            raise RequestError("this server was not started by "
+                               "conductor.py serve - cannot respawn")
+        _respawn_serve(sargs)
+    threading.Timer(0.4, server.shutdown).start()
+    return {"ok": True, "action": act}
+
+
 def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                            requests_dir: Path | None = None,
                            manifests_dir: Path = MANIFESTS_DIR,
@@ -18513,7 +18531,7 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
     # 503 payload on /api/assistant/*, never a dead dashboard.
     _assist = {"core": None, "runtime": None, "err": None}
 
-    def assistant_open():
+    def assistant_open(server=None):
         with STATE_LOCK:
             if _assist["core"] is None and _assist["err"] is None:
                 try:
@@ -18522,7 +18540,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     core, rt = open_runtime(
                         data_dir=runs_dir.parent / "assistant",
                         runs_dir=runs_dir, requests_dir=requests_dir,
-                        devin_argv=devin_argv)
+                        manifests_dir=manifests_dir, trash_dir=trash_dir,
+                        devin_argv=devin_argv,
+                        power=(lambda act, s=server: _serve_power(s, act)
+                               if server is not None else None))
                     _assist.update(core=core, runtime=rt)
                 except Exception as exc:                # noqa: BLE001
                     LOG.exception("assistant runtime init failed")
@@ -18603,7 +18624,7 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
             core.read_upload, never a client-supplied path."""
             from assistant import http_api
             from assistant.core import AssistantError
-            core, err = assistant_open()
+            core, err = assistant_open(server=self.server)
             if core is None:
                 self._json({"error": f"assistant unavailable: {err}"},
                            503)
@@ -18788,23 +18809,8 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     return
                 body = self._body()
                 if path == "/api/serve/power":
-                    # Stop/Restart the dashboard itself. The response is
-                    # flushed before the shutdown thread fires; restart
-                    # spawns the detached replacement first so the gap is
-                    # just the bind handoff (--wait-port).
-                    act = str(body.get("action") or "")
-                    if act not in ("stop", "restart"):
-                        raise RequestError(
-                            "action must be 'stop' or 'restart'")
-                    if act == "restart":
-                        sargs = getattr(self.server, "serve_args", None)
-                        if sargs is None:
-                            raise RequestError(
-                                "this server was not started by "
-                                "conductor.py serve - cannot respawn")
-                        _respawn_serve(sargs)
-                    self._json({"ok": True, "action": act})
-                    threading.Timer(0.4, self.server.shutdown).start()
+                    self._json(_serve_power(self.server,
+                                            body.get("action")))
                     return
                 if path == "/api/requests":
                     self._json(create_request(body, requests_dir, runs_dir), 201)

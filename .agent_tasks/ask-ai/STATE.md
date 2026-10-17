@@ -86,9 +86,11 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
 - [ ] images-and-dictation - attachments + webSpeech composer
       (server side done: POST /api/assistant/attachments + ref binding;
       client composer + SpeechRecognition belong here)
-- [ ] guarded-dashboard-actions - action proposals + confirmations
-      (audit flow + readonly recheck done; implement ActionAdapter over
-      conductor functions + proposal parsing + confirm cards)
+- [x] guarded-dashboard-actions - action proposals + confirmations
+      (ConductorActions adapter: 28-kind whitelist over the same
+      conductor.py functions, launch-tier armed confirms, readonly
+      recheck, failed-proposal audit, action cards; see 'Implemented
+      contracts (guarded-dashboard-actions)' below)
 - [ ] usage-and-price-visibility - per-exchange + session rollups
       (usage/price snapshot columns + rollup endpoint exist; needs
       provider-side capture + UI)
@@ -481,16 +483,111 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
   ClipboardEvent path is verified; OS-level paste keeps the same
   `clipboardData.items` contract but is unverified end-to-end.
 
+## Implemented contracts (guarded-dashboard-actions)
+
+- `assistant/actions.py` - `ActionAdapter` is a concrete host seam (not
+  ABC): `spec_for`/`validate`/`execute` required, `expected_ack(row)`
+  + `describe()` optional. `LAUNCH_TIER_KINDS` = launch_request,
+  generate_request, answer_request, discard_request, stop_generation,
+  resume_run, merge_run, summarize_run, stop_run, stop_step,
+  batch_step_stop, interrupt_step, delete_run, empty_trash,
+  serve_power - kinds that spawn work, kill processes, merge, delete,
+  or bounce the server. KIND_RE is a compiled regex (2-41 chars).
+- `assistant/store.py` - schema v4: `actions.explain TEXT` (the model's
+  one-line reason, shown on the confirm card). Migration test pattern
+  moved to v5.
+- `assistant/core.py` - `_record_action()` is the single bounded audit
+  insert (payload JSON-capped at 150KB - the largest legit payload is
+  an edit_request carrying a republished TOML). `propose_action(...,
+  explain=, record_failure=)`: with record_failure a rejected proposal
+  lands as a terminal `failed` row (audited, visible, never executes)
+  instead of raising. `decide_action`: proposed->confirmed/denied,
+  confirmed->denied retraction, terminal rows are no-ops.
+  `execute_action(aid, ack=)`: readonly is re-read on the CURRENT
+  conversation row immediately before the adapter call; `failed` is a
+  terminal no-op; launch-tier kinds must echo `expected_ack` (the
+  adapter's exact-target string) or 409. `post_message` drops a
+  per-message `settings.readonly` claim and stamps the CONVERSATION's
+  readonly into the stored settings_json - a message can never claim a
+  capability the conversation lacks. `expected_ack(aid)` +
+  `action_catalog()` are the runtime/UI reads.
+- `assistant/runtime.py` - `_proposals` parses ```proposed_action
+  blocks ONLY from the model's final reply (never from retrieved
+  tool_result text), caps at _MAX_PROPOSALS, persists `explain`, and
+  records malformed blocks as `failed` rows with kind `(malformed)`.
+  The fresh-turn prompt appends `core.action_catalog()` under
+  "Whitelisted actions you may propose" so the model only ever names
+  real kinds.
+- `assistant_host/actions.py` - `ConductorActions(runs_dir,
+  requests_dir=, manifests_dir=, trash_dir=, devin_argv=, power=)`.
+  `_KINDS` maps 28 kinds to {text (card effect line), help (prompt
+  catalog line), validate (propose-time gate), call (execute), target
+  (ack fragment)}. Validators resolve stable ids to real records -
+  run dir names via `_run_dir_checked`, step names against state.json
+  OR the run's manifest names (`manifest_ok` for state-free controls),
+  request ids via `_read_request`, trash entries via `_trash_entry` -
+  then run the host's own shape gates (`_request_fields`,
+  `validate_proposal`, `_attachment_fields`, bound checks). `serve_power`
+  exists ONLY when `power` is wired (spec_for/describe hide it
+  otherwise). Executors call the same functions the dashboard POST
+  endpoints call - `_assert_unwatched`, stage gates, liveness, merge
+  claims, retry-safety all inherited. `_batch` helpers give per-item
+  results/errors for batch_* kinds.
+- `conductor.py` - `_serve_power(server, act)` extracted from the
+  /api/serve/power endpoint so the endpoint and the action share one
+  implementation; `assistant_open(server=)` forwards manifests_dir +
+  trash_dir + the power seam into `open_runtime`.
+- `assistant/static/chat.js` - `S.actions[xid]` rows render `.aim-card`
+  under the exchange's message: kind/effect/params/explain/result +
+  state badge. proposed+readonly -> disabled controls + 'read-only is
+  on' hint (cards never hide). confirm tier -> Run/Deny. launch tier ->
+  `Review & run` arms a second confirm block spelling the verbatim
+  `expected_ack` target + effect; `Confirm & run` posts
+  {approve, execute, ack} to `/actions/<id>/confirm`. Decisions write
+  the returned row back into `S.actions` before the actions reload.
+- `assistant/static/chat.css` - `.aim-card` + `.st-*` state styles,
+  `.act-arm` armed block, `.act-params`, `.act-btns`.
+- POST `/conversations/<id>/actions/<aid>/confirm` body gains `ack`
+  (http_api -> execute_action); GET `/conversations/<id>/actions`
+  rows include `expected_ack` + `explain`.
+
+### Verified (guarded-dashboard-actions)
+
+- 37 new tests: `tests/test_assistant_actions.py` (33) - whitelist
+  coverage/serve_power seam; validators (wrong-target 404s, manifest-
+  declared steps, request/trash gates, extra+malformed params, injection
+  text staying data); ack naming + the full no-ack path (proposed,
+  confirmed-no-ack, wrong-ack all refuse before conductor.stop_run is
+  ever called); forged confirmed row -> failed at the adapter boundary;
+  rejected proposals as failed rows; duplicate-decide idempotence;
+  readonly deny + flip invalidation; per-message settings can't claim
+  permission; fixture executions (archive stamp, review marks, batch
+  partial errors, create/discard-to-trash, delete-to-trash, executor-
+  error -> failed row, full HTTP flow with ack, deny over HTTP).
+  `test_assistant_runtime.py` (+3): rejected/malformed proposals
+  audited as failed rows; action catalog reaches the fresh prompt;
+  (pre-existing: proposal inert under readonly, retrieval evidence
+  can't flip readonly). `test_assistant_ui.py` (+1): card proposed/
+  armed/executed rendering, verbatim ack POST, deny body, readonly
+  inert state, injection escaping.
+- `python run_tests.py` -> 702 tests, OK. `node --check` on chat.js +
+  md.js clean.
+- No test launches real work: launch-tier executors either never reach
+  the conductor call (ack gate) or the `conductor.*` function is
+  mocked at the boundary.
+
 ## Where it stopped
 
-`images-and-dictation` is implemented and tested: image paste/pick/
-preview/remove/send/thumbnails ride the new id-gated
-`/api/assistant/attachments` raw POST + row-id GET routes (ctype
-recorded server-side, foreign convs and >20 ids refused), and the mic
-dictates into the textarea via SpeechRecognition with honest
-unavailable/permission states and teardown on close/switch/send.
-Remaining per the manifest: `guarded-dashboard-actions` (conductor
-ActionAdapter + confirm cards), `usage-and-price-visibility` UI, then
+`guarded-dashboard-actions` is implemented and tested: model-authored
+```proposed_action blocks become audited action rows via the runtime's
+reply-tail scan; `ConductorActions` whitelists 28 kinds, each delegating
+to the same conductor.py function the dashboard endpoint calls;
+proposals render as confirm cards (Run/Deny for normal kinds,
+armed exact-target Confirm&run for launch tier posting the verbatim
+`expected_ack`); read-only is re-checked server-side at execute time;
+rejected/malformed proposals land as terminal `failed` rows; 170
+assistant + 702-test suite green, node --check clean.
+Remaining per the manifest: `usage-and-price-visibility` UI, then
 `integration-and-design-review` + `follow-up-plan`.
 
 ## Deferred or blocked

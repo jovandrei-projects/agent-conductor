@@ -117,7 +117,7 @@ def _h_conv_settings(core, g, body, raw, q):
 def _h_confirm(core, g, body, raw, q):
     a = core.decide_action(g[1], bool((body or {}).get("approve")))
     if (body or {}).get("approve") and (body or {}).get("execute"):
-        a = core.execute_action(a["id"])
+        a = core.execute_action(a["id"], ack=(body or {}).get("ack"))
     return 200, a
 
 

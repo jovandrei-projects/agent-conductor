@@ -192,6 +192,9 @@ class FakeActions(ActionAdapter):
     def execute(self, action):
         return {"ok": True}
 
+    def describe(self):
+        return "- stop_run {run} - stop the run's live steps"
+
 
 # ------------------------------------------------------------- calc
 
@@ -735,6 +738,60 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(core.get_conversation(cv["id"])["readonly"])
             # nothing was proposed - the block lives in evidence, not the reply
             self.assertEqual(core.list_actions(cv["id"]), [])
+            core.close()
+
+    def test_rejected_proposal_is_recorded_failed_and_audited(self):
+        """A proposal the whitelist refuses does not vanish silently:
+        the failed row stays on the conversation (card + audit) and can
+        never execute."""
+        with tempfile.TemporaryDirectory() as td:
+            def on_send(rec):
+                return [PollResult(
+                    done=True, session_id=rec["handle"].session_id,
+                    text=("I will run this for you.\n"
+                          "```proposed_action\n{\"kind\": \"shell_exec\","
+                          " \"params\": {\"cmd\": \"format c:\"},"
+                          " \"explain\": \"cleanup\"}\n```\n"
+                          "```proposed_action\n{\"kind\": \"stop_run\","
+                          " \"params\": {\"run\": \"r1\"}}\n```\n"
+                          "```proposed_action\nnot-json\n```"))]
+            p = ScriptedProvider(on_send)
+            core, rt = self._open(td, p, actions=FakeActions())
+            cv = core.create_conversation({"view": "dashboard"})
+            r = ask(core, cv, "do it")
+            x = wait_x(core, r["exchange"]["id"])
+            self.assertEqual(x["status"], "done")
+            acts = core.list_actions(cv["id"])
+            self.assertEqual(len(acts), 3)
+            by_kind = {a["kind"]: a for a in acts}
+            self.assertEqual(by_kind["shell_exec"]["state"], "failed")
+            self.assertIn("not allowed", by_kind["shell_exec"]["result"])
+            self.assertEqual(by_kind["shell_exec"]["explain"], "cleanup")
+            self.assertEqual(by_kind["stop_run"]["state"], "proposed")
+            self.assertEqual(by_kind["(malformed)"]["state"], "failed")
+            for a in acts:
+                if a["state"] == "failed":
+                    # a failed row is terminal - execute is a no-op
+                    self.assertEqual(
+                        core.execute_action(a["id"])["state"], "failed")
+                else:
+                    # proposed + read-only conversation -> 409, inert
+                    with self.assertRaises(AssistantError):
+                        core.execute_action(a["id"])
+            core.close()
+
+    def test_action_catalog_reaches_the_fresh_prompt(self):
+        """The model only proposes real kinds because the adapter's
+        describe() is in the contract it reads."""
+        with tempfile.TemporaryDirectory() as td:
+            p = ScriptedProvider()
+            core, rt = self._open(td, p, actions=FakeActions())
+            cv = core.create_conversation({"view": "dashboard"})
+            r = ask(core, cv, "hi")
+            x = wait_x(core, r["exchange"]["id"])
+            self.assertEqual(x["status"], "done")
+            self.assertIn("Whitelisted actions", p.sends[0]["prompt"])
+            self.assertIn("stop_run", p.sends[0]["prompt"])
             core.close()
 
     def test_prompt_stays_bounded_under_huge_input(self):

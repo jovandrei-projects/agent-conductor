@@ -190,6 +190,31 @@
   background: #0d1117; }
 #aichat .aim-card .k { color: #d29922; font-weight: 600; }
 #aichat .aim-card .sub { color: #8b949e; margin-top: 3px; }
+#aichat .aim-card.st-executed { border-color: #3fb950; }
+#aichat .aim-card.st-executed .k { color: #3fb950; }
+#aichat .aim-card.st-failed { border-color: #f85149; }
+#aichat .aim-card.st-failed .k { color: #f85149; }
+#aichat .aim-card.st-denied { border-color: #30363d; opacity: .75; }
+#aichat .aim-card.st-denied .k { color: #8b949e; }
+#aichat .act-why { margin-top: 3px; }
+#aichat .act-params { color: #8b949e; font-family: inherit;
+  margin-top: 3px; word-break: break-all; }
+#aichat .act-btns { display: flex; gap: 6px; margin-top: 6px; }
+#aichat .act-btn { background: #21262d; color: #e6edf3;
+  border: 1px solid #30363d; border-radius: 6px; font: inherit;
+  font-size: 11px; padding: 3px 10px; cursor: pointer; }
+#aichat .act-btn:hover:not(:disabled) { border-color: #58a6ff;
+  color: #79c0ff; }
+#aichat .act-btn:disabled { opacity: .45; cursor: default; }
+#aichat .act-btn.danger { border-color: #f85149; color: #ff7b72; }
+#aichat .act-btn.danger:hover { background: #f85149; color: #fff; }
+#aichat .act-armed { margin-top: 6px; border-left: 3px solid #f85149;
+  padding: 6px 9px; background: #161b22; }
+#aichat .act-warn { color: #ff7b72; }
+#aichat .act-tgt { color: #8b949e; font-family: inherit; margin-top: 3px;
+  word-break: break-all; }
+#aichat .act-ok { color: #3fb950; font-weight: 600; margin-top: 3px; }
+#aichat .act-err { color: #f85149; font-weight: 600; margin-top: 3px; }
 
 /* composer: text column (attachment strip + textarea) + button column */
 #aichat .ai-compose { flex: none; display: flex; gap: 8px;

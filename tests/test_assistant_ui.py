@@ -553,6 +553,98 @@ setRoute((url,opt)=>{
             route_js="setRoute(()=>({items:[]}));")
         self.assertEqual(p.returncode, 0, p.stderr)
 
+    def test_action_cards_propose_arm_execute_deny(self):
+        """The guarded-action card: proposed -> Run/Deny (confirm tier) or
+        Review&run -> armed exact-target block -> Confirm&run (launch
+        tier, ack posted verbatim). Read-only renders the buttons inert
+        with a hint; deny posts approve:false; card text escapes."""
+        p = run_node(r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const S=window.AskAI._s;
+  S.conv={id:'conv-1',model:'m',effort:'',fast:0,readonly:0};
+  const ac1={id:'act-1',conversation_id:'conv-1',exchange_id:'x1',
+    kind:'set_run_archived',
+    payload:'{"run":"r1","archived":true}',state:'proposed',
+    requires_confirm:1,confirm_text:'Archive this run',explain:'it done',
+    result:null,expected_ack:null};
+  const ac2={id:'act-2',conversation_id:'conv-1',exchange_id:'x1',
+    kind:'stop_run',payload:'{"run":"r1"}',state:'proposed',
+    requires_confirm:1,confirm_text:'Stop this run - tasks die',
+    explain:'<img src=x onerror=alert(1)>',result:null,
+    expected_ack:'stop_run:r1'};
+  S.actions={x1:[ac1,ac2]};
+  // confirm-tier proposed: Run + Deny, explanation + params shown
+  let h=window.AskAI._actHtml(ac1);
+  assert.match(h,/proposed: set run archived/);
+  assert.match(h,/it done/);
+  assert.match(h,/Run</);
+  assert.match(h,/Deny</);
+  assert.doesNotMatch(h,/Review &/);
+  // launch tier proposes with 'Review & run' (no instant Run)
+  h=window.AskAI._actHtml(ac2);
+  assert.match(h,/Review &amp; run/);
+  assert.doesNotMatch(h,/>Run</);
+  assert.doesNotMatch(h,/<img/, 'model text is escaped');
+  assert.match(h,/&lt;img/);
+  // read-only: inert buttons + the hint (never hidden)
+  S.conv.readonly=1;
+  h=window.AskAI._actHtml(ac1);
+  assert.match(h,/disabled/);
+  assert.match(h,/read-only is on/);
+  S.conv.readonly=0;
+  // arm -> the card shows the exact target + effect, then disarm
+  await window.AskAI._actDecide('act-2','arm');
+  h=window.AskAI._actHtml(ac2);
+  assert.match(h,/Confirm &amp; run/);
+  assert.match(h,/target: r1/);
+  assert.match(h,/Stop this run - tasks die/);
+  await window.AskAI._actDecide('act-2','disarm');
+  assert(!S.armed['act-2']);
+  // arm again + confirm-run posts approve+execute+the verbatim ack
+  await window.AskAI._actDecide('act-2','arm');
+  await window.AskAI._actDecide('act-2','exec');
+  await flush();
+  const post=fetches.find(f=>f.url.includes('/actions/act-2/confirm'));
+  assert(post,'confirm POST happened');
+  assert.deepEqual(JSON.parse(post.opt.body),
+    {approve:true,execute:true,ack:'stop_run:r1'});
+  // the executed row lands in the cache and renders the done state
+  h=window.AskAI._actHtml(S.actions['x1'][1]);
+  assert.equal(S.actions['x1'][1].state,'executed');
+  assert.match(h,/done/);
+  // deny posts approve:false - no execute, no ack
+  await window.AskAI._actDecide('act-1','deny');
+  const dpost=fetches.find(f=>f.url.includes('/actions/act-1/confirm'));
+  assert.deepEqual(JSON.parse(dpost.opt.body),{approve:false});
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js=r'''
+const rows={
+  'act-1':{id:'act-1',conversation_id:'conv-1',exchange_id:'x1',
+    kind:'set_run_archived',payload:'{}',state:'proposed',
+    requires_confirm:1,confirm_text:'x',explain:null,result:null,
+    expected_ack:null},
+  'act-2':{id:'act-2',conversation_id:'conv-1',exchange_id:'x1',
+    kind:'stop_run',payload:'{}',state:'proposed',requires_confirm:1,
+    confirm_text:'x',explain:null,result:null,expected_ack:'stop_run:r1'}};
+setRoute((url,opt)=>{
+  if(url.includes('/actions/')&&url.endsWith('/confirm')){
+    const aid=url.split('/actions/')[1].split('/confirm')[0];
+    const b=JSON.parse(opt.body);
+    rows[aid].state=b.approve?(b.execute?'executed':'confirmed'):'denied';
+    rows[aid].result=JSON.stringify({stopping:[]});
+    return rows[aid];
+  }
+  if(url.includes('/actions'))
+    return{items:Object.values(rows)};
+  return{items:[]};
+});
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
     def test_paste_image_uploads_text_paste_untouched(self):
         """Clipboard handling: an image item becomes an eager upload +
         thumbnail (default paste suppressed only for it), while a

@@ -20,7 +20,7 @@ import conductor  # noqa: E402
 from assistant import context as ctxmod  # noqa: E402
 from assistant.core import AssistantCore  # noqa: E402
 from assistant.retrieval import MAX_EXCERPT_BYTES  # noqa: E402
-from assistant.store import Store  # noqa: E402
+from assistant.store import SCHEMA_VERSION, Store  # noqa: E402
 from assistant_host.context import ConductorContext  # noqa: E402
 from assistant_host.retrieval import (ConductorRetrieval,  # noqa: E402
                                       interpret_window)
@@ -541,7 +541,7 @@ class CoreIntegrationTests(unittest.TestCase):
     def test_exchange_sources_persist_and_thaw(self):
         with tempfile.TemporaryDirectory() as td:
             core, _ = self._core(td)
-            self.assertEqual(core.store.user_version(), 3)
+            self.assertEqual(core.store.user_version(), SCHEMA_VERSION)
             cv = core.create_conversation({"view": "dashboard"})
             r = core.post_message(cv["id"], "q", client_msg_id="cm-src-0001")
             xid = r["exchange"]["id"]

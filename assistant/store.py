@@ -22,7 +22,7 @@ import threading
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Chat entity ids look like the project's request ids with a short type
 # prefix: ``msg-20261017-051359-1ab2c3d4``. The regex is the authorization
@@ -163,11 +163,17 @@ _SCHEMA_V2 = ["ALTER TABLE exchanges ADD COLUMN sources TEXT"]
 # "internal request" detail view; nothing is recomputed later.
 _SCHEMA_V3 = ["ALTER TABLE exchanges ADD COLUMN requests TEXT"]
 
+# Schema v4: actions.explain - the model's one-line reason for proposing
+# the action, kept so the confirmation card shows intent next to the
+# exact target and effect. Audit data like the other JSON columns.
+_SCHEMA_V4 = ["ALTER TABLE actions ADD COLUMN explain TEXT"]
+
 # Ordered additive migrations: (new user_version, statements). v1 is the
 # baseline above; append (N, [...]) for the next change - never edit v1/v2.
 MIGRATIONS: tuple[tuple[int, list[str]], ...] = ((1, _SCHEMA_V1),
                                                (2, _SCHEMA_V2),
-                                               (3, _SCHEMA_V3))
+                                               (3, _SCHEMA_V3),
+                                               (4, _SCHEMA_V4))
 
 
 def _row(r: sqlite3.Row | None) -> dict | None:
@@ -422,10 +428,10 @@ class Store:
         conn.execute(
             "INSERT INTO actions(id, conversation_id, exchange_id, kind,"
             " payload, state, requires_confirm, confirm_text, result,"
-            " created_at, decided_at, executed_at)"
+            " explain, created_at, decided_at, executed_at)"
             " VALUES(:id,:conversation_id,:exchange_id,:kind,:payload,"
-            " :state,:requires_confirm,:confirm_text,:result,:created_at,"
-            " :decided_at,:executed_at)", rec)
+            " :state,:requires_confirm,:confirm_text,:result,:explain,"
+            " :created_at,:decided_at,:executed_at)", rec)
         return rec
 
     def get_action(self, aid: str) -> dict | None:
