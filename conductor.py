@@ -13088,6 +13088,12 @@ td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top
 /* the agents table's run name: extra right padding keeps a long,
    ellipsized name from visually colliding with the model column */
 td.rcell { padding-right:18px; }
+/* td's text-overflow only ellipsizes the cell's own text - a clipped
+   link button showed a hard mid-word cut right against the next
+   column. Letting the button ellipsize itself gives a real '...' plus
+   the rcell gutter, so a long run name degrades gracefully. */
+.run-link { display:inline-block; max-width:100%; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; vertical-align:bottom; }
 td.wrap { white-space:normal; color:#8b949e; font-size:12px; }
 td.step { white-space:normal; }  /* wt/merged chips wrap under a long name */
 /* tr.agen is not clickable as a row anymore - its named controls (step
@@ -13692,8 +13698,8 @@ let AGENTS = [];          // last payload, for the detail modal
 // column layout shared by every per-project table (fixed layout -> the
 // same widths line up across tables)
 const AGENT_COLS = '<colgroup>' +
-  '<col style="width:8%"><col style="width:20%">' +
-  '<col style="width:9%"><col class="hide-s" style="width:6%">' +
+  '<col style="width:8%"><col style="width:19%">' +
+  '<col style="width:10%"><col class="hide-s" style="width:6%">' +
   '<col class="hide-s" style="width:5%"><col class="hide-s" style="width:5%">' +
   '<col style="width:6%"><col style="width:6%">' +
   '<col class="hide-s" style="width:10%"><col class="hide-s" style="width:5%">' +
