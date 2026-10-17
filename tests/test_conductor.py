@@ -1722,6 +1722,38 @@ prompt = "Review the catalog tests."
             self.assertTrue(
                 seen["flags"] & subprocess.CREATE_NEW_PROCESS_GROUP)
 
+    def test_planner_finished_turn_survives_nonzero_exit(self):
+        # A STATUS: line completes the planner's reply - a nonzero rc
+        # afterwards (killed at STATUS grace, or a CLI exit-path failure)
+        # must not discard the finished proposal. rc!=0 with no STATUS
+        # stays a 'did not finish' error.
+        for wait, log_body, raises in (
+                ((1, False, True, False, 0.0), "STATUS: done\n", False),
+                ((1, False, False, False, 0.0), "STATUS: done\n", False),
+                ((1, False, False, False, 0.0), "", True),
+                ((0, True, False, False, 0.0), "STATUS: done\n", True)):
+            rec = self.new()
+            proposal = self.proposal()
+
+            class FakeProc:
+                def __init__(self, cmd, **kwargs):
+                    if "--prompt-file" not in cmd:
+                        return
+                    kwargs["stdout"].write(
+                        ("BEGIN_MANIFEST\n" + proposal +
+                         "END_MANIFEST\n" + log_body).encode())
+                    kwargs["stdout"].flush()
+
+            with mock.patch.object(conductor.subprocess, "Popen", FakeProc), \
+                    mock.patch.object(conductor, "wait_worker",
+                                      return_value=wait):
+                if raises:
+                    with self.assertRaises(conductor.RequestError):
+                        conductor._planner_response(rec, {}, ["devin"])
+                else:
+                    text = conductor._planner_response(rec, {}, ["devin"])
+                    self.assertEqual(text.strip(), proposal.strip())
+
     def test_planner_tokens_recorded_on_request(self):
         rec = self.new()
         proposal = self.proposal()

@@ -8646,6 +8646,13 @@ def _planner_response(rec: dict, projects: dict,
             "gap still remains.\n\n")
     known_verify = {s: p["verify"] for s, p in projects.items()
                     if p.get("verify")}
+    branch_bits = []
+    for s, p in sorted(projects.items()):
+        bs = list_local_branches(p["path"])[:20]
+        if bs:
+            branch_bits.append(f"{s}: {', '.join(bs)}")
+    branches_hint = ("Existing local branches per project: "
+                     + "; ".join(branch_bits) + ". " if branch_bits else "")
     verify_hint = (f"Registered verify commands: {known_verify} - set "
                    "verify under [defaults] (or per [[step]]) to the "
                    "command for each step's project. A failed verify "
@@ -8676,6 +8683,8 @@ user intent and a project permitted for cloud. No prompt_file or preamble.
 merge_target = "<branch>" (optional, [run] or per [[step]]) names an existing
 local branch the step's worktree branch is created from and merged back into
 instead of the checkout's current branch; it requires worktree = true.
+{branches_hint}Omit merge_target unless the human named one - a guessed
+branch name fails validation.
 {verify_hint}Do not reproduce credentials or private data in the tracked manifest; refer
 agents to the project files containing those details instead.
 The proposal must NOT start work; the human will edit it and launch later.
@@ -8730,7 +8739,7 @@ STATUS: done
                 with REQUEST_LOCK:
                     _GEN_PROCS[rid] = proc
             try:
-                rc, timed_out, _hung, stopped, _ext = wait_worker(
+                rc, timed_out, hung, stopped, _ext = wait_worker(
                     proc, log, 600,
                     stop_flags=(sflag,) if sflag is not None else ())
             finally:
@@ -8747,10 +8756,14 @@ STATUS: done
             rec["_gen_session_ids"] = sids
         if stopped or (sflag is not None and sflag.is_file()):
             raise GenerationStopped(f"request {rid} proposal stopped")
-        if timed_out or rc != 0:
+        text = log.read_text(encoding="utf-8", errors="replace")
+        # A STATUS: line ends the planner's turn - its reply is complete,
+        # so a nonzero rc afterwards (CLI exit-path failure, or our own
+        # kill at STATUS grace) must not discard a finished proposal.
+        if timed_out or (rc != 0 and not hung
+                         and not STATUS_RE.search(text)):
             raise RequestError("Planner did not finish; check CLI auth and "
                                "retry generation", 502)
-        text = log.read_text(encoding="utf-8", errors="replace")
     matches = re.findall(r"^BEGIN_MANIFEST\s*\n(.*?)^END_MANIFEST\s*$",
                          text, re.M | re.S)
     if not matches:
