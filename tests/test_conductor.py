@@ -6156,7 +6156,7 @@ vm.runInContext(src,ctx);
   // group header: project + recorded target + integration baseline
   assert.match(html,/Pending merges \(5\)/);
   assert.match(html,/<b>proj<\/b>/);
-  assert.match(html,/lands on<\/span> <code>master<\/code>/);
+  assert.match(html,/merges into<\/span> <code>master<\/code>/);
   assert.match(html,/conductor\/r1\/baseline-proj/);
   // entries: verify chips, alternative chips, unverified disabled
   assert.match(html,/data-pm="seq1"/);
@@ -6165,7 +6165,7 @@ vm.runInContext(src,ctx);
   assert.match(html,/data-pm="bad"[^>]*disabled/);
   assert.match(html,/alternative/);
   assert.match(html,/not verified - the merge never lands it/);
-  assert.match(html,/auto-merge branches that never landed/);
+  assert.match(html,/worktree branches parked by a merge conflict/);
   assert.match(html,/Merge selected pending work/);
   // ticking is tracked in mergeSel; alternatives are exclusive (the DOM
   // checks the box BEFORE change fires, so set checked first; the change

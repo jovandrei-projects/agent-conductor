@@ -12362,6 +12362,19 @@ td :is(a,button):focus-visible { outline-offset:-2px; }
 #detail label.pmentry { display:flex; align-items:flex-start; gap:8px; margin:4px 0; font-size:13px; color:#e6edf3; cursor:pointer; }
 #detail label.pmentry input[type=checkbox] { width:auto; margin-top:3px; }
 #detail label.pmentry input[type=checkbox]:disabled { cursor:not-allowed; }
+/* run modal: each action cluster (meta / pending merges / run control /
+   admin) is its own panel so related copy+button stay together instead of
+   one wrapped button row */
+#detail .runpanel { border:1px solid #30363d; border-radius:8px; padding:10px 12px; margin:12px 0; }
+#detail .runpanel h3 { margin-top:0; }
+#detail .runpanel .actions { margin:8px 0 0; }
+/* merge button with nothing ticked: outline-only so it reads as idle but
+   stays clickable (a click explains what to tick via pm-msg) */
+.btn.idle { background:transparent; color:#8b949e; border-color:#30363d; }
+.btn.idle:hover:not(:disabled) { border-color:#58a6ff; color:#e6edf3; }
+/* sessions kv row: collapsed to a summary line, full list scrolls */
+#detail details.sessx summary { cursor:pointer; }
+#detail details.sessx .sessfull { margin-top:6px; max-height:140px; overflow:auto; }
 /* questionnaire modal (planner 'ask me questions' flow) */
 .qopts { display:flex; flex-direction:column; gap:6px; margin:10px 0 4px; }
 .qopt { text-align:left; border:1px solid #30363d; border-radius:6px;
@@ -12601,6 +12614,7 @@ let modalRunKey = null;     // run_key of the open run-details modal - the
                             // change, so a mid-merge refresh stays live
 const mergeSel = {};        // runKey -> Set of pending steps ticked for merge
 const mergeResult = {};     // runKey -> last merge attempt's outcome text
+const sessOpen = {};        // runKey -> sessions list expanded in run modal
 let modalRequest = null;
 let modalQA = null;         // {id, rec, sel:Set, free:''} while the planner
                             // questionnaire modal is open
@@ -13748,9 +13762,18 @@ function showRunDetails(key, keepStack){
       ` (self-serve rates, plan + steps)`:'-'],
     ['manifest / dir',r.dir],
     ['resume log',r.resume_log],
-    ['sessions', AGENTS.filter(a=>(a.run_key||a.run_dir)===key &&
-      a.session_id).map(a=>`${a.step}: ${a.session_id}`).join(' \u00b7 ')
-      ||'-']];
+    // sessions collapse to a one-line <details> - the full step:session
+    // list is long and rarely needed (sessOpen[key] persists expansion
+    // across refresh re-renders)
+    ['sessions', (()=>{ const ss = AGENTS.filter(
+        a=>(a.run_key||a.run_dir)===key && a.session_id);
+      return ss.length
+        ? `<details class="sessx"${sessOpen[key]?' open':''}>` +
+          `<summary>${ss.length} session(s)</summary>` +
+          `<div class="sessfull">` +
+          ss.map(a=>`${esc(a.step)}: ${esc(a.session_id)}`).join(' \u00b7 ') +
+          `</div></details>`
+        : '-'; })()]];
   const ctl = runCtl(r);
   const canResume = ctl.canResume;
   const liveSteps = ctl.liveSteps;
@@ -13794,7 +13817,12 @@ function showRunDetails(key, keepStack){
     `${sel.has(e.step)?' checked':''}${dis?' disabled':''}>` +
     `<span><b>${esc(e.step)}</b>` +
     ` <span class="chip" style="color:${COLORS[e.status]||'#8b949e'}">` +
-    `${esc(e.status)}</span>${vchip(e)}` +
+    `${esc(e.status)}</span>` +
+    // same chip the task rows carry for merged===false - every entry in
+    // this panel is unmerged by definition, so say it the same way
+    ` <span class="chip" style="color:#f0883e" ` +
+    `title="this branch was never merged back - ticking it merges it ` +
+    `now">unmerged</span>${vchip(e)}` +
     (e.kind==='alternative'
       ? ` <span class="chip" style="color:#d2a8ff" title="an ` +
         `alternative implementation from a same-project wave - merge ` +
@@ -13805,7 +13833,7 @@ function showRunDetails(key, keepStack){
     `</span></span></label>`;
   const pmGroups = (r.pending_merges||[]).map((g,gi)=>
     `<div class="pmgrp"><div><b>${esc(g.slug)}</b> ` +
-    `<span class="sub">lands on</span> ` +
+    `<span class="sub">merges into</span> ` +
     `<code>${esc(g.target||'?')}</code>` +
     (g.busy ? ` <span class="stage live" title="another process holds ` +
       `this repo's merge lock">repo busy - a merge is in flight</span>`
@@ -13836,23 +13864,74 @@ function showRunDetails(key, keepStack){
       (bySlug[e.slug||'?'] ??= []).push(e));
     return Object.entries(bySlug).map(([slug, es]) =>
       `<div class="pmgrp"><div><b>${esc(slug)}</b> ` +
-      `<span class="sub">auto-merge branches that never landed ` +
-      `(parked by a conflict or an interrupted run - they merge into ` +
-      `the project checkout, no recorded target)</span></div>` +
+      `<span class="sub">worktree branches parked by a merge conflict ` +
+      `or an interrupted run - they merge into the project's checkout ` +
+      `(no recorded target)</span></div>` +
       es.map(e => pmbox(e, !!e.live, null,
         e.live ? 'step still live' : '')).join('') + `</div>`).join('');
   })() : '';
   const pmCount = (r.pending_merges||[]).reduce(
     (s,g)=>s+g.entries.length,0) + (r.pending_branches||[]).length;
-  const pmHtml = pmCount ? `<h3 style="margin-top:14px">Pending merges ` +
-    `(${pmCount})</h3>` +
-    `<div class="sub" style="margin-bottom:8px">retained worktree ` +
-    `branches waiting for an explicit merge - deferred work is staged, ` +
-    `re-verified and landed on its recorded target; unverified entries ` +
-    `are never auto-merged. Tick the work to land.</div>` +
+  // Pending merges is its own panel - finished work parked on worktree
+  // branches, awaiting an explicit merge. The button belongs to the
+  // panel, not the general run actions; it renders outline-only ('idle')
+  // until something is ticked.
+  const pmHtml = pmCount ? `<div class="runpanel">` +
+    `<h3>Pending merges (${pmCount})</h3>` +
+    `<div class="sub" style="margin-bottom:8px">finished work still ` +
+    `sitting on worktree branches - tick entries to merge them into ` +
+    `the target branch now. Unticked entries stay parked untouched; ` +
+    `unverified entries are never merged.</div>` +
     (r.merge_busy ? `<div class="notice warn">A merge is in progress ` +
       `for this run - new clicks are ignored.</div>`:'') +
-    pmGroups + pmLegacy : '';
+    pmGroups + pmLegacy +
+    `<div class="actions"><button type="button" id="pm-go" ` +
+    `class="btn${sel.size?'':' idle'}" ` +
+    `data-merge-run="${esc(base(r.dir))}" ` +
+    `data-rk="${esc(key)}"${(executing || r.merge_busy)
+      ? ' disabled' : ''} ` +
+    `title="${r.merge_busy
+      ? 'a merge is already running for this run'
+      : (executing
+        ? 'unavailable while the run is still executing - it unlocks ' +
+          'once the run has actually stopped or finished (a stop ' +
+          'request needs a moment to land)'
+        : 'merge the ticked pending branches into their target ' +
+          'branches - verified entries are staged, re-verified and ' +
+          'merged atomically; unticked entries stay parked')}">` +
+    `Merge selected pending work</button>` +
+    `<span class="sub" id="pm-msg" style="margin-left:8px">` +
+    `${sel.size?'':'tick the work to merge'}</span>` +
+    `</div></div>` : '';
+  // Run control is its own panel too: resume re-runs every non-done step
+  // in a fresh session (parked branches get another merge attempt first)
+  // - the heavier option compared to a merge-only pass.
+  const ctlHtml = (liveSteps.length || canResume)
+    ? `<div class="runpanel"><h3>Run control</h3>` +
+      `<div class="sub" style="margin-bottom:8px">` +
+      (liveSteps.length
+        ? `the run is executing - pause lets in-flight steps finish, ` +
+          `stop kills them now; committed work stays either way`
+        : `resume re-runs every step that isn't done in a fresh ` +
+          `session - parked branches get another merge attempt first, ` +
+          `and a per-step note set from the task's own view reaches the ` +
+          `new session (e.g. "VPN is back on")`) + `</div>` +
+      `<div class="actions">` +
+      (liveSteps.length ? `<button type="button" class="btn" ` +
+        `data-pause-run="${esc(base(r.dir))}" ` +
+        `title="let in-flight steps finish, then hold the run - nothing ` +
+        `new launches until Resume">Pause run</button>` +
+        `<button type="button" class="btn danger" ` +
+        `data-stop-run="${esc(base(r.dir))}" ` +
+        `title="kill every live step's process tree now - committed ` +
+        `work stays; nothing new launches; Resume restarts unfinished ` +
+        `steps">Stop run now</button>` : '') +
+      (canResume ? `<button type="button" class="btn" ` +
+        `data-resume-run="${esc(base(r.dir))}" ` +
+        `title="re-run every non-done step in a fresh session - covers ` +
+        `paused, stopped and interrupted runs">` +
+        `Resume unfinished steps</button>` : '') +
+      `</div></div>` : '';
   const notice = (r.aborted==='paused' && canResume)
     ? `<div class="notice warn">Paused - in-flight steps finished and ` +
       `nothing new launched. Resume continues where it left off ` +
@@ -13870,11 +13949,15 @@ function showRunDetails(key, keepStack){
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">` +
       (k==='tokens'
         ? `<span title="${esc(TOK_HELP)}">${esc(v??'-')}</span>`
-        : esc(v??'-')) + `</div>`).join('') + '</div>' +
+        : k==='sessions' && v!=='-'
+          ? v    // already-escaped <details> markup, not plain text
+          : esc(v??'-')) + `</div>`).join('') + '</div>' +
     (mergeResult[key]
       ? `<div class="notice">${esc(mergeResult[key])}</div>` : '') +
-    pmHtml +
-    `<div class="actions"><button type="button" class="btn secondary" ` +
+    // meta/view actions get their own compact row right under the kv -
+    // the execution controls below each live inside their own panel
+    `<div class="actions" style="margin-top:10px">` +
+    `<button type="button" class="btn secondary" ` +
     `data-filter-run="${esc(key)}">Show only this run</button>` +
     (r.stage ? '' : `<button type="button" class="btn secondary" ` +
       `data-run-summary="${esc(key)}" ` +
@@ -13910,36 +13993,14 @@ function showRunDetails(key, keepStack){
         `data-stop-gen="${esc(r.request_id)}" ` +
         `title="cancel this planning pass - the request stays editable ` +
         `and any previous proposal is kept">Stop proposal</button>` : '') +
-    (pmCount ? `<button type="button" id="pm-go" class="btn" ` +
-      `data-merge-run="${esc(base(r.dir))}" ` +
-      `data-rk="${esc(key)}"${(executing || r.merge_busy)
-        ? ' disabled' : ''} ` +
-      `title="${r.merge_busy
-        ? 'a merge is already running for this run'
-        : (executing
-          ? 'unavailable while the run is still executing - it unlocks ' +
-            'once the run has actually stopped or finished (a stop ' +
-            'request needs a moment to land)'
-          : 'land the ticked pending work onto its recorded targets - ' +
-            'verified entries are staged, re-verified and merged ' +
-            'atomically; anything unticked stays retained')}">` +
-      `Merge selected pending work</button>` +
-      `<span class="sub" id="pm-msg" style="margin-left:8px"></span>` : '') +
-    (liveSteps.length ? `<button type="button" class="btn" ` +
-      `data-pause-run="${esc(base(r.dir))}" ` +
-      `title="let in-flight steps finish, then hold the run - nothing ` +
-      `new launches until Resume">Pause run</button>` +
-      `<button type="button" class="btn danger" ` +
-      `data-stop-run="${esc(base(r.dir))}" ` +
-      `title="kill every live step's process tree now - committed work ` +
-      `stays; nothing new launches; Resume restarts unfinished steps">` +
-      `Stop run now</button>` : '') +
-    (canResume ? `<button type="button" class="btn" ` +
-      `data-resume-run="${esc(base(r.dir))}" ` +
-      `title="re-run every non-done step in a fresh session - covers ` +
-      `paused, stopped and interrupted runs">` +
-      `Resume unfinished steps</button>` : '') +
-    (r.stage ? '' : `<button type="button" class="btn secondary" ` +
+    '</div>' +
+    pmHtml +
+    ctlHtml +
+    taskTbl +
+    // admin/destructive actions sit at the very bottom, after the task
+    // list - away from the controls a user reaches for first
+    (r.stage ? '' : `<div class="actions">` +
+      `<button type="button" class="btn secondary" ` +
       `data-arch-run="${esc(base(r.dir))}" ` +
       `data-arch-set="${r.archived?0:1}" ` +
       `title="${r.archived
@@ -13954,8 +14015,7 @@ function showRunDetails(key, keepStack){
         ? 'disabled while a step is still live - stop the run first'
         : 'move this run record - state, logs, prompts, exports - to ' +
           'Trash; recoverable for 48h, Empty trash deletes it for good'}">` +
-      `Delete run</button>`) +
-    '</div>' + taskTbl;
+      `Delete run</button></div>`);
   modalRunKey = key;
   applyModalScroll();
   document.getElementById('backdrop').hidden = false;
@@ -15900,15 +15960,15 @@ document.addEventListener('click', async e=>{
     const msg=document.getElementById('pm-msg');
     if(!steps.length){
       if (msg) msg.textContent='Tick at least one pending change above ' +
-        '(unverified entries can never be auto-merged).';
+        '(unverified entries are never merged).';
       return; }
     if(!await askConfirm(`Merge the ${steps.length} ticked pending change(s) ` +
-                `(${steps.join(', ')}) into their recorded target ` +
-                `branches? Verified deferred work is staged, re-verified ` +
-                `and landed atomically; conflicts stay parked for manual ` +
+                `(${steps.join(', ')}) into their target branches? ` +
+                `Verified deferred work is staged, re-verified and ` +
+                `merged atomically; conflicts stay parked for manual ` +
                 `resolution (or a resolve-* session when merge_resolver ` +
-                `is set). Everything unticked stays retained - nothing ` +
-                `starts a new run.`)) return;
+                `is set). Everything unticked stays parked - no steps ` +
+                `are re-run.`)) return;
     t.disabled=true; t.textContent='Merging…';
     if (msg) msg.textContent='staged merge running - a resolver session ' +
       'can make this take minutes; the page keeps refreshing';
@@ -16313,6 +16373,13 @@ document.addEventListener('click', async e=>{
 document.addEventListener('toggle', e=>{
   const d = e.target;
   if (!d || !d.classList || !d.closest) return;
+  // the run modal's sessions list is a plain <details> too - persist its
+  // expansion separately (tests register ONE handler per event type, so
+  // this stays folded in here, never a second 'toggle' listener)
+  if (d.classList.contains('sessx')){
+    if (runModalKey) sessOpen[runModalKey]=d.open;
+    return;
+  }
   const box = d.closest('.arc[data-akey]');
   if (!box) return;
   const st = trajOpenFor(box.dataset.akey);
@@ -16443,8 +16510,14 @@ document.addEventListener('change', e=>{
         if (b!==t){ b.checked=false; sel.delete(b.dataset.pm); }});
     const msg=document.getElementById('pm-msg');
     if (msg && t.dataset.pmAlt) msg.textContent='alternative picked - ' +
-      'its sibling variants stay retained; merge them one at a time.';
+      'its sibling variants stay parked; merge them one at a time.';
   } else sel.delete(t.dataset.pm);
+  // the merge button reads as outline-only while nothing is ticked and
+  // fills once there is work selected - no re-render needed
+  const pb=document.getElementById('pm-go');
+  if (pb) pb.classList.toggle('idle', !sel.size);
+  const pmMsg=document.getElementById('pm-msg');
+  if (pmMsg && !sel.size) pmMsg.textContent='tick the work to merge';
 });
 document.addEventListener('keydown', e=>{
   // the open row menu owns the keyboard: Esc dismisses (focus returns to
