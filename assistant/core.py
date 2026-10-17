@@ -96,13 +96,19 @@ class AssistantCore:
     - dispatcher: object with .launch(exchange) / .cancel(exchange) the
       runtime provides; None leaves exchanges 'queued'.
     - actions: ActionAdapter for proposal validation/execution.
+    - retrieval: RetrievalAdapter for bounded evidence lookups; None = the
+      runtime answers without retrieval. Stored, not called here - the
+      dispatcher drives search()/fetch() during prompt assembly.
+    - enricher: callable(envelope dict) -> dict producing the server-side
+      `enriched` block for each posted message; a failure is recorded
+      honestly in the envelope, never silently dropped or fatal.
     - catalog: callable -> {models:[{uid,label,prices...}]} for /models.
     - now: epoch clock seam (tests inject; host passes conductor._now).
     """
 
     def __init__(self, store: Store, *, guard=None, attachment_saver=None,
                  attachments_dir=None, dispatcher=None, actions=None,
-                 catalog=None, now=None):
+                 retrieval=None, enricher=None, catalog=None, now=None):
         self.store = store
         self._guard = guard
         self._save_attach = attachment_saver
@@ -110,6 +116,8 @@ class AssistantCore:
                             else None)
         self._dispatcher = dispatcher
         self._actions = actions
+        self.retrieval = retrieval
+        self._enricher = enricher
         self._catalog = catalog
         self._now = now or time.time
 
@@ -289,6 +297,18 @@ class AssistantCore:
         try:
             env = ctxmod.new_envelope_from_client(client_ctx or {},
                                                   at=self._iso())
+            if self._enricher:
+                # Server-side enrichment replaces whatever `enriched` the
+                # client claimed - its refs are re-resolved against real
+                # state, its text never becomes authority. A failed lookup
+                # is recorded honestly instead of killing the question.
+                try:
+                    ctxmod.set_enriched(env, self._enricher(dict(env)))
+                except Exception as exc:      # noqa: BLE001 - degrade, note
+                    ctxmod.set_enriched(
+                        env, {"context_error":
+                              f"view-context enrichment failed: "
+                              f"{type(exc).__name__}: {exc}"[:300]})
             frozen_ctx = ctxmod.freeze(env)
         except ctxmod.ContextError as exc:
             raise AssistantError(str(exc)) from exc
@@ -341,7 +361,7 @@ class AssistantCore:
                 "llm_steps": None, "model_uid": None, "model_label": None,
                 "price_in": None, "price_cached": None, "price_out": None,
                 "price_fetched_at": None, "price_source": None,
-                "usd": None, "error": None})
+                "usd": None, "error": None, "sources": None})
             conn.execute(
                 "UPDATE conversations SET last_active_at=?, updated_at=?"
                 " WHERE id=?", (now, now, conv_id))
@@ -423,9 +443,26 @@ class AssistantCore:
                 self.store.update_exchange(conn, xid, **uf)
         return self.exchange_view(xid)
 
+    def record_sources(self, xid: str, sources: list) -> dict:
+        """Attach the retrieval adapter's Source list to a live exchange -
+        the citation set the answer draws on. Sources are evidence, not
+        instructions; they're stored verbatim (already host-bounded)."""
+        x = self._xid(xid)
+        if x["status"] in EXCHANGE_TERMINAL:
+            return x
+        if not isinstance(sources, list):
+            raise AssistantError("sources must be a list")
+        self._guarded(self.store.path.parent)
+        with self.store.txn() as conn:
+            self.store.update_exchange(
+                conn, xid,
+                sources=json.dumps(sources, ensure_ascii=False))
+        return self.store.get_exchange(xid)
+
     def complete_exchange(self, xid: str, text: str, *, usage=None,
                           model=None, price=None, usd="auto",
-                          request_id=None, status="done") -> dict:
+                          request_id=None, sources=None,
+                          status="done") -> dict:
         """Terminal write: assistant text + token/price snapshot, one
         transaction. Repeating a completion is a no-op - usage can never
         double-land."""
@@ -462,6 +499,8 @@ class AssistantCore:
                 price_fetched_at=price.get("fetched_at",
                                            x.get("price_fetched_at")),
                 price_source=price.get("source", x.get("price_source")),
+                sources=(json.dumps(sources, ensure_ascii=False)
+                         if sources is not None else x.get("sources")),
                 usd=usd)
             conn.execute(
                 "UPDATE conversations SET last_active_at=?, updated_at=? "
@@ -525,11 +564,25 @@ class AssistantCore:
                  if x.get("assistant_msg_id") else None)
         out["text"] = (reply or {}).get("text", "")
         out["message_status"] = (reply or {}).get("status")
+        try:    # the stored JSON list -> ready-to-render citation dicts
+            out["sources"] = (json.loads(out["sources"])
+                              if isinstance(out.get("sources"), str)
+                              else (out.get("sources") or []))
+        except ValueError:
+            out["sources"] = []
         return out
 
     def list_exchanges(self, conv_id: str) -> list[dict]:
         self._conv(conv_id)
-        return self.store.list_exchanges(conv_id)
+        rows = self.store.list_exchanges(conv_id)
+        for r in rows:      # citation sources thaw for the whole page
+            try:
+                r["sources"] = (json.loads(r["sources"])
+                                if isinstance(r.get("sources"), str)
+                                else (r.get("sources") or []))
+            except ValueError:
+                r["sources"] = []
+        return rows
 
     def usage(self, conv_id: str) -> dict:
         """Per-exchange usage rows + conversation rollup. Unpriced
