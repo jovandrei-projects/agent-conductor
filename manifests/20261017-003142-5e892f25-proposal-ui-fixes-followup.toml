@@ -59,6 +59,9 @@
 #   python conductor.py run  manifests\proposal-ui-fixes-followup.toml
 
 [run]
+merge_target = "main"
+summarize = false
+merge = "auto"
 name = "proposal-ui-fixes-followup"
 description = "Land the parked compact-live-output branch, harden the flaky sentinel-flag test family (second flake seen), and live-smoke both planner-UI fixes from the parent run."
 on_failure = "continue"
@@ -103,7 +106,6 @@ NEVER finish with a merge in progress: each merge ends committed or `git merge -
 [[step]]
 name = "harden-flag-timing-tests"
 project = "agent-conductor"
-worktree = true
 timeout_min = 60
 prompt = '''
 The _flag_soon sentinel-poll test family has now flaked twice inside full-suite runs, each time green standalone:
@@ -125,7 +127,6 @@ NOTE: manifests/ux-controls-followup.toml contains a narrower version of this wo
 [[step]]
 name = "proposal-ui-live-smoke"
 project = "agent-conductor"
-worktree = true
 timeout_min = 45
 verify = ""
 prompt = '''
@@ -147,7 +148,6 @@ Kill the serve process you spawned BEFORE printing STATUS - a live child keeps t
 [[step]]
 name = "follow-up-plan"
 project = "agent-conductor"
-worktree = true
 timeout_min = 30
 verify = ""
 prompt = '''

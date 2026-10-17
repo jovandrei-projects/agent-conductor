@@ -4347,9 +4347,13 @@ assert.match(row('failed-run'),/Needs review/);   // planning failed, stale stay
 const vm=require('node:vm'), assert=require('node:assert/strict');
 const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
 const nodes=new Map(), handlers={};
-const elem=id=>{ if(!nodes.has(id)) nodes.set(id,
+const elem=id=>{ if(!nodes.has(id)){ const el=
   {innerHTML:'',hidden:true,textContent:'',value:'',checked:false,
-   disabled:false,title:''}); return nodes.get(id); };
+   disabled:false,title:'',_cls:new Set()};
+  el.classList={toggle:(c,on)=>{on?el._cls.add(c):el._cls.delete(c);},
+    contains:c=>el._cls.has(c)};
+  el.closest=()=>null;
+  nodes.set(id,el); } return nodes.get(id); };
 const document={getElementById:elem,querySelector:()=>null,
   querySelectorAll:()=>[],activeElement:null,
   addEventListener:(ev,h)=>{handlers[ev]=h;}};
@@ -4404,20 +4408,27 @@ const check=(id,v)=>{ elem(id).checked=v;
   assert.equal(elem('pend-note').hidden,false);
   assert.equal(elem('rq-apply').disabled,false);
   assert.equal(elem('rq-run').disabled,true);
+  // ...and the changed field itself carries the amber pendchg frame
+  assert.equal(elem('rq-effort')._cls.has('pendchg'),true);
+  assert.equal(elem('rq-raw')._cls.has('pendchg'),false);
   // revert to baseline clears the mark live - no save needed
   await type('rq-effort','max');
   assert.equal(elem('pend-note').hidden,true);
   assert.equal(elem('rq-apply').disabled,true);
   assert.equal(elem('rq-run').disabled,false);
+  assert.equal(elem('rq-effort')._cls.has('pendchg'),false);
   // a checkbox the same: toggle on, toggle off
   await check('rq-worktrees',true);
   assert.match(elem('pend-note').innerHTML,/worktrees/);
   assert.equal(elem('rq-apply').disabled,false);
+  assert.equal(elem('rq-worktrees')._cls.has('pendchg'),true);
   await check('rq-worktrees',false);
   assert.equal(elem('pend-note').hidden,true);
+  assert.equal(elem('rq-worktrees')._cls.has('pendchg'),false);
   // a generation input -> Regenerate is the only way, Apply neutralized
   await type('rq-raw','widen the scope');
   assert.match(elem('pend-note').innerHTML,/request text/);
+  assert.equal(elem('rq-raw')._cls.has('pendchg'),true);
   assert.match(elem('pend-note').innerHTML,/Regenerate tasks/);
   assert.equal(elem('rq-apply').disabled,true);
   assert.equal(elem('rq-run').disabled,true);
@@ -4429,6 +4440,7 @@ const check=(id,v)=>{ elem(id).checked=v;
   await type('rq-effort','max');
   assert.equal(elem('pend-note').hidden,true);
   assert.equal(elem('rq-run').disabled,false);
+  assert.equal(elem('rq-raw')._cls.has('pendchg'),false);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
@@ -11312,6 +11324,88 @@ prompt = "the manifest was already written; say done"
         st = json.loads((run / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(st["followup"]["status"], "registered")
 
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_js_followup_chips_links_and_linked_rows(self):
+        """Follow-up chips are neutral fulink elements (compact 'follow-up'
+        on the proposal row, red status word on a bad outcome), the run
+        modal's task table carries a review column, the modals link both
+        directions, and the related row marks .dlinked under .dsel."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const cls={toggle(){this.t=true;},add(){},remove(){},contains:()=>false};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,
+  {innerHTML:'',hidden:true,textContent:'',classList:{...cls,
+     toggle(){}}});
+  return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(e,h)=>{handlers[e]=h;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',
+ agents:[
+  {step:'s1',run:'src-run',run_dir:'/r1',run_key:'request:src',
+   slug:'p',status:'done',task:'t',needs_review:true,review:null,
+   completion_seq:1},
+  {step:'s2',run:'fu-run',run_dir:'/r2',run_key:'request:fur',
+   slug:'p',status:'done',task:'t',needs_review:false,
+   review:{reviewed:true,seq:1,at:'x'},completion_seq:1}],
+ runs:[
+  // the run that drafted the follow-up: chip links to the proposal
+  {run:'src-run',key:'request:src',request_id:'src',dir:'/r1',
+   counts:{done:1},followup:{status:'registered',request:'fu'}},
+  // the follow-up proposal row: compact neutral chip back to the run
+  {run:'fu-prop',key:'request:fu',request_id:'fu',stage:'ready',
+   counts:{planned:1},
+   followup_src:{run:'src-run',key:'request:src'}},
+  // a follow-up RUN (launched) with a broken own stamp -> red word
+  {run:'fu-run',key:'request:fur',dir:'/r2',counts:{done:1},
+   followup:{status:'invalid'},followup_src:{run:'src-run',
+   key:'request:src'}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const rows=elem('runs').innerHTML.split('runrow');
+const row=name=>rows.find(r=>r.includes('>'+name+'<'));
+// compact neutral chips - never the verbose 'follow-up of <run>' text,
+// never the default linkbtn blue
+assert.match(row('fu-prop'),/class="fulink"[^>]*>follow-up<\/button>/);
+assert.doesNotMatch(row('fu-prop'),/follow-up of src-run/);
+assert.doesNotMatch(row('fu-prop'),/linkbtn"[^>]*data-run-details/);
+// the source run's stamp chip is a neutral link to the proposal
+assert.match(row('src-run'),/class="fulink"[^>]*data-open-request="fu"[^>]*>follow-up &rarr; ready/);
+// a bad outcome colors just the status word red
+assert.match(row('fu-run'),/follow-up &rarr; <b class="fu-bad">invalid<\/b>/);
+(async()=>{
+  // run modal: task table review column - pill, 'reviewed', '-'
+  await vm.runInContext(
+    'showRunDetails("request:src")',ctx);
+  const b=()=>elem('dbody').innerHTML;
+  assert.match(b(),/<th>review<\/th>/);
+  assert.match(b(),/stage unreviewed" role="status"[^>]*>unreviewed</);
+  // the run's own follow-up row links to the proposal
+  assert.match(b(),/<div class="k">follow-up<\/div><div class="wrap"><button[^>]*data-open-request="fu"[^>]*>open the follow-up proposal/);
+  // the launched follow-up run modal links back to its source run
+  await vm.runInContext('showRunDetails("request:fur")',ctx);
+  assert.match(b(),/<div class="k">follow-up of<\/div><div class="wrap"><button[^>]*data-run-details="request:src"[^>]*>src-run/);
+  // a task inside the source run links forward to the proposal
+  await vm.runInContext(
+    'showDetail(AGENTS.findIndex(a=>a.step==="s1"))',ctx);
+  assert.match(b(),/<div class="k">follow-up<\/div><div class="wrap"><button[^>]*data-open-request="fu"/);
+  // a task inside the follow-up run links back to the source run
+  await vm.runInContext(
+    'showDetail(AGENTS.findIndex(a=>a.step==="s2"))',ctx);
+  assert.match(b(),/<div class="k">follow-up of<\/div><div class="wrap"><button[^>]*data-run-details="request:src"/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True,
+                           encoding="utf-8", timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
 
 class DeviceOwnershipTests(unittest.TestCase):
     """The `device` step key leases ONE adb serial machine-wide for a
@@ -12414,25 +12508,159 @@ prompt = "{prompt}"
             self.assertFalse(a["needs_review"])
             self.assertFalse(self._collect(runs)["runs"][0]["needs_review"])
 
-    def test_run_and_step_marks_are_independent(self):
+    def _finish_two_step_run(self, base: Path):
+        """s1+s2 both done; returns (runs_dir, run_dir) with flag cleanup
+        registered like _finish_run."""
+        proj = make_project(base)
+        runs = base / "runs"
+        m = write_manifest(base, f'''
+[[step]]
+name = "s1"
+project = "{proj.as_posix()}"
+prompt = "one"
+
+[[step]]
+name = "s2"
+project = "{proj.as_posix()}"
+prompt = "two"
+''')
+        self.assertEqual(run_manifest(m, runs), 0)
+        run_dir = next(runs.glob("*/state.json")).parent
+        self._dead_driver(run_dir)
+        self.addCleanup(lambda: [
+            conductor.review_flag(run_dir, s).unlink(missing_ok=True)
+            for s in (None, "s1", "s2")])
+        return runs, run_dir
+
+    def test_run_mark_cascades_to_tasks(self):
+        """Run-level 'needs review' flags every completed task; a
+        run-level ack clears all of them - the two levels can never
+        disagree."""
         with tempfile.TemporaryDirectory() as td:
-            _m, runs, run_dir = self._finish_run(Path(td))
-            # ack the run only -> the task stays unreviewed
+            runs, run_dir = self._finish_two_step_run(Path(td))
+            d = self._collect(runs)
+            for st in ("s1", "s2"):
+                self.assertTrue(next(
+                    x for x in d["agents"] if x["step"] == st)
+                    ["needs_review"])
+            # 'needs review' on the run tombstones every completed task
+            conductor.set_run_review(
+                run_dir.name, {"reviewed": False}, runs)
+            a1 = next(x for x in self._collect(runs)["agents"]
+                      if x["step"] == "s1")
+            self.assertTrue(a1["needs_review"])
+            # ack the run -> every task's chip goes too
             conductor.set_run_review(
                 run_dir.name, {"reviewed": True}, runs)
             d = self._collect(runs)
             self.assertFalse(d["runs"][0]["needs_review"])
-            a = next(x for x in d["agents"] if x["step"] == "s1")
-            self.assertTrue(a["needs_review"])
-            # ack the task only -> the run stays unreviewed
-            conductor.set_run_review(
-                run_dir.name, {"reviewed": False}, runs)
+            for st in ("s1", "s2"):
+                self.assertFalse(next(
+                    x for x in d["agents"] if x["step"] == st)
+                    ["needs_review"])
+            # the folded marks live in state.json, not just sentinels
+            st = self._state(run_dir)
+            self.assertTrue(st["steps"]["s1"]["review"]["reviewed"])
+            self.assertTrue(st["steps"]["s2"]["review"]["reviewed"])
+
+    def test_task_marks_derive_the_run_mark(self):
+        """The run is 'reviewed' only once EVERY recorded task is:
+        acking one of two keeps the run unreviewed, acking the second
+        clears it - and a task tombstone flags the run again."""
+        with tempfile.TemporaryDirectory() as td:
+            runs, run_dir = self._finish_two_step_run(Path(td))
             conductor.set_step_review(
                 run_dir.name, "s1", {"reviewed": True}, runs)
             d = self._collect(runs)
+            self.assertFalse(next(
+                x for x in d["agents"] if x["step"] == "s1")
+                ["needs_review"])
             self.assertTrue(d["runs"][0]["needs_review"])
-            a = next(x for x in d["agents"] if x["step"] == "s1")
-            self.assertFalse(a["needs_review"])
+            conductor.set_step_review(
+                run_dir.name, "s2", {"reviewed": True}, runs)
+            d = self._collect(runs)
+            self.assertFalse(d["runs"][0]["needs_review"])
+            # a task tombstone flags the parent again
+            conductor.set_step_review(
+                run_dir.name, "s1", {"reviewed": False}, runs)
+            d = self._collect(runs)
+            self.assertTrue(d["runs"][0]["needs_review"])
+
+    def test_run_unreviewed_skips_never_run_steps(self):
+        """A run-level tombstone does not invent work on steps that
+        never completed - only seq/terminal records get flagged."""
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            rd = runs / "20260101-000000-t"
+            rd.mkdir(parents=True)
+            (rd / "state.json").write_text(json.dumps({
+                "run": "t", "started_at": "2026-01-01T00:00:00",
+                "ended_at": "2026-01-01T01:00:00",
+                "driver_pid": 999_999_999, "completion_seq": 1,
+                "steps": {
+                    "s1": {"name": "s1", "status": "done",
+                           "ended_at": "2026-01-01T00:10:00",
+                           "completion_seq": 1},
+                    "q": {"name": "q", "status": "queued"},
+                    "sk": {"name": "sk", "status": "skipped"}}}),
+                encoding="utf-8")
+            self.addCleanup(lambda: [
+                conductor.review_flag(rd, s).unlink(missing_ok=True)
+                for s in (None, "s1", "q", "sk")])
+            conductor.set_run_review(
+                rd.name, {"reviewed": False}, runs)
+            self.assertTrue(
+                conductor.review_flag(rd, "s1").is_file())
+            self.assertFalse(
+                conductor.review_flag(rd, "q").is_file())
+            self.assertFalse(
+                conductor.review_flag(rd, "sk").is_file())
+
+    def test_seed_review_flags_marks_legacy_completions(self):
+        """Completions that predate completion_seq get tombstones; any
+        existing mark is left alone and queued/skipped work is never
+        seeded, so the pass is idempotent."""
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            rd = runs / "20260101-000000-t"
+            rd.mkdir(parents=True)
+            (rd / "state.json").write_text(json.dumps({
+                "run": "t", "started_at": "2026-01-01T00:00:00",
+                "ended_at": "2026-01-01T01:00:00",
+                "driver_pid": 999_999_999,
+                "steps": {
+                    "legacy": {"name": "legacy", "status": "done",
+                               "ended_at": "2026-01-01T00:10:00"},
+                    "marked": {"name": "marked", "status": "done",
+                               "ended_at": "2026-01-01T00:11:00",
+                               "review": {"reviewed": True, "seq": None,
+                                          "at": "2026-01-01T00:12:00"}},
+                    "q": {"name": "q", "status": "queued"}}}),
+                encoding="utf-8")
+            self.addCleanup(lambda: [
+                conductor.review_flag(rd, s).unlink(missing_ok=True)
+                for s in (None, "legacy", "marked", "q")])
+            lines = conductor.seed_review_flags(runs)
+            self.assertTrue(any(rd.name in ln for ln in lines))
+            # seq-less legacy step + run get flagged
+            d = self._collect(runs)
+            self.assertTrue(next(
+                x for x in d["agents"] if x["step"] == "legacy")
+                ["needs_review"])
+            self.assertTrue(d["runs"][0]["needs_review"])
+            # the pre-existing ack survives untouched, the queued step
+            # got nothing, and a second pass writes nothing new
+            self.assertFalse(next(
+                x for x in d["agents"] if x["step"] == "marked")
+                ["needs_review"])
+            self.assertFalse(
+                conductor.review_flag(rd, "q").is_file())
+            self.assertEqual(conductor.seed_review_flags(runs), [])
+            # the tombstone folded into state.json (nothing live)
+            st = self._state(rd)
+            self.assertFalse(
+                st["steps"]["legacy"]["review"]["reviewed"])
+            self.assertFalse(st["review"]["reviewed"])
 
     def test_legacy_records_never_autoflag_but_take_marks(self):
         """A seq-less historical record is not presented as freshly
@@ -12650,7 +12878,8 @@ prompt = "second"
                 {"reviewed": False})
             self.assertEqual(status, 200)
             self.assertTrue(out["needs_review"])
-            # the run mark above never covered the task
+            # the run ack above cascaded to the task; this tombstone
+            # overrides it again
             status, _ = call("POST", "/api/runs/nope/review",
                              {"reviewed": True})
             self.assertEqual(status, 404)

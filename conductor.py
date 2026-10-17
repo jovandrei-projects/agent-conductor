@@ -3135,6 +3135,77 @@ def _needs_review(seq, mark: dict | None) -> bool:
                                 or mark.get("seq") != seq)
 
 
+# Step outcomes that left work worth a human look - a review tombstone or
+# a cascade mark only ever lands on these (or a seq-bearing record, which
+# already implies one). queued/skipped/waiting steps never ran: marking
+# them 'needs review' would invent work that never happened.
+_REVIEWABLE_ST = {"done", "failed", "timed_out", "stopped", "lost",
+                  "blocked", "partial"}
+
+
+def seed_review_flags(runs_dir: Path) -> list[str]:
+    """One-time 'nothing was ever reviewed' seeding: completions that
+    predate completion_seq can't flag themselves (a seq-less record only
+    shows on an explicit tombstone), so runs/steps that ended with no
+    mark at all get one here and read 'unreviewed' like everything
+    newer. Records that carry ANY mark - ack or tombstone - are left
+    alone, which makes the pass idempotent and safe at every serve
+    start; it can never undo a human's ack."""
+    lines = []
+    try:
+        _flag_dir().mkdir(exist_ok=True)
+    except OSError:
+        return lines
+    for sj in sorted(runs_dir.glob("*/state.json")):
+        try:
+            st = json.loads(sj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        d = sj.parent
+        wrote = False
+        # The run flags itself on a seq mismatch once ended; only a
+        # seq-less ending needs the explicit tombstone.
+        if (st.get("ended_at") and st.get("completion_seq") is None
+                and _review_mark(d, st.get("review")) is None):
+            try:
+                review_flag(d).write_text(json.dumps(
+                    {"reviewed": False, "seq": None,
+                     "at": now_iso()}), encoding="utf-8")
+                wrote = True
+            except OSError:
+                pass
+        for sname, srec in (st.get("steps") or {}).items():
+            if (srec.get("completion_seq") is not None
+                    or srec.get("status") not in _REVIEWABLE_ST
+                    or _review_mark(d, srec.get("review"), sname)
+                    is not None):
+                continue
+            try:
+                review_flag(d, sname).write_text(json.dumps(
+                    {"reviewed": False, "seq": None,
+                     "at": now_iso()}), encoding="utf-8")
+                wrote = True
+            except OSError:
+                pass
+        if not wrote:
+            continue
+        lines.append(f"{d.name}: seeded needs-review marks")
+        # Fold at once when nothing in the run is live - the marks then
+        # survive a tempdir cleanup; a live/watched run keeps them
+        # flag-only until a later save lands them (same rule as the
+        # endpoint's own writes).
+        if not driver_alive(st) and not any(
+                step_live(r, False)
+                for r in (st.get("steps") or {}).values()):
+            try:
+                _assert_unwatched(runs_dir, d)
+            except RequestError:
+                pass
+            else:
+                save_state(d, st)
+    return lines
+
+
 def _fold_review_flags(run_dir: Path, state: dict) -> None:
     """Fold this run's review-* sentinels into the state dict - called
     from save_state so every driver save carries the newest human marks
@@ -10421,6 +10492,32 @@ def _set_review(run_name: str, step_name: str | None, body: dict,
         _flag_dir().mkdir(exist_ok=True)
         review_flag(d, step_name).write_text(
             json.dumps(out), encoding="utf-8")
+        # Marks cascade parent <-> children so the two levels never read
+        # inconsistently: a run-level mark covers every recorded task
+        # ('needs review' flags them all, an ack clears each completion
+        # it saw), and a task mark re-derives the run's - reviewed only
+        # once EVERY recorded step is covered, unreviewed as soon as one
+        # needs a look. Steps that never completed anything (no seq, no
+        # terminal outcome) are skipped: flagging them would invent work
+        # to review that never happened.
+        steps = st.get("steps") or {}
+        if step_name is None:
+            for sname, srec in steps.items():
+                if not reviewed and srec.get("completion_seq") is None \
+                        and srec.get("status") not in _REVIEWABLE_ST:
+                    continue
+                review_flag(d, sname).write_text(json.dumps(
+                    {"reviewed": reviewed,
+                     "seq": srec.get("completion_seq"),
+                     "at": out["at"]}), encoding="utf-8")
+        elif steps:
+            covered = all(not _needs_review(
+                srec.get("completion_seq"),
+                _review_mark(d, srec.get("review"), sname))
+                for sname, srec in steps.items())
+            review_flag(d).write_text(json.dumps(
+                {"reviewed": covered, "seq": st.get("completion_seq"),
+                 "at": out["at"]}), encoding="utf-8")
     except OSError as exc:
         raise RequestError(f"Could not write the review flag: {exc}",
                            500) from exc
@@ -11852,6 +11949,17 @@ def collect_dashboard(runs_dir: Path,
                      "key": key, "request_id": st.get("request_id"),
                      "archived": st.get("archived"),
                      "followup": st.get("followup"),
+                     # A run launched FROM a follow-up proposal carries
+                     # the same back-link the proposal row does, so the
+                     # run modal and its tasks can jump to the source run
+                     "followup_src": (
+                         {"run": request.get("source_run"),
+                          "key": request.get("source_run_key") or
+                                 request.get("source_run"),
+                          "manifest": request.get("source_manifest")}
+                         if request and (request.get("source_run")
+                                         or request.get("source_manifest"))
+                         else None),
                      "executing": executing,
                      "iso": _run_isolation(cfg, st, request),
                      # Retained-but-unlanded worktree work for the run
@@ -12330,6 +12438,30 @@ tr.agen.unreviewed td.step > span { font-weight:700; }
 .linkbtn { background:none; border:0; color:#58a6ff; cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
 .run-name { color:#58a6ff; text-decoration:underline; text-align:left; }
 .run-name:hover { color:#79c0ff; }
+/* Follow-up links are metadata chips, not actions competing with the
+   row's real links: neutral grey, and the underline only appears on
+   hover. A bad outcome (error/invalid/missing/...) colors just the
+   status word, leaving the 'follow-up' prefix grey. */
+.fulink { background:none; border:0; color:#8b949e; cursor:pointer;
+  font:inherit; padding:0; text-decoration:none; }
+.fulink:hover { color:#c9d1d9; text-decoration:underline; }
+span.fulink { cursor:default; }
+span.fulink:hover { color:#8b949e; text-decoration:none; }
+.fu-bad { color:#f85149; }
+/* the other half of a follow-up pair while a modal shows one side -
+   lighter than .dsel (the open view's own row) */
+tr.dlinked td { background:#141e29; }
+tr.dlinked td:first-child { box-shadow:inset 3px 0 #3d444d; }
+/* a request field whose value differs from the saved proposal/baseline
+   gets a subtle amber frame so the pend-note's list maps onto the form */
+input.pendchg, select.pendchg, textarea.pendchg, div.pendchg {
+  border-color:#d29922 !important;
+  box-shadow:0 0 0 2px rgba(210,153,34,.4); }
+input[type="checkbox"].pendchg { border-color:#d29922 !important;
+  outline:2px solid rgba(210,153,34,.85); outline-offset:2px;
+  box-shadow:none; }
+label.check.pendchg-lab { box-shadow:0 0 0 2px rgba(210,153,34,.35);
+  border-radius:4px; }
 /* td has padding-left:0 + overflow:hidden, so an outset focus ring is
    clipped at the cell edge - draw it inside the element instead */
 td :is(a,button):focus-visible { outline-offset:-2px; }
@@ -13489,7 +13621,25 @@ function showDetail(i, keepStack){
     return `<span class="stc st-${cls}">${esc(m[0])}</span>` +
            esc(s.slice(m[0].length));
   };
-  const kv = [['step',a.step],['run',a.run],['project',a.slug],
+  const runKey_ = a.run_key||a.run_dir;
+  // Follow-up links both ways: a task inside a run that DRAFTED one
+  // links forward to the proposal; a task inside the follow-up run
+  // links back to the run that drafted it
+  const ownRun = (lastData?.runs||[]).find(x=>runKey(x)===runKey_) || {};
+  const ownFu = ownRun.followup, ownSrc = ownRun.followup_src;
+  const kv = [['step',a.step],['run',a.run],
+    ...(ownSrc ? [['follow-up of',
+      `<button type="button" class="linkbtn" ` +
+      `data-run-details="${esc(ownSrc.key || ownSrc.run)}">` +
+      `${esc(ownSrc.run || '?')}</button>`]] : []),
+    ...(ownFu ? [['follow-up',
+      (ownFu.request
+        ? `<button type="button" class="linkbtn" ` +
+          `data-open-request="${esc(ownFu.request)}">` +
+          `open the follow-up proposal</button>`
+        : `<span class="sub">${esc(ownFu.status || 'recorded')}` +
+          ` - no proposal linked</span>`)]] : []),
+    ['project',a.slug],
     ['status',a.status+(a.status==='failed'&&a.exit_code===0&&
       a.status_line==null?' - ended without the STATUS: line':'')],
     ['review',reviewLine(a)],
@@ -13566,7 +13716,6 @@ function showDetail(i, keepStack){
   // report IS the run summary
   const sumKey = a.aux ? 'run|'+(a.run_key||base(a.run_dir))
                        : agentKey(a);
-  const runKey_ = a.run_key||a.run_dir;
   // Every control that mutates the task or its run lives in ONE zone at
   // the end of the modal - review, lifecycle, prompt/notes edits, the
   // timeout editor - under one rule + header, IntelliJ-style. View-only
@@ -13695,6 +13844,8 @@ function showDetail(i, keepStack){
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">` +
       (k==='status' ? statusHTML(v)
         : k==='task prompt' ? `<pre class="taskpre">${esc(v??'-')}</pre>`
+        : k.startsWith('follow-up')
+        ? v    // the link/label above is already escaped markup
         : k==='run' && runKey_
         ? `<button type="button" class="linkbtn" ` +
           `data-run-details="${esc(runKey_)}">${esc(v??'-')}</button>`
@@ -13841,6 +13992,23 @@ function showRunDetails(key, keepStack){
     // review marks live on run records only - a proposal/planner row is
     // preparation history, never a completion to ack
     ...(r.stage?[]:[['review',reviewLine(r)]]),
+    // a run launched from a follow-up proposal links back to the run
+    // that drafted it
+    ...(r.followup_src ? [['follow-up of',
+      `<button type="button" class="linkbtn" ` +
+      `data-run-details="${esc(r.followup_src.key ||
+        r.followup_src.run)}">${esc(r.followup_src.run || '?')}` +
+      `</button>`]] : []),
+    // the follow-up this run drafted, when the closing step left one -
+    // the link opens the proposal (Back returns here; the proposal's own
+    // row marks .dlinked while this modal shows)
+    ...(r.followup ? [['follow-up',
+      (r.followup.request
+        ? `<button type="button" class="linkbtn" ` +
+          `data-open-request="${esc(r.followup.request)}">` +
+          `open the follow-up proposal</button>`
+        : `<span class="sub">${esc(r.followup.status || 'recorded')}` +
+          ` - no proposal linked</span>`)]] : []),
     ['steps',(total?`${total} total · `:'')+
       Object.entries(r.counts||{}).map(([s,n])=>`${n} ${s}`).join(', ')],
     ['tokens',tokTitle(r.tokens)||'-'],
@@ -13874,13 +14042,18 @@ function showRunDetails(key, keepStack){
   const taskTbl = tasks.length
     ? `<h3 style="margin-top:14px">tasks</h3>` +
       `<div class="wrapw"><table>` +
-      `<tr><th>step</th><th>status</th><th>elapsed</th></tr>` +
+      `<tr><th>step</th><th>status</th><th>review</th><th>elapsed</th>` +
+      `</tr>` +
       tasks.map(t=>`<tr>` +
         `<td><button type="button" class="linkbtn" ` +
         `data-agent-detail="${esc(agentKey(t))}">${esc(t.step)}` +
         `</button>${t.aux?' <span class="sub">aux</span>':''}</td>` +
         `<td><span style="color:${COLORS[t.status]||'#8b949e'}">` +
         `${esc(t.status)}</span></td>` +
+        `<td>${t.needs_review ? unreviewedPill('this task')
+          : (t.review && t.review.reviewed===true
+            ? '<span class="sub">reviewed</span>'
+            : '<span class="sub">-</span>')}</td>` +
         `<td>${elapsed(t, Date.now())}</td></tr>`).join('') +
       `</table></div>` : '';
   // Retained worktree work awaiting an explicit merge, straight from
@@ -14036,6 +14209,8 @@ function showRunDetails(key, keepStack){
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">` +
       (k==='tokens'
         ? `<span title="${esc(TOK_HELP)}">${esc(v??'-')}</span>`
+        : k.startsWith('follow-up')
+          ? v    // the link/label above is already escaped markup
         : k==='sessions' && v!=='-'
           ? v    // already-escaped <details> markup, not plain text
           : esc(v??'-')) + `</div>`).join('') + '</div>' +
@@ -14504,6 +14679,13 @@ function showRequestForm(rec){
       stage==='launched'?'Original request': 'Request details'}</h3>` +
     (stage==='new'?'':`<span class="stage ${esc(stage)}">` +
       `${esc(STAGES[stage]||stage)}</span>`) +
+    // a follow-up proposal names the run that drafted it - the link opens
+    // that run's details (Back returns here) and its row marks .dlinked
+    (rec.source_run
+      ? `<div class="notice">Drafted as the follow-up of run ` +
+        `<button type="button" class="linkbtn" ` +
+        `data-run-details="${esc(rec.source_run_key ||
+          rec.source_run)}">${esc(rec.source_run)}</button>.</div>` : '') +
     `<div class="notice">Save keeps your request as a draft. Generate asks Devin ` +
       `to propose a TOML runbook only; no implementation starts. ` +
       `Starting the run requires a separate, explicit click. Generated TOML ` +
@@ -14790,9 +14972,32 @@ function pendNote(p){
     `call needed. Regenerate tasks also works but re-plans the whole ` +
     `proposal.`;
 }
+// pending key -> the form field it lives in, so the pend-note's list
+// maps onto the actual controls (a subtle amber frame, not just words)
+const PEND_EL={raw:'rq-raw',project:'rq-project',attachments:'rq-attach',
+  model:'rq-model',effort:'rq-effort',on_failure:'rq-on_failure',
+  max_attempts:'rq-attempts',worktrees:'rq-worktrees',
+  merge_resolver:'rq-merge_resolver',merge:'rq-merge',
+  followup:'rq-followup',merge_target:'rq-merge_target',
+  manifest:'rq-manifest'};
 function refreshPending(){
   const stage=(modalRequest&&modalRequest.status)||'';
   const p=pendingNow();
+  // the changed field/checkbox is what 'Needs review' refers to - frame
+  // it so the note's key list stops being guesswork. Suppressed mid-
+  // planning like the note itself (the change is being regenerated).
+  const quiet = stage==='generating'||stage==='questions';
+  const hot = quiet ? new Set()
+    : new Set([...p.gen, ...p.opts]
+        .map(k=>PEND_EL[k]).filter(Boolean));
+  for (const id of new Set(Object.values(PEND_EL))){
+    const el=document.getElementById(id);
+    if (!el || !el.classList) continue;
+    const on = hot.has(id);
+    el.classList.toggle('pendchg', on);
+    const lab = el.closest && el.closest('label.check');
+    if (lab && lab.classList) lab.classList.toggle('pendchg-lab', on);
+  }
   const note=document.getElementById('pend-note');
   if (note){
     // mid-planning the regeneration/answers already own the change
@@ -15445,17 +15650,21 @@ function render(d){
       deferred:'follow-up registration is waiting on the checkout',
       discarded:'follow-up proposal was discarded',
       absent:'follow-up step did not finish cleanly - no file produced'};
+    // a broken outcome colors the status word red; the 'follow-up ->'
+    // prefix stays neutral either way
+    const BAD = {invalid:1, missing:1, absent:1, error:1};
     const label = L[fu.status] || fu.status || '?';
+    const lab = BAD[fu.status]
+      ? `<b class="fu-bad">${esc(label)}</b>` : esc(label);
     const tip = (T[fu.status] || 'follow-up-plan outcome') +
       (fu.source ? ` - source ${fu.source}` : '');
     return fu.request
-      ? ` <button type="button" class="linkbtn" ` +
+      ? ` <button type="button" class="fulink" ` +
         `data-open-request="${esc(fu.request)}" ` +
         `title="${esc(tip)} - open the proposal">` +
-        `follow-up &rarr; ${esc(label)}</button>`
-      : ` <span class="stage ${esc(fu.status==='registered' ? 'followup' :
-        (fu.status || 'followup'))}" ` +
-        `title="${esc(tip)}">follow-up &rarr; ${esc(label)}</span>`;
+        `follow-up &rarr; ${lab}</button>`
+      : ` <span class="fulink" ` +
+        `title="${esc(tip)}">follow-up &rarr; ${lab}</span>`;
   };
   for (const r of shownRuns){
     const counts = Object.entries(r.counts||{})
@@ -15535,18 +15744,22 @@ function render(d){
         (r.stage==='generating'
           ? `<span class="dots"><span>.</span><span>.</span><span>.</span></span>`
           : '') + `</span>` + staleChip + isoChip(r) +
+        // the 'this IS a follow-up' chip: compact and neutral - the
+        // source run's name moved to the tooltip, and a click opens the
+        // source run's details (dlinked row pair while it shows)
         (r.followup_src
           ? (r.followup_src.run
-            ? ` <button type="button" class="linkbtn" ` +
+            ? ` <button type="button" class="fulink" ` +
               `data-run-details="${esc(r.followup_src.key ||
                 r.followup_src.run)}" ` +
               `title="follow-up drafted by run ` +
               `${esc(r.followup_src.run)}` +
               `${r.followup_src.manifest
-                ? ` - source ${esc(r.followup_src.manifest)}` : ''}">` +
-              `follow-up of ${esc(r.followup_src.run)}</button>`
+                ? ` - source ${esc(r.followup_src.manifest)}` : ''}` +
+              ` - open that run">follow-up</button>`
             : ` <span class="stage followup" ` +
-              `title="imported proposal manifest">imported</span>`)
+              `title="imported follow-up proposal manifest">` +
+              `follow-up</span>`)
           : '') +
         (cgen ? ` <span class="genline${gfresh?' fresh':''}" ` +
           `title="${esc(cgen)}">${esc(cgen)}</span>` : '') +
@@ -16751,13 +16964,55 @@ function selKeys(){
   if (modalQA && modalQA.id) s.add('r:request:'+modalQA.id);
   return s;
 }
+// Run rows RELATED to the open view but not the view itself - the other
+// half of a follow-up pair (a source run <-> the proposal it drafted)
+// and the run a task/summary modal's step belongs to. They render
+// .dlinked, a notch under .dsel which marks the open view's own row.
+function linkKeys(){
+  const s = new Set();
+  const runs = (lastData && lastData.runs) || [];
+  const rowOf = rk => runs.find(x=>runKey(x)===rk) || {};
+  const fuReq = rk => {
+    const f = rowOf(rk).followup;
+    return f && f.request; };
+  const srcOf = rk => {
+    const f = rowOf(rk).followup_src;
+    return f && (f.key || f.run); };
+  const ownRunOf = akey => {
+    const a = AGENTS.find(x=>agentKey(x)===akey);
+    return a && (a.run_key||a.run_dir); };
+  const linkRun = rk => {
+    const rid = fuReq(rk);
+    if (rid) s.add('r:request:'+rid);
+    const sk = srcOf(rk);
+    if (sk) s.add('r:'+sk); };
+  if (runModalKey) linkRun(runModalKey);
+  const mrec = (modalRequest && modalRequest.record) || {};
+  if (mrec.source_run_key || mrec.source_run)
+    s.add('r:' + (mrec.source_run_key || mrec.source_run));
+  if (detailKey!=null){
+    const rk = ownRunOf(detailKey);
+    if (rk){ s.add('r:'+rk); linkRun(rk); }
+  }
+  if (summaryView){
+    const k = String(summaryView.key);
+    const rk = k.startsWith('run|') ? k.slice(4) : ownRunOf(k);
+    if (rk){ s.add('r:'+rk); linkRun(rk); }
+  }
+  // the open view's own row keeps the stronger .dsel mark
+  const strong = selKeys();
+  for (const k of strong) s.delete(k);
+  return s;
+}
 function applySel(){
-  const want = selKeys();
+  const want = selKeys(), link = linkKeys();
   document.querySelectorAll('tr.runrow[data-run-key],tr.agen[data-akey]')
     .forEach(x=>{
       const agen = x.classList && x.classList.contains('agen');
+      const k = agen?x.dataset.akey:x.dataset.runKey;
       x.classList.toggle('dsel',
-        want.has((agen?'a:':'r:') + (agen?x.dataset.akey:x.dataset.runKey)));
+        want.has((agen?'a:':'r:') + k));
+      x.classList.toggle('dlinked', !agen && link.has('r:'+k));
     });
 }
 document.addEventListener('mouseover', e=>{
@@ -17129,6 +17384,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # ...and registers follow-up manifests produced while it was down -
     # the same pass then reruns throttled inside the dashboard loop.
     for line in discover_followups(runs_dir):
+        print(f"sweep: {line}")
+    # completions that predate completion_seq get explicit needs-review
+    # tombstones so every finished task reads 'unreviewed' until a human
+    # looks - idempotent, never overwrites an existing mark
+    for line in seed_review_flags(runs_dir):
         print(f"sweep: {line}")
     handler = make_dashboard_handler(runs_dir, devin_argv)
     # --port wins; a worker-spawned serve falls back to the port its step
