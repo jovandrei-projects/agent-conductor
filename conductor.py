@@ -12488,6 +12488,166 @@ def _respawn_serve(args: argparse.Namespace) -> None:
     subprocess.Popen(argv, **kw)
 
 
+# ------------------------------------------------------------ tour feed api
+#
+# The 'What's new' endpoints (GET /api/tour + the viewed/snooze/unview
+# transitions) are a thin HTTP layer over tour_state (the persisted
+# watermark + entry descriptors) and tour_feeds (the deterministic card
+# list). All caches live in a per-server `tour_ctx` so a second
+# dashboard (tests, a worktree serve) never shares another's feed.
+TOUR_FEED_TTL_S = 60.0      # ~60s feed cache: the badge polls /api/state
+                            # far more often than repo changes arrive
+
+
+def tour_ctx(runs_dir: Path, requests_dir: Path | None = None,
+             manifests_dir: Path = MANIFESTS_DIR,
+             repo_dir: Path | None = None) -> dict:
+    """The dirs the tour reads plus its caches. ``repo_dir`` is the repo
+    the change feed runs `git log` on - the conductor checkout itself in
+    production (the tour covers THIS tool's changes), a fixture repo in
+    tests. The state file sits next to the served runs/ dir, matching
+    tour_state's data/tour-state.json."""
+    return {"repo_dir": Path(repo_dir) if repo_dir is not None else ROOT,
+            "runs_dir": runs_dir,
+            "requests_dir": requests_dir or runs_dir.parent / "requests",
+            "manifests_dir": manifests_dir,
+            "state_path": runs_dir.parent / "tour-state.json",
+            "feed": None,     # {"at": epoch, "payload": GET /api/tour body}
+            "count": None,    # {"at": epoch, "value": int}
+            "busy": False,    # a background build owns the refresh
+            "lock": threading.Lock()}
+
+
+def _tour_mods():
+    """tour_state/tour_feeds, imported lazily: the dashboard must still
+    boot when a checkout predates them - the badge then reads 'unknown'
+    instead of taking /api/state down."""
+    import tour_feeds                                   # noqa: E402
+    import tour_state                                   # noqa: E402
+    return tour_state, tour_feeds
+
+
+def _tour_build(ctx: dict, *, now: float | None = None) -> dict:
+    """One feed build, cached as both the GET payload and the unseen
+    count. Pure reads (tour_state.load never writes): nothing on the
+    GET path can mark an entry or move the watermark."""
+    tour_state, tour_feeds = _tour_mods()
+    ts = time.time() if now is None else now
+    state = tour_state.load(ctx["state_path"])
+    boundary = tour_state.capture_boundary(ctx["repo_dir"], now=now)
+    feed = tour_feeds.build_feed(
+        state, boundary, repo_dir=ctx["repo_dir"],
+        runs_dir=ctx["runs_dir"], requests_dir=ctx["requests_dir"],
+        manifests_dir=ctx["manifests_dir"])
+    payload = {"generated_at": (_iso_from(now) if now is not None
+                                else now_iso()),
+               "boundary": feed["boundary"], "range": feed["range"],
+               "entries": feed["entries"], "history": feed["history"],
+               "unseen_count": feed["unseen_count"],
+               "warnings": feed["warnings"]}
+    with ctx["lock"]:
+        ctx["feed"] = {"at": ts, "payload": payload}
+        ctx["count"] = {"at": ts, "value": feed["unseen_count"]}
+    return payload
+
+
+def tour_feed(ctx: dict, *, now: float | None = None,
+              fresh: bool = False) -> dict:
+    """GET /api/tour's payload: the ~60s cache while warm, one rebuild
+    on expiry (or when `fresh` forces it). Read-only."""
+    ts = time.time() if now is None else now
+    with ctx["lock"]:
+        cached = ctx["feed"]
+    if not fresh and cached is not None \
+            and ts - cached["at"] < TOUR_FEED_TTL_S:
+        return cached["payload"]
+    return _tour_build(ctx, now=now)
+
+
+def tour_unseen(ctx: dict, *, now: float | None = None) -> int | None:
+    """The unseen-count field /api/state carries: the LAST computed
+    value (None = never computed - an honest unknown, not a fake 0).
+    Never builds inline: a missing/stale feed re-arms ONE daemon rebuild
+    (the _SESS_BUSY pattern) so the dashboard paint and the first state
+    response never wait on git log or record scans; the next poll picks
+    the count up."""
+    ts = time.time() if now is None else now
+    spawn = False
+    with ctx["lock"]:
+        stale = ctx["feed"] is None \
+            or ts - ctx["feed"]["at"] >= TOUR_FEED_TTL_S
+        if stale and not ctx["busy"]:
+            ctx["busy"] = spawn = True
+        count = ctx["count"]
+    if spawn:
+        def work() -> None:
+            try:
+                _tour_build(ctx)
+            except Exception:                            # noqa: BLE001
+                LOG.exception("tour feed refresh failed")
+            finally:
+                with ctx["lock"]:
+                    ctx["busy"] = False
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except Exception:                                # noqa: BLE001
+            with ctx["lock"]:
+                ctx["busy"] = False
+    return count["value"] if count is not None else None
+
+
+def _tour_find(payload: dict, entry_id: str) -> dict | None:
+    """Entry lookup across live entries AND the re-materialized viewed
+    history - every recorded descriptor lands in exactly one of them,
+    so this covers every id the persisted transitions accept."""
+    for e in payload["entries"] + payload["history"]:
+        if e.get("id") == entry_id:
+            return e
+    return None
+
+
+def tour_transition(ctx: dict, entry_id: str, action: str,
+                    *, now: float | None = None) -> dict:
+    """POST /api/tour/<id>/<action>: validate the entry against the feed
+    (a cached miss retries once on a fresh build - a change that landed
+    inside the TTL is still acknowledgeable), run the persisted
+    transition, then rebuild so neither the feed cache nor the unseen
+    count can serve pre-mutation state."""
+    if action not in ("viewed", "snooze", "unview"):
+        raise RequestError(f"unknown tour action: {action}", 404)
+    entry_id = str(entry_id or "").strip()
+    if not entry_id or len(entry_id) > 512:
+        raise RequestError("invalid tour entry id")
+    tour_state, _tour_feeds = _tour_mods()
+    payload = tour_feed(ctx, now=now)
+    entry = _tour_find(payload, entry_id)
+    if entry is None:
+        payload = tour_feed(ctx, now=now, fresh=True)
+        entry = _tour_find(payload, entry_id)
+    if entry is None:
+        raise RequestError(f"unknown tour entry: {entry_id}", 404)
+    if action == "viewed":
+        # ids still 'new' after this mark - only an empty list lets the
+        # watermark advance, and only to THIS feed's captured boundary
+        still_new = [e["id"] for e in payload["entries"]
+                     if e.get("state") == "new" and e["id"] != entry_id]
+        result = tour_state.mark_viewed(
+            entry_id, entry.get("range"), payload["boundary"],
+            remaining_new=still_new, path=ctx["state_path"],
+            repo_dir=ctx["repo_dir"], now=now)
+    elif action == "snooze":
+        result = tour_state.snooze(entry_id, entry.get("range"),
+                                   path=ctx["state_path"], now=now)
+    else:
+        result = tour_state.unview(entry_id, path=ctx["state_path"],
+                                   now=now)
+    with ctx["lock"]:
+        ctx["feed"] = ctx["count"] = None    # drop pre-mutation copies
+    refreshed = _tour_build(ctx, now=now)
+    result["unseen_count"] = refreshed["unseen_count"]
+    return result
+
+
 def collect_dashboard(runs_dir: Path,
                       devin_argv: list[str] | None = None,
                       requests_dir: Path | None = None,
@@ -18545,10 +18705,14 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                            requests_dir: Path | None = None,
                            manifests_dir: Path = MANIFESTS_DIR,
                            attachments_dir: Path | None = None,
-                           trash_dir: Path | None = None):
+                           trash_dir: Path | None = None,
+                           tour_repo: Path | None = None):
     requests_dir = requests_dir or runs_dir.parent / "requests"
     attachments_dir = attachments_dir or runs_dir.parent / "attachments"
     trash_dir = trash_dir or runs_dir.parent / "trash"
+    # The 'What's new' tour endpoints share one ctx: its feed/count caches
+    # are per-serve so a fixture or second dashboard never sees another's.
+    tour = tour_ctx(runs_dir, requests_dir, manifests_dir, tour_repo)
 
     # The assistant surface: one lazily-opened host runtime per serve
     # process. Errors are cached - a broken provider init degrades to a
@@ -18714,12 +18878,19 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 if path == "/api/state":
                     q = urllib.parse.parse_qs(
                         urllib.parse.urlsplit(self.path).query)
-                    self._json(collect_dashboard(
+                    payload = collect_dashboard(
                         runs_dir, devin_argv, requests_dir,
                         include_archived=q.get("archived", [""])[0]
                         in ("1", "true", "yes"),
                         include_trash=q.get("trash", [""])[0]
-                        in ("1", "true", "yes")))
+                        in ("1", "true", "yes"))
+                    # the tour badge rides the state poll as one tiny
+                    # field, filled by a background rebuild - never an
+                    # inline feed collection on the paint path
+                    payload["tour_unseen"] = tour_unseen(tour)
+                    self._json(payload)
+                elif path == "/api/tour":
+                    self._json(tour_feed(tour))
                 elif (m := re.fullmatch(
                         r"/api/projects/([^/]+)/branches", path)):
                     # Merge-target selector data: eligible local branches of
@@ -18886,6 +19057,11 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                             request_id, requests_dir, manifests_dir,
                             runs_dir, trash_dir))
                 elif (m := re.fullmatch(
+                        r"/api/tour/([^/]+)/(viewed|snooze|unview)", path)):
+                    self._json(tour_transition(
+                        tour, urllib.parse.unquote(m.group(1)),
+                        m.group(2)))
+                elif (m := re.fullmatch(
                         r"/api/trash/([^/]+)/restore", path)):
                     self._json(restore_trash(m.group(1), trash_dir,
                                              runs_dir, requests_dir,
@@ -18985,6 +19161,7 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
             _assist["core"] = _assist["runtime"] = None
 
     Handler.assistant_close = staticmethod(assistant_close)
+    Handler.tour_ctx = tour          # tests drive the cache via this
     return Handler
 
 
