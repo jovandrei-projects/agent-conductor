@@ -1,0 +1,416 @@
+"""Tests for the 'What's new' tour HTTP layer in conductor.py:
+GET /api/tour, POST /api/tour/<id>/{viewed,snooze,unview}, the ~60s
+feed cache, and the tiny tour_unseen field on /api/state.
+
+Convention: C:\\Projects\\TESTING.md - real git fixture repos, a real
+ThreadingHTTPServer on 127.0.0.1:0, no network, no LLM.
+"""
+import http.client
+import json
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+sys.path.insert(0, str(ROOT))
+
+import conductor  # noqa: E402
+import tour_feeds  # noqa: E402
+import tour_state  # noqa: E402
+
+TAGS = ("new", "improved", "fixed")
+STATES = ("new", "viewed", "snoozed")
+
+
+def git(path: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(path), "-c", "user.email=t@t",
+         "-c", "user.name=t", "-c", "commit.gpgsign=false", *args],
+        capture_output=True, text=True)
+
+
+def rev(repo: Path) -> str:
+    return git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def commit(repo: Path, path: str, content: str, subject: str) -> str:
+    p = repo / path
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", subject)
+    return rev(repo)
+
+
+def _poll(pred, timeout=5.0) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+class TourApiTests(unittest.TestCase):
+    """Endpoint tests over a real dashboard handler. The fixture repo
+    carries an init commit (watermarked) plus two feature commits ->
+    exactly two 'new' area cards ('power' improved, 'assistant' new)
+    plus any record cards a test writes."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        base = Path(self._td.name)
+        self.base = base
+        self.repo = base / "repo"
+        self.repo.mkdir()
+        git(self.repo, "init")
+        (self.repo / "f.txt").write_text("0\n", encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "init")
+        self.c0 = rev(self.repo)
+        self.c_power = commit(self.repo, "conductor.py", "x",
+                              "Improve power dialog")
+        self.c_chat = commit(self.repo, "assistant/chat.py", "x",
+                             "Add assistant chat panel")
+        self.data = base / "data"
+        self.runs = self.data / "runs"
+        self.requests = self.data / "requests"
+        self.manifests = base / "manifests"
+        for d in (self.runs, self.requests, self.manifests):
+            d.mkdir(parents=True)
+        self.state_path = self.data / "tour-state.json"
+        self.seed_state()
+        handler = conductor.make_dashboard_handler(
+            self.runs, ["no-such-devin"], self.requests, self.manifests,
+            tour_repo=self.repo)
+        self.tour = handler.tour_ctx
+        self.server = conductor.http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), handler)
+        threading.Thread(target=self.server.serve_forever,
+                         daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.port = self.server.server_port
+
+    def seed_state(self, watermark=None, viewed=(), snoozed=()):
+        """Write data/tour-state.json directly - the seeded watermark is
+        the init commit + a long-ago `at`, so only the two feature
+        commits (and windowed records) feed."""
+        wm = watermark or {"commit": self.c0,
+                           "at": "2020-01-01T00:00:00",
+                           "origin": "advance"}
+        self.state_path.write_text(json.dumps(
+            {"watermark": wm, "viewed": list(viewed),
+             "snoozed": list(snoozed)}), encoding="utf-8")
+
+    def state_file(self) -> dict:
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def call(self, method, path, data=None, ctype="application/json",
+             origin=None, host=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                          timeout=10)
+        headers = {"Content-Type": ctype,
+                   "Origin": origin or f"http://127.0.0.1:{self.port}"}
+        if host:
+            headers["Host"] = host
+        conn.request(method, path,
+                     json.dumps(data).encode("utf-8")
+                     if data is not None else None, headers)
+        res = conn.getresponse()
+        raw = res.read()
+        conn.close()
+        try:
+            return res.status, json.loads(raw)
+        except ValueError:
+            return res.status, raw
+
+    def get(self, path="/api/tour"):
+        s, d = self.call("GET", path)
+        self.assertEqual(s, 200, d)
+        return d
+
+    def post(self, entry_id, action):
+        return self.call("POST", f"/api/tour/{entry_id}/{action}", {})
+
+    def ids(self, payload=None):
+        return {e["id"]: e
+                for e in (payload or self.get())["entries"]}
+
+    # ------------------------------------------------------- contract
+
+    def test_response_contract(self):
+        d = self.get()
+        for k in ("entries", "history", "unseen_count"):
+            self.assertIn(k, d)
+        self.assertEqual(len(d["entries"]), 2)
+        self.assertEqual(d["unseen_count"], 2)
+        for e in d["entries"]:
+            self.assertIn(e["tag"], TAGS)
+            self.assertIn(e["state"], STATES)
+            for k in ("id", "title", "blurb", "anchor", "commits",
+                      "runs", "requests"):
+                self.assertIn(k, e)
+            for c in e["commits"]:
+                self.assertEqual(sorted(c), ["sha", "subject"])
+        ids = self.ids(d)
+        power = ids[f"area:power:{self.c_power[:12]}"]
+        self.assertEqual(power["anchor"], "#power-btn")
+        self.assertEqual(power["tag"], "improved")
+        self.assertEqual([c["sha"] for c in power["commits"]],
+                         [self.c_power])
+        chat = ids[f"area:assistant:{self.c_chat[:12]}"]
+        self.assertEqual(chat["anchor"], "#dask")
+        self.assertEqual(chat["tag"], "new")
+
+    def test_records_and_ride_alongs(self):
+        """A windowed request + finished run land as cards keyed by
+        request id / dashboard run key."""
+        rid = "20261017-010000-aaaabbbb"
+        (self.requests / f"{rid}.json").write_text(json.dumps(
+            {"id": rid, "status": "ready", "label": "new stuff",
+             "created_at": "2026-10-17T01:00:00"}), encoding="utf-8")
+        rd = self.runs / "20261017-020000-somename"
+        rd.mkdir(parents=True)
+        (rd / "state.json").write_text(json.dumps(
+            {"run": "somename", "request_id": rid,
+             "ended_at": "2026-10-17T02:00:00", "steps": {}}),
+            encoding="utf-8")
+        ids = self.ids()
+        self.assertEqual(ids[f"request:{rid}"]["requests"], [rid])
+        run = ids["run:20261017-020000-somename:2026-10-17T02:00:00"]
+        self.assertEqual(run["runs"], [f"request:{rid}"])
+        self.assertEqual(run["requests"], [rid])
+
+    # ---------------------------------------------------- transitions
+
+    def test_viewed_then_unview_round_trip(self):
+        ids = self.ids()
+        eid = f"area:power:{self.c_power[:12]}"
+        s, d = self.post(eid, "viewed")
+        self.assertEqual(s, 200, d)
+        self.assertEqual(d["state"], "viewed")
+        self.assertEqual(d["unseen_count"], 1)
+        self.assertFalse(d["advanced"])          # one still 'new'
+        # immediately consistent - no TTL wait
+        self.assertEqual(self.ids()[eid]["state"], "viewed")
+        st = self.state_file()
+        self.assertEqual([v["id"] for v in st["viewed"]], [eid])
+        s, d = self.post(eid, "unview")
+        self.assertEqual(s, 200, d)
+        self.assertEqual(d["state"], "new")
+        self.assertEqual(d["unseen_count"], 2)
+        self.assertEqual(self.ids()[eid]["state"], "new")
+        self.assertTrue(self.state_file()["viewed"][0].get("unviewed_at"))
+
+    def test_snooze_defers_without_acknowledging(self):
+        eid = f"area:assistant:{self.c_chat[:12]}"
+        s, d = self.post(eid, "snooze")
+        self.assertEqual(s, 200, d)
+        self.assertEqual(d["state"], "snoozed")
+        self.assertEqual(d["unseen_count"], 1)   # snoozed isn't 'new'
+        self.assertEqual(self.ids()[eid]["state"], "snoozed")
+        st = self.state_file()
+        self.assertEqual([x["id"] for x in st["snoozed"]], [eid])
+        # a snooze never moves the watermark
+        self.assertEqual(st["watermark"]["commit"], self.c0)
+
+    def test_last_new_viewed_advances_watermark(self):
+        ids = self.ids()
+        s, d = self.post(f"area:power:{self.c_power[:12]}", "viewed")
+        self.assertFalse(d["advanced"])
+        s, d = self.post(f"area:assistant:{self.c_chat[:12]}", "viewed")
+        self.assertEqual(s, 200, d)
+        self.assertTrue(d["advanced"], d)
+        # the watermark lands at the feed's captured boundary = HEAD
+        st = self.state_file()
+        self.assertEqual(st["watermark"]["commit"], rev(self.repo))
+        self.assertEqual(st["watermark"]["origin"], "advance")
+        # both entries moved to the viewed history the section needs
+        feed = self.get()
+        self.assertEqual(feed["unseen_count"], 0)
+        self.assertEqual(feed["entries"], [])
+        self.assertEqual({h["id"] for h in feed["history"]}, set(ids))
+        for h in feed["history"]:
+            self.assertEqual(h["state"], "viewed")
+            self.assertTrue(h.get("viewed_at"))
+
+    def test_snoozed_entry_does_not_pin_the_watermark(self):
+        """Snooze one, view the other: the deferred card is not 'new'
+        so nothing blocks the advance."""
+        self.post(f"area:assistant:{self.c_chat[:12]}", "snooze")
+        s, d = self.post(f"area:power:{self.c_power[:12]}", "viewed")
+        self.assertTrue(d["advanced"], d)
+        # ...but the snoozed card is still retrievable, not acked
+        feed = self.get()
+        e = self.ids(feed)[f"area:assistant:{self.c_chat[:12]}"]
+        self.assertEqual(e["state"], "snoozed")
+
+    def test_unview_after_advancement_resurfaces_new(self):
+        """An entry behind the advanced watermark keeps its range, so
+        unview re-injects it into entries and the unseen count."""
+        for eid in (f"area:power:{self.c_power[:12]}",
+                    f"area:assistant:{self.c_chat[:12]}"):
+            self.post(eid, "viewed")
+        self.assertEqual(self.get()["unseen_count"], 0)
+        s, d = self.post(f"area:power:{self.c_power[:12]}", "unview")
+        self.assertEqual(s, 200, d)
+        self.assertEqual(d["unseen_count"], 1)
+        e = self.ids()[f"area:power:{self.c_power[:12]}"]
+        self.assertEqual(e["state"], "new")
+
+    def test_new_commit_in_viewed_area_is_new_again(self):
+        """A fresh change in an already-viewed area gets a NEW id - it
+        can never silently inherit 'viewed'."""
+        self.post(f"area:power:{self.c_power[:12]}", "viewed")
+        c_new = commit(self.repo, "conductor.py", "y",
+                       "Improve power dialog again")
+        # the ~60s cache still holds the pre-commit feed - expire it the
+        # way the TTL would, then the fresh card surfaces
+        self.tour["feed"]["at"] -= conductor.TOUR_FEED_TTL_S + 1
+        ids = self.ids(self.call("GET", "/api/tour")[1])
+        fresh = ids[f"area:power:{c_new[:12]}"]
+        self.assertEqual(fresh["state"], "new")
+        self.assertNotEqual(fresh["id"],
+                            f"area:power:{self.c_power[:12]}")
+
+    def test_viewed_idempotent_and_snooze_moves_lists(self):
+        eid = f"area:power:{self.c_power[:12]}"
+        self.post(eid, "viewed")
+        s, d = self.post(eid, "viewed")          # re-mark: still one row
+        self.assertEqual(s, 200, d)
+        self.assertEqual(len(self.state_file()["viewed"]), 1)
+        s, d = self.post(eid, "snooze")          # viewed -> snoozed
+        self.assertEqual(d["state"], "snoozed")
+        st = self.state_file()
+        self.assertEqual(len(st["viewed"]), 0)
+        self.assertEqual(len(st["snoozed"]), 1)
+
+    # ------------------------------------------------- invalid inputs
+
+    def test_invalid_requests_never_mutate(self):
+        before = self.state_path.read_bytes()
+        s, _ = self.post("no-such-entry", "viewed")
+        self.assertEqual(s, 404)
+        s, _ = self.post("no-such-entry", "snooze")
+        self.assertEqual(s, 404)
+        s, _ = self.call("POST", "/api/tour/x/obliterate", {})
+        self.assertEqual(s, 404)                  # route whitelist
+        s, _ = self.call("GET",
+                         f"/api/tour/area:power:{self.c_power[:12]}/viewed")
+        self.assertEqual(s, 404)                  # GET never transitions
+        s, _ = self.call("POST",
+                         f"/api/tour/area:power:{self.c_power[:12]}/viewed",
+                         {}, ctype="text/plain")
+        self.assertEqual(s, 415)                  # JSON body required
+        s, _ = self.call("POST",
+                         f"/api/tour/area:power:{self.c_power[:12]}/viewed",
+                         {}, origin="http://evil.invalid")
+        self.assertEqual(s, 403)                  # origin protection
+        self.assertEqual(self.state_path.read_bytes(), before)
+
+    def test_get_is_read_only(self):
+        """GET /api/tour + /api/state must not write the state file,
+        mark entries, or move the watermark."""
+        self.state_path.unlink()
+        d = self.get()
+        self.assertEqual(d["unseen_count"], 3)   # unbounded: init too
+        self.assertFalse(self.state_path.exists())
+        self.call("GET", "/api/state")
+        time.sleep(0.3)                          # bg refresh completes
+        self.assertFalse(self.state_path.exists())
+        # with a seeded file: bytes identical after reads
+        self.seed_state()
+        before = self.state_path.read_bytes()
+        self.get(); self.call("GET", "/api/state")
+        self.assertEqual(self.state_path.read_bytes(), before)
+
+    # --------------------------------------------------------- caching
+
+    def test_feed_cached_then_expires(self):
+        with mock.patch.object(tour_feeds, "build_feed",
+                               wraps=tour_feeds.build_feed) as spy:
+            d1 = self.get()
+            d2 = self.get()
+            self.assertEqual(d1["generated_at"], d2["generated_at"])
+            self.assertEqual(spy.call_count, 1)  # second hit served cache
+            self.tour["feed"]["at"] -= conductor.TOUR_FEED_TTL_S + 1
+            self.get()
+            self.assertEqual(spy.call_count, 2)
+
+    def test_mutation_invalidates_without_waiting_for_ttl(self):
+        eid = f"area:power:{self.c_power[:12]}"
+        self.get()                                # warm the cache
+        self.post(eid, "viewed")
+        d = self.get()                            # still inside the TTL
+        self.assertEqual(self.ids(d)[eid]["state"], "viewed")
+        self.assertEqual(d["unseen_count"], 1)
+
+    def test_transition_refreshes_cached_count(self):
+        self.get()
+        self.assertEqual(self.tour["count"]["value"], 2)
+        self.post(f"area:power:{self.c_power[:12]}", "viewed")
+        self.assertEqual(self.tour["count"]["value"], 1)
+
+    # -------------------------------------------------- /api/state
+
+    def test_state_field_is_tiny_and_eventually_filled(self):
+        """The badge field rides /api/state: None while cold, an int
+        once the daemon build lands - and /api/state itself never
+        writes tour state."""
+        s, d = self.call("GET", "/api/state")
+        self.assertEqual(s, 200, d)
+        self.assertIsNone(d["tour_unseen"])      # cold cache: unknown
+        self.assertTrue(_poll(
+            lambda: self.tour["count"] is not None))
+        s, d = self.call("GET", "/api/state")
+        self.assertEqual(d["tour_unseen"], 2)
+
+    def test_state_never_waits_on_feed_collection(self):
+        """A slow feed build must not stall the state poll - the
+        response returns the last count while a daemon refreshes."""
+        gate = threading.Event()
+        real = tour_feeds.build_feed
+
+        def slow(*a, **kw):
+            gate.wait(10)
+            return real(*a, **kw)
+
+        with mock.patch.object(tour_feeds, "build_feed",
+                               side_effect=slow) as spy:
+            t0 = time.time()
+            s, d = self.call("GET", "/api/state")
+            self.assertEqual(s, 200, d)
+            self.assertLess(time.time() - t0, 5)
+            self.assertIsNone(d["tour_unseen"])
+            # a second poll joins the same in-flight build, not another
+            self.call("GET", "/api/state")
+            gate.set()
+            self.assertTrue(_poll(
+                lambda: self.tour["count"] is not None))
+            self.assertEqual(spy.call_count, 1)
+
+    def test_count_updates_after_mutation_via_state_poll(self):
+        self.get()
+        self.assertEqual(self.call("GET", "/api/state")[1]
+                         ["tour_unseen"], 2)
+        self.post(f"area:power:{self.c_power[:12]}", "viewed")
+        s, d = self.call("GET", "/api/state")
+        self.assertEqual(d["tour_unseen"], 1)    # no stale count
+
+    def test_transition_result_carries_fresh_count(self):
+        s, d = self.post(f"area:power:{self.c_power[:12]}", "viewed")
+        self.assertEqual(d["unseen_count"], 1)
+        s, d = self.post("definitely-missing", "unview")
+        self.assertEqual(s, 404)
+
+
+if __name__ == "__main__":
+    unittest.main()

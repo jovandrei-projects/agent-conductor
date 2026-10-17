@@ -715,6 +715,67 @@ Requires `devin` on PATH and `devin auth login` to have been run once
 (`devin auth status` is checked at run start; conductor aborts cleanly if
 not logged in).
 
+What's new tour: `tour_state.py` (repo root, stdlib-only) owns the
+walkthrough's persisted state - `data/tour-state.json` is exactly
+`{watermark, viewed[], snoozed[]}`. The watermark is a `{commit, at}`
+pair: a RESOLVED sha bounding `git log <commit>..<boundary.commit>` plus
+an ISO instant bounding the record feeds - never symbolic HEAD, never a
+serve_boot id, never touched at serve start. First init writes
+`{commit:null, at:null}` (nothing acknowledged) rather than pinning
+HEAD; an unresolvable recorded commit stays recorded and refuses
+advancement instead of resetting. `mark_viewed` is the only watermark
+mover - only when the caller reports no 'new' entries, and only as far
+as the feed's captured boundary (never a fresh HEAD); `snooze` defers
+without acknowledging, `unview` flags `unviewed_at` keeping the
+descriptor's `{base,tip}` range so entries behind the watermark stay
+retrievable and resurface as new. All mutations are lock-serialized
+tmp+replace writes.
+
+`tour_feeds.py` (repo root, stdlib-only, imports `tour_state`) builds
+the deterministic feed: `build_feed(state, boundary, repo_dir=,
+runs_dir=, requests_dir=, manifests_dir=)` -> `{entries, history,
+unseen_count, range, boundary, warnings}` - no LLM, no HTTP. Commits
+come from `git log <base.commit>..<tip.commit>` (null base = unbounded;
+an unresolvable base warns + falls back unbounded, never a silent
+reset) and group one card per feature area: TOUR_STOPS (repo registry
+`{id: {selector, title}}` of real _DASH_HTML anchors; `tour` uses
+`#tour-btn, #power-btn` so it anchors once the dashboard step adds the
+button) plus unanchored pseudo-areas (conductor/mobile/tests/manifests/
+tracking/mixed). Records use their OWN event stamps inside
+`(base.at, tip.at]`: requests+follow-ups on `created_at`, runs on
+`ended_at` - never run creation. Card ids embed the newest commit
+(`area:<stop>:<tip>`) or the record identity (`request:<rid>`,
+`run:<dir>:<ended_at>`, `followup:<rid>`, `curated:<stop>:<tip>`), so
+re-feeds bind viewed state but a fresh commit in a viewed area reads
+'new' again. Dedup: a finished run absorbs its `conductor/<dir>/<step>`
+merge commits + chains; `manifests/whatsnew.jsonl` curated lines
+`{stop, blurb, title?, tag?, commits|since+until|requests|runs}` fold
+into the named card when they claim exactly its own change, extract to
+a dedicated card otherwise, and get skipped (with a `warnings` note)
+when malformed or out of range. `history` re-materializes recorded
+descriptors over their stored `{base,tip}` ranges - viewed cards stay
+retrievable after the watermark advances past them; snoozed/unviewed
+descriptors re-inject into `entries`.
+
+The HTTP layer lives in conductor.py's `tour_ctx` block (just before
+`collect_dashboard`): one ctx per `make_dashboard_handler` holds the
+dirs, a ~60s `TOUR_FEED_TTL_S` feed cache, a count snapshot and a
+busy flag, so tests/second dashboards never share state (the handler
+takes `tour_repo=`; the ctx is `Handler.tour_ctx`). `GET /api/tour`
+serves `tour_feed(ctx)` = `{generated_at, boundary, range, entries,
+history, unseen_count, warnings}` - read-only end to end (the state
+file first appears on a mutation). `POST /api/tour/<id>/{viewed,
+snooze,unview}` runs `tour_transition`: the id is validated against
+entries+history (one fresh rebuild on a cache miss, else 404), the
+persisted transition runs, then BOTH caches drop and one rebuild lands
+- no pre-mutation state can be served; the result carries the fresh
+`unseen_count` (+ `advanced`/`advance_blocked`/`watermark` on viewed).
+`/api/state` gains only `tour_unseen`: `tour_unseen(ctx)` returns the
+last computed count (null = never computed) and re-arms ONE daemon
+`_tour_build` when the feed is stale/absent - the same busy-flag
+pattern as `_SESS_BUSY`, so the paint path never runs git log.
+Endpoint tests are tests/test_tour_api.py.
+
 ## Traps
 
 Append as they are hit.
