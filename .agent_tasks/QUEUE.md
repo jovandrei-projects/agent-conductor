@@ -22,7 +22,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 9 | Retain the create-proposal session as step-0 preparation history on the plan's task list | done | retain-proposal-session/ | 221/221 mock tests + demo green; plan_sessions + plan_gen_id persisted per attempt |
 | 10 | Verify the three proposal-flow changes together (stop / retain-session / compact labels) in the merged state | done | verify-proposal-flow/ | both parked branches merged, 4 integration regressions fixed (same-second publish race, stale overlay, drain records, chip wrap); 232/232 + demo + live probe green |
 | 11 | Interrupt + instruct: stop+resume a running step with added instructions/screenshots, exactly-once across races/restarts | done | interrupt-with-instructions/ | intrq sentinel -> rnote fold -> same-step respawn (not a retry); late/stop-wins banking, restart exactly-once; composer+ctx UI, attach reuse; 303/303 + demo green |
-| 12 | Run/task review UX: ack state + outcome summaries + nav/timing/merge-guard pass | in progress | run-review-ux/ | manifest run 20261016-100852-run-review-ux; design in run-review-ux/DESIGN.md; review-workflow + outcome/nav/stability/wt merged, 3 impl steps left (cumulative-elapsed, merge-guard, integration-verify) |
+| 12 | Run/task review UX: ack state + outcome summaries + nav/timing/merge-guard pass | in progress | run-review-ux/ | manifest run 20261016-100852-run-review-ux; design in run-review-ux/DESIGN.md; review-workflow + outcome/nav/stability/wt/cumulative-elapsed merged, 2 impl steps left (merge-guard, integration-verify) |
 
 ## Not yet filed as tasks
 

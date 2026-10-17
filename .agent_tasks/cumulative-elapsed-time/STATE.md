@@ -50,11 +50,12 @@ Session window: 2026-10-16 ~13:58 → (running)
 - [x] JS: cumulative `elapsed()` + `runElapsed()`, runs-table elapsed
      column + `data-rel` ticking via tickElapsed, run modal + task
      modal elapsed/first-started rows
-- [ ] suite + demo green; QUEUE.md DONE row; AGENTS.md schema note
+- [x] suite + demo green; QUEUE.md DONE row; AGENTS.md schema note
 
 ## Where it stopped
 
-Implementation + 9 deterministic tests in; full-suite regression run in
-flight. Remaining: confirm no existing tests relied on the old
-started_at-tick semantics for queued rows (intentionally removed —
-queued resumed rows show banked total only), demo smoke, docs/commit.
+DONE — merged to master 2026-10-16 (merge d99c4e4) via merge-resolver
+session after the wave merge conflicted on QUEUE.md bookkeeping appends,
+the ended_at/run_elapsed stamp sites, dashboard payload fields, and the
+shared-harness class tails in tests (kept both sides; 446/446 suite
+green on the merge).

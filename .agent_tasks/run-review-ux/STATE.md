@@ -58,13 +58,22 @@ See `DESIGN.md` for full reasoning + sources. Headlines:
       (landed on master, merge 12fbe2b)
 - [x] modal-refresh-stability - scroll-stable modal rebuilds
       (landed on master, merge 8cb3988)
-- [ ] cumulative-elapsed-time - interval accumulation + runs elapsed col
+- [x] cumulative-elapsed-time - interval accumulation + runs elapsed col
+      (landed on master, merge d99c4e4)
 - [x] execution-context-labels - run-level wt chip + watcher identity
       (landed on master, merge 6b1418c)
 - [ ] manual-merge-guard - disable/refuse while run live (driver included)
 - [ ] integration-verification + follow-up-plan
 
 ## Where it stopped
+
+`cumulative-elapsed-time` merged to master 2026-10-16 (merge d99c4e4)
+via merge-resolver session — conflicts were QUEUE.md bookkeeping
+appends, the ended_at/_run_iv_close stamp sites vs _bump_completion,
+dashboard payload fields (elapsed_s/exec_start vs review marks), the
+run-modal kv rows, and shared-harness class tails in tests; both sides
+kept, 446/446 suite green on the merge. Details in
+`.agent_tasks/cumulative-elapsed-time/STATE.md`.
 
 `review-workflow` merged to master 2026-10-16 (merge bcade8f) via
 merge-resolver session after the wave merge conflicted on bookkeeping
