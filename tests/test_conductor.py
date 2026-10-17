@@ -2138,6 +2138,46 @@ prompt = "Polish the catalog."
             conductor.discard_request(rec["id"], self.requests,
                                       self.manifests, self.runs)
 
+    def _self_targeting_ready(self):
+        """A ready request whose proposal's steps resolve to the
+        conductor checkout itself (project slug 'self' -> ROOT)."""
+        reg = {"proj": {"path": self.proj, "cloud_ok": False},
+               "self": {"path": Path(conductor.ROOT), "cloud_ok": False}}
+        p = mock.patch.object(conductor, "load_projects", return_value=reg)
+        p.start()
+        self.addCleanup(p.stop)
+        rec = self.new()
+        return conductor.save_request(
+            rec["id"], {"manifest": self.proposal().replace(
+                'project = "proj"', 'project = "self"')},
+            self.requests, self.manifests, self.runs)
+
+    def test_launch_self_target_ignores_gen_export_sidecars(self):
+        """Regression: a self-targeting launch scans requests_dir/*.json
+        for a live generation - and the planner's *.gen.export.json
+        transcripts match that glob while carrying no 'id'. They used to
+        crash launch_request with KeyError behind a generic 500."""
+        rec = self._self_targeting_ready()
+        (self.requests / f"{rec['id']}.gen.export.json").write_text(
+            json.dumps({"schema_version": "ATIF-v1.7",
+                        "session_id": "no-id-here"}))
+        with mock.patch.object(conductor, "_launch_process",
+                               return_value=42) as start:
+            conductor.launch_request(rec["id"], self.requests,
+                                     self.manifests, self.runs, ["devin"])
+        self.assertTrue(start.called)
+
+    def test_launch_self_target_still_blocks_a_live_generation(self):
+        rec = self._self_targeting_ready()
+        (self.requests / "20261017-000000-abcdefab.json").write_text(
+            json.dumps({"id": "20261017-000000-abcdefab",
+                        "status": "generating",
+                        "generation_started_at": conductor.now_iso()}))
+        with self.assertRaises(conductor.RequestError) as error:
+            conductor.launch_request(rec["id"], self.requests,
+                                     self.manifests, self.runs, ["devin"])
+        self.assertEqual(error.exception.status, 409)
+
     # ---- planner isolation from merges ---------------------------------
     # A worktree merge can sit in the main checkout for minutes (a live
     # resolve-* session watches the repo root, or MERGE_HEAD is open).

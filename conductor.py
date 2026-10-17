@@ -9145,8 +9145,12 @@ def launch_request(request_id: str,
                         "); wait or isolate work in a worktree", 409)
         if ROOT.resolve() in targets and any(
                 _request_status(r, runs_dir) == "generating" for f in
-                requests_dir.glob("*.json") for r in [json.loads(
-                    f.read_text(encoding="utf-8"))]):
+                requests_dir.glob("*.json")
+                # *.gen.export.json transcripts share the dir and match the
+                # glob - only a request record carries the 'id' field
+                # _request_status reads
+                if REQUEST_ID_RE.fullmatch(f.stem)
+                for r in [json.loads(f.read_text(encoding="utf-8"))]):
             raise RequestError("Wait for proposal generation to finish before "
                                "running work in agent-conductor", 409)
         rec.update(status="launching", launched_at=now_iso(), error=None)
