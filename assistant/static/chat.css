@@ -32,7 +32,7 @@
    to the Close X. It lives outside #dbody so a view repaint never
    rebuilds it and every modal view is covered with no per-view markup. */
 #dask {
-  position: absolute; top: 11px; right: 64px; z-index: 7;
+  position: absolute; top: 11px; right: 72px; z-index: 7;
   background: #21262d; color: #e6edf3; border: 1px solid #30363d;
   border-radius: 6px; padding: 3px 9px; font: inherit; font-size: 12px;
   cursor: pointer;

@@ -13217,7 +13217,7 @@ a { color:#58a6ff; text-decoration:none; }
 /* margin-bottom buys real clearance: a sticky first-child with the
    -18px top pull leaves the next line tucked ~6px under the bar's
    bottom edge in Chrome, so the nominal gap must exceed that drift */
-#detail .dnav { position:sticky; top:0; z-index:6; display:flex; align-items:center; gap:10px; margin:-18px -22px 26px; padding:7px 140px 7px 22px; background:#161b22; border-bottom:1px solid #30363d; border-radius:9px 9px 0 0; }
+#detail .dnav { position:sticky; top:0; z-index:6; display:flex; align-items:center; gap:10px; margin:-18px -22px 26px; padding:7px 170px 7px 22px; background:#161b22; border-bottom:1px solid #30363d; border-radius:9px 9px 0 0; }
 #detail .dnav-btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; min-width:38px; max-width:40%; background:#21262d; border:1px solid #30363d; color:#e6edf3; border-radius:6px; padding:4px 10px; font:inherit; font-size:12px; cursor:pointer; }
 #detail .dnav-btn.nav { min-width:130px; }
 #detail .dnav-btn span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
