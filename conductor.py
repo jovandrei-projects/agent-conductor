@@ -9488,8 +9488,14 @@ def _request_run_dir(request_id: str, runs_dir: Path) -> Path | None:
     return None
 
 
-def _request_status(rec: dict, runs_dir: Path) -> str:
-    if _request_run_dir(rec["id"], runs_dir):
+def _request_status(rec: dict, runs_dir: Path,
+                    launched: set[str] | None = None) -> str:
+    # `launched` - a request_id set the caller already derived while
+    # scanning run dirs (collect_dashboard builds one anyway) - skips an
+    # O(every state.json) glob per request, the dominant payload cost
+    # once runs accumulate.
+    if (rec["id"] in launched) if launched is not None \
+            else _request_run_dir(rec["id"], runs_dir):
         return "launched"
     # A spooled overlay outranks the request file until the deferred
     # publish/flush lands - after a crash it is the only place the
@@ -11623,6 +11629,8 @@ _STATUS_COLOR = {"done": "#3fb950", "partial": "#d29922", "blocked": "#d29922",
 
 _AUTH_CACHE = [0.0, "unknown"]        # [checked_at, label]
 _SESS_CACHE = [0.0, {}]               # [checked_at, {work_dir: set|None}]
+_SESS_BUSY = False                    # a background re-list is in flight
+_SESS_LOCK = threading.Lock()         # guards _SESS_BUSY check-and-set
 _MODELS_CACHE = [0.0, {}]             # [checked_at, {family: [suffixes]}]
 _EFFORT_ORDER = ("", "min", "low", "medium", "high", "xhigh", "max")
 
@@ -11825,17 +11833,10 @@ def estimate_cost(tokens: dict | None, model: str | None,
     return {"usd": round(usd, 4), "uid": used, "label": ent.get("label")}
 
 
-def live_sessions_by_dir(runs_dir: Path,
-                         devin_argv: list[str]) -> dict[str, dict | None]:
-    """work_dir -> {session id: last_activity epoch} from `devin list`
-    there, cached 2min. A dir maps to None when listing failed (devin
-    down/missing) - never interpret None as 'all sessions gone'.
-
-    Dirs are collected for two uses: records with a session_id (gone
+def _collect_session_dirs(runs_dir: Path) -> set[str]:
+    """work_dirs worth a `devin list`: records with a session_id (gone
     checks) and steps still plausibly alive (live attribution of the
     not-yet-recorded session id)."""
-    if _SESS_CACHE[1] and time.time() - _SESS_CACHE[0] < 120:
-        return _SESS_CACHE[1]
     dirs: set[str] = set()
     for sj in runs_dir.glob("*/state.json"):
         try:
@@ -11847,9 +11848,43 @@ def live_sessions_by_dir(runs_dir: Path,
             if wd and (rec.get("session_id") or step_live(rec, driver_alive(st))) \
                     and Path(wd).is_dir():
                 dirs.add(wd)
-    out = {d: session_activity(devin_argv, Path(d)) for d in dirs}
-    _SESS_CACHE[0], _SESS_CACHE[1] = time.time(), out
-    return out
+    return dirs
+
+
+def live_sessions_by_dir(runs_dir: Path,
+                         devin_argv: list[str]) -> dict[str, dict | None]:
+    """work_dir -> {session id: last_activity epoch} from `devin list`
+    there, cached 2min. A dir maps to None when listing failed (devin
+    down/missing) - never interpret None as 'all sessions gone'.
+
+    Each listing is a `devin list` SUBPROCESS per dir - tens of them
+    serialize into multi-second stalls, so an expired cache re-lists on
+    a background thread and the caller gets the last map meanwhile
+    (stale answers beat a frozen poll; a dir missing from the map reads
+    'unknown', which the gone-checks already treat as can't-tell)."""
+    if _SESS_CACHE[1] and time.time() - _SESS_CACHE[0] < 120:
+        return _SESS_CACHE[1]
+    global _SESS_BUSY
+    with _SESS_LOCK:
+        if _SESS_BUSY:
+            return _SESS_CACHE[1]
+        _SESS_BUSY = True
+
+    def work() -> None:
+        global _SESS_BUSY
+        try:
+            dirs = _collect_session_dirs(runs_dir)
+            out = {d: session_activity(devin_argv, Path(d))
+                   for d in dirs}
+            _SESS_CACHE[0], _SESS_CACHE[1] = time.time(), out
+        finally:
+            _SESS_BUSY = False
+
+    try:
+        threading.Thread(target=work, daemon=True).start()
+    except Exception:
+        _SESS_BUSY = False
+    return _SESS_CACHE[1]
 
 
 def task_label(rec: dict, full: bool = False) -> str | None:
@@ -12788,7 +12823,7 @@ def collect_dashboard(runs_dir: Path,
     for rid, rec in requests.items():
         if rid in launched:
             continue
-        stage = _request_status(rec, runs_dir)
+        stage = _request_status(rec, runs_dir, launched)
         if stage == "launched":
             continue
         steps = rec.get("proposed_steps") or []
@@ -13024,6 +13059,14 @@ td.res.fresh { animation:fresh 1.2s ease-out; }
 .chip.active { background:#1c3041; border-color:#58a6ff; }
 button.chip { background:transparent; font:inherit; color:inherit; }
 button.chip.active { background:#1c3041; }
+button.chip.busy { position:relative; padding-right:22px; }
+button.chip.busy::after { content:""; position:absolute; right:6px;
+  top:50%; width:8px; height:8px; margin-top:-5px; border:2px solid #58a6ff;
+  border-top-color:transparent; border-radius:50%;
+  animation:chipspin .7s linear infinite; }
+@keyframes chipspin { to { transform:rotate(360deg) } }
+body.viewload #runs, body.viewload #agents, body.viewload #trashwrap
+  { opacity:.5; transition:opacity .15s; }
 button.chip:focus-visible, button:focus-visible, tr.runrow:focus-visible, tr.agen:focus-visible { outline:2px solid #58a6ff; outline-offset:2px; }
 .filter-group { display:inline-block; margin:0 14px 5px 0; }
 .filter-label { color:#8b949e; margin-right:6px; }
@@ -15523,6 +15566,46 @@ async function refresh(){
   const d = await api('GET', stateUrl());
   if (my===stateReqSeq) render(d);
 }
+// A user-clicked refetch (view chips, trash ops) can take seconds - the
+// state payload re-reads every run dir, and a stale session cache lists
+// devin sessions in the background. Show it processing: spinner on the
+// clicked chip + a dim over the content being recomputed, so a slow
+// answer never reads as a dropped click. Busy state is keyed in
+// chipBusy, not on the element - render() rebuilds the chips every poll,
+// so a slow fetch outlives the node it started on (the re-rendered chip
+// re-stamps 'busy' from the set and its click guard keeps holding - a
+// repeat click mid-flight must never re-toggle the view flag back off).
+const chipBusy = new Set();
+let viewloadN = 0;
+async function busyRefresh(el, key){
+  if (key){ if (chipBusy.has(key)) return; chipBusy.add(key); }
+  if (el){
+    el._busy = true;
+    if (el.classList) el.classList.add('busy');
+    if (el.setAttribute) el.setAttribute('aria-busy','true');
+  }
+  viewloadN++;
+  if (document.body && document.body.classList)
+    document.body.classList.add('viewload');
+  let ferr = null;
+  try { await refresh(); }
+  catch(err){ ferr = err; }
+  if (key) chipBusy.delete(key);
+  if (el){
+    el._busy = false;
+    if (el.classList) el.classList.remove('busy');
+    if (el.removeAttribute) el.removeAttribute('aria-busy');
+  }
+  if (--viewloadN<=0){
+    viewloadN = 0;
+    if (document.body && document.body.classList)
+      document.body.classList.remove('viewload');
+  }
+  if (ferr){   // the toggle already persisted - the next tick retries
+    if (typeof showAlert==='function')
+      await showAlert('Update failed: '+(ferr.message || ferr));
+  }
+}
 function effortOptionsFor(model){
   const e=(lastData?.model_options||{})[model];
   return (e && e.length ? e : ['min','low','medium','high','max'])
@@ -16688,14 +16771,18 @@ function render(d){
       `${facetCounts[f]} ${f}${facets.has(f)?' ×':''}</button>`).join('') +
     '</span>' +
     `<span class="filter-group"><span class="filter-label">view:</span>` +
-    `<button type="button" class="chip${showArchived?' active':''}" ` +
-    `data-arch aria-pressed="${showArchived}" ` +
+    `<button type="button" class="chip${showArchived?' active':''}` +
+    `${chipBusy.has('arch')?' busy':''}" data-arch ` +
+    `aria-pressed="${showArchived}"` +
+    `${chipBusy.has('arch')?' aria-busy="true"':''} ` +
     `title="list archived runs - finished runs are auto-archived after ` +
     `48h (CONDUCTOR_ARCHIVE_HOURS); files stay on disk, Unarchive in the ` +
     `run modal brings one back">${d.archived_runs||0} archived` +
     `${showArchived?' ×':''}</button>` +
-    `<button type="button" class="chip${showTrash?' active':''}" ` +
-    `data-trash aria-pressed="${showTrash}" ` +
+    `<button type="button" class="chip${showTrash?' active':''}` +
+    `${chipBusy.has('trash')?' busy':''}" data-trash ` +
+    `aria-pressed="${showTrash}"` +
+    `${chipBusy.has('trash')?' aria-busy="true"':''} ` +
     `title="recoverable trash - deleted runs and proposals rest here for ` +
     `48h before a sweep purges them; Restore puts one back, Empty trash ` +
     `removes all of them for good">${d.trash_count||0} trash` +
@@ -17766,18 +17853,20 @@ document.addEventListener('click', async e=>{
     only.clear(); facets.clear(); projs.clear();
     if (lastData) render(lastData); return; }
   if (t.dataset && t.dataset.arch!==undefined){   // 'N archived' view chip
+    if (chipBusy.has('arch')) return;
     showArchived=!showArchived;
     store.setItem('ac-arch', showArchived?'1':'0');
-    await refresh(); return;
+    await busyRefresh(t,'arch'); return;
   }
   if (t.dataset && t.dataset.trash!==undefined){   // 'N trash' view chip
+    if (chipBusy.has('trash')) return;
     showTrash=!showTrash;
     store.setItem('ac-trash', showTrash?'1':'0');
-    await refresh(); return;
+    await busyRefresh(t,'trash'); return;
   }
   if (t.dataset && t.dataset.trashOpen!==undefined){   // Undo bar link
     showTrash=true; store.setItem('ac-trash','1');
-    await refresh();
+    await busyRefresh(t,'trash');
     const tw=document.getElementById('trashwrap');
     if (tw && tw.scrollIntoView) tw.scrollIntoView();
     return;
@@ -17788,7 +17877,7 @@ document.addEventListener('click', async e=>{
     try {
       const out=await api('POST',
         `/api/trash/${encodeURIComponent(id)}/restore`,{});
-      lastTrash=null; await refresh();
+      lastTrash=null; await busyRefresh(t);
       await showAlert(`Restored ${out.restored_as||out.restored||'it'}.`);
     } catch(err){ await showAlert('Restore failed: '+err.message); t.disabled=false; }
     return; }
@@ -17801,7 +17890,7 @@ document.addEventListener('click', async e=>{
       const out=await api('POST',
         `/api/trash/${encodeURIComponent(id)}/restore`,{});
       if (lastTrash && lastTrash.id===id) lastTrash=null;
-      await refresh();
+      await busyRefresh(t);
       await showAlert(`Restored ${out.restored_as||out.restored||'it'}.`);
     } catch(err){ await showAlert('Restore failed: '+err.message); t.disabled=false; }
     return; }
@@ -17813,7 +17902,7 @@ document.addEventListener('click', async e=>{
     t.disabled=true;
     try {
       await api('POST','/api/trash/empty',{confirm:true});
-      lastTrash=null; await refresh();
+      lastTrash=null; await busyRefresh(t);
     } catch(err){ await showAlert('Empty trash failed: '+err.message);
       t.disabled=false; }
     return; }

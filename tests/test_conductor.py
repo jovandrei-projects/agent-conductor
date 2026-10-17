@@ -4384,6 +4384,96 @@ class SessionGoneGraceTests(unittest.TestCase):
                 sleeper.kill(); sleeper.wait()
 
 
+class SessionCacheStaleTests(unittest.TestCase):
+    """live_sessions_by_dir is stale-while-revalidate: `devin list` per
+    work_dir serializes into multi-second stalls, so an expired or empty
+    cache answers instantly with the last map while ONE daemon thread
+    re-lists. Concurrent polls never double-spawn it, a fresh cache
+    doesn't relist, and a stale map keeps being served mid-refresh."""
+
+    def setUp(self):
+        self._saved = (conductor._SESS_CACHE[0],
+                       dict(conductor._SESS_CACHE[1]),
+                       conductor._SESS_BUSY)
+        conductor._SESS_CACHE[0] = 0.0
+        conductor._SESS_CACHE[1] = {}
+        conductor._SESS_BUSY = False
+
+    def tearDown(self):
+        # drain a still-running refresh worker so it can't clobber the
+        # restored globals after the test ends
+        for _ in range(200):
+            if not conductor._SESS_BUSY:
+                break
+            time.sleep(0.02)
+        (conductor._SESS_CACHE[0], conductor._SESS_CACHE[1],
+         conductor._SESS_BUSY) = self._saved
+
+    def _runs(self, base: Path) -> tuple[Path, Path]:
+        runs = base / "runs"
+        rd = runs / "20261014-000000-t"
+        rd.mkdir(parents=True)
+        proj = base / "proj"
+        proj.mkdir()
+        (rd / "state.json").write_text(json.dumps({
+            "run": "t", "started_at": conductor.now_iso(),
+            "steps": {"s": {"status": "done", "session_id": "abc",
+                            "work_dir": str(proj)}}}))
+        return runs, proj
+
+    def test_cold_cache_never_blocks(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs, proj = self._runs(Path(td))
+            calls, gate = [], threading.Event()
+            def fake(argv, cwd):
+                calls.append(str(cwd))
+                gate.wait(5)
+                return {"sess": 1.0}
+            with mock.patch.object(conductor, "session_activity", fake):
+                t0 = time.time()
+                out = conductor.live_sessions_by_dir(runs, ["devin"])
+                self.assertLess(time.time() - t0, 1.0)   # didn't block
+                self.assertEqual(out, {})                # cold -> empty
+                # a second poll while the refresh is parked returns the
+                # same stale map and must NOT spawn a second worker
+                self.assertEqual(
+                    conductor.live_sessions_by_dir(runs, ["devin"]), {})
+                gate.set()
+                for _ in range(200):
+                    if not conductor._SESS_BUSY and conductor._SESS_CACHE[1]:
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(calls, [str(proj)])
+                # fresh cache now answers with the fetched map, no relist
+                self.assertEqual(
+                    conductor.live_sessions_by_dir(runs, ["devin"]),
+                    {str(proj): {"sess": 1.0}})
+                self.assertEqual(len(calls), 1)
+
+    def test_stale_map_served_while_refreshing(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs, proj = self._runs(Path(td))
+            stale = {str(proj): {"old": 0.5}}
+            conductor._SESS_CACHE[1] = stale
+            conductor._SESS_CACHE[0] = time.time() - 9999   # expired
+            gate = threading.Event()
+            with mock.patch.object(conductor, "session_activity",
+                                   lambda a, c: (gate.wait(5),
+                                                 {"new": 9.0})[1]):
+                # mid-refresh the caller still gets the previous map
+                self.assertIs(
+                    conductor.live_sessions_by_dir(runs, ["devin"]), stale)
+                gate.set()
+                for _ in range(200):
+                    if conductor._SESS_CACHE[1].get(str(proj), {}).get(
+                            "new") == 9.0:
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(
+                    conductor.live_sessions_by_dir(runs, ["devin"]),
+                    {str(proj): {"new": 9.0}})
+
+
 class DashboardJsFilterTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_status_chips_filter_agents_and_runs(self):
@@ -5227,6 +5317,105 @@ const click=t=>handlers.click({target:{...t,closest:()=>null},
   await new Promise(r=>setImmediate(r));
   // queue empty -> server flipped to generating -> modal closed
   assert.equal(elem('backdrop').hidden,true);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_view_chip_busy_feedback(self):
+        """Slow view chips (archived/trash refetch the whole state) show a
+        spinner + content dim while the fetch is in flight, ignore a
+        repeat click on the same chip (no toggle-back), and clear up on
+        success AND failure. Regression for 'clicked, nothing happened,
+        clicked again and un-toggled'."""
+        html = conductor._DASH_HTML
+        # static hooks: chip spinner + content dim + a busy click gate
+        self.assertRegex(html, r'button\.chip\.busy::after[^}]*animation:chipspin')
+        self.assertRegex(html, r'body\.viewload #runs')
+        self.assertIn("chipBusy.has('arch')", html)
+        js = html.split("<script>\n", 1)[1].split("</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const mkCls=init=>{const s=new Set(init?[init]:[]);
+  return {_s:s,add:c=>s.add(c),remove:c=>s.delete(c),
+    contains:c=>s.has(c),toggle:(c,on)=>on?s.add(c):s.delete(c)};};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',scrollTop:0,style:{},dataset:{},classList:mkCls(),
+  querySelector:()=>null,querySelectorAll:()=>[]}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,body:{classList:mkCls()},
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const data={serve_boot:'b',generated_at:'2026-10-17T00:00:00',agents:[],
+  runs:[],archived_runs:3,trash_count:2};
+const fetches=[]; const pending=[]; let failNext=false;
+const fetch=(url,opt)=>{fetches.push(url);
+  if(failNext) return Promise.reject(new Error('net down'));
+  return new Promise(res=>pending.push(()=>res(
+    {ok:true,json:async()=>data})));};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},fetch,confirm:()=>true});
+vm.runInContext(src,ctx);
+const chip=(ds)=>{const o={id:'',dataset:ds,disabled:false,
+  isContentEditable:false,classList:mkCls(),_attrs:{},
+  setAttribute:(k,v)=>{o._attrs[k]=v;},
+  removeAttribute:k=>{delete o._attrs[k];},
+  closest:()=>null,matches:()=>false}; return o;};
+const click=t=>handlers.click({target:t,preventDefault:()=>{}});
+(async()=>{
+  // --- archived chip: slow fetch shows busy feedback immediately
+  const arch=chip({arch:''});
+  const p1=click(arch);                    // do NOT await yet
+  assert.equal(arch.classList.contains('busy'),true);
+  assert.equal(arch._attrs['aria-busy'],'true');
+  assert.equal(document.body.classList.contains('viewload'),true);
+  assert.deepEqual(fetches,['/api/state?archived=1']);
+  // a repeat click while it spins must not toggle back off / refetch
+  const p2=click(arch);
+  await p2;
+  assert.equal(fetches.length,1);
+  // a mid-flight render (the 2s tick) rebuilds the chip - the new node
+  // must still carry the busy spinner, and its replacement stays inert
+  vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+  assert.match(elem('filters').innerHTML,
+    /data-arch[^>]*class="chip[^"]*busy[^"]*"|class="chip[^"]*busy[^"]*"[^>]*data-arch/);
+  assert.match(elem('filters').innerHTML,/aria-busy="true"/);
+  const archAgain=chip({arch:''});
+  await click(archAgain);
+  assert.equal(fetches.length,1);
+  // a DIFFERENT view chip still works - trash joins, URL combines both
+  const trash=chip({trash:''});
+  const p3=click(trash);
+  assert.equal(fetches.length,2);
+  assert.equal(fetches[1],'/api/state?archived=1&trash=1');
+  // resolving the first fetch must NOT lift the dim while the second is
+  // still in flight (refcount, not a boolean)
+  pending.shift()(); await p1;
+  assert.equal(arch.classList.contains('busy'),false);
+  assert.equal(arch._attrs['aria-busy'],undefined);
+  assert.equal(document.body.classList.contains('viewload'),true);
+  pending.shift()(); await p3;
+  assert.equal(document.body.classList.contains('viewload'),false);
+  assert.equal(trash.classList.contains('busy'),false);
+  // both chips now rendered active
+  assert.match(elem('filters').innerHTML,/data-arch aria-pressed="true"/);
+  assert.match(elem('filters').innerHTML,/data-trash aria-pressed="true"/);
+  // --- failure: spinner still clears and the user is told (ask modal)
+  failNext=true;
+  const arch2=chip({arch:''});
+  const p4=click(arch2);
+  await new Promise(r=>setImmediate(r));
+  assert.equal(arch2.classList.contains('busy'),false);
+  assert.equal(document.body.classList.contains('viewload'),false);
+  assert.equal(elem('askwrap').hidden,false);
+  assert.match(elem('askmsg').innerHTML,/Update failed/);
+  // dismiss the alert -> the click promise settles
+  await click({dataset:{},
+    closest:s=>s==='[data-ask]'?{dataset:{ask:'0'}}:null});
+  await p4;
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
