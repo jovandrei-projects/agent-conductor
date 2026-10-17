@@ -393,20 +393,104 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
 - Full test_conductor suite needs a rerun (bridge initially used
   `window.` which vm harnesses lack - now `globalThis.`).
 
+## Implemented contracts (images-and-dictation)
+
+- `assistant/core.py` - `save_upload(conv_id, bytes, client_ref=None)`:
+  validates conv exists, dedupes on client_ref, caps 200 rows/conv
+  (`ATTACH_PER_CONV_MAX`), runs the unwatched-dir guard, calls the
+  injected saver (returns `{name,path,ctype}`), verifies the saved path
+  stays under `attachments_dir`, stores ctype+bytes+client_ref. Host
+  `RequestError`s re-raise as `AssistantError` keeping their HTTP
+  status. `_bind_attachments` refuses foreign-conv ids (404), already-
+  bound ids (409) and >20 ids (400). `read_upload(att_id)` validates
+  the id format, checks conv existence + dir confinement, returns
+  `(bytes, image/* ctype or octet-stream)` - 404 on bad ids/missing
+  files.
+- `conductor.py` - `save_attachment` returns `{name,path,ctype}` (the
+  magic-sniffed type); `_attachment_fields` preserves `ctype` when a
+  stored upload row is echoed back so request records still round-trip
+  byte-for-byte. `GET /api/assistant/attachments/<id>` serves row bytes
+  through `core.read_upload` - a row id is the only client key, never
+  a path (e.g. `/att-abc`, not `?path=...`). POST body cap: 20MB scoped
+  to `/api/assistant/attachments` only; other `/api/assistant/*` POSTs
+  keep the 512KB JSON bound.
+- `assistant/static/chat.js` - composer: `.ai-cwrap` (strip + textarea)
+  beside `.ai-cbtns` (attach, mic, send). Paste: `clipboardData` file
+  items route through `attachFiles` (image/* + 20MB + 20-count
+  preflight with 'Skipped: X' notes - server magic-byte validation is
+  authoritative); a clipboard without files falls through to normal
+  text paste untouched. `#ai-file` (hidden, `accept="image/*"`,
+  multiple) opened by `#ai-attach`. `uploadAtt` pushes a pending slot,
+  `ensureConv`s, POSTs raw bytes to
+  `/attachments?conversation=<id>&ref=<client-ref>`; slots carry
+  `conv` - a mid-load/switch race migrates the slot to its OWN conv's
+  `S.pendAtt` stash (loadConv re-parks foreign slots before restoring
+  and filters them out on restore). `paintAtt` shows uploading/failed
+  chips + preview thumbs from `/api/assistant/attachments/<id>`;
+  corner `x` removes the pending slot. `send` gates on
+  uploading/failed slots, requires text-or-attachments, posts
+  `attachments:[ids]` (only ids under the current conv), clears the
+  strip on success. Message render: `aim-ats` thumbs on user messages
+  from `msg_attachments` JSON (path never enters markup). Vision
+  refusals surface 'no verified image support' + 'settings -> pick a
+  vision-capable model'.
+- Dictation (same file): `micCtor` = `SpeechRecognition ||
+  webkitSpeechRecognition` - absent = `.na` inert button + explanatory
+  tooltip + click note (Firefox case), never a fake control.
+  `startDict` toggles start/stop; continuous+interim; results write
+  `base + final + interim` (boundary-space join) into the textarea -
+  typed text preserved, transcript fully editable, nothing
+  auto-submits. onerror maps not-allowed/service-not-allowed/audio-
+  capture/network/language-not-supported/no-speech/aborted to inline
+  notes; the once-per-tab disclosure states the browser/vendor speech
+  service processes audio and no recording is stored. `teardownDict`
+  aborts + invalidates callbacks on send, minimize, and every conv
+  switch; `aria-pressed` + `.rec` paint the recording state.
+- `assistant/static/chat.css` - `.ai-cbtn` controls (attach/mic),
+  `.na`/`aria-pressed`/`.rec`+`airec` pulse states, `.ai-ats` pending
+  strip, `.aim-ats` message thumbs, `.ai-cwrap`/`.ai-cbtns` composer
+  columns.
+
+### Verified (images-and-dictation)
+
+- 134 assistant tests green (test_assistant 46 + runtime 40 + host 24 +
+  ui 24): real-saver magic-byte/empty/oversize paths, per-conv cap,
+  bound-id refusal, `read_upload` round-trip + tampered-ctype/path/
+  missing-file gates, raw upload route incl. dedupe/404/415, runtime
+  vision refusal + attachment-path-in-prompt, static route upload +
+  byte serve + JSON-cap split, node-vm paste/file/remove/send-ids/
+  thumbs/mic-unavailable/dictation-lifecycle/vision-note tests.
+- Full suite: `python run_tests.py --quick --jobs 8` -> 667 tests,
+  8/8 shards ok.
+- Live probe on :8806 (headless Chromium): composer controls present;
+  real file-picker upload -> 201 + thumbnail `naturalWidth>0` via the
+  GET route; mid-load race parks the slot under its own conv
+  (`S.pendAtt`); synthetic image paste pushes a pending slot; text
+  paste untouched; `webkitSpeechRecognition` present -> mic click
+  painted `.rec` + disclosure note.
+
+### Still requires a real-browser/human check
+
+- Live `devin -p` multimodal turn: the vision gate + path-in-prompt
+  delivery are test-covered, but a real session reading a real image
+  (DESIGN.md's 2026-10-17 probe pattern) was not re-run here - no real
+  provider spawn was launched in verification.
+- Real mic permission grant/deny + speech: needs a physical mic +
+  headed browser; headless Chromium never exercises the real prompt.
+- Real OS clipboard paste (image from Paint/screenshot): the synthetic
+  ClipboardEvent path is verified; OS-level paste keeps the same
+  `clipboardData.items` contract but is unverified end-to-end.
+
 ## Where it stopped
 
-`persistent-chat-interface` is implemented and tested: the durable chat
-surface (launcher on page + every modal via shell-level `#dask`, FAB,
-compact/expanded panel, history rail, composer, settings dialog,
-citations, per-exchange polling, per-conv drafts) landed as
-`assistant/static/{chat.js,md.js,chat.css}` + the `_DASH_HTML` bridge +
-`/api/assistant/static/*` serving, all tested by
-`tests/test_assistant_ui.py` and the live :8806 smoke. Remaining per the
-manifest: `images-and-dictation` (client composer attach/mic UX +
-SpeechRecognition; server side done incl. raw-body route), `guarded-
-dashboard-actions` (conductor ActionAdapter over conductor functions +
-confirm cards), `usage-and-price-visibility` UI (client chips exist,
-usage/price display + rollup surfacing belong here), then
+`images-and-dictation` is implemented and tested: image paste/pick/
+preview/remove/send/thumbnails ride the new id-gated
+`/api/assistant/attachments` raw POST + row-id GET routes (ctype
+recorded server-side, foreign convs and >20 ids refused), and the mic
+dictates into the textarea via SpeechRecognition with honest
+unavailable/permission states and teardown on close/switch/send.
+Remaining per the manifest: `guarded-dashboard-actions` (conductor
+ActionAdapter + confirm cards), `usage-and-price-visibility` UI, then
 `integration-and-design-review` + `follow-up-plan`.
 
 ## Deferred or blocked
