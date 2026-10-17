@@ -1,0 +1,111 @@
+[run]
+summarize = true
+name = "dashboard-whats-new"
+description = "Build a persistent dashboard What's new walkthrough with deterministic change feeds, an asynchronous unread badge, anchored cards, optional cached LLM polish, and regression tests."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 90
+max_attempts = 3
+verify = "python run_tests.py --jobs 8"
+
+[[step]]
+name = "tour-state"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Implement the persistent state and watermark logic for the What's new tour. Inspect the existing persistence conventions, relevant record formats, and test infrastructure before choosing implementation locations.
+
+Store state in data/tour-state.json with the top-level shape {watermark, viewed[], snoozed[]}. Serialize read-modify-write operations and use atomic replacement so concurrent actions cannot lose updates. Define the watermark's commit and time boundary semantics against the actual git and record sources. It must never be serve_boot, and restarting the server must not acknowledge or erase unviewed changes. Handle first initialization and unavailable watermark revisions conservatively rather than silently resetting to HEAD.
+
+Implement viewed, snooze, and unview transitions with mutually exclusive viewed/snoozed membership. Snooze defers an entry rather than acknowledging it; unview restores new state. Only a viewed transition may advance the watermark, and only when no unread entries remain. Advance only through an acknowledged range, never over changes arriving after its captured boundary. Preserve the information needed to retrieve viewed entries and explicitly unview them after advancement.
+
+Write focused tests for watermark math, initialization, restart persistence, transition idempotence, snoozed entries, unview after advancement, and new changes arriving during acknowledgment. Keep this step limited to persistence and state logic; HTTP routes and dashboard UI belong to later steps.
+'''
+
+[[step]]
+name = "tour-feeds"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Implement the deterministic, free, no-LLM change feeds on top of the persistent tour state. Inspect the actual git, request, run, follow-up, and dashboard structures; do not assume filenames or record fields beyond those specified here.
+
+Collect commits using git log <watermark>..HEAD with an explicit --format and --name-only, grouping changes by touched feature area. Include new request records, runs that finished since the watermark, and newly registered follow-ups, using the corresponding event boundaries rather than run creation time. Preserve their existing run/request associations.
+
+Support worker-appended curated records in manifests/whatsnew.jsonl containing a human blurb and stop id with enough change identity to associate them with the correct range. Prefer curated blurbs over git subjects; use commit subjects when curated text is absent. Validate records and tolerate malformed or incomplete lines without breaking the feed. Avoid duplicate cards when sources describe the same change.
+
+Ship a TOUR_STOPS registry shaped as {id: {selector, title}}, mapping actual feature areas to actual DOM anchors in _DASH_HTML. Unknown stops must permit an unanchored card. Produce stable entry identities, titles, blurbs, deterministic new/improved/fixed tags, commit references, and related run/request references. New changes in an already-viewed area must not inherit viewed state accidentally. Support retrieving viewed history after the active watermark advances.
+
+Add fixture-based tests for grouping, event cutoffs, curated precedence, commit-subject fallback, deduplication, stable identities, newly added changes, and historical entry lookup. Do not call an LLM or implement HTTP/UI behavior in this step.
+'''
+
+[[step]]
+name = "tour-api"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Expose the tour core through the existing backend routing and caching conventions.
+
+Implement GET /api/tour returning entries and unseen_count. Each entry must contain id, title, blurb, tag with value new|improved|fixed, anchor, commits as [{sha,subject}], runs as run keys, requests as request ids, and state with value viewed|snoozed|new. Resolve anchors through TOUR_STOPS when available and include the history needed by the viewed section.
+
+Implement POST /api/tour/<id>/viewed, POST /api/tour/<id>/snooze, and POST /api/tour/<id>/unview using the persistent transition logic. Validate actions and entry identities, preserve existing request protections, and ensure invalid requests do not mutate state. GET requests must never mark entries viewed or advance the watermark.
+
+Cache tour feed computation for approximately 60 seconds. Invalidate affected responses and counts after state mutations, and do not serve stale state merely because feed content is cached. Add only a tiny unseen-count field to /api/state, consistent with entry-state semantics. Keep this path cheap even with a cold cache: dashboard painting and the initial state response must not wait for expensive feed collection or optional model work. Refresh the count asynchronously using an approach compatible with the existing backend.
+
+Add endpoint tests for the response contract, all transitions, invalid requests, read-only GET behavior, cache expiry/invalidation, and lightweight /api/state behavior. Leave frontend rendering and optional LLM enrichment to their own steps.
+'''
+
+[[step]]
+name = "tour-dashboard"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Implement the What's new walkthrough in vanilla JavaScript inside _DASH_HTML, without new dependencies. Reuse the existing .backdrop and .dlinked patterns, dashboard state refresh, and run/request modal-opening behavior.
+
+Place a What's new button beside the power button in the top bar, with an unread dot and count. Paint the dashboard first and fill the badge asynchronously from the count in /api/state. Do not fetch /api/tour merely to populate the badge. Fetch tour entries when the walkthrough is opened, with appropriate loading, empty, and error states.
+
+Render cards with Update i of N, title, new/improved/fixed tag chip, blurb, commit list, and related run/request chips that open their existing modals. Render repository and record text safely rather than interpolating it as trusted HTML.
+
+When an anchor selector resolves to a usable element, dim the page, pulse a ring around that element, and position the card nearby in a Driver.js-style spotlight without using Driver.js. Otherwise center the card. Keep positioning usable during scrolling/resizing, and clean up overlays, rings, focus handling, and listeners when the tour closes. Respect reduced-motion preferences.
+
+Mark viewed must persist the action successfully before advancing to the next card and refreshing the unread state. Skip closes the walkthrough and leaves the entry unread. Escape and backdrop dismissal behave exactly like Skip: never send viewed or implicitly snooze. Include a viewed section that can reopen historical entries after watermark advancement.
+
+Add or extend a dependency-free JS harness following the project's test conventions. Cover card rendering, asynchronous badge updates, missing anchors, related modal links, Mark viewed advancement, and Skip/Escape/backdrop behavior.
+'''
+
+[[step]]
+name = "tour-llm-polish"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Add strictly optional, disabled-by-default LLM polishing without making the deterministic tour depend on model access. Follow the project's actual configuration conventions and reuse an existing provider integration if one is suitable. Select a cheap, fast model through a configuration constant. Refer to existing credential configuration rather than copying secrets into tracked files.
+
+Only when explicitly enabled, make one bounded call for an uncached watermark range to map git log --oneline --stat, capped at approximately 30 commits, plus TOUR_STOPS into grouped cards. Bound input, output, and request duration. Validate returned cards and stop references; generated content must not invent commits or record links, override curated blurbs, or destabilize persisted entry identities.
+
+Persist results in data/tour-cache.json using atomic writes. Key the cache by the captured watermark range, including its ending revision, so changed ranges cannot reuse stale output. Coalesce concurrent attempts for the same range. Persist a fallback outcome when an attempt fails so ordinary page loads do not repeatedly retry it. Keep deterministic request/run/follow-up feeds and unread state independent of the enrichment cache.
+
+Disabled configuration, absent provider access, timeouts, malformed responses, and other failures must fall back to the deterministic commit-subject cards without breaking the tour or delaying dashboard painting and badge refresh. Never recompute enrichment per page load.
+
+Use mocks for tests covering disabled and unavailable providers, bounded inputs, valid output, invalid output, failure fallback, cache hits, range-key changes, and duplicate concurrent requests. Do not enable the feature or make real provider calls during implementation or verification.
+'''
+
+[[step]]
+name = "tour-validation"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Verify the assembled walkthrough end to end and fix only defects within this feature. Use the existing test infrastructure with isolated data, fixture repositories/records, controlled clocks, and mocked optional model calls.
+
+Cover the full lifecycle: discover git and record changes; prefer curated text; open and dismiss without acknowledgment; mark individual cards viewed; snooze and unview; restart with unread entries intact; advance the watermark only after the unread guard permits it; introduce changes during acknowledgment; and reopen viewed entries after advancement. Ensure new commits in a previously viewed feature area remain visible.
+
+Exercise the approximately 60-second API cache, immediate mutation/count consistency, optional enrichment cache range keying, persisted failure fallback, and default operation without any LLM. Confirm /api/state remains lightweight and the dashboard paints before the asynchronous badge fills in.
+
+Run the JS harness against the actual dashboard renderer and badge integration. Verify anchored and centered cards, spotlight cleanup, related run/request modal links, viewed-history reopening, and that Skip, Escape, and backdrop dismissal never send a viewed action.
+
+Run python run_tests.py --jobs 8 and address regressions introduced by the walkthrough. Keep test-generated state and cache data isolated from real user data. Do not perform unrelated cleanup, enable live LLM access, or change repository security policies to make verification pass.
+'''
