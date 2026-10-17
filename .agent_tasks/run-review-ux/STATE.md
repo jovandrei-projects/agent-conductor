@@ -52,21 +52,62 @@ See `DESIGN.md` for full reasoning + sources. Headlines:
 ### Phase 2 - implementation (manifest steps, other sessions)
 
 - [x] review-workflow - the model above (done 2026-10-16, see below)
-- [x] task-outcome-summary - SUMMARY: line -> rec["outcome"] -> modal/table
+- [x] task-outcome-summary - OUTCOME: line -> rec["outcome"]/["outcomes"]
+      (bounded history x8) -> modal/table; STATUS:/NEXT: untouched
       (landed on master, merge d57e9c2)
-- [x] task-table-navigation - name-targeted clicks + selection highlight
+- [x] task-table-navigation - name-targeted clicks + .dsel selection +
+      run-name filter + prev/next sibling nav
       (landed on master, merge 12fbe2b)
-- [x] modal-refresh-stability - scroll-stable modal rebuilds
+- [x] modal-refresh-stability - landmark/scroll-anchored modal rebuilds
       (landed on master, merge 8cb3988)
-- [x] cumulative-elapsed-time - interval accumulation + runs elapsed col
+- [x] cumulative-elapsed-time - exec_intervals on steps+run, _now() seam,
+      elapsed column + live tick
       (landed on master, merge d99c4e4)
-- [x] execution-context-labels - run-level wt chip + watcher identity
+- [x] execution-context-labels - run-level wt chip (_run_isolation) +
+      watcher identity strings
       (landed on master, merge 6b1418c)
-- [x] manual-merge-guard - disable/refuse while run live (driver included)
+- [x] manual-merge-guard - run_executing + merge-<runkey> claim + resume
+      serialization
       (landed on master, merge e5b470d)
-- [ ] integration-verification + follow-up-plan
+- [x] integration-verification - combined merge of the three parked
+      branches + full verification (below)
+- [ ] follow-up-plan
 
 ## Where it stopped
+
+`integration-verification` done 2026-10-16. The three parked branches
+(review-workflow, cumulative-elapsed-time, manual-merge-guard) were
+merged into the integration worktree on top of the four already-merged
+steps and verified TOGETHER in the combined state:
+
+- `python run_tests.py`: 457/457 OK (~13min - over the 600s verify cap,
+  see below). One defect found + fixed during merge: a
+  tests/test_conductor.py splice read `git show` output through a
+  PowerShell pipe, so non-cp1252 bytes became literal '?' and broke JS
+  regex asserts (8 failures); rebuilt the file from af996d3 + branch
+  class + manual-merge-guard diff with raw-byte subprocess reads.
+- `python conductor.py demo`: green into this worktree's data/runs; the
+  produced run dir exercised live: run+step needs_review=True ->
+  set_step_review/set_run_review acks fold into state.json (sentinel +
+  folded mark both verified), stale-seq ack 409s, 'Mark needing review'
+  tombstone re-flags, a simulated re-completion (completion_seq bump)
+  re-flags despite the older ack, re-ack at seq 2 quiets again.
+- `python conductor.py serve` smoke on the worktree data: /api/state
+  carries needs_review/completion_seq/elapsed_s/exec_start/executing;
+  POST /api/runs/<d>/review + .../steps/<s>/review return 200 and flip
+  needs_review end-to-end over HTTP.
+- run_executing verified live: None on the ended demo run, driver-alive
+  reason on a live-pid stamp, per-step reason on a live step with dead
+  driver; merge guard + claim + resume-side serialization covered by
+  the merged test classes (worktrees + test_conductor).
+- `python conductor.py plan <manifest>` green.
+- Outcome/status contract verified on the demo record: status/
+  status_line/next intact beside outcome/outcomes - machine handoff
+  fields untouched, human summary additive.
+- STATUS/NEXT consumers: run_manifest/driver path + cmd_status exercised
+  by demo + suite.
+
+Prior merge notes (how the individual steps reached master):
 
 `manual-merge-guard` merged to master 2026-10-16 (merge e5b470d) via
 merge-resolver session — conflicts were QUEUE.md bookkeeping appends,
@@ -120,20 +161,26 @@ green on the merge). It was implemented + verified on the branch
   resume re-completion re-flag, HTTP endpoint statuses, Node JS badge/
   modal/ctx/dispatch regression.
 
-Next session = integration-verification finalization (its work is
-parked on branch conductor/20261016-100852-run-review-ux/
-integration-verification, 31ee57f - already union-merges the other
-four; per the follow-up-plan DONE entry it verified 457/457
-in-worktree). Do NOT implement other scopes here.
+Next session = follow-up-plan (the run's last step), then the umbrella
+task can close.
 
 ## Deferred or blocked
 
-Nothing. Known risk carried to implementers: `run_tests.py` now ~460s vs
-the 600s hard verify cap in `run_step` - a slow step's post-verify could
-flirt with the cap (hit once before, see QUEUE.md compact-live-output).
+Nothing parked by this step. Carried risk, now MEASURED: `run_tests.py`
+takes ~783s vs the 600s hard verify cap in `run_step` - any step whose
+manifest verify is `python run_tests.py` will now time out post-verify
+even on a green suite. This step's own outer verify hits it. Follow-up
+material: raise/config the cap, or shard the suite.
+
+Manual checks not covered by tests: a real-browser pass over the
+combined dashboard (node-harness tests cover row/modal behavior, not
+rendered CSS). Watch out: `tests.log` is rotating - long runs overwrite
+early lines.
 
 ## Verification
 
-`python run_tests.py` (276 tests, ~7.7min), `python conductor.py demo`,
-`python conductor.py plan <manifest>`. Design-only step: verified by
-inspection + full suite green, no code changed.
+`python run_tests.py` -> 457/457 OK (combined state, ~783s);
+`python conductor.py demo` green; `python conductor.py plan <manifest>`
+green; live serve smoke on real run data (review POSTs + state payload);
+isolated exercises of review ack/reversal/stale-seq/re-completion and
+run_executing on the produced demo run dir.

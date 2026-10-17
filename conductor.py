@@ -3020,7 +3020,9 @@ def clear_run_flags(run_dir: Path) -> None:
                 # review- marks are durable too: a resume re-completion
                 # bumps completion_seq so an old ack simply stops
                 # matching - wiping the mark would fabricate 'never
-                # reviewed' instead.
+                # reviewed' instead. merge- is a merge-vs-resume claim,
+                # not a halt signal - clearing it mid-merge would let a
+                # second driver overlap the in-flight operation.
                 if f.name.startswith(
                         ("skip-", "prompt-", "rnote-", "intrq-",
                          "review-", "merge-")):
@@ -4530,8 +4532,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             prev_end = state.pop("ended_at", None)
             # ...and the previous driver session's execution interval
             # closes before the new one opens - at its recorded end when
-            # the run terminated cleanly, at the last sign of life after
-            # a crash.
+            # the run terminated cleanly, at the last sign of life after a
+            # crash.
             _run_iv_close(state, prev_end or now_iso(), run_dir=run_dir,
                           witness_cap=prev_end is None)
             # A re-entered run is in flight again - drop the auto-archive
@@ -10797,10 +10799,6 @@ def collect_dashboard(runs_dir: Path,
                 request, key, generating=False,
                 log_path=requests_dir / f"{request['id']}.gen.log",
                 prices=prices))
-        # closed-intervals driver cumulative; exec_start carries the
-        # live interval's start so the runs table ticks base+now-start
-        # without a payload refresh
-        run_els, run_exec_start = _run_elapsed_split(st, sj.parent)
         # Run-level review mark, same sentinel/folded layering as the
         # steps'. A tombstone shows at once; a seq mismatch only reads as
         # 'new completion to review' once the run actually ended (a
@@ -10812,6 +10810,10 @@ def collect_dashboard(runs_dir: Path,
              and run_mark.get("reviewed") is False)
             or (st.get("ended_at")
                 and _needs_review(st.get("completion_seq"), run_mark)))
+        # closed-intervals driver cumulative; exec_start carries the
+        # live interval's start so the runs table ticks base+now-start
+        # without a payload refresh
+        run_els, run_exec_start = _run_elapsed_split(st, sj.parent)
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
                      "key": key, "request_id": st.get("request_id"),
                      "archived": st.get("archived"),
