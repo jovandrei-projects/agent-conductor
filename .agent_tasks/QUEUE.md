@@ -1168,3 +1168,22 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   transient overlay reads retry, dead attempts can't leave a
   'generating' overlay, test-fake deadlines no longer self-fire under
   CPU starvation. Full --jobs 8 = 511/511 in the worktree.
+- DONE 2026-10-17 (model combobox recs-group smear, interactive):
+  typing in a Planner/Step model field rendered the Recommendations
+  rows as dotted garbage - .mpop is a 300px flex column and the recs
+  .mgrp had default flex-shrink, so the 54-row all-models list squeezed
+  it while its .mopt children kept their height and overflowed into the
+  group below. .mgrp is now flex:0 0 auto with a 160px cap + the recs
+  options scroll inside a .mall like the all-models group. Verified in
+  Chromium: recs 160px scrollable, rows 27px, all-models intact below.
+- DONE 2026-10-17 (plan-proposal task prompt truncated, interactive):
+  the planner history row shipped task_full = the same 120-char label
+  as task and has no prompt file to recover from - the modal's task
+  prompt box was permanently clipped mid-sentence. task_full now carries
+  'Propose a TOML runbook for: <raw>' verbatim on both builder paths
+  (history rows + live generating row). Also fixed a structural flake:
+  RetainProposalSessionTests' resume step failed in isolation because
+  the test pid lands inside pid_alive's 5s reuse window of
+  driver_started_at ('still has a live conductor') - driver_alive is
+  patched out for that assertion, its subject is prep-history never
+  being runnable.
