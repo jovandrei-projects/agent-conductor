@@ -126,6 +126,21 @@ def _price_snapshot(uid: str, label: str | None) -> dict | None:
             "source": conductor._PRICE_CACHE.get("source") or "docs"}
 
 
+def _pricing_meta() -> dict:
+    """Provenance of the rate table itself, for the settings modal's
+    'where do these prices come from' line - the same snapshot rows
+    exchanges store per-record."""
+    try:
+        cache = conductor._PRICE_CACHE or {}
+    except Exception:                       # noqa: BLE001
+        cache = {}
+    return {"currency": "USD", "unit": "per 1M tokens",
+            "tier": "TEAMS_TIER_PRO",
+            "fetched_at": cache.get("fetched"),
+            "source": cache.get("source")
+            or "docs.devin.ai modelCostData (TEAMS_TIER_PRO)"}
+
+
 def _seed_defaults(core: AssistantCore) -> None:
     """The product's initial preference (verified gpt-6-luna, low
     thinking, fast). A PREFERENCE, not an availability claim - dispatch
@@ -181,8 +196,10 @@ def open_runtime(*, data_dir: Path = ASSISTANT_DIR,
         data_dir=data_dir, runs_dir=runs_dir, requests_dir=requests_dir,
         devin_argv=argv, dispatcher=runtime, actions=actions,
         settings_validator=modelpick.make_validator(options),
-        catalog=lambda: modelpick.annotate_catalog(
-            _default_catalog(argv), options() or {}, core.defaults()))
+        catalog=lambda: {
+            **modelpick.annotate_catalog(
+                _default_catalog(argv), options() or {}, core.defaults()),
+            "pricing": _pricing_meta()})
     runtime.bind(core)
     runtime._retrieval = runtime._retrieval or core.retrieval
     _seed_defaults(core)

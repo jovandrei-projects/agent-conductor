@@ -50,14 +50,21 @@ class AssistantError(ValueError):
         self.status = status
 
 
+USAGE_COUNTERS = ("prompt_t", "completion_t", "cached_t", "llm_steps")
+PRICE_COUNTERS = ("prompt_t", "completion_t", "cached_t")
+
+
 def price_usage(usage: dict, rates: dict | None) -> float | None:
     """Same formula as conductor.estimate_cost: cached is a share of input
     priced at the cache-read rate. Returns None = unknown (never a
-    zero-guess)."""
+    zero-guess): no rates -> None, and a usage dict with NO token counter
+    at all -> None (a missing report is not a free request)."""
     if not usage or not rates:
         return None
     rin, rcr, rout = rates.get("in"), rates.get("cached"), rates.get("out")
     if rin is None or rout is None:
+        return None
+    if all(usage.get(k) is None for k in PRICE_COUNTERS):
         return None
     p = usage.get("prompt_t") or 0
     c = usage.get("cached_t") or 0
@@ -500,6 +507,28 @@ class AssistantCore:
                 (session_id, x["conversation_id"]))
         return self.store.get_exchange(xid)
 
+    def set_price_snapshot(self, xid: str, price: dict | None) -> dict:
+        """Stamp the dispatch-time pricing inputs on the exchange -
+        FIRST WRITE WINS per column so a later rate-table update (or a
+        re-armed reconcile pass) can never rewrite what this dispatch
+        was priced against. The terminal write (complete/fail) may
+        still overwrite with a label-matched set - that's the final
+        accounting, not history drift."""
+        x = self._xid(xid)
+        if not isinstance(price, dict) or not price:
+            return x
+        pairs = {"price_in": "in", "price_cached": "cached",
+                 "price_out": "out", "price_fetched_at": "fetched_at",
+                 "price_source": "source"}
+        fields = {col: price.get(src) for col, src in pairs.items()
+                  if x.get(col) is None and price.get(src) is not None}
+        if not fields:
+            return x
+        self._guarded(self.store.path.parent)
+        with self.store.txn() as conn:
+            self.store.update_exchange(conn, xid, **fields)
+        return self.store.get_exchange(xid)
+
     def record_request(self, xid: str, entry: dict) -> dict:
         """Append one internal request-boundary record (a provider dispatch
         hop: spawn ids, timing, per-hop usage delta + cumulative snapshot)
@@ -579,10 +608,15 @@ class AssistantCore:
             return self.exchange_view(xid)          # terminal is sticky
         self._guarded(self.store.path.parent)
         now = self._iso()
-        usage = usage or {}
+        usage = _merged_usage(x, usage)
         price = price or {}
+        eff_price = {src: (price.get(src) if price.get(src) is not None
+                           else x.get(col))
+                     for src, col in (("in", "price_in"),
+                                      ("cached", "price_cached"),
+                                      ("out", "price_out"))}
         if usd == "auto":
-            usd = price_usage(usage, price)
+            usd = price_usage(usage, eff_price)
         with self.store.txn() as conn:
             self.store.update_message(
                 conn, x["assistant_msg_id"],
@@ -591,11 +625,10 @@ class AssistantCore:
             self.store.update_exchange(
                 conn, xid, status=status, ended_at=now,
                 request_id=request_id or x.get("request_id"),
-                prompt_t=usage.get("prompt_t", x.get("prompt_t")),
-                completion_t=usage.get("completion_t",
-                                       x.get("completion_t")),
-                cached_t=usage.get("cached_t", x.get("cached_t")),
-                llm_steps=usage.get("llm_steps", x.get("llm_steps")),
+                prompt_t=usage["prompt_t"],
+                completion_t=usage["completion_t"],
+                cached_t=usage["cached_t"],
+                llm_steps=usage["llm_steps"],
                 model_uid=(model or {}).get("uid") or x.get("model_uid"),
                 model_label=(model or {}).get("label")
                 or x.get("model_label"),
@@ -615,12 +648,30 @@ class AssistantCore:
         return self.exchange_view(xid)
 
     def fail_exchange(self, xid: str, error: str, *, partial_text=None,
-                      usage=None) -> dict:
+                      usage=None, price=None, usd="auto") -> dict:
+        """Terminal 'error' write. A failed dispatch still consumed
+        provider tokens, so its usage lands (billable) and, when a price
+        snapshot is available, its calculated usd too - 'failed' never
+        means 'free' or 'invisible'."""
         x = self._xid(xid)
         if x["status"] in ("done", "error", "cancelled"):
             return self.exchange_view(xid)
         self._guarded(self.store.path.parent)
         now = self._iso()
+        fields = _usage_fields(usage)
+        if isinstance(price, dict):
+            fields.update({col: v for col, v in (
+                ("price_in", price.get("in")),
+                ("price_cached", price.get("cached")),
+                ("price_out", price.get("out")),
+                ("price_fetched_at", price.get("fetched_at")),
+                ("price_source", price.get("source")))
+                if v is not None})
+        if usd == "auto":
+            usd = price_usage(_merged_usage(x, usage),
+                              _row_price({**x, **fields}))
+        if usd is not None:
+            fields["usd"] = usd
         with self.store.txn() as conn:
             self.store.update_message(
                 conn, x["assistant_msg_id"], status="error",
@@ -630,8 +681,7 @@ class AssistantCore:
                           x["assistant_msg_id"])["text"]))
             self.store.update_exchange(
                 conn, xid, status="error", ended_at=now,
-                error=str(error or "failed")[:800],
-                **_usage_fields(usage))
+                error=str(error or "failed")[:800], **fields)
             conn.execute(
                 "UPDATE conversations SET last_active_at=?, updated_at=? "
                 "WHERE id=?", (now, now, x["conversation_id"]))
@@ -639,7 +689,10 @@ class AssistantCore:
 
     def cancel_exchange(self, xid: str) -> dict:
         """Cancel a live exchange: dispatcher kill first (so a completed
-        provider can't race the cancel), then the terminal row update."""
+        provider can't race the cancel), then the terminal row update.
+        Usage-so-far was landed by the dispatcher's partial update; when
+        a price snapshot exists the partial consumption is priced too -
+        a cancelled request can still be billed."""
         x = self._xid(xid)
         if x["status"] not in EXCHANGE_LIVE:
             return self.exchange_view(xid)
@@ -650,11 +703,14 @@ class AssistantCore:
             except Exception:            # noqa: BLE001 - kill is best-effort
                 pass
         now = self._iso()
+        fields = {"status": "cancelled", "ended_at": now}
+        usd = price_usage(_merged_usage(x, None), _row_price(x))
+        if usd is not None:
+            fields["usd"] = usd
         with self.store.txn() as conn:
             self.store.update_message(conn, x["assistant_msg_id"],
                                       status="cancelled")
-            self.store.update_exchange(conn, xid, status="cancelled",
-                                       ended_at=now)
+            self.store.update_exchange(conn, xid, **fields)
         return self.exchange_view(xid)
 
     def mark_launch_failed(self, xid: str, error: str) -> dict:
@@ -678,6 +734,7 @@ class AssistantCore:
                             else (out.get(col) or []))
             except ValueError:
                 out[col] = []
+        out["usage_extra"] = _usage_extra(out["requests"])
         return out
 
     def list_exchanges(self, conv_id: str) -> list[dict]:
@@ -691,25 +748,57 @@ class AssistantCore:
                               else (r.get(col) or []))
                 except ValueError:
                     r[col] = []
+            r["usage_extra"] = _usage_extra(r["requests"])
         return rows
 
     def usage(self, conv_id: str) -> dict:
-        """Per-exchange usage rows + conversation rollup. Unpriced
-        exchanges are COUNTED separately - never silently zero."""
-        self._conv(conv_id)
-        rows = self.store.list_exchanges(conv_id)
+        """Per-exchange usage rows + conversation rollup. The rows carry
+        their internal request records (thawed) so the breakdown can
+        expand hops server-side-identically; `by_model` keeps multi-model
+        conversations honest (a mixed total would blend rates); unpriced
+        exchanges are COUNTED separately - never silently zero. A
+        cancelled row only counts as unpriced when it actually consumed
+        tokens (nothing to price = nothing reported missing)."""
+        rows = self.list_exchanges(conv_id)
         tot = {"prompt_t": 0, "completion_t": 0, "cached_t": 0,
                "llm_steps": 0, "usd": 0.0, "exchanges": len(rows),
                "unpriced": 0}
+        by_model = {}
+        price_seen = {"fetched_at": 0.0, "source": None}
         for r in rows:
-            for k in ("prompt_t", "completion_t", "cached_t", "llm_steps"):
+            for k in USAGE_COUNTERS:
                 tot[k] += r.get(k) or 0
+            terminal = r["status"] in EXCHANGE_TERMINAL
+            has_usage = any(r.get(k) is not None for k in PRICE_COUNTERS)
+            key = (r.get("model_uid") or r.get("model_label")
+                   or "(unresolved)")
+            grp = by_model.setdefault(key, {
+                "model_uid": r.get("model_uid"),
+                "model_label": r.get("model_label"), "exchanges": 0,
+                "prompt_t": 0, "completion_t": 0, "cached_t": 0,
+                "llm_steps": 0, "usd": 0.0, "unpriced": 0})
+            grp["exchanges"] += 1
+            for k in USAGE_COUNTERS:
+                grp[k] += r.get(k) or 0
             if r.get("usd") is None:
-                tot["unpriced"] += (1 if r["status"] in EXCHANGE_TERMINAL
-                                    and r["status"] != "cancelled" else 0)
+                if terminal and (r["status"] != "cancelled" or has_usage):
+                    tot["unpriced"] += 1
+                    grp["unpriced"] += 1
             else:
                 tot["usd"] += r["usd"]
+                grp["usd"] += r["usd"]
+            if r.get("price_fetched_at") and \
+                    r["price_fetched_at"] > price_seen["fetched_at"]:
+                price_seen = {"fetched_at": r["price_fetched_at"],
+                              "source": r.get("price_source")}
+            grp["usd"] = round(grp["usd"], 9)
         tot["usd"] = round(tot["usd"], 9)
+        tot["by_model"] = by_model
+        tot["currency"] = "USD"            # rates are USD/1M tokens
+        tot["cost_kind"] = "calculated"    # estimate, never an invoice
+        if price_seen["fetched_at"]:
+            tot["price_fetched_at"] = price_seen["fetched_at"]
+            tot["price_source"] = price_seen["source"]
         return {"exchanges": rows, "totals": tot}
 
     def model_history(self, conv_id: str,
@@ -1003,6 +1092,38 @@ def _usage_fields(usage: dict | None) -> dict:
     overwrite a stored value with NULL."""
     if not usage:
         return {}
-    return {k: usage[k] for k in
-            ("prompt_t", "completion_t", "cached_t", "llm_steps")
+    return {k: usage[k] for k in USAGE_COUNTERS
             if usage.get(k) is not None}
+
+
+def _merged_usage(x: dict, usage: dict | None) -> dict:
+    """Effective usage for a terminal pricing write: the explicit `usage`
+    delta wins per counter, falling back to counters already landed on
+    the row (partial updates stamp usage mid-run). An explicit None is
+    'not reported', not a zero - it never overrides stored data."""
+    usage = usage or {}
+    return {k: (usage.get(k) if usage.get(k) is not None else x.get(k))
+            for k in USAGE_COUNTERS}
+
+
+def _row_price(row: dict) -> dict:
+    """The price snapshot stored on the exchange row -> the rates dict
+    price_usage understands."""
+    return {"in": row.get("price_in"), "cached": row.get("price_cached"),
+            "out": row.get("price_out")}
+
+
+def _usage_extra(requests) -> dict:
+    """Sum the provider's NON-canonical counters (cache writes, image or
+    summarization billing when a provider reports them under extra
+    `total_*` keys) across a row's internal request records - kept raw
+    (no pricing semantics invented) so the UI can show them verbatim."""
+    out = {}
+    for ent in requests or []:
+        ex = (ent.get("usage") or {}).get("extra") \
+            if isinstance(ent, dict) else None
+        if isinstance(ex, dict):
+            for k, v in ex.items():
+                if isinstance(v, (int, float)):
+                    out[k] = out.get(k, 0) + v
+    return out

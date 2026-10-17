@@ -184,7 +184,54 @@
 }
 #aichat .aim-src:hover { color: #79c0ff; border-color: #58a6ff; }
 #aichat .aim-src:focus-visible { outline: 2px solid #58a6ff; }
+
+/* per-exchange usage: compact summary + expandable internal-request
+   breakdown (native <details> = keyboard/screen-reader accessible) */
 #aichat .aim-use { font-size: 10px; color: #6e7681; margin-top: 4px; }
+#aichat .aim-use summary { cursor: pointer; list-style: none;
+  display: inline-block; }
+#aichat .aim-use summary::-webkit-details-marker { display: none; }
+#aichat .aim-use summary::before { content: "\25B8"; color: #58a6ff;
+  margin-right: 4px; }
+#aichat .aim-use[open] summary::before { content: "\25BE"; }
+#aichat .aim-use summary:hover { color: #8b949e; }
+#aichat .aim-use summary:focus-visible { outline: 2px solid #58a6ff;
+  border-radius: 3px; }
+#aichat .aim-udet { margin-top: 4px; border-left: 2px solid #30363d;
+  padding: 3px 0 3px 8px; }
+#aichat .aim-udet .um-l { margin-top: 2px; overflow-wrap: anywhere;
+  word-break: break-word; }
+#aichat .aim-udet .um-h { color: #8b949e; font-weight: 600;
+  margin-top: 5px; }
+#aichat .aim-udet .um-r { margin-top: 2px; padding-left: 8px;
+  overflow-wrap: anywhere; word-break: break-word; }
+#aichat .aim-udet .um-r.err { color: #f85149; }
+#aichat .um-warn { color: #d29922; }
+
+/* header usage chip: a <details> dropdown with the conversation-level
+   breakdown (grand total, per-model split, unpriced honesty) */
+#aichat .ai-usage { flex: none; position: relative; font-size: 11px;
+  color: #8b949e; max-width: 40%; }
+#aichat .ai-usage summary { cursor: pointer; list-style: none;
+  padding: 2px 4px; border-radius: 5px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+#aichat .ai-usage summary::-webkit-details-marker { display: none; }
+#aichat .ai-usage summary:hover { color: #e6edf3; }
+#aichat .ai-usage summary:focus-visible { outline: 2px solid #58a6ff; }
+#aichat .ai-useview {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 4;
+  min-width: 250px; max-width: 340px; max-height: 320px;
+  overflow-y: auto; background: #0d1117; color: #8b949e;
+  border: 1px solid #30363d; border-radius: 8px; padding: 8px 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .5); font-size: 11px;
+}
+#aichat .ai-useview .um-h { color: #8b949e; font-weight: 600;
+  margin-top: 2px; }
+#aichat .ai-useview .um-g { margin-top: 4px; }
+#aichat .ai-useview .um-m { color: #79c0ff; }
+#aichat .ai-useview .um-t { margin-top: 6px; padding-top: 5px;
+  border-top: 1px solid #21262d; color: #e6edf3; }
+#aichat .ai-useview .um-l { font-size: 10px; margin-top: 4px; }
 #aichat .aim-card { margin-top: 6px; border: 1px solid #d29922;
   border-radius: 6px; padding: 6px 9px; font-size: 11px; color: #e6edf3;
   background: #0d1117; }

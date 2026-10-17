@@ -82,7 +82,11 @@ function fmtTok(n) {
 }
 function fmtUsd(n) {
   if (n == null) return null;
-  return '$' + (+n).toFixed(n < 0.01 ? 4 : 2);
+  var v = +n;
+  /* a real-but-tiny cost must never round-display as $0.00 - that
+     reads as 'free'; show the floor instead */
+  if (v > 0 && v < 0.0001) return '<$0.0001';
+  return '$' + v.toFixed(v < 0.01 ? 4 : 2);
 }
 function timeShort(iso) {
   if (!iso) return '';
@@ -334,23 +338,173 @@ function msgHtml(m) {
   for (var k = 0; k < acts.length; k++) {
     h += actHtml(acts[k]);
   }
-  if (xa && TERMINAL[xa.status] && xa.status !== 'cancelled' &&
-      (xa.prompt_t != null || xa.completion_t != null || xa.usd != null)) {
-    var use = 'in ' + fmtTok(xa.prompt_t) + ' \u00b7 out ' +
-      fmtTok(xa.completion_t);
-    if (xa.cached_t) use += ' \u00b7 cached ' + fmtTok(xa.cached_t);
-    if (xa.llm_steps) use += ' \u00b7 ' + xa.llm_steps + ' turn' +
-      (xa.llm_steps === 1 ? '' : 's');
-    var priceTip = xa.usd != null
-      ? ' est. ' + fmtUsd(xa.usd) +
-        (xa.price_source ? ' (' + xa.price_source + ' rates)' : '')
-      : ' no price data';
-    h += '<div class="aim-use" title="' + esc(priceTip + '; model ' +
-      (xa.model_uid || xa.model_label || '?')) + '">' +
-      esc(use + (xa.usd != null ? ' \u00b7 ~' + fmtUsd(xa.usd) : '')) +
-      '</div>';
-  }
+  h += usageHtml(xa, snap);
   h += '</div>';
+  return h;
+}
+
+function msgById(id) {
+  for (var i = 0; i < S.msgs.length; i++)
+    if (S.msgs[i].id === id) return S.msgs[i];
+  return null;
+}
+
+function fmtDay(epoch) {
+  if (!epoch) return '';
+  var d = new Date(epoch * 1000);           // price stamps are epoch s
+  return isNaN(d) ? '' : d.toLocaleDateString();
+}
+
+function reqLine(r) {
+  /* one internal request boundary (a provider dispatch hop: the first
+     turn, a resume, a tool continuation, or a reconcile adoption).
+     Billable retries and failed hops stay listed - 'internal' never
+     means 'free'. */
+  var bits = ['#' + (r.n || '?') + ' ' + (r.kind || 'request')];
+  if (r.request_id) bits.push(r.request_id);
+  if (r.started_at != null && r.ended_at != null)
+    bits.push(Math.max(0, Math.round(r.ended_at - r.started_at)) + 's');
+  if (r.exit_code != null) bits.push('exit ' + r.exit_code);
+  var u = r.usage || {};
+  if (u.prompt_t != null || u.completion_t != null) {
+    var rt = 'in ' + fmtTok(u.prompt_t) + ' \u00b7 out ' +
+      fmtTok(u.completion_t);
+    if (u.cached_t) rt += ' (' + fmtTok(u.cached_t) + ' cached)';
+    bits.push(rt);
+  }
+  if (u.llm_steps != null)
+    bits.push(u.llm_steps + ' turn' + (u.llm_steps === 1 ? '' : 's'));
+  if (u.extra && typeof u.extra === 'object')
+    Object.keys(u.extra).forEach(function (k) {
+      bits.push(k.replace(/^total_/, '').replace(/_/g, ' ') + ' ' +
+        fmtTok(u.extra[k]));
+    });
+  var row = '<div class="um-r">' + esc(bits.join(' \u00b7 ')) + '</div>';
+  if (r.error)
+    row += '<div class="um-r err">' + esc('error: ' + r.error) + '</div>';
+  return row;
+}
+
+function usageHtml(xa, snap) {
+  /* Per-exchange usage: a compact summary line plus a native
+     <details> breakdown - accessible expand/collapse needs no extra
+     wiring. Token counters are provider-REPORTED deltas; the $
+     figure is a CALCULATED USD estimate from this exchange's stored
+     rate snapshot; a missing report stays 'unknown', never $0. */
+  if (!xa || !TERMINAL[xa.status]) return '';
+  var hasU = xa.prompt_t != null || xa.completion_t != null ||
+    xa.cached_t != null || xa.llm_steps != null;
+  var bits = [];
+  if (hasU) {
+    var inp = 'in ' + fmtTok(xa.prompt_t);
+    if (xa.cached_t) inp += ' (' + fmtTok(xa.cached_t) + ' cached)';
+    bits.push(inp, 'out ' + fmtTok(xa.completion_t));
+    if (xa.llm_steps) bits.push(xa.llm_steps + ' turn' +
+      (xa.llm_steps === 1 ? '' : 's'));
+    if (xa.usage_extra && Object.keys(xa.usage_extra).length)
+      bits.push('+' + Object.keys(xa.usage_extra).length +
+        ' extra counter' +
+        (Object.keys(xa.usage_extra).length === 1 ? '' : 's'));
+  } else {
+    bits.push('usage not reported');
+  }
+  if (xa.usd != null) bits.push('~' + fmtUsd(xa.usd) + ' est.');
+  else if (hasU || xa.status !== 'cancelled')
+    bits.push('cost unknown');
+  var h = '<details class="aim-use"><summary>' +
+    esc(bits.join(' \u00b7 ')) + '</summary><div class="aim-udet">';
+  /* the settings snapshot this exchange actually ran under (frozen on
+     the message - later settings edits never rewrite it) */
+  var mb = xa.model_uid || xa.model_label || '?';
+  if (xa.model_label && xa.model_label !== xa.model_uid)
+    mb += ' (' + xa.model_label + ')';
+  var sb = [];
+  if (snap.model) sb.push(snap.model);
+  if (snap.effort) sb.push(snap.effort);
+  if (snap.fast) sb.push('fast');
+  sb.push(snap.readonly === false ? 'read-write' : 'read-only');
+  h += '<div class="um-l">model ' + esc(mb) + ' \u00b7 ' +
+    esc(sb.join(' ')) + ' \u00b7 status ' + esc(xa.status) +
+    (xa.provider_session_id
+      ? ' \u00b7 session ' + esc(xa.provider_session_id) : '') + '</div>';
+  var reqs = (xa.requests || []).filter(function (r) {
+    return r && typeof r === 'object'; });
+  if (reqs.length)
+    h += '<div class="um-l um-h">internal requests</div>' +
+      reqs.map(reqLine).join('');
+  var extra = xa.usage_extra || {};
+  var ekeys = Object.keys(extra);
+  if (ekeys.length)
+    h += '<div class="um-l">also reported (no price semantics ' +
+      'attached): ' + esc(ekeys.map(function (k) {
+        return k.replace(/^total_/, '').replace(/_/g, ' ') + ' ' +
+          fmtTok(extra[k]);
+      }).join(' \u00b7 ')) + '</div>';
+  if (hasU && xa.usd != null) {
+    var rb = [];
+    if (xa.price_in != null) {
+      rb.push('rates $' + xa.price_in + ' in / $' +
+        (xa.price_cached != null ? xa.price_cached : '?') +
+        ' cached / $' + xa.price_out + ' out per 1M tok');
+      if (xa.price_source) rb.push('source ' + xa.price_source);
+      if (xa.price_fetched_at)
+        rb.push('fetched ' + fmtDay(xa.price_fetched_at));
+      h += '<div class="um-l">' + esc(rb.join(' \u00b7 ')) + '</div>';
+    }
+    h += '<div class="um-l">cost ~' + esc(fmtUsd(xa.usd)) +
+      ' USD - a calculated estimate, not an invoice</div>';
+  } else if (hasU) {
+    h += '<div class="um-l">no rate data for this model - the cost ' +
+      'is unknown, not zero</div>';
+  } else {
+    h += '<div class="um-l">the provider reported no usage for this ' +
+      'exchange - cost unknown, not zero</div>';
+  }
+  var um = msgById(xa.user_msg_id);
+  if (um && thaw(um.attachments).length)
+    h += '<div class="um-l">image input included - the current rate ' +
+      'table has no separate image charge; image processing lands ' +
+      'inside the token counters</div>';
+  return h + '</div></details>';
+}
+
+function usageViewHtml() {
+  /* The conversation-level breakdown behind the header chip: grand
+     totals, a per-model split (a mixed-model chat must not blend
+     rates), the unpriced count and pricing provenance - under one
+     native <details> so keyboard and screen-reader access need no
+     extra wiring. */
+  var u = S.usage, t = (u && u.totals) || {};
+  if (!t.exchanges) return '<div class="um-l">no usage yet</div>';
+  var bm = t.by_model || {}, keys = Object.keys(bm), h = '';
+  if (keys.length > 1) h += '<div class="um-h">by model</div>';
+  keys.forEach(function (k) {
+    var g = bm[k];
+    h += '<div class="um-g">' +
+      (keys.length > 1
+        ? '<span class="um-m">' + esc(k) + '</span> ' : '') +
+      esc(g.exchanges + ' exch \u00b7 in ' + fmtTok(g.prompt_t) +
+        ' \u00b7 out ' + fmtTok(g.completion_t) +
+        (g.cached_t ? ' (' + fmtTok(g.cached_t) + ' cached)' : '') +
+        (g.usd ? ' \u00b7 ~' + fmtUsd(g.usd) : ' \u00b7 unpriced')) +
+      (g.unpriced ? ' <span class="um-warn">' + esc(g.unpriced +
+        ' unpriced') + '</span>' : '') + '</div>';
+  });
+  h += '<div class="um-t">' + esc('total ' + t.exchanges +
+    ' exchange' + (t.exchanges === 1 ? '' : 's') + ' \u00b7 in ' +
+    fmtTok(t.prompt_t) + ' \u00b7 out ' + fmtTok(t.completion_t) +
+    (t.cached_t ? ' (' + fmtTok(t.cached_t) + ' cached)' : '') +
+    (t.usd ? ' \u00b7 ~' + fmtUsd(t.usd) : '')) + '</div>';
+  if (t.unpriced)
+    h += '<div class="um-l um-warn">' + esc(t.unpriced + ' exchange' +
+      (t.unpriced === 1 ? ' has' : 's have') +
+      ' no price data - their cost is unknown, not zero') + '</div>';
+  h += '<div class="um-l">' + esc('costs are calculated ' +
+    (t.currency || 'USD') + ' estimates' +
+    (t.price_source ? ' - rates ' + t.price_source : '') +
+    (t.price_fetched_at
+      ? ' - fetched ' + fmtDay(t.price_fetched_at) : '') +
+    ' - not an invoice') + '</div>';
   return h;
 }
 
@@ -510,13 +664,18 @@ function paint() {
   var use = byId('ai-usage');
   if (use) {
     var tot = (S.usage && S.usage.totals) || {};
-    use.textContent = tot.exchanges
-      ? fmtTok(tot.prompt_t) + '/' + fmtTok(tot.completion_t) +
-        ' tok' + (tot.usd != null ? ' \u00b7 ~' + fmtUsd(tot.usd) : '')
-      : '';
-    use.title = 'conversation usage: prompt/completion tokens' +
-      (tot.unpriced
-        ? ' - ' + tot.unpriced + ' exchange(s) unpriced' : '');
+    var sum = byId('ai-usage-sum');
+    if (sum) {
+      sum.textContent = tot.exchanges
+        ? fmtTok(tot.prompt_t) + '/' + fmtTok(tot.completion_t) +
+          ' tok' + (tot.usd != null ? ' \u00b7 ~' + fmtUsd(tot.usd) : '')
+        : '';
+      sum.title = 'conversation usage: prompt/completion tokens' +
+        (tot.unpriced
+          ? ' - ' + tot.unpriced + ' exchange(s) unpriced' : '');
+    }
+    var uv = byId('ai-useview');
+    if (uv) uv.innerHTML = usageViewHtml();
   }
   var histBtn = byId('ai-hist');
   if (histBtn) histBtn.className = 'ai-hbtn' + (S.rail ? ' on' : '');
@@ -1242,22 +1401,43 @@ function settingsNotes() {
   }
   var pr = byId('ais-price');
   if (pr) {
+    /* price + capability trade-offs BEFORE the selection lands: the
+       resolved variant's own rates (family fallback when the variant is
+       unpriced), the standard-vs-fast comparison when the fast toggle
+       reprices, image capability, and where the numbers come from.
+       Nothing here changes the selection by itself - a more expensive
+       model is only ever the user's explicit pick. */
     var uidv = resolvedUid();
     var ent = uidv && uidEntry(uidv);
     var fent = famEntry(fam);
     var vis = ent ? ent.vision : (fent && fent.vision);
     var bits = [];
     bits.push(uidv ? 'resolves to ' + uidv : 'unresolved');
-    if (ent && (ent['in'] != null || ent.out != null))
+    if (ent && (ent['in'] != null || ent.out != null)) {
       bits.push('~$' + ent['in'] + ' in / $' + ent.out +
         ' out per 1M tok' + (ent.cached != null
           ? ' ($' + ent.cached + ' cached)' : ''));
-    else if (fent && (fent['in'] != null || fent.out != null))
+      if (S.sel && S.sel.fast && !famIsFastBrand(fam)) {
+        var plainUid = S.sel.effort
+          ? fam + '-' + S.sel.effort : fam;
+        var plain = uidEntry(plainUid);
+        if (plain && plain['in'] != null && plain.uid !== ent.uid &&
+            (plain['in'] !== ent['in'] || plain.out !== ent.out))
+          bits.push('vs standard ' + (S.sel.effort || 'default') +
+            ': ~$' + plain['in'] + ' / $' + plain.out);
+      }
+    } else if (fent && (fent['in'] != null || fent.out != null))
       bits.push('family ~$' + fent['in'] + ' in / $' + fent.out +
         ' out per 1M tok');
     else bits.push('no price data for this variant');
     bits.push(vis === true ? 'image input verified'
       : 'image input unverified');
+    var pm = (S.catalog && S.catalog.pricing) || {};
+    bits.push('estimates in ' + (pm.currency || 'USD') +
+      (pm.fetched_at ? ' - rates fetched ' + fmtDay(pm.fetched_at)
+                     : ' - rates never fetched') +
+      (pm.source ? ' (' + pm.source + ')' : '') +
+      ' - not an invoice');
     pr.textContent = bits.join(' \u00b7 ');
   }
 }
@@ -1459,7 +1639,13 @@ function injectDom() {
       '<span id="ai-state" class="ai-pill ro">read-only</span>' +
       '<span id="ai-ctx" class="ai-ctx">about: dashboard</span>' +
       '<span class="ai-flex"></span>' +
-      '<span id="ai-usage" class="ai-usage" title=""></span>' +
+      '<details id="ai-usage" class="ai-usage">' +
+        '<summary id="ai-usage-sum" ' +
+          'title="conversation usage - expand for the breakdown">' +
+        '</summary>' +
+        '<div id="ai-useview" class="ai-useview" role="region" ' +
+          'aria-label="Conversation usage breakdown"></div>' +
+      '</details>' +
       '<button type="button" id="ai-hist" class="ai-hbtn" ' +
         'aria-label="Conversation history" ' +
         'title="Conversation history">&#9776;</button>' +
