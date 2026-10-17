@@ -757,6 +757,25 @@ descriptors over their stored `{base,tip}` ranges - viewed cards stay
 retrievable after the watermark advances past them; snoozed/unviewed
 descriptors re-inject into `entries`.
 
+The HTTP layer lives in conductor.py's `tour_ctx` block (just before
+`collect_dashboard`): one ctx per `make_dashboard_handler` holds the
+dirs, a ~60s `TOUR_FEED_TTL_S` feed cache, a count snapshot and a
+busy flag, so tests/second dashboards never share state (the handler
+takes `tour_repo=`; the ctx is `Handler.tour_ctx`). `GET /api/tour`
+serves `tour_feed(ctx)` = `{generated_at, boundary, range, entries,
+history, unseen_count, warnings}` - read-only end to end (the state
+file first appears on a mutation). `POST /api/tour/<id>/{viewed,
+snooze,unview}` runs `tour_transition`: the id is validated against
+entries+history (one fresh rebuild on a cache miss, else 404), the
+persisted transition runs, then BOTH caches drop and one rebuild lands
+- no pre-mutation state can be served; the result carries the fresh
+`unseen_count` (+ `advanced`/`advance_blocked`/`watermark` on viewed).
+`/api/state` gains only `tour_unseen`: `tour_unseen(ctx)` returns the
+last computed count (null = never computed) and re-arms ONE daemon
+`_tour_build` when the feed is stale/absent - the same busy-flag
+pattern as `_SESS_BUSY`, so the paint path never runs git log.
+Endpoint tests are tests/test_tour_api.py.
+
 ## Traps
 
 Append as they are hit.

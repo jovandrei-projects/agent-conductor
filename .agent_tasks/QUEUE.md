@@ -25,7 +25,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 12 | Run/task review UX: ack state + outcome summaries + nav/timing/merge-guard pass | in progress | run-review-ux/ | manifest run 20261016-100852-run-review-ux; design in run-review-ux/DESIGN.md; all impl steps merged incl. integration-verification (merge e6655ad), 1 step left (follow-up-plan) |
 | 13 | Project-aware merge targets: merge_target key + conductor merge worktree + persisted target + dashboard branch selector | done | project-merge-targets/ | 247/247 mock tests + demo green; wave step of run 20261016-013719-workflow-ux-safety; landed on master via merge 6a40935 |
 | 14 | Ask AI assistant: persistent contextual chat on dashboard + every modal, history db, view-context, citations, images, dictation, model settings, read-only gate, controlled actions, usage/cost | in progress | ask-ai/ | manifest run 20261017-051357-dashboard-ask-ai; research+design done (ask-ai/DESIGN.md): devin -p -r transport + gpt-6-luna-low-priority + vision + permission gate all live-verified; ACP session/new blocked on devin 3000.6.2 session-db migration; persistent-chat-core + view-context-and-retrieval + assistant-runtime done (assistant/ pkg + sqlite store; ConductorContext + ConductorRetrieval + static preamble; devin_print provider + AssistantRuntime dispatcher + tool loop + reconcile; modelpick catalog validation; /api/assistant/* registered in serve; live -p/-r smoke verified on gpt-6-luna-low-priority; persistent-chat-interface done (assistant/static chat.js+md.js+chat.css, #dask shell launcher, aiView/aiNav bridge, /api/assistant/static/*, 16 UI tests + :8806 smoke); images-and-dictation done (id-gated /api/assistant/attachments raw POST + row-id GET, composer paste/pick/preview/remove/bind, SpeechRecognition mic with unavailable/permission states + teardown; 24 UI + 134 assistant tests + 667-test quick suite green, headless-Chromium :8806 probe). guarded-dashboard-actions done (ConductorActions adapter over the same conductor.py functions: 28-kind whitelist, propose-time validation, launch-tier second-confirm acks, readonly re-check at execute, rejected proposals audited as failed rows, action cards + armed confirm in chat.js; 37 new tests, schema v4 actions.explain; 170 assistant + 702-test suite green). usage-and-price-visibility done (dispatch-time rate snapshots + priced fail/cancel paths, extra total_* counter passthrough into usage_extra, by-model rollup + unpriced honesty in GET .../usage, expandable per-exchange <details> usage breakdown + header conversation panel + settings price provenance in chat.js; 18 new tests, 130 assistant tests green). integration-and-design-review done (fetch-by-key re-resolution + nav/label synthesis, kinds/status filters, batch seq, fast-without-effort resolve, bounded pow, raced-terminal/attachment/ack fixes, conv-scoped actions + attachments, usage-details repaint, settings focus/outage, z-order, in-text nav links; 734-test suite green minus 1 transient file-lock, 46-browser-check probe, 2 live exchanges ~$0.034 verified incl. --noEmit + apartment-3d camera answers with working citations). Next: follow-up-plan |
-| 15 | Dashboard What's new tour: persistent state + feeds + API + walkthrough UI + optional LLM polish | in progress | dashboard-whats-new/ | manifest run 20261017-145726-dashboard-whats-new; tour-state done (tour_state.py + 26 tests; parked branch merged into tour-feeds), tour-feeds done (tour_feeds.py + 28 tests), tour-api next |
+| 15 | Dashboard What's new tour: persistent state + feeds + API + walkthrough UI + optional LLM polish | in progress | dashboard-whats-new/ | manifest run 20261017-145726-dashboard-whats-new; tour-state done (tour_state.py + 26 tests; parked branch merged into tour-feeds), tour-feeds done (tour_feeds.py + 28 tests), tour-api done (conductor.py routes + 18 tests), tour-dashboard next |
 
 ## Not yet filed as tasks
 
@@ -1240,3 +1240,32 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   dead revision, boundary math incl. stale/descendant/time-clamp guards,
   transitions, history-after-advance, mid-ack arrivals, 20-thread no-
   lost-update).
+
+- DONE 2026-10-17 (tour-api, wave step of run
+  20261017-145726-dashboard-whats-new): the tour core is now HTTP -
+  conductor.py gained a per-serve `tour_ctx` (dirs + feed/count caches +
+  busy flag; `make_dashboard_handler` takes `tour_repo=` and exposes
+  `Handler.tour_ctx` for tests). `GET /api/tour` serves
+  `tour_feed(ctx)` = {generated_at, boundary, range, entries, history,
+  unseen_count, warnings} behind a ~60s `TOUR_FEED_TTL_S` cache; every
+  entry carries the contract fields (id/title/blurb/tag/anchor/commits
+  [{sha,subject}]/runs/requests/state) plus kind/stop/stop_title/at/
+  range. `POST /api/tour/<id>/{viewed,snooze,unview}` runs
+  `tour_transition`: id validated against entries+history (one fresh
+  rebuild on a cache miss, unknown -> 404), the persisted tour_state
+  transition runs (mark_viewed advances only to the feed's captured
+  boundary and only with no 'new' left; snooze defers without pinning;
+  unview resurfaces behind-watermark entries), then BOTH caches drop
+  and one rebuild lands so responses and the badge count are never
+  pre-mutation; the result carries the fresh `unseen_count` (plus
+  advanced/advance_blocked/watermark on viewed). `/api/state` gains
+  only `tour_unseen`: the last computed count (null cold) with a
+  _SESS_BUSY-style daemon `_tour_build` re-arm - the paint path never
+  runs git log, and GETs are read-only end to end (the state file
+  appears only on the first POST). 18 new tests in
+  tests/test_tour_api.py (contract, transitions incl.
+  advance/snooze/unview-after-advance, invalid-request no-mutation,
+  read-only GET, cache expiry + post-mutation invalidation,
+  lightweight/async /api/state); 72/72 tour tests green, full
+  --jobs 8 suite green modulo one unrelated StopControl timing flake
+  that passes in isolation.
