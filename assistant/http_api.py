@@ -22,6 +22,9 @@ Route summary (all under /api/assistant/):
   GET  exchanges/<xid>                      - poll state/text/usage
   POST exchanges/<xid>/cancel
   POST attachments?ref=                     - raw image bytes -> row
+  GET  attachments/<id>                     - image bytes for previews;
+       served by the host handler (raw response, not JSON dispatch) -
+       core.read_upload owns the id/conversation/dir authorization
   GET  settings | POST settings             - global defaults
   GET  models                               - catalog for settings modal
 """

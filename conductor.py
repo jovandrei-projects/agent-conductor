@@ -6790,7 +6790,7 @@ def save_attachment(data: bytes,
             f"{sig[0]}")
     p = attachments_dir / name
     p.write_bytes(bytes(data))
-    return {"name": name, "path": str(p.resolve())}
+    return {"name": name, "path": str(p.resolve()), "ctype": sig[1]}
 
 
 def read_attachment(name: str,
@@ -6825,7 +6825,16 @@ def _attachment_fields(value) -> list[dict]:
         name, path = str(a.get("name") or ""), str(a.get("path") or "")
         if not ATTACH_NAME_RE.fullmatch(name) or not 1 <= len(path) <= 600:
             raise RequestError("Invalid attachment")
-        out.append({"name": name, "path": path})
+        ent = {"name": name, "path": path}
+        # save_attachment's POST row carries the magic-sniffed type -
+        # keep it when the client echoes the row back; the record then
+        # round-trips byte-for-byte and the assistant's stored
+        # attachment refs agree (it never becomes a served header -
+        # GET /api/attachments re-sniffs)
+        ctype = str(a.get("ctype") or "")
+        if ctype.startswith("image/") and len(ctype) <= 64:
+            ent["ctype"] = ctype
+        out.append(ent)
     return out
 
 
@@ -18587,20 +18596,41 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
         def _assistant(self, method: str, path: str) -> None:
             """Route /api/assistant/* into the chat core's route table.
             POSTs pass the RAW body through - the attachments route takes
-            an image body, everything else is JSON parsed by dispatch."""
+            an image body, everything else is JSON parsed by dispatch.
+            GET attachments/<id> is the ONE binary route: it mirrors
+            /api/attachments/<name> (bytes + sniffed ctype) but the
+            authorization boundary is the assistant's attachment row -
+            core.read_upload, never a client-supplied path."""
             from assistant import http_api
+            from assistant.core import AssistantError
             core, err = assistant_open()
             if core is None:
                 self._json({"error": f"assistant unavailable: {err}"},
                            503)
                 return
+            if method == "GET":
+                m = re.fullmatch(
+                    r"/api/assistant/attachments/([^/?]+)", path)
+                if m:
+                    try:
+                        data, ctype = core.read_upload(
+                            urllib.parse.unquote(m[1]))
+                    except AssistantError as exc:
+                        self._json({"error": str(exc)}, exc.status)
+                        return
+                    self._send(data, ctype)
+                    return
             raw = b""
             if method != "GET":
                 try:
                     size = int(self.headers.get("Content-Length") or 0)
                 except ValueError:
                     raise RequestError("Missing request body")
-                if not 0 <= size <= max(ATTACH_MAX_BYTES, 524288):
+                # the upload route alone gets the image-size allowance -
+                # JSON POSTs stay at the dashboard's usual cap
+                cap = (ATTACH_MAX_BYTES if path.endswith("/attachments")
+                       else 524288)
+                if not 0 <= size <= cap:
                     raise RequestError("Request body is too large", 413)
                 raw = self.rfile.read(size)
             status, body = http_api.dispatch(
