@@ -13446,7 +13446,12 @@ a { color:#58a6ff; text-decoration:none; }
 #detail .kv { display:grid; grid-template-columns:96px 1fr; gap:4px 12px; }
 #detail .k { color:#8b949e; }
 #detail pre { white-space:pre-wrap; color:#8b949e; background:#0d1117; border-radius:6px; padding:8px 10px; font-size:12px; max-height:180px; overflow:auto; }
-#detail .x { position:absolute; top:10px; right:16px; cursor:pointer; color:#8b949e; background:none; border:0; font:inherit; }
+/* fixed, not absolute: #detail's translate() transform makes it the
+   containing block, so the Close button stays pinned to the
+   modal's top-right instead of scrolling away with #dbody */
+#detail .x { position:fixed; top:10px; right:16px; z-index:8;
+  cursor:pointer; color:#8b949e; background:none; border:0;
+  font:inherit; }
 /* prev/next task bar - sticky like .topbar: top:0 plus margins that undo
    #detail's padding so it pins flush over the scroll gap. The right pad
    leaves room for the Close X which overlays the bar. */
@@ -17307,6 +17312,10 @@ function render(d){
     const counts = Object.entries(r.counts||{})
       .map(([k,v])=>`<span style="color:${COLORS[k]||'#8b949e'}">${v} ${k}</span>`)
       .join('');
+    // finished-but-unacked tasks in this run - a cyan count pill in the
+    // counts cell; clicking it applies the 'unreviewed' tag filter
+    const unrev = AGENTS.filter(a=>!a.aux && a.needs_review &&
+      (a.run_key||a.run_dir)===runKey(r)).length;
     const runUsd = (r.cost&&r.cost.usd!=null)||(r.plan_cost&&r.plan_cost.usd!=null)
       ? (r.cost&&r.cost.usd||0)+(r.plan_cost&&r.plan_cost.usd||0) : null;
     // Compact density hides the .sub planner-output line entirely, so the
@@ -17431,6 +17440,10 @@ function render(d){
         'cumulative driver execution time'}">${runElapsed(r,now)}</td>` +
       `<td class="counts">` +
       `${counts||'<span class="toksub">not planned</span>'}` +
+      (unrev ? `<button type="button" class="chip" ` +
+        `data-facet="unreviewed" style="color:#39c5cf" ` +
+        `title="${unrev} task(s) finished but not marked reviewed` +
+        ` - click to filter">${unrev} unreviewed</button>` : '') +
       // the run table shows token lines at full density only (compact
       // hides .toksub); they always render in fmtTc short form - the
       // same labeled numbers the agents table's tokens column shows
