@@ -378,6 +378,25 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   `purpose` kv row; agents rows carry `purpose`. HTML sanitization
   unchanged - escaping tests + new injection test green. 262/262 mock
   tests + demo green; verified against the real run's state.json.
+- DONE 2026-10-16 (deferred-merge-controls, wave step of run
+  20261016-013719-workflow-ux-safety): merge timing is now a separate
+  proposal option from worktree isolation - a `Merge timing` select on
+  the request form (auto = merge after each step; deferred = hold for a
+  manual merge). The `merge` field validates/persists/stale-marks like
+  other request fields, is guaranteed into TOML at publish
+  (`[run] merge = "deferred"`, implied `worktree = true` on non-cloud
+  steps, per-step `merge = "auto"` on cloud steps), and is shown on
+  proposals + agent rows (`deferred` chip/facet, merge-policy row in the
+  agent modal). Run details grew a **Pending merges** panel: deferred
+  groups per project repo with recorded target, integration-baseline
+  state, kept-stage/moved residue, repo-busy and `resolve-*` progress,
+  plus legacy parked branches; entries are ticked for a selective
+  `{"steps": [...]}` POST to `/api/runs/<dir>/merge` - alternatives are
+  mutually exclusive (never combined), unverified entries can't be
+  ticked, and the button is disabled while steps are live or a merge is
+  in flight. The modal re-renders on every poll (`mergeSel`/`mergeResult`
+  survive), so refresh-mid-merge and failure recovery are visible, not
+  guessed. 258/258 tests + demo green.
 - DONE 2026-10-16 (deferred-merge-engine, wave step of run
   20261016-013719-workflow-ux-safety): `merge = "deferred"` (run-level
   or per-step; implies worktree) separates worktree isolation from

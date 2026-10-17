@@ -282,8 +282,9 @@ the Back stack like everything else.
 `worktree = true`, incompatible with `cloud`) separates isolation from
 merging: nothing lands after the wave - branch, worktree, commits and
 verify results stay pending in `state.json`'s `pending_merges` until a
-human runs `python conductor.py merge <run_dir>` or clicks Merge pending
-branches (`{"steps": [...]}` lands a subset). Sequential deferred steps
+human runs `python conductor.py merge <run_dir>` or ticks pending entries
+in the run modal's Pending merges panel (`{"steps": [...]}` lands only
+the ticked subset). Sequential deferred steps
 on one project still see verified predecessors: each branches off the
 run's integration baseline `conductor/<run>/baseline-<slug>`, which
 fast-forwards over a step only after status=done AND a green verify, and
@@ -433,16 +434,23 @@ stays valid, and a model present in both groups is two distinct options
 so `aria-activedescendant` never aliases. The fixed fallback list is all
 you get while logged out.
 Discard removes only an unrun, app-owned proposal and its planned rows.
-The `worktrees`/`merge resolver` checkboxes reach the planner prompt and
-are guaranteed into the TOML at publish (`_guarantee_isolation` - never
-applied to `cloud=true` steps; wave-required members always keep
-`worktree = true`); Review's `Apply` button is the deterministic path -
+The `worktrees`/`merge resolver` checkboxes and the `Merge timing`
+select (auto = merge after each step; deferred = hold everything pending
+for a manual merge) reach the planner prompt and are guaranteed into the
+TOML at publish (`_guarantee_isolation` - never applied to `cloud=true`
+steps; wave-required members always keep `worktree = true`; `deferred`
+implies `worktree = true` on non-cloud steps and writes a per-step
+`merge = "auto"` on cloud steps since deferred+cloud is invalid).
+Picking `deferred` force-checks + greys the worktrees box
+(`syncMergeTiming`), restoring the pre-forced state on revert. Review's
+`Apply` button is the deterministic path -
 `_apply_fields_to_toml` syncs run-level keys + per-step overrides the
 form owns, so an unchecked `worktrees` strips planner-added flags except
-where a same-project wave requires them. The `Merge target` field's
-datalist comes from `GET /api/projects/<slug>/branches` of the SELECTED
-project's repo (conductor/* excluded); untouched it defaults to the
-checkout's branch (`main` editable while the project is inferred);
+where a same-project wave requires them, and per-step `merge` keys are
+stripped so `[run] merge` is the sole policy. The `Merge target`
+field's datalist comes from `GET /api/projects/<slug>/branches` of the
+SELECTED project's repo (conductor/* excluded); untouched it defaults to
+the checkout's branch (`main` editable while the project is inferred);
 Apply writes it project-scoped - per-step keys on that project's
 worktree steps when a project is chosen, `[run].merge_target` as the
 inferred default - and it joins the stale-on-change set with the other
@@ -536,10 +544,22 @@ from committed state instead of trusting a clean start. `model =
 "adaptive"` is a valid step/planner model - it takes no effort suffix,
 and the export's `agent.model_name` lands in `rec.model_actual` so the
 dashboard shows which real model adaptive picked and prices against it. When a run has unmerged
-`conductor/*` branches a `Merge pending branches` button appears
-(`POST /api/runs/<dir>/merge` -> `merge_run`): it replays the post-wave
-merge loop for parked branches, spawns the `resolve-*` session when the
-manifest opts in, and is the fix for "the conductor died/conflicted
+`conductor/*` branches the run modal shows a **Pending merges** panel:
+deferred `pending_merges` groups per project repo (recorded target
+branch, baseline, stuck/kept-stage/moved residue, live `resolve-*`
+state, repo merge-lock busy flag) plus legacy parked branches, each
+entry tickable with its status/verify/`alternative` kind - alternatives
+are mutually exclusive picks (ticking one unticks its siblings; they are
+never combined silently), unverified deferred entries can't be ticked
+(never auto-merged; merge by hand if wanted). **Merge selected pending
+work** POSTs `{"steps": [...]}` to `/api/runs/<dir>/merge` ->
+`merge_run`, disabled while any step is live or `_MERGE_BUSY` holds the
+run; the modal re-renders on every state poll (selections survive in
+`mergeSel`) so an in-flight merge's progress shows live, and the
+per-bucket result (merged/conflicted/skipped/unverified/verify_failed/
+moved/busy/kept) renders inline. For parked auto-policy branches it
+replays the post-wave merge loop, spawns the `resolve-*` session when
+the manifest opts in - the fix for "the conductor died/conflicted
 before merging" without `--resume`. The manual merge is gated on the
 run actually being done executing - `run_executing()` is the shared
 predicate (live driver pid, or a step record still backed by something

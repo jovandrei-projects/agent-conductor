@@ -5103,16 +5103,21 @@ const window={innerWidth:1200,innerHeight:800,addEventListener:()=>{},
   getSelection:()=>sel};
 // 'exe' is mid-flight between waves: its only step row reads 'failed'
 // (so pendingMerge is true) but the server says executing. 'st' is the
-// same shape genuinely stopped - merge must be offered there.
+// same shape genuinely stopped - merge must be offered there. The
+// pending_branches payload is what puts the merge control in the modal.
 const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',agents:[
   {step:'p',run:'exe',run_dir:'/runs/exe',run_key:'/runs/exe',slug:'prj',
    status:'failed',branch:'conductor/exe/p',merged:false,task:'t'},
   {step:'q',run:'st',run_dir:'/runs/st',run_key:'/runs/st',slug:'prj',
    status:'failed',branch:'conductor/st/q',merged:false,task:'t'}],
  runs:[{run:'exe',dir:'/runs/exe',key:'/runs/exe',counts:{failed:1},
-        executing:true},
+        executing:true,
+        pending_branches:[{step:'p',status:'failed',slug:'prj',
+          branch:'conductor/exe/p',verify_ok:false}]},
        {run:'st',dir:'/runs/st',key:'/runs/st',counts:{failed:1},
-        executing:false,ended_at:'2026-10-16T01:00:00'}]};
+        executing:false,ended_at:'2026-10-16T01:00:00',
+        pending_branches:[{step:'q',status:'failed',slug:'prj',
+          branch:'conductor/st/q',verify_ok:false}]}]};
 const fetch=async(url,opt)=>{
   posts.push({url,body:opt&&opt.body?JSON.parse(opt.body):null});
   if(url.startsWith('/api/state')) return {ok:true,json:async()=>data};
@@ -5136,17 +5141,19 @@ const onRow=row=>({isContentEditable:false,dataset:{},
 const rclick=t=>handlers.contextmenu({target:t,clientX:60,clientY:70,
   preventDefault:()=>{}});
 (async()=>{
-  // executing run: the item exists (the pending merge is real) but is
-  // disabled with the explanation - it cannot be clicked into the POST
+  // the context-menu item opens the run details' pending-merges panel
+  // (ticking happens there) - it stays reachable while the run executes
+  // since the panel is where merge progress shows
   rclick(onRow(runRow('/runs/exe')));
   const m=elem('ctxmenu');
   assert.match(m.innerHTML,
-    /disabled[^>]*data-merge-run="exe"[^>]*>Merge pending branches/);
-  assert.match(m.innerHTML,/title="[^"]*still executing/);
-  // a genuinely stopped run: same item, enabled, normal title
+    /data-run-details="\/runs\/exe"[^>]*>Merge pending branches/);
+  assert.match(m.innerHTML,/title="[^"]*run executes/);
+  // a genuinely stopped run: same item offered the same way
   rclick(onRow(runRow('/runs/st')));
-  assert.match(m.innerHTML,/data-merge-run="st"[^>]*>Merge pending branches/);
-  assert.doesNotMatch(m.innerHTML,/disabled[^>]*data-merge-run="st"/);
+  assert.match(m.innerHTML,
+    /data-run-details="\/runs\/st"[^>]*>Merge pending branches/);
+  assert.doesNotMatch(m.innerHTML,/disabled[^>]*data-run-details="\/runs\/st"/);
   // the modal mirrors it: disabled + explained for the executing run
   vm.runInContext('showRunDetails("/runs/exe")',ctx);
   assert.match(elem('dbody').innerHTML,
@@ -5766,6 +5773,432 @@ prompt = "check the thing"
         self.assertTrue(cfg.merge_resolver)
         self.assertTrue(all(s.worktree for s in cfg.steps))
         self.assertTrue(all(s["wt"] for s in out["proposed_steps"]))
+
+    # ------------------------------------------- merge timing (deferred)
+
+    def test_merge_field_persists_validates_and_stales(self):
+        """`merge` is a request field like on_failure: validated at
+        create/save, persisted on the record, and toggling it marks an
+        existing proposal stale until Apply rewrites the TOML."""
+        rec = conductor.create_request(
+            {"raw": "x", "project": "proj", "merge": "deferred"},
+            self.requests, self.runs)
+        self.assertEqual(rec["merge"], "deferred")
+        rec = conductor.save_request(rec["id"], {}, self.requests,
+                                     self.manifests, self.runs)
+        self.assertEqual(rec["merge"], "deferred")   # survives reopen
+        # a held-merge choice guarantees the TOML at publish even when the
+        # pasted manifest has no merge key at all
+        out = conductor.save_request(rec["id"],
+                                     {"manifest": self.proposal()},
+                                     self.requests, self.manifests,
+                                     self.runs)
+        text = Path(out["manifest"]).read_text(encoding="utf-8")
+        self.assertIn('merge = "deferred"', text)
+        cfg = conductor.load_manifest(Path(out["manifest"]))
+        self.assertEqual(cfg.merge_policy, "deferred")
+        self.assertTrue(all(s.worktree for s in cfg.steps))  # implied
+        self.assertTrue(all(s["merge"] == "deferred"
+                            for s in out["proposed_steps"]))
+        # back to auto marks the proposal stale, Apply clears it
+        out = conductor.save_request(rec["id"], {"merge": "auto"},
+                                     self.requests, self.manifests,
+                                     self.runs)
+        self.assertTrue(out["stale"])
+        out = conductor.apply_request(rec["id"], {"merge": "auto"},
+                                      self.requests, self.manifests,
+                                      self.runs)
+        self.assertFalse(out["stale"])
+        self.assertIn('merge = "auto"',
+                      Path(out["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            conductor.load_manifest(Path(out["manifest"])).merge_policy,
+            "auto")
+        with self.assertRaises(conductor.RequestError):
+            conductor.create_request(
+                {"raw": "x", "merge": "sometimes"}, self.requests,
+                self.runs)
+
+    def test_apply_deferred_forces_worktree_and_strips_step_keys(self):
+        """merge=deferred implies worktree: applying it flips a step's
+        explicit worktree=false and removes per-step merge keys so
+        [run] is the sole policy."""
+        text = self.proposal('''
+worktree = false
+merge = "auto"
+''')
+        rec = conductor.create_request(
+            {"raw": "x", "project": "proj", "model": "swe-2",
+             "effort": "max"}, self.requests, self.runs)
+        rec = conductor.save_request(rec["id"], {"manifest": text},
+                                     self.requests, self.manifests,
+                                     self.runs)
+        out = conductor.apply_request(rec["id"], {"merge": "deferred"},
+                                      self.requests, self.manifests,
+                                      self.runs)
+        body = Path(out["manifest"]).read_text(encoding="utf-8")
+        self.assertIn('merge = "deferred"', body)
+        step_body = body.split("[[step]]")[1]
+        self.assertNotIn('merge =', step_body)   # run-level owns it
+        cfg = conductor.load_manifest(Path(out["manifest"]))
+        self.assertEqual(cfg.steps[0].merge, "deferred")
+        self.assertTrue(cfg.steps[0].worktree)
+
+    def test_apply_deferred_keeps_cloud_step_out(self):
+        """deferred+cloud is a manifest error, so a cloud step under a
+        deferred run carries an explicit per-step merge = "auto" - and
+        still no worktree flag."""
+        cproj = make_project(self.base, "cproj")
+        with mock.patch.object(conductor, "load_projects", return_value={
+                "proj": {"path": self.proj, "cloud_ok": False},
+                "cproj": {"path": cproj, "cloud_ok": True}}):
+            rec = conductor.create_request(
+                {"raw": "x", "project": "proj"}, self.requests, self.runs)
+            rec = conductor.save_request(rec["id"],
+                {"manifest": self.proposal('''
+[[step]]
+name = "sky"
+project = "cproj"
+cloud = true
+prompt = "check the thing"
+''')}, self.requests, self.manifests, self.runs)
+            out = conductor.apply_request(rec["id"], {"merge": "deferred"},
+                                          self.requests, self.manifests,
+                                          self.runs)
+        by_name = {s.name: s for s in
+                   conductor.load_manifest(Path(out["manifest"])).steps}
+        self.assertEqual(by_name["organize"].merge, "deferred")
+        self.assertTrue(by_name["organize"].worktree)
+        self.assertEqual(by_name["sky"].merge, "auto")  # explicit override
+        self.assertFalse(by_name["sky"].worktree)
+
+    def test_apply_merge_auto_strips_step_overrides(self):
+        """The form owns `merge`: applying auto drops a planner-written
+        per-step deferred key and pins merge = "auto" in [run]."""
+        rec = conductor.create_request(
+            {"raw": "x", "project": "proj"}, self.requests, self.runs)
+        rec = conductor.save_request(rec["id"],
+            {"manifest": self.proposal('''
+merge = "deferred"
+worktree = true
+''')}, self.requests, self.manifests, self.runs)
+        out = conductor.apply_request(rec["id"], {"merge": "auto"},
+                                      self.requests, self.manifests,
+                                      self.runs)
+        body = Path(out["manifest"]).read_text(encoding="utf-8")
+        self.assertIn('merge = "auto"', body.split("[run]")[1]
+                      .split("[[step]]")[0])
+        self.assertNotIn('merge = "deferred"',
+                         body.split("[[step]]")[1])
+        self.assertEqual(
+            conductor.load_manifest(Path(out["manifest"])).steps[0].merge,
+            "auto")
+
+
+class PendingMergeViewTests(unittest.TestCase):
+    """collect_dashboard's pending-merge payload: what the run modal's
+    pending panel renders - deferred groups with targets/kind/verify,
+    legacy parked branches, the merge-in-flight flag."""
+
+    def _state(self, base, run="r1", steps=None, **extra):
+        runs = base / "runs"
+        rd = runs / run
+        rd.mkdir(parents=True)
+        (rd / "state.json").write_text(json.dumps(
+            {"run": "t", "steps": steps or {}, **extra}))
+        return runs, rd
+
+    def test_pending_merges_groups_and_legacy_exposed(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            grp_key = conductor._repo_key(proj.resolve())
+            runs, rd = self._state(base, steps={
+                "a": {"name": "a", "status": "done", "slug": "proj",
+                      "project": str(proj), "branch": "conductor/r1/a",
+                      "work_dir": str(base / "wta"), "deferred": True,
+                      "merge_kind": "sequential",
+                      "deferred_verified": True, "verify_ok": True,
+                      "target_branch": "master"},
+                "alt1": {"name": "alt1", "status": "done", "slug": "proj",
+                         "project": str(proj), "branch": "conductor/r1/a1",
+                         "deferred": True, "merge_kind": "alternative",
+                         "deferred_verified": True, "verify_ok": True,
+                         "target_branch": "master"},
+                "bad": {"name": "bad", "status": "failed", "slug": "proj",
+                        "project": str(proj), "branch": "conductor/r1/bad",
+                        "deferred": True, "merge_kind": "sequential",
+                        "deferred_verified": False, "verify_ok": False,
+                        "target_branch": "master"},
+                "parked": {"name": "parked", "status": "failed",
+                           "slug": "proj", "project": str(proj),
+                           "branch": "conductor/r1/parked",
+                           "merged": False},
+                "live": {"name": "live", "status": "running",
+                         "slug": "proj", "project": str(proj),
+                         "started_at": conductor.now_iso(),
+                         "timeout_min": 60,
+                         "branch": "conductor/r1/live"}},
+                pending_merges={grp_key: {
+                    "repo_dir": str(proj.resolve()), "slug": "proj",
+                    "target_branch": "master", "target_sha": "abc",
+                    "baseline": "conductor/r1/baseline-proj",
+                    "baseline_stuck": True,
+                    "stage_kept": {"dir": "C:/x/stage-9f", "ref": "s/x",
+                                   "verify_ok": False, "kept_at": "t",
+                                   "reason": "verify"},
+                    "moved_reason": "dirty checkout",
+                    "entries": ["a", "alt1", "bad"]}})
+            with mock.patch.object(conductor, "refresh_prices"):
+                d = conductor.collect_dashboard(runs, ["no-such-devin"])
+            r = d["runs"][0]
+            self.assertEqual(len(r["pending_merges"]), 1)
+            g = r["pending_merges"][0]
+            self.assertEqual(g["slug"], "proj")
+            self.assertEqual(g["target"], "master")
+            self.assertTrue(g["baseline_stuck"])
+            self.assertEqual(g["moved_reason"], "dirty checkout")
+            self.assertEqual(g["stage_kept"]["ref"], "s/x")
+            self.assertEqual(
+                [e["step"] for e in g["entries"]], ["a", "alt1", "bad"])
+            by = {e["step"]: e for e in g["entries"]}
+            self.assertEqual(by["alt1"]["kind"], "alternative")
+            self.assertTrue(by["a"]["verified"])
+            self.assertFalse(by["bad"]["verified"])
+            self.assertFalse(by["bad"]["verify_ok"])
+            # 'live' is a running auto-policy step: no legacy row for it
+            self.assertEqual(
+                [e["step"] for e in r["pending_branches"]], ["parked"])
+            self.assertFalse(r["merge_busy"])
+            # ...until _MERGE_BUSY names this run dir
+            conductor._MERGE_BUSY.add(rd.name)
+            try:
+                with mock.patch.object(conductor, "refresh_prices"):
+                    d = conductor.collect_dashboard(runs, ["no-such-devin"])
+                self.assertTrue(d["runs"][0]["merge_busy"])
+            finally:
+                conductor._MERGE_BUSY.discard(rd.name)
+            # agent rows carry the deferred markers for the facet/chip
+            arow = next(a for a in d["agents"] if a["step"] == "alt1")
+            self.assertTrue(arow["deferred"])
+            self.assertEqual(arow["merge_kind"], "alternative")
+            self.assertEqual(arow["target_branch"], "master")
+            prow = next(a for a in d["agents"] if a["step"] == "parked")
+            self.assertFalse(prow["deferred"])
+
+    def test_merged_entries_leave_the_pending_list(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            grp_key = conductor._repo_key(proj.resolve())
+            runs, rd = self._state(base, steps={
+                "gone": {"name": "gone", "status": "done", "slug": "proj",
+                         "project": str(proj), "branch": "b/gone",
+                         "deferred": True, "merged": True,
+                         "deferred_verified": True},
+                "held": {"name": "held", "status": "done", "slug": "proj",
+                         "project": str(proj), "branch": "b/held",
+                         "deferred": True, "deferred_verified": True}},
+                pending_merges={grp_key: {
+                    "repo_dir": str(proj.resolve()), "slug": "proj",
+                    "target_branch": "master",
+                    "entries": ["gone", "held"]}})
+            with mock.patch.object(conductor, "refresh_prices"):
+                d = conductor.collect_dashboard(runs, ["no-such-devin"])
+            entries = d["runs"][0]["pending_merges"][0]["entries"]
+            self.assertEqual([e["step"] for e in entries], ["held"])
+
+
+class DeferredMergeUiTests(unittest.TestCase):
+    """Node-harness coverage of the deferred-merge dashboard controls:
+    the request form's merge-timing select, and the run modal's
+    pending-merge panel (per-project groups, verify gating, alternative
+    exclusivity, selective merge POST, busy/live disabled states)."""
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_request_form_merge_timing_select(self):
+        """The merge-timing select is a separate option from worktree
+        isolation: it defaults to auto, persists `merge` into
+        requestFields, and picking 'hold for review' forces + greys the
+        worktrees box (restoring the prior state on revert)."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',value:'',checked:false,disabled:false,dataset:{},
+  classList:{add(){},remove(){},toggle(){}}}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,fn)=>{handlers[ev]=fn;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},fetch:async()=>({ok:true,json:async()=>({})}),
+  confirm:()=>true,alert:()=>{}});
+vm.runInContext(src,ctx);
+const d={serve_boot:'b',generated_at:'x',agents:[],runs:[],
+  project_options:[{slug:'p',cloud_ok:false}],
+  defaults:{model:'swe-2',effort:'max'}};
+vm.runInContext('render('+JSON.stringify(d)+')',ctx);
+vm.runInContext('openNew()',ctx);
+// the form renders the separate merge-timing control with its own
+// explanation (isolation vs timing are distinct options)
+const html=elem('dbody').innerHTML;
+assert.match(html,/id="rq-merge"/);
+assert.match(html,/Merge timing/);
+assert.match(html,/merge after each step/);
+assert.match(html,/hold for review/);
+assert.match(html,/implied by held merges/);
+const m=elem('rq-merge'), wt=elem('rq-worktrees');
+// a real <select> reports its selected option as .value - the stub has
+// no option parsing, so set the browser-truth value before each event
+m.value='deferred';
+handlers.input({target:{id:'rq-merge'}});
+assert.equal(wt.checked,true);    // deferred implies worktree isolation
+assert.equal(wt.disabled,true);
+let f=vm.runInContext('requestFields()',ctx);
+assert.equal(f.merge,'deferred');
+assert.equal(f.worktrees,true);
+// reverting to auto re-enables the box and undoes the FORCED check
+m.value='auto';
+handlers.input({target:{id:'rq-merge'}});
+assert.equal(wt.disabled,false);
+assert.equal(wt.checked,false);
+// ...but a deliberate tick is never undone by the coupling
+wt.checked=true;
+m.value='deferred'; handlers.input({target:{id:'rq-merge'}});
+m.value='auto'; handlers.input({target:{id:'rq-merge'}});
+assert.equal(wt.checked,true);
+// a reopened deferred draft renders the held option selected
+vm.runInContext('showRequestForm({status:"ready",id:"r1",merge:"deferred",' +
+  'worktrees:true,raw:"x",proposed_steps:[],manifest:"m.toml"})',ctx);
+assert.match(elem('dbody').innerHTML,
+  /<option value="deferred" selected>/);
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_pending_panel_selective_merge(self):
+        """Run details list pending merges per project with verify +
+        alternative state; ticking alternatives is exclusive; the merge
+        POST sends only the ticked steps; the result lands inline."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, posts=[];
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',value:'',checked:false,disabled:false,dataset:{},
+  classList:{add(){},remove(){},toggle(){}}}); return nodes.get(id); };
+// pending-merge boxes are real objects the harness controls; the page
+// code queries them via querySelectorAll('#detail [data-pm]:checked')
+// and '#detail [data-pm-alt="<gi>"]'
+const boxes=[
+  {dataset:{pm:'seq1'},checked:false,disabled:false},
+  {dataset:{pm:'altA',pmAlt:'0'},checked:false,disabled:false},
+  {dataset:{pm:'altB',pmAlt:'0'},checked:false,disabled:false},
+  {dataset:{pm:'bad'},checked:false,disabled:true},
+  {dataset:{pm:'legacy'},checked:false,disabled:false}];
+const tgt=o=>Object.assign({closest:()=>null,preventDefault:()=>{},
+  textContent:'',value:''},o);
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:sel=>sel.includes('data-pm-alt')
+    ?boxes.filter(b=>b.dataset.pmAlt===sel.split('"')[1])
+    :sel.includes('[data-pm]')?boxes.filter(b=>b.checked&&!b.disabled):[],
+  activeElement:null,addEventListener:(ev,fn)=>{handlers[ev]=fn;}};
+const state={serve_boot:'b',generated_at:'x',agents:[
+    {run_key:'rk',run_dir:'runs/r1',step:'seq1',status:'done',slug:'proj'}],
+  runs:[{run:'t',dir:'runs/r1',key:'rk',counts:{done:4},ended_at:'x',
+    merge_busy:false,
+    pending_merges:[{slug:'proj',repo:'P:/proj',target:'master',
+      baseline:'conductor/r1/baseline-proj',entries:[
+        {step:'seq1',status:'done',kind:'sequential',verified:true,
+         verify_ok:true,branch:'conductor/r1/seq1'},
+        {step:'altA',status:'done',kind:'alternative',verified:true,
+         verify_ok:true,branch:'conductor/r1/altA'},
+        {step:'altB',status:'done',kind:'alternative',verified:true,
+         verify_ok:true,branch:'conductor/r1/altB'},
+        {step:'bad',status:'failed',kind:'sequential',verified:false,
+         verify_ok:false,branch:'conductor/r1/bad'}]}],
+    pending_branches:[{step:'legacy',status:'failed',slug:'proj',
+      branch:'conductor/r1/legacy',verify_ok:null}]}],
+  project_options:[],defaults:{}};
+const fetch=async(path,opts)=>{
+  if(path.endsWith('/merge')){
+    posts.push(JSON.parse(opts.body));
+    return {ok:true,json:async()=>({merged:['seq1'],conflicted:[],
+      skipped:[],unverified:[],verify_failed:[],moved:[],busy:[],
+      kept:[]})};}
+  return {ok:true,json:async()=>state};};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},fetch,confirm:()=>true,alert:()=>{}});
+vm.runInContext(src,ctx);
+(async()=>{
+  await vm.runInContext('render('+JSON.stringify(state)+')',ctx);
+  vm.runInContext('showRunDetails("rk")',ctx);
+  const html=elem('dbody').innerHTML;
+  // group header: project + recorded target + integration baseline
+  assert.match(html,/Pending merges \(5\)/);
+  assert.match(html,/<b>proj<\/b>/);
+  assert.match(html,/lands on<\/span> <code>master<\/code>/);
+  assert.match(html,/conductor\/r1\/baseline-proj/);
+  // entries: verify chips, alternative chips, unverified disabled
+  assert.match(html,/data-pm="seq1"/);
+  assert.match(html,/data-pm="altA" data-pm-alt="0"/);
+  assert.match(html,/data-pm="altB" data-pm-alt="0"/);
+  assert.match(html,/data-pm="bad"[^>]*disabled/);
+  assert.match(html,/alternative/);
+  assert.match(html,/not verified - the merge never lands it/);
+  assert.match(html,/auto-merge branches that never landed/);
+  assert.match(html,/Merge selected pending work/);
+  // ticking is tracked in mergeSel; alternatives are exclusive (the DOM
+  // checks the box BEFORE change fires, so set checked first; the change
+  // listener only reads dataset/checked, so the raw box is the target)
+  boxes[0].checked=true; handlers.change({target:boxes[0]});
+  boxes[1].checked=true; handlers.change({target:boxes[1]});
+  boxes[2].checked=true; handlers.change({target:boxes[2]});
+  assert.equal(boxes[1].checked,false);        // altB bumped altA
+  const sel=[...vm.runInContext('mergeSel["rk"]',ctx)];
+  assert.deepEqual([...sel].sort(),['altB','seq1']);
+  // the merge POST carries only the ticked steps
+  const btn=tgt({dataset:{mergeRun:'r1',rk:'rk'},disabled:false,
+                 textContent:'Merge selected pending work'});
+  await handlers.click({target:btn});
+  assert.equal(posts.length,1);
+  assert.deepEqual(posts[0].steps.sort(),['altB','seq1']);
+  // the result renders inline (the modal re-rendered with it)
+  await new Promise(r=>setImmediate(r));
+  assert.match(elem('dbody').innerHTML,/merged: seq1/);
+  // while the modal is open, a refresh carrying merge_busy re-renders it
+  // with the in-flight notice and a disabled button
+  const busy=JSON.parse(JSON.stringify(state));
+  busy.runs[0].merge_busy=true;
+  await vm.runInContext('render('+JSON.stringify(busy)+')',ctx);
+  assert.match(elem('dbody').innerHTML,/A merge is in progress/);
+  assert.match(elem('dbody').innerHTML,/pm-go[^>]*disabled/);
+  // a live step disables the merge button the same way
+  const live=JSON.parse(JSON.stringify(state));
+  live.agents[0].status='running';
+  await vm.runInContext('render('+JSON.stringify(live)+')',ctx);
+  assert.match(elem('dbody').innerHTML,/pm-go[^>]*disabled/);
+  assert.match(elem('dbody').innerHTML,/still live/);
+  // an empty selection POSTs nothing and explains why
+  boxes.forEach(b=>b.checked=false);
+  await handlers.click({target:tgt({dataset:{mergeRun:'r1',rk:'rk'},
+    disabled:false})});
+  assert.equal(posts.length,1);   // unchanged
+  assert.match(elem('pm-msg').textContent,/Tick at least one/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
 
 
 class PendingStateTests(unittest.TestCase):

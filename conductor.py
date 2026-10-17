@@ -6284,12 +6284,13 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
             "raw", "label", "project", "model", "effort", "manifest",
             "followup", "on_failure", "max_attempts",
             "plan_model", "plan_effort", "merge_target",
-            "worktrees", "merge_resolver", "summarize", "ask",
+            "worktrees", "merge_resolver", "merge", "summarize", "ask",
             "attachments"}:
         raise RequestError("Invalid request fields")
     model, effort = default_model_effort()
     fields = {k: (rec or {}).get(k, v) for k, v in (
         ("raw", ""), ("label", ""), ("project", ""), ("on_failure", "continue"),
+        ("merge", "auto"),
         ("model", model), ("effort", effort), ("merge_target", ""),
         ("plan_model", model), ("plan_effort", effort))}
     for key in fields:
@@ -6313,6 +6314,8 @@ def _request_fields(payload: dict, rec: dict | None = None) -> dict:
         raise RequestError("max_attempts must be 1-10")
     if fields["on_failure"] not in ("stop", "continue"):
         raise RequestError("on_failure must be stop or continue")
+    if fields["merge"] not in ("auto", "deferred"):
+        raise RequestError("merge must be auto or deferred")
     if not fields["raw"] or len(fields["raw"]) > 100_000:
         raise RequestError("Request text must be 1–100,000 characters")
     if len(fields["label"]) > 80:
@@ -6625,13 +6628,18 @@ def _wave_worktree_required(cfg: Manifest, manifests_dir: Path) -> set[str]:
 def _apply_fields_to_toml(text: str, fields: dict,
                           manifests_dir: Path = MANIFESTS_DIR) -> str:
     """Patch a proposal's option fields in place - the 'Apply to TOML' path.
-    Only keys present in `fields` are touched: {on_failure, merge_resolver}
-    write [run]; {model, effort, max_attempts} write [defaults] and are
-    stripped from [[step]] sections so the form value wins; {worktrees}
-    sets/clears per-step worktree (kept on same-project wave members and
-    never added to cloud steps - both would fail validation);
-    {followup} adds/removes the closing follow-up-plan step. Request text
-    and project are NOT applyable - those need regeneration."""
+    Only keys present in `fields` are touched: {on_failure, merge_resolver,
+    merge, summarize} write [run]; {model, effort, max_attempts} write
+    [defaults] and are stripped from [[step]] sections so the form value
+    wins; {worktrees} sets/clears per-step worktree (kept on same-project
+    wave members and never added to cloud steps - both would fail
+    validation); {merge} is stripped from [[step]]s so [run] is the sole
+    policy - 'deferred' then implies worktree on every non-cloud step and
+    writes a per-step merge = "auto" on cloud steps (deferred+cloud is a
+    manifest error); {merge_target} writes [run] as the default or
+    per-step keys on the selected project's worktree steps; {followup}
+    adds/removes the closing follow-up-plan step. Request text and project
+    are NOT applyable - those need regeneration."""
     try:
         cfg = load_manifest(manifests_dir / "applied.toml", text)
     except (ManifestError, tomllib.TOMLDecodeError) as exc:
@@ -6674,6 +6682,9 @@ def _apply_fields_to_toml(text: str, fields: dict,
     if "merge_resolver" in fields:
         _toml_set(lines, *ensure("run"), "merge_resolver",
                   "true" if fields["merge_resolver"] else "false")
+    if fields.get("merge") in ("auto", "deferred"):
+        _toml_set(lines, *ensure("run"), "merge",
+                  json.dumps(fields["merge"]))
     if "summarize" in fields:
         _toml_set(lines, *ensure("run"), "summarize",
                   "true" if fields["summarize"] else "false")
@@ -6724,6 +6735,8 @@ def _apply_fields_to_toml(text: str, fields: dict,
     # applied value - strip them so defaults/run keys are the sole source.
     drop_keys = ({"merge_resolver"} if "merge_resolver" in fields else
                  set()) | (
+        {"merge"} if fields.get("merge") in ("auto", "deferred")
+        else set()) | (
         {"model", "effort"}
         if any(fields.get(k) is not None for k in ("model", "effort"))
         else set()) | (
@@ -6757,6 +6770,19 @@ def _apply_fields_to_toml(text: str, fields: dict,
                 i = _toml_key_at(lines, ss, se, "worktree")
                 if i is not None:
                     del lines[i]
+    if fields.get("merge") == "deferred":
+        # merge=deferred implies worktree on every step where isolation is
+        # possible; on cloud steps a local retained branch is meaningless,
+        # so they carry an explicit per-step merge = "auto" out of the
+        # run-wide deferred policy (deferred+cloud fails validation).
+        for s in cfg.steps:
+            ss, se = step_sect(s.name)
+            if ss is None:
+                continue
+            if s.cloud:
+                _toml_set(lines, ss, se, "merge", '"auto"')
+            else:
+                _toml_set(lines, ss, se, "worktree", "true")
     if "followup" in fields:
         ss, se = step_sect("follow-up-plan")
         if fields["followup"] and ss is None and cfg.steps:
@@ -6779,15 +6805,19 @@ def _apply_fields_to_toml(text: str, fields: dict,
 
 def _guarantee_isolation(text: str, rec: dict,
                          manifests_dir: Path = MANIFESTS_DIR) -> str:
-    """The worktrees/merge_resolver checkboxes and the merge-target field
-    are guarantees, not hints: add them when the planner omitted them.
-    One-directional - an unchecked box never strips a deliberate flag, and
-    an empty merge target never removes a deliberate merge_target."""
+    """The worktrees/merge_resolver/merge-timing options and the
+    merge-target/summarize fields are guarantees, not hints: add them
+    when the planner omitted them. One-directional - an unchecked box
+    never strips a deliberate flag, 'auto' merge timing never strips a
+    hand-set merge key, and an empty merge target never removes a
+    deliberate merge_target."""
     fields = {}
     if rec.get("worktrees"):
         fields["worktrees"] = True
     if rec.get("merge_resolver"):
         fields["merge_resolver"] = True
+    if rec.get("merge") == "deferred":
+        fields["merge"] = "deferred"
     if rec.get("summarize"):
         fields["summarize"] = True
     if rec.get("merge_target"):
@@ -6814,7 +6844,7 @@ def _guarantee_isolation(text: str, rec: dict,
 # the next planning pass and can never stale the current proposal.
 GEN_INPUT_FIELDS = ("raw", "project", "attachments")
 OPTION_FIELDS = ("model", "effort", "on_failure", "max_attempts",
-                 "worktrees", "merge_resolver", "followup",
+                 "worktrees", "merge_resolver", "merge", "followup",
                  "merge_target")
 
 
@@ -6869,11 +6899,20 @@ def _manifest_options(text: str, manifests_dir: Path) -> dict:
             None if step_mts else "")
     elif not isinstance(mt, str):
         mt = None
+    # Merge timing reads run-level first (what Apply writes), then a
+    # unanimous effective policy across non-cloud steps (a cloud step's
+    # forced merge="auto" under a deferred run is plumbing, not policy);
+    # a mixed set is None - the single select cannot express it.
+    mg = run.get("merge")
+    if mg is None:
+        eff = {s.merge for s in cfg.steps if not s.cloud}
+        mg = eff.pop() if len(eff) == 1 else (None if eff else "auto")
     return {"model": defaults.get("model"),
             "effort": defaults.get("effort") or "",
             "on_failure": run.get("on_failure", "stop"),
             "max_attempts": attempts, "worktrees": wt,
             "merge_resolver": bool(run.get("merge_resolver", False)),
+            "merge": mg,
             "followup": any(s.name == "follow-up-plan" for s in cfg.steps),
             "merge_target": mt}
 
@@ -6919,6 +6958,7 @@ def _pending_actions(rec: dict) -> dict:
                 "max_attempts": int(rec.get("max_attempts") or 3),
                 "worktrees": bool(rec.get("worktrees")),
                 "merge_resolver": bool(rec.get("merge_resolver")),
+                "merge": rec.get("merge") or "auto",
                 "followup": bool(rec.get("followup")),
                 "merge_target": (rec.get("merge_target") or "").strip()}
         for key, value in form.items():
@@ -6969,7 +7009,7 @@ def _publish_proposal(rec: dict, text: str, requests_dir: Path,
             manifests=MANIFESTS_DIR.as_posix())
         cfg = validate_proposal(text, manifests_dir)
     if rec.get("worktrees") or rec.get("merge_resolver") \
-            or rec.get("merge_target"):
+            or rec.get("merge") == "deferred" or rec.get("merge_target"):
         # The checkboxes/fields are guarantees: add what the planner omitted.
         text = _guarantee_isolation(text, rec, manifests_dir)
         cfg = validate_proposal(text, manifests_dir)
@@ -6989,7 +7029,7 @@ def _publish_proposal(rec: dict, text: str, requests_dir: Path,
                    "step": s.name, "slug": s.project, "model": s.model,
                    "effort": s.effort, "mode": s.mode,
                    "task": task_summary(s.prompt), "wt": s.worktree,
-                   "mt": s.merge_target,
+                   "mt": s.merge_target, "merge": s.merge,
                    "cloud": s.cloud} for s in cfg.steps])
     # The gen baseline moved to what this publish was built from, but the
     # option fields can still diverge from a hand-edited TOML - compute
@@ -7872,6 +7912,17 @@ def _planner_response(rec: dict, projects: dict,
                     "true step, where worktrees are meaningless). Each "
                     "step then runs on a conductor/<run>/<step> branch in "
                     "its own checkout and merges back after its wave.\n\n")
+    if rec.get("merge") == "deferred":
+        isolate += ("The human asked for held merges: set merge = "
+                    "\"deferred\" in [run]. Steps still run in worktrees "
+                    "(deferred implies worktree = true) but NOTHING merges "
+                    "back automatically - verified branches stay pending "
+                    "for a human-requested merge at the end, and "
+                    "sequential steps on one project still see their "
+                    "verified predecessors through a per-run integration "
+                    "baseline. On any cloud = true step add a per-step "
+                    "merge = \"auto\" (deferred keeps a local branch, "
+                    "which makes no sense for cloud work).\n\n")
     if rec.get("merge_resolver"):
         isolate += ("The human asked for automatic conflict resolution: "
                     "set merge_resolver = true in [run], so a conflicted "
@@ -9563,7 +9614,7 @@ def _merge_run_body(d: Path, name: str, st: dict, runs_dir: Path,
 
 def cmd_merge(args: argparse.Namespace) -> int:
     """CLI handle for the explicit merge: land a run's pending branches -
-    the same op the dashboard's 'Merge pending branches' button runs.
+    the same op the dashboard's 'Merge selected pending work' runs.
     For deferred runs this is THE merge: staged, verified, serialized."""
     try:
         out = merge_run(args.run_dir,
@@ -11038,6 +11089,9 @@ def proposal_agent(step: dict, rec: dict, projects: dict, key: str,
             "timeout_min": step.get("timeout_min"),
             "attempts": None, "max_attempts": None,
             "merged": None, "cloud": step.get("cloud"), "tokens": None,
+            "deferred": step.get("merge") == "deferred",
+            "merge_kind": None, "target_branch": None,
+            "deferred_verified": None,
             "cost": None,
             "alive": False, "outcome": None, "outcomes": None,
             "note": "Run ended before this step started" if status == "skipped"
@@ -11109,6 +11163,8 @@ def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
             "note": note, "next": None, "exit_code": None,
             "outcome": None, "outcomes": None,
             "branch": None, "merged": None,
+            "deferred": False, "merge_kind": None, "target_branch": None,
+            "deferred_verified": None,
             "tokens": e.get("tokens"), "wt": False,
             "cost": estimate_cost(e.get("tokens"), e.get("model"),
                                   e.get("effort"), prices,
@@ -11166,6 +11222,8 @@ def summary_agent(st: dict, key: str, run_dir: Path,
                     if rs.get("generated_at") else None),
         "outcomes": None,
         "branch": None, "merged": None,
+        "deferred": False, "merge_kind": None, "target_branch": None,
+        "deferred_verified": None,
         "tokens": tokens, "wt": False,
         "cost": estimate_cost(tokens, model, None, prices,
                               rs.get("model_actual")),
@@ -11202,7 +11260,7 @@ def _manifest_pending(st: dict, projects: dict) -> list[dict]:
                     "task": task, "model": step.model,
                     "effort": step.effort, "mode": step.mode,
                     "cloud": step.cloud, "wt": step.worktree,
-                    "mt": step.merge_target,
+                    "mt": step.merge_target, "merge": step.merge,
                     "timeout_min": step.timeout_min})
     return out
 
@@ -11282,8 +11340,80 @@ def _pending_agent(st: dict, sd: dict, key: str, run_dir: str,
             "timeout_min": sd.get("timeout_min"),
             "attempts": None, "max_attempts": None,
             "merged": None, "cloud": sd.get("cloud"), "tokens": None,
+            "deferred": sd.get("merge") == "deferred",
+            "merge_kind": None, "target_branch": None,
+            "deferred_verified": None,
             "cost": None, "alive": False, "outcome": None,
             "outcomes": None, "note": None}
+
+
+def _pending_merge_view(st: dict, eff: dict[str, str]) -> tuple[
+        list[dict], list[dict]]:
+    """(deferred groups, legacy parked branches) for the run modal.
+
+    Deferred entries come from state["pending_merges"] - one group per
+    project repo, entries = step names still unlanded. Each entry carries
+    what the selection UI needs: status, verify, kind (sequential |
+    alternative - alternatives are same-wave variants that must never be
+    silently combined), live-ness and the retained branch/worktree. The
+    group surfaces the recorded target branch, baseline state and any
+    kept-stage/moved-target residue from a previous merge attempt.
+
+    Legacy pending = auto-policy worktree branches that never landed
+    (conflict parked them, or the conductor died before its post-wave
+    merge). They merge through the same merge_run(only=) op.
+    """
+    steps = st.get("steps") or {}
+    drv = driver_alive(st)
+    groups: list[dict] = []
+    for _key, grp in (st.get("pending_merges") or {}).items():
+        entries = []
+        for n in grp.get("entries") or []:
+            rec = steps.get(n) or {}
+            if not rec.get("branch") or rec.get("merged") is True:
+                continue
+            entries.append({
+                "step": n, "status": eff.get(n, rec.get("status", "?")),
+                "branch": rec.get("branch"),
+                "kind": rec.get("merge_kind") or "sequential",
+                "verified": bool(rec.get("deferred_verified")),
+                "verify_ok": rec.get("verify_ok"),
+                "live": step_live(rec, drv),
+                "note": rec.get("note"),
+                "work_dir": rec.get("work_dir")})
+        if not entries:
+            continue
+        repo = grp.get("repo_dir") or ""
+        groups.append({
+            "slug": grp.get("slug") or (Path(repo).name if repo else "?"),
+            "repo": repo,
+            "target": grp.get("target_branch"),
+            "target_sha": grp.get("target_sha"),
+            # a resolve-<step> session alive right now means the staged
+            # merge is in conflict resolution - surface it on the group
+            "resolving": [f"resolve-{e['step']}" for e in entries
+                          if step_live(steps.get(f"resolve-{e['step']}")
+                                       or {}, drv)],
+            "baseline": grp.get("baseline"),
+            "baseline_stuck": bool(grp.get("baseline_stuck")),
+            "stage_kept": grp.get("stage_kept"),
+            "moved_reason": grp.get("moved_reason"),
+            # A live merge lock held by ANOTHER pid = a foreign merge is in
+            # flight on this repo (our own merges surface via merge_busy).
+            "busy": bool(repo) and _repo_merge_busy(Path(repo)),
+            "entries": entries})
+    legacy = [{
+        "step": n, "status": eff.get(n, rec.get("status", "?")),
+        "slug": rec.get("slug"),
+        "branch": rec.get("branch"),
+        "verify_ok": rec.get("verify_ok"),
+        "live": step_live(rec, drv),
+        "note": rec.get("note"),
+        "work_dir": rec.get("work_dir")}
+        for n, rec in steps.items()
+        if rec.get("branch") and rec.get("merged") is not True
+        and not rec.get("deferred") and not step_live(rec, drv)]
+    return groups, legacy
 
 
 def collect_dashboard(runs_dir: Path,
@@ -11515,6 +11645,10 @@ def collect_dashboard(runs_dir: Path,
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
                 "merged_at": rec.get("merged_at"),
                 "merge_target": rec.get("merge_target"),
+                "deferred": bool(rec.get("deferred")),
+                "merge_kind": rec.get("merge_kind"),
+                "target_branch": rec.get("target_branch"),
+                "deferred_verified": rec.get("deferred_verified"),
                 "timeout_min": timeout_min,
                 "timeout_ext_s": rec.get("timeout_extended_s"),
                 "attempts": rec.get("attempts"),
@@ -11601,12 +11735,20 @@ def collect_dashboard(runs_dir: Path,
         # live interval's start so the runs table ticks base+now-start
         # without a payload refresh
         run_els, run_exec_start = _run_elapsed_split(st, sj.parent)
+        pm_groups, pm_legacy = _pending_merge_view(st, eff)
         runs.append({"run": st.get("run"), "dir": str(sj.parent),
                      "key": key, "request_id": st.get("request_id"),
                      "archived": st.get("archived"),
                      "followup": st.get("followup"),
                      "executing": executing,
                      "iso": _run_isolation(cfg, st, request),
+                     # Retained-but-unlanded worktree work for the run
+                     # modal's selective merge: deferred groups carry
+                     # recorded targets + alternatives; legacy rows are
+                     # auto-policy branches that never landed.
+                     "pending_merges": pm_groups,
+                     "pending_branches": pm_legacy,
+                     "merge_busy": sj.parent.name in _MERGE_BUSY,
                      "description": st.get("description") or
                      (request or {}).get("description"),
                      "started_at": st.get("started_at"),
@@ -11726,6 +11868,8 @@ def collect_dashboard(runs_dir: Path,
                 "note": None, "next": None, "exit_code": None,
                 "outcome": None, "outcomes": None,
                 "branch": None, "merged": None, "tokens": None, "wt": False,
+                "deferred": False, "merge_kind": None,
+                "target_branch": None, "deferred_verified": None,
                 "cost": None,
                 "stdout_log": str(log_p) if log_p.is_file() else None,
                 "tail": gen_tail, "export": None, "prompt": None})
@@ -12107,6 +12251,13 @@ td :is(a,button):focus-visible { outline-offset:-2px; }
 #detail .proposal-list { margin-top:12px; padding-left:20px; }
 #detail .proposal-list li { margin:8px 0; }
 #detail .proposal-list small { color:#8b949e; }
+/* pending-merge panel in run details: one boxed group per project repo,
+   each pending step a tickable row (unverified rows stay untickable) */
+#detail .pmgrp { border:1px solid #21262d; border-radius:6px; padding:8px 10px; margin:8px 0; background:#0d1117; }
+#detail .pmgrp .sub { margin:2px 0 6px; }
+#detail label.pmentry { display:flex; align-items:flex-start; gap:8px; margin:4px 0; font-size:13px; color:#e6edf3; cursor:pointer; }
+#detail label.pmentry input[type=checkbox] { width:auto; margin-top:3px; }
+#detail label.pmentry input[type=checkbox]:disabled { cursor:not-allowed; }
 /* questionnaire modal (planner 'ask me questions' flow) */
 .qopts { display:flex; flex-direction:column; gap:6px; margin:10px 0 4px; }
 .qopt { text-align:left; border:1px solid #30363d; border-radius:6px;
@@ -12313,9 +12464,10 @@ const SHOW_N = 10;
 let runsShown = SHOW_N;   // visible run-table rows; active runs never hide
 const ORDER = ['running','queued','waiting','planned','done','partial',
                'blocked','stopped','timed_out','failed','skipped','lost'];
-const FACETS = ['wt','merged','unmerged'];
+const FACETS = ['wt','merged','unmerged','deferred'];
 const matchesFacet = (a,f) => f==='wt' ? a.wt :
-  f==='merged' ? a.merged===true : a.merged===false;
+  f==='merged' ? a.merged===true :
+  f==='unmerged' ? a.merged===false : a.deferred===true;
 const runKey = r => r.key||r.dir;
 let lastData = null;
 let AGENTS = [];          // last payload, for the detail modal
@@ -12336,6 +12488,11 @@ let detailIdx = null;
 let detailKey = null;       // run_key|step of the open agent modal - the
                             // payload re-sorts each tick, so the index is
                             // re-resolved by key before every re-render
+let modalRunKey = null;     // run_key of the open run-details modal - the
+                            // pending-merge panel re-renders on data
+                            // change, so a mid-merge refresh stays live
+const mergeSel = {};        // runKey -> Set of pending steps ticked for merge
+const mergeResult = {};     // runKey -> last merge attempt's outcome text
 let modalRequest = null;
 let modalQA = null;         // {id, rec, sel:Set, free:''} while the planner
                             // questionnaire modal is open
@@ -12656,6 +12813,7 @@ function closeDetail(force=false, keepStack=false){
     qDismissed.add(qSig(modalQA.id, modalQA.rec.pending_questions));
   detailIdx = null; detailKey = null; modalRequest = null; modalQA = null;
   runModalKey = null; summaryView = null; detailHTML = '';
+  modalRunKey = null;
   if (!keepStack){ modalHist.length = 0; modalScroll = null; }
   document.getElementById('backdrop').hidden = true;
   applySel();        // every row mark clears with the dialog it belongs to
@@ -13043,6 +13201,11 @@ function showDetail(i, keepStack){
     ['merged',a.merged===true?'yes'+(a.merged_at?' @ '+a.merged_at:'')
       :a.merged],
     ['merge target',a.merge_target],
+    ['merge',a.deferred
+      ? `deferred${a.merge_kind?` (${a.merge_kind})`:''} - held pending;` +
+        ` target ${a.target_branch||'?'}; verified: ${
+        a.deferred_verified==null?'-':(a.deferred_verified?'yes':'no')}`
+      : 'auto - merges after its step/wave'],
     ['prompt file',a.prompt],['stdout',a.stdout_log],['export',a.export],
     ['state file',a.state_md]];
   // A conductor-internal step (resolve-*) names its machine purpose - the
@@ -13332,6 +13495,8 @@ function showRunDetails(key, keepStack){
   const snap = keepStack ? null : snapshotModal();
   if (!closeDetail(false, !!(keepStack || snap))) return;
   if (snap && !(snap.kind==='run' && snap.key===key)) pushHist(snap);
+  else if (snap && modalScroll==null)
+    modalScroll = snap.scroll;  // same-view re-render keeps its offset
   runModalKey = key;
   const total = Object.values(r.counts||{}).reduce((s,n)=>s+n,0);
   const runUsd = (r.cost&&r.cost.usd!=null)||(r.plan_cost&&r.plan_cost.usd!=null)
@@ -13355,7 +13520,6 @@ function showRunDetails(key, keepStack){
       ||'-']];
   const ctl = runCtl(r);
   const canResume = ctl.canResume;
-  const pendingMerge = ctl.pendingMerge;
   const liveSteps = ctl.liveSteps;
   const interrupted = ctl.interrupted;
   const executing = ctl.executing;
@@ -13376,6 +13540,86 @@ function showRunDetails(key, keepStack){
         `${esc(t.status)}</span></td>` +
         `<td>${elapsed(t, Date.now())}</td></tr>`).join('') +
       `</table></div>` : '';
+  // Retained worktree work awaiting an explicit merge, straight from
+  // state.json: deferred groups (one per project repo - recorded target,
+  // baseline state, alternatives, per-entry verify) plus legacy
+  // auto-policy branches that never landed (conflict parked them, or the
+  // conductor died between the wave and the merge). Ticked entries
+  // survive the re-render via mergeSel[key]; the POST sends just them.
+  const sel = mergeSel[key] || (mergeSel[key] = new Set());
+  const vchip = e =>
+    ` <span class="chip" style="color:${
+      e.verify_ok==null?'#8b949e':(e.verify_ok?'#3fb950':'#f85149')}" ` +
+    `title="${e.verify_ok==null?'no verify gate was set':
+      (e.verify_ok?'verify gate passed':'verify gate FAILED')}">` +
+    `${e.verify_ok==null?'no verify':
+      (e.verify_ok?'verified':'verify FAILED')}</span>`;
+  const pmbox = (e, dis, altGrp, why) =>
+    `<label class="pmentry"><input type="checkbox" data-pm="` +
+    `${esc(e.step)}"` +
+    (altGrp!=null?` data-pm-alt="${altGrp}"`:'') +
+    `${sel.has(e.step)?' checked':''}${dis?' disabled':''}>` +
+    `<span><b>${esc(e.step)}</b>` +
+    ` <span class="chip" style="color:${COLORS[e.status]||'#8b949e'}">` +
+    `${esc(e.status)}</span>${vchip(e)}` +
+    (e.kind==='alternative'
+      ? ` <span class="chip" style="color:#d2a8ff" title="an ` +
+        `alternative implementation from a same-project wave - merge ` +
+        `alternatives one at a time (ticking one unticks the others); ` +
+        `they are never combined silently">alternative</span>` : '') +
+    `<br><span class="sub">${esc(e.branch||'')}` +
+    `${e.note?' · '+esc(e.note):''}${why?` · ${esc(why)}`:''}` +
+    `</span></span></label>`;
+  const pmGroups = (r.pending_merges||[]).map((g,gi)=>
+    `<div class="pmgrp"><div><b>${esc(g.slug)}</b> ` +
+    `<span class="sub">lands on</span> ` +
+    `<code>${esc(g.target||'?')}</code>` +
+    (g.busy ? ` <span class="stage live" title="another process holds ` +
+      `this repo's merge lock">repo busy - a merge is in flight</span>`
+      : '') +
+    ((g.resolving||[]).length ? ` <span class="stage live" ` +
+      `title="a resolve-* session is finishing the staged merge">` +
+      `resolving: ${esc(g.resolving.join(', '))}</span>` : '') + `</div>` +
+    `<div class="sub">integration branch ` +
+    `<code>${esc(g.baseline||'-')}</code>` +
+    (g.baseline_stuck
+      ? ` · <span style="color:#d29922">baseline diverged from the ` +
+        `target - the staged merge reconciles it at land time</span>`
+      : '') +
+    (g.stage_kept ? ` · a previous attempt's staging worktree is kept ` +
+      `at ${esc(g.stage_kept)} for inspection` : '') +
+    (g.moved_reason ? ` · last land attempt refused: ` +
+      `${esc(g.moved_reason)}` : '') + `</div>` +
+    g.entries.map(e => pmbox(e, !e.verified || !!e.live,
+      e.kind==='alternative' ? gi : null,
+      e.live ? 'step still live - unticks are harmless, the merge '
+        + 'is refused anyway' :
+        (!e.verified ? 'not verified - the merge never lands it '
+          + '(merge by hand if it is actually wanted)' : ''))).join('') +
+    `</div>`).join('');
+  const pmLegacy = (r.pending_branches||[]).length ? (() => {
+    const bySlug = {};
+    (r.pending_branches||[]).forEach(e =>
+      (bySlug[e.slug||'?'] ??= []).push(e));
+    return Object.entries(bySlug).map(([slug, es]) =>
+      `<div class="pmgrp"><div><b>${esc(slug)}</b> ` +
+      `<span class="sub">auto-merge branches that never landed ` +
+      `(parked by a conflict or an interrupted run - they merge into ` +
+      `the project checkout, no recorded target)</span></div>` +
+      es.map(e => pmbox(e, !!e.live, null,
+        e.live ? 'step still live' : '')).join('') + `</div>`).join('');
+  })() : '';
+  const pmCount = (r.pending_merges||[]).reduce(
+    (s,g)=>s+g.entries.length,0) + (r.pending_branches||[]).length;
+  const pmHtml = pmCount ? `<h3 style="margin-top:14px">Pending merges ` +
+    `(${pmCount})</h3>` +
+    `<div class="sub" style="margin-bottom:8px">retained worktree ` +
+    `branches waiting for an explicit merge - deferred work is staged, ` +
+    `re-verified and landed on its recorded target; unverified entries ` +
+    `are never auto-merged. Tick the work to land.</div>` +
+    (r.merge_busy ? `<div class="notice warn">A merge is in progress ` +
+      `for this run - new clicks are ignored.</div>`:'') +
+    pmGroups + pmLegacy : '';
   const notice = (r.aborted==='paused' && canResume)
     ? `<div class="notice warn">Paused - in-flight steps finished and ` +
       `nothing new launched. Resume continues where it left off ` +
@@ -13394,6 +13638,9 @@ function showRunDetails(key, keepStack){
       (k==='tokens'
         ? `<span title="${esc(TOK_HELP)}">${esc(v??'-')}</span>`
         : esc(v??'-')) + `</div>`).join('') + '</div>' +
+    (mergeResult[key]
+      ? `<div class="notice">${esc(mergeResult[key])}</div>` : '') +
+    pmHtml +
     `<div class="actions"><button type="button" class="btn secondary" ` +
     `data-filter-run="${esc(key)}">Show only this run</button>` +
     (r.stage ? '' : `<button type="button" class="btn secondary" ` +
@@ -13430,16 +13677,21 @@ function showRunDetails(key, keepStack){
         `data-stop-gen="${esc(r.request_id)}" ` +
         `title="cancel this planning pass - the request stays editable ` +
         `and any previous proposal is kept">Stop proposal</button>` : '') +
-    (pendingMerge ? `<button type="button" class="btn" ` +
+    (pmCount ? `<button type="button" id="pm-go" class="btn" ` +
       `data-merge-run="${esc(base(r.dir))}" ` +
-      `data-rk="${esc(key)}"${executing ? ' disabled' : ''} ` +
-      `title="${executing
-        ? 'unavailable while the run is still executing - it unlocks ' +
-          'once the run has actually stopped or finished (a stop ' +
-          'request needs a moment to land)'
-        : 'merge this run\u2019s parked or deferred worktree branches ' +
-          'into their project checkouts now'}">` +
-      `Merge pending branches</button>` : '') +
+      `data-rk="${esc(key)}"${(executing || r.merge_busy)
+        ? ' disabled' : ''} ` +
+      `title="${r.merge_busy
+        ? 'a merge is already running for this run'
+        : (executing
+          ? 'unavailable while the run is still executing - it unlocks ' +
+            'once the run has actually stopped or finished (a stop ' +
+            'request needs a moment to land)'
+          : 'land the ticked pending work onto its recorded targets - ' +
+            'verified entries are staged, re-verified and merged ' +
+            'atomically; anything unticked stays retained')}">` +
+      `Merge selected pending work</button>` +
+      `<span class="sub" id="pm-msg" style="margin-left:8px"></span>` : '') +
     (liveSteps.length ? `<button type="button" class="btn" ` +
       `data-pause-run="${esc(base(r.dir))}" ` +
       `title="let in-flight steps finish, then hold the run - nothing ` +
@@ -13471,6 +13723,7 @@ function showRunDetails(key, keepStack){
           'Trash; recoverable for 48h, Empty trash deletes it for good'}">` +
       `Delete run</button>`) +
     '</div>' + taskTbl;
+  modalRunKey = key;
   applyModalScroll();
   document.getElementById('backdrop').hidden = false;
   applySel();        // mark this run's row while its modal is open
@@ -13539,13 +13792,14 @@ function ctxRunItems(r){
         attrs:ctxAttrs({'resume-run':base(r.dir)}),
         title:'re-run every non-done step in a fresh session'});
     if (c.pendingMerge)
-      act.push({label:'Merge pending branches', dis:c.executing,
-        attrs:ctxAttrs({'merge-run':base(r.dir),'rk':key}),
+      act.push({label:'Merge pending branches\u2026',
+        attrs:ctxAttrs({'run-details':key}),
         title: c.executing
-          ? 'unavailable while the run is still executing - it unlocks ' +
-            'once the run has actually stopped or finished'
-          : 'merge this run\u2019s parked worktree branches into their ' +
-            'project checkouts'});
+          ? 'open the run details - the pending merges panel shows ' +
+            'progress while the run executes; merging unlocks once ' +
+            'it has actually stopped or finished'
+          : 'open the run details to tick and merge this run\u2019s ' +
+            'parked or deferred worktree branches'});
     if (act.length) it.push({sep:1}, ...act);
     it.push({sep:1});
     it.push({label:r.needs_review?'Mark as reviewed':'Mark as needing review',
@@ -13819,6 +14073,23 @@ function mpopPick(inp,idx){
     inp.dispatchEvent(new Event('input',{bubbles:true}));
   mpopClose(inp);
 }
+// Held merges imply worktree isolation - deferred work has to live on a
+// retained branch. Picking 'hold for review' checks + greys the
+// worktrees box; switching back restores whatever the box was before the
+// coupling forced it (a deliberate checked state is never undone).
+function syncMergeTiming(){
+  const m=document.getElementById('rq-merge'),
+        wt=document.getElementById('rq-worktrees');
+  if(!m||!wt) return;
+  if(m.value==='deferred'){
+    if(!wt.disabled && !wt.checked && wt.dataset) wt.dataset.forced='1';
+    wt.checked=true; wt.disabled=true;
+  } else {
+    wt.disabled=!!m.disabled;
+    if(wt.dataset && wt.dataset.forced){
+      wt.checked=false; delete wt.dataset.forced; }
+  }
+}
 function openNew(){
   if (!closeDetail()) return;
   const defaults=lastData?.defaults||{model:'swe-2',effort:'max'};
@@ -13910,6 +14181,14 @@ function showRequestForm(rec){
       `value="${esc(rec.merge_target||'')}"${disabled} ` +
       `placeholder="checkout branch">` +
     `<datalist id="rq-branches"></datalist></div></div>` +
+    `<div class="field-row"><div><label for="rq-merge">Merge timing</label>` +
+    `<select id="rq-merge"${disabled}>` +
+      `<option value="auto"${rec.merge==='deferred'?'':' selected'}>` +
+      `merge after each step - verified branches land back as the run ` +
+      `goes (default)</option>` +
+      `<option value="deferred"${rec.merge==='deferred'?' selected':''}>` +
+      `hold for review - keep work on pending branches; merge what you ` +
+      `pick from the run details at the end</option></select></div></div>` +
     `<div class="sub" id="rq-mt-hint">An existing local branch the ` +
       `worktree branches are created from and merged back into - empty ` +
       `means the project checkout's current branch. With a project ` +
@@ -13944,9 +14223,10 @@ function showRequestForm(rec){
     `<label class="check"><input type="checkbox" id="rq-worktrees"` +
       `${rec.worktrees?' checked':''}${disabled}><span>Run every step in ` +
       `its own git worktree (<code>worktree = true</code>): changes land ` +
-      `on a conductor/&lt;run&gt;/&lt;step&gt; branch and merge back ` +
-      `after each wave - required anyway for same-project parallel ` +
-      `steps</span></label>` +
+      `on a conductor/&lt;run&gt;/&lt;step&gt; branch - <i>Merge timing</i> ` +
+      `decides whether they merge back after each step or stay pending ` +
+      `for a manual merge. Required anyway for same-project parallel ` +
+      `steps, and implied by held merges</span></label>` +
     `<label class="check"><input type="checkbox" id="rq-merge_resolver"` +
       `${rec.merge_resolver?' checked':''}${disabled}><span>On a ` +
       `worktree merge conflict, spawn a resolve-* session to finish the ` +
@@ -13975,8 +14255,9 @@ function showRequestForm(rec){
       `<ol class="proposal-list">${steps.map(s=>`<li><b>${esc(s.step)}</b> ` +
         `<small>${esc(s.slug)} · ${esc(s.model||'-')} / ${esc(s.effort||'-')}` +
         `${s.wt?' · worktree':''}` +
-        `${s.mt?' · merge&rarr;'+esc(s.mt):''}</small>` +
-        `<br>${esc(s.task||'')}</li>`).join('')}</ol>`:'') +
+        `${s.mt?' · merge&rarr;'+esc(s.mt):''}` +
+        `${s.merge==='deferred'?' · merge held':''}` +
+        `</small><br>${esc(s.task||'')}</li>`).join('')}</ol>`:'') +
     (rec.manifest ? `<details class="proposal"><summary>Edit proposed TOML ` +
       `(steps, verify, model, effort and description)</summary>` +
       `<div class="notice">The TOML is the plan that will run. Changes to ` +
@@ -14025,6 +14306,7 @@ function showRequestForm(rec){
   applyModalScroll();
   document.getElementById('backdrop').hidden = false;
   renderAttach(editable);
+  syncMergeTiming();
   syncEffort(document.getElementById('rq-model'),'rq-effort','rq-efforts');
   syncEffort(document.getElementById('rq-plan_model'),
              'rq-plan_effort','rq-plan_efforts');
@@ -14051,12 +14333,13 @@ function showRequestForm(rec){
 // pre-baseline records, unexpressible for a mixed worktree state).
 const GEN_KEYS=['raw','project','attachments'];
 const OPT_KEYS=['model','effort','on_failure','max_attempts','worktrees',
-  'merge_resolver','followup','merge_target'];
+  'merge_resolver','merge','followup','merge_target'];
 const PEND_LABEL={raw:'request text',project:'target project',
   attachments:'image attachments',fields:'request fields',
   model:'step model',effort:'step effort',on_failure:'failure policy',
   max_attempts:'attempts/step',worktrees:'worktrees',
-  merge_resolver:'merge resolver',followup:'follow-up step',
+  merge_resolver:'merge resolver',merge:'merge timing',
+  followup:'follow-up step',
   merge_target:'merge target',manifest:'the proposal TOML'};
 const pendName=k=>PEND_LABEL[k]||k;
 function sameBase(k,v,b){
@@ -14088,8 +14371,11 @@ function pendingNow(){
   for (const k of OPT_KEYS){
     pend.opts.delete(k);
     // null = the TOML cannot express the form value (absent key or a
-    // mixed worktree set) - diverged whichever way the field sits
-    if (base[k]==null || !sameBase(k,f[k],base[k])) pend.opts.add(k);
+    // mixed worktree set) - diverged whichever way the field sits.
+    // merge is the exception: an absent key IS 'auto', so a pre-field
+    // baseline compares the form against the default, not 'diverged'.
+    const bv = k==='merge' && base[k]==null ? 'auto' : base[k];
+    if (bv==null || !sameBase(k,f[k],bv)) pend.opts.add(k);
   }
   return {gen:[...pend.gen],opts:[...pend.opts]};
 }
@@ -14357,8 +14643,9 @@ async function openRequest(id, keepStack){
 function requestFields(){
   const f=Object.fromEntries(
     ['raw','label','project','model','effort','on_failure',
-     'plan_model','plan_effort','merge_target'].map(k=>
+     'plan_model','plan_effort','merge','merge_target'].map(k=>
     [k,document.getElementById(`rq-${k}`).value]));
+  if (!f.merge) f.merge='auto';   // an unread select reads as the default
   for (const k of ['followup','worktrees','merge_resolver','summarize',
                    'ask']){
     const el=document.getElementById(`rq-${k}`);
@@ -15035,6 +15322,13 @@ function render(d){
              : a.merged===false
              ? ` <button type="button" class="chip" data-facet="unmerged" ` +
                `style="color:#f0883e">unmerged</button>`
+             : '') +
+            (a.deferred
+             ? ` <button type="button" class="chip" data-facet="deferred" ` +
+               `style="color:#d2a8ff" title="merge held - this branch ` +
+               `stays pending until an explicit merge from the run ` +
+               `details${a.merge_kind==='alternative'
+                 ? ' · alternative variant' : ''}">deferred</button>`
              : '')
           : ''}</td>` +
         // the run name applies the existing run filter (same path as the
@@ -15100,6 +15394,15 @@ function render(d){
       // would destroy it, so the refresh defers until it's released
       if (!modalSelActive()) showDetail(j, true);
     } else closeDetail(true);
+  }
+  // The open run-details modal re-renders on every payload change: the
+  // pending-merge panel must reflect a merge's progress (busy flag,
+  // landed entries dropping off, a kept stage appearing) without the
+  // user reopening it. Ticked boxes ride mergeSel across the rebuild.
+  if (modalRunKey!=null && !document.getElementById('backdrop').hidden){
+    if (d.runs.some(x=>runKey(x)===modalRunKey))
+      showRunDetails(modalRunKey);
+    else closeDetail(true);
   }
   const modalRun = modalRequest?.id && d.runs.find(r=>r.request_id===modalRequest.id);
   const modalStage = modalRun && (modalRun.stage||'launched');
@@ -15347,16 +15650,28 @@ document.addEventListener('click', async e=>{
       t.textContent='Resume unfinished steps'; }
     return; }
   if (t.dataset && t.dataset.mergeRun){
-    if(!confirm('Merge the pending worktree branches of this run into ' +
-                'their ' +
-                'main checkouts? Clean merges land and drop the worktree; ' +
-                'conflicts stay parked for manual resolution (or a ' +
-                'resolve-* session when merge_resolver is set).')) return;
     const rk = t.dataset.rk;
+    const steps=[...(document.querySelectorAll(
+      '#detail [data-pm]:checked')||[])].map(b=>b.dataset.pm);
+    const msg=document.getElementById('pm-msg');
+    if(!steps.length){
+      if (msg) msg.textContent='Tick at least one pending change above ' +
+        '(unverified entries can never be auto-merged).';
+      return; }
+    if(!confirm(`Merge the ${steps.length} ticked pending change(s) ` +
+                `(${steps.join(', ')}) into their recorded target ` +
+                `branches? Verified deferred work is staged, re-verified ` +
+                `and landed atomically; conflicts stay parked for manual ` +
+                `resolution (or a resolve-* session when merge_resolver ` +
+                `is set). Everything unticked stays retained - nothing ` +
+                `starts a new run.`)) return;
     t.disabled=true; t.textContent='Merging…';
+    if (msg) msg.textContent='staged merge running - a resolver session ' +
+      'can make this take minutes; the page keeps refreshing';
     try {
       const out=await api('POST',
-        `/api/runs/${encodeURIComponent(t.dataset.mergeRun)}/merge`,{});
+        `/api/runs/${encodeURIComponent(t.dataset.mergeRun)}/merge`,
+        {steps});
       const bits=[];
       if (out.merged?.length) bits.push(`merged: ${out.merged.join(', ')}`);
       if (out.conflicted?.length)
@@ -15372,11 +15687,16 @@ document.addEventListener('click', async e=>{
         bits.push(`repo busy with another merge: ${out.busy.join(', ')}`);
       if (out.kept?.length)
         bits.push(`prior merge attempt kept for inspection: ${out.kept.join(', ')}`);
+      if (rk){ mergeResult[rk]=bits.join(' | ')||'Nothing pending to merge.';
+        steps.forEach(s=>(mergeSel[rk]||new Set()).delete(s)); }
       await refresh();
-      if (rk) showRunDetails(rk);
-      alert(bits.length ? bits.join(' | ') : 'Nothing pending to merge.');
-    } catch(err){ alert('Merge failed: '+err.message); t.disabled=false;
-      t.textContent='Merge pending branches'; }
+      if (rk) showRunDetails(rk); else
+        alert(bits.length ? bits.join(' | ') : 'Nothing pending to merge.');
+    } catch(err){
+      if (rk){ mergeResult[rk]='Merge failed: '+err.message;
+        await refresh(); showRunDetails(rk); }
+      else alert('Merge failed: '+err.message);
+      t.disabled=false; t.textContent='Merge selected pending work'; }
     return; }
   if (t.dataset && (t.dataset.skipStep || t.dataset.unskipStep)){
     const un = !!t.dataset.unskipStep;
@@ -15791,6 +16111,7 @@ document.addEventListener('input', e=>{
     if (msg) msg.hidden=true;
     // syncEffort may rewrite the effort input when its model changed -
     // run it first so the pending diff sees the settled value
+    if (e.target.id==='rq-merge') syncMergeTiming();
     if (e.target.id==='rq-model' || e.target.id==='rq-plan_model'){
       syncEffort(e.target,
                  e.target.id==='rq-model'?'rq-effort':'rq-plan_effort',
@@ -15848,18 +16169,37 @@ document.addEventListener('paste', e=>{
     .map(i=>i.getAsFile()).filter(Boolean);
   if(files.length){ e.preventDefault(); attachFiles(files); }
 });
-// the paperclip's hidden file input shares the drop/paste upload path.
+// the paperclip's hidden file input shares the drop/paste upload path;
+// pending-merge checkboxes ride the same listener (one 'change'
+// registration keeps every delegate reachable - including under the
+// node test stubs, which keep only the last-registered handler).
 // A canceled dialog delivers no files and changes nothing; clearing the
 // value lets picking the same file twice still fire 'change'.
 document.addEventListener('change', e=>{
-  // either hidden picker - the request form's or the interrupt
-  // composer's - shares the drop/paste upload path
   const fi=e.target;
-  if(!fi || (fi!==document.getElementById('rq-file') &&
-             fi!==document.getElementById('d-instr-file'))) return;
-  const files=[...(fi.files||[])];
-  try{fi.value='';}catch(err){}
-  if(files.length) attachFiles(files);
+  if(fi && (fi===document.getElementById('rq-file') ||
+            fi===document.getElementById('d-instr-file'))){
+    const files=[...(fi.files||[])];
+    try{fi.value='';}catch(err){}
+    if(files.length) attachFiles(files);
+  }
+  // pending-merge ticks live in mergeSel (they survive the modal's
+  // per-refresh rebuild); alternatives are same-wave variants of the
+  // same task, so ticking one unticks its group's siblings - the merge
+  // must never silently combine them.
+  const t=e.target;
+  if (!(t.dataset && t.dataset.pm!==undefined) || modalRunKey==null) return;
+  const sel = mergeSel[modalRunKey] || (mergeSel[modalRunKey] = new Set());
+  if (t.checked){
+    sel.add(t.dataset.pm);
+    if (t.dataset.pmAlt!==undefined && t.dataset.pmAlt!=='')
+      document.querySelectorAll(
+        `#detail [data-pm-alt="${t.dataset.pmAlt}"]`).forEach(b=>{
+        if (b!==t){ b.checked=false; sel.delete(b.dataset.pm); }});
+    const msg=document.getElementById('pm-msg');
+    if (msg && t.dataset.pmAlt) msg.textContent='alternative picked - ' +
+      'its sibling variants stay retained; merge them one at a time.';
+  } else sel.delete(t.dataset.pm);
 });
 document.addEventListener('keydown', e=>{
   // the open row menu owns the keyboard: Esc dismisses (focus returns to
