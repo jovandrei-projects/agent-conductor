@@ -27,6 +27,29 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-17 (follow-up-plan, closing step of run
+  20261017-051357-dashboard-ask-ai): reviewed the run against the
+  request (ask-ai assistant). ALL NINE feature steps did real,
+  in-branch-verified work but recorded `failed` on ONE shared cause -
+  the post-step verify gate `python run_tests.py --jobs 8` hit the
+  hard-coded 600s cap every time (suite ~890s unsharded / ~330s worst
+  shard; the driving conductor predates `verify_timeout_min`, which
+  only reached master mid-run at 01d9ad7). Every branch parked via
+  step_merge_kept - nothing is on master. Workers chained branches
+  forward anyway, so tip e102e30 (integration-and-design-review) holds
+  the ENTIRE feature (+16.3k lines: assistant/ package,
+  assistant_host/ adapters, chat UI, guarded actions, usage/price,
+  ~200 new tests, 46 browser checks, 2 live exchanges ~$0.034);
+  e8c61bb (research docs) is the only tip not its ancestor. Drafted
+  manifests/dashboard-ask-ai-followup.toml (validated by `plan`):
+  land-parked-ask-ai (main-checkout merge + bookkeeping + green
+  suite), post-merge-assistant-verification (browser pass + live
+  vision-attachment + guarded-action round-trip on isolated data),
+  closing follow-up-plan. NOT launched - human review. Still honestly
+  unverified and left to the human: real mic transcription, OS-level
+  clipboard image paste (both need a headed browser + hardware). ACP
+  streaming stays upstream-blocked (devin 3000.6.2 session-db
+  migration) - informational only.
 - DONE 2026-10-17 (parallel-run-slot-pool + request-form defaults,
   user-requested batch): `[run] parallel = true` schedules all ordinary
   steps into one shared pool (follow-up-plan stays last; `wave=` rejected
