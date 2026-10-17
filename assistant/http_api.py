@@ -17,6 +17,8 @@ Route summary (all under /api/assistant/):
        citation sources (chips survive reload)
   GET  conversations/<id>/actions           - audit rows for the conv
   POST conversations/<id>/settings          - per-conv settings update
+  POST conversations/<id>/title             - rename {title}
+  POST conversations/<id>/delete            - drop the conv + its rows
   POST conversations/<cid>/actions/<aid>/confirm {approve}
   GET  last                                 - last-active conversation
   GET  exchanges/<xid>                      - poll state/text/usage
@@ -123,6 +125,14 @@ def _h_conv_settings(core, g, body, raw, q):
     return 200, core.update_settings(g[0], body or {})
 
 
+def _h_conv_title(core, g, body, raw, q):
+    return 200, core.rename_conversation(g[0], (body or {}).get("title"))
+
+
+def _h_conv_delete(core, g, body, raw, q):
+    return 200, core.delete_conversation(g[0])
+
+
 def _h_confirm(core, g, body, raw, q):
     appr = (body or {}).get("approve")
     if appr is not None and not isinstance(appr, bool):
@@ -193,6 +203,10 @@ ROUTES = [
      _h_conv_settings),
     ("PUT",    re.compile(rf"/api/assistant/conversations/{_ID}/settings\Z"),
      _h_conv_settings),
+    ("POST",   re.compile(rf"/api/assistant/conversations/{_ID}/title\Z"),
+     _h_conv_title),
+    ("POST",   re.compile(rf"/api/assistant/conversations/{_ID}/delete\Z"),
+     _h_conv_delete),
     ("POST",   re.compile(
         rf"/api/assistant/conversations/{_ID}/actions/{_ID}/confirm"),
      _h_confirm),

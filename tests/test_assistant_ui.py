@@ -1259,9 +1259,12 @@ setRoute((url,opt)=>{
   assert.match(uv,/calculated USD estimates/);
   assert.match(uv,/docs-test/);
   assert.match(uv,/not an invoice/);
-  // the collapsed chip keeps the compact grand total
+  // the collapsed chip keeps a compact grand total - token sum, with
+  // the in/out split preserved on the tooltip instead of the cramped
+  // 'in/out' pair that truncated to '22.0/...' in the 400px card
   const sum=nodes.get('ai-usage-sum').textContent;
-  assert.match(sum,/300\/60 tok \u00b7 ~\$0\.0010/);
+  assert.match(sum,/tok 360 \u00b7 ~\$0\.0010/);
+  assert.match(nodes.get('ai-usage-sum').title,/300 in \/ 60 out/);
 })().then(()=>process.exitCode=0).catch(e=>{console.error(e);
   process.exitCode=1;});
 ''',
@@ -1317,6 +1320,151 @@ setRoute((url,opt)=>{
     effort:'low',fast:true,readonly:true}};
   return{items:[]};
 });
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
+class ChatHistoryRailTests(unittest.TestCase):
+    """The history panel is a floating sibling docked to the chat's
+    LEFT edge - not a column inside the card - and its rows carry
+    rename/delete/size management."""
+
+    def test_rail_markup_is_a_sibling_not_a_column(self):
+        # the rail markup lives outside .ai-main entirely
+        main = CHAT_JS.split("'<div class=\"ai-main\">'", 1)[1]
+        main = main.split("'<div class=\"ai-compose\">'", 1)[0]
+        self.assertNotIn('ai-rail', main)
+        # and is emitted as a top-level sibling after the chat card
+        status = CHAT_JS.find('id="ai-status"')
+        rail = CHAT_JS.find('id="ai-rail"')
+        self.assertLess(status, rail)
+        css = (STATIC_DIR / "chat.css").read_text(encoding="utf-8")
+        # docked to the card's left edge via a fixed position calc
+        self.assertRegex(css, r'#ai-rail \{[^}]*position: fixed')
+        self.assertRegex(css, r'#ai-rail \{[^}]*right: calc\(18px')
+        self.assertIn('#ai-rail[hidden] { display: none; }', css)
+        # second header line carries the view chip + usage chip
+        self.assertIn('class="ai-sub"', CHAT_JS)
+        sub = CHAT_JS.split('class="ai-sub"', 1)[1]
+        self.assertIn('id="ai-ctx"', sub.split('</div>', 1)[0])
+        self.assertIn('id="ai-usage"', sub.split('</div>', 1)[0])
+
+    def test_settings_opens_instantly_and_caches_catalog(self):
+        """Opening settings must not await the /models subprocess call -
+        the dialog is visible synchronously and the last catalog is
+        reused from localStorage on later opens."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const w=nodes.get('aisetwrap');
+  // the dialog is visible BEFORE the /models fetch resolves
+  const clicked={target:{closest:s=>s==='#ai-name'
+    ?nodes.get('ai-name'):null}};
+  nodes.get('aichat')._h.click(clicked);
+  assert.equal(w.hidden,false,'dialog opens without awaiting fetch');
+  await flush();
+  // the fetched catalog was persisted for the next open
+  const cached=JSON.parse(store.getItem('ac-ai-catalog'));
+  assert(cached.data.models.length,'catalog cached to localStorage');
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js=r'''
+setRoute((url,opt)=>{
+  if(url.endsWith('/models'))return{models:[
+    {uid:'m1',family:'m1',label:'M1',in:0.1,out:0.5}]};
+  if(url.endsWith('/settings'))return{defaults:{}};
+  return{items:[]};
+});
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_rail_rows_size_rename_delete(self):
+        """Rows show a stored-size estimate and hover ops; rename swaps
+        the row for an input that commits via POST /title; delete is a
+        two-click arm (no modal in the harness) that POSTs /delete and
+        resets the open chat when the current conv is removed."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const S=window.AskAI._s;
+  S.rail=true;
+  S.conv={id:'conv-1',readonly:1};
+  S.convList=[{id:'conv-1',title:'chat one',last_active_at:'2026-01-01',
+    model:'m',size_bytes:2048},
+    {id:'conv-2',title:'chat two',last_active_at:'2026-01-02',
+     model:'m',size_bytes:512}];
+  window.AskAI._paint();
+  const html=window.AskAI._railHtml();
+  assert(html.includes('data-ai-ren="conv-1"'),'rename op rendered');
+  assert(html.includes('data-ai-del="conv-2"'),'delete op rendered');
+  assert.match(html,/2 KB/,'size estimate shown');
+  assert.match(html,/KB/,'KB unit present');
+  // rename: clicking the pen swaps the row to an input
+  nodes.get('ai-rail')._h.click({target:{closest:s=>
+    s==='[data-ai-ren]'?{getAttribute:()=>'conv-2'}:null}});
+  await flush();
+  assert.equal(S.renaming,'conv-2');
+  assert(window.AskAI._railHtml().includes('data-ai-renin="conv-2"'));
+  // Enter commits -> POST /title, list + current title update
+  nodes.get('ai-rail')._h.keydown({key:'Enter',
+    preventDefault(){},
+    target:{closest:s=>s==='[data-ai-renin]'?{
+      getAttribute:()=>'conv-2',value:'new name'}:null}});
+  await flush();
+  const ren=fetches.find(f=>f.url.endsWith('/title'));
+  assert(ren,'POST /title fired');
+  assert.equal(JSON.parse(ren.opt.body).title,'new name');
+  assert.equal(S.convList[1].title,'new name');
+  assert.equal(S.renaming,null);
+  // delete: first click arms, second click posts /delete
+  await window.AskAI._delConv('conv-1');
+  assert(!fetches.some(f=>f.url.endsWith('/delete')),
+    'first click only arms');
+  await window.AskAI._delConv('conv-1');
+  const del=fetches.find(f=>f.url.endsWith('/delete'));
+  assert(del,'second click POSTs /delete');
+  assert.equal(S.convList.length,1,'row removed from the list');
+  assert.equal(S.conv,null,'the open chat was the deleted one - reset');
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js=r'''
+setRoute((url,opt)=>{
+  if(url.endsWith('/title'))return{id:'conv-2',title:'new name'};
+  if(url.endsWith('/delete'))return{deleted:'conv-1'};
+  return{items:[]};
+});
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_thinking_is_boxless_and_expandable(self):
+        """An in-flight reply renders as a bare gray 'thinking' line
+        (no bubble) with the honest recorded breadcrumb expandable."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const S=window.AskAI._s;
+  S.conv={id:'conv-1',readonly:1};
+  S.msgs=[{id:'am1',role:'assistant',text:'',status:'pending',
+    attachments:'[]'}];
+  S.exchByAid={am1:{id:'x1',status:'running',text:'',
+    requests:[{n:1,kind:'fresh'},{n:2,kind:'tool'}],
+    sources:[{kind:'run',key:'r1|s1',label:'run alpha'}]}};
+  const html=window.AskAI._msgHtml(S.msgs[0]);
+  assert.match(html,/aim-body think/,'boxless class applied');
+  assert.match(html,/ai-dots">thinking<i>\.<\/i>/,'animated dots');
+  assert.match(html,/ai-trace/,'trace details rendered');
+  assert.match(html,/looking at run alpha/,'last source summarized');
+  assert.match(html,/request 2 \u00b7 tool/,'hop listed on expand');
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
 ''')
         self.assertEqual(p.returncode, 0, p.stderr)
 

@@ -137,6 +137,8 @@ var S = {
   ctxEnv: null,                // last computed next-question envelope
   attach: [],                  // pending uploads for the CURRENT conv
   pendAtt: {},                 // conv id -> stashed pending uploads
+  renaming: null,              // conv id whose rail row is an <input>
+  delArm: {},                  // conv id -> delete confirm-armed (fallback)
   dict: null                   // live dictation {rec,base,final} or null
 };
 
@@ -324,9 +326,15 @@ function msgHtml(m) {
         ' loading="lazy"></a>';
     }).join('') + '</div>';
   }
+  /* the in-flight reply renders as a bare gray "thinking" line, no
+     bubble chrome - the .think class strips the box on the body cell */
+  var thinking = m.role !== 'user' &&
+    !((xa && xa.text) || m.text) &&
+    ((xa && (xa.status === 'queued' || xa.status === 'running')) ||
+     (!xa && m.status === 'pending'));
   h += '<div class="aim ' + role + '" data-mid="' + esc(m.id) + '">' +
     '<div class="aim-meta">' + meta + '</div>' +
-    '<div class="aim-body">' +
+    '<div class="aim-body' + (thinking ? ' think' : '') + '">' +
     (m.role === 'user'
       ? (m.text ? '<p>' + esc(m.text).replace(/\n/g, '<br>') + '</p>'
                 : '') + attHtml
@@ -612,14 +620,47 @@ function actHtml(ac) {
   return h;
 }
 
+function traceHtml(xa) {
+  /* the honest mid-flight breadcrumb: what the exchange has already
+     fetched (recorded sources) and which provider hops it took - never
+     invented narration. Collapsed by default like the model-picker's
+     compact trace in other assistants, expandable on click */
+  if (!xa) return '';
+  /* rows that came straight from a POST response still carry JSON
+     strings - only exchange_view thaws them */
+  var reqs = Array.isArray(xa.requests) ? xa.requests
+    : (thaw(xa.requests) || []);
+  var srcs = Array.isArray(xa.sources) ? xa.sources
+    : (thaw(xa.sources) || []);
+  if (!reqs.length && !srcs.length) return '';
+  var last = srcs.length
+    ? 'looking at ' + esc((srcs[srcs.length - 1].label ||
+        srcs[srcs.length - 1].key || 'a source'))
+    : 'request ' + (reqs[reqs.length - 1].n || reqs.length) + ' of ' +
+      'the exchange';
+  var det = '';
+  reqs.forEach(function (r) {
+    det += '<div class="ai-trace-l">request ' + esc(String(r.n || '?')) +
+      ' \u00b7 ' + esc(r.kind || 'call') + '</div>';
+  });
+  srcs.forEach(function (s, i) {
+    det += '<div class="ai-trace-l">read ' + esc(srcLabel(s, i)
+      .replace(/^\[\d+\] /, '')) + '</div>';
+  });
+  return '<details class="ai-trace"><summary>' + last + '</summary>' +
+    '<div class="ai-trace-d">' + det + '</div></details>';
+}
+
 function renderReply(m, xa) {
   /* exchange_view text carries the newest reply text even mid-run;
      messages row text only lands at completion */
   var text = (xa && xa.text) || m.text || '';
   if (!text && xa && (xa.status === 'queued' || xa.status === 'running'))
-    return '<span class="ai-dots">thinking</span>';
+    return '<span class="ai-dots">thinking' +
+      '<i>.</i><i>.</i><i>.</i></span>' + traceHtml(xa);
   if (!text && m.status === 'pending')
-    return '<span class="ai-dots">thinking</span>';
+    return '<span class="ai-dots">thinking' +
+      '<i>.</i><i>.</i><i>.</i></span>' + traceHtml(xa);
   if (!text && m.status === 'error')
     return '<p><em>the reply failed' +
       (xa && xa.error ? ': ' + esc(xa.error) : '') + '</em></p>';
@@ -628,6 +669,15 @@ function renderReply(m, xa) {
   if (xa && (xa.status === 'running' || xa.status === 'queued'))
     html += '<span class="ai-caret">\u258d</span>';
   return html || '<p><em>(no text)</em></p>';
+}
+
+function fmtKb(b) {
+  /* the stored-bytes estimate the list endpoint ships - '~' is honest:
+     it counts characters + attachment bytes, not sqlite pages */
+  if (b == null) return '';
+  b = +b;
+  return '~' + (b < 1024 ? Math.max(1, Math.ceil(b / 1024 * 10) / 10)
+                        : Math.round(b / 1024)) + ' KB';
 }
 
 function railHtml() {
@@ -639,11 +689,29 @@ function railHtml() {
   else h = list.map(function (c) {
     var on = convId() === c.id ? ' on' : '';
     var t = c.title || '(untitled chat)';
-    return '<button type="button" class="ai-conv' + on +
-      '" data-ai-conv="' + esc(c.id) + '" title="' + esc(t) + '">' +
+    if (S.renaming === c.id)
+      return '<div class="ai-conv-row' + on + '">' +
+        '<input type="text" class="ai-ren-in" data-ai-renin="' +
+        esc(c.id) + '" value="' +
+        esc(t === '(untitled chat)' ? '' : t) + '" maxlength="120" ' +
+        'aria-label="Rename this chat" placeholder="chat title">' +
+        '</div>';
+    var sub = esc(timeShort(c.last_active_at)) +
+      (c.model ? ' \u00b7 ' + esc(c.model) : '') +
+      (c.size_bytes != null ? ' \u00b7 ' + fmtKb(c.size_bytes) : '');
+    return '<div class="ai-conv-row' + on + '">' +
+      '<button type="button" class="ai-conv" data-ai-conv="' +
+      esc(c.id) + '" title="' + esc(t) + '">' +
       '<span class="t">' + esc(t) + '</span>' +
-      '<span class="s">' + esc(timeShort(c.last_active_at)) +
-      (c.model ? ' \u00b7 ' + esc(c.model) : '') + '</span></button>';
+      '<span class="s">' + sub + '</span></button>' +
+      '<span class="ai-cvops">' +
+      '<button type="button" class="ai-cvop" data-ai-ren="' +
+      esc(c.id) + '" title="Rename chat" ' +
+      'aria-label="Rename ' + esc(t) + '">&#9998;</button>' +
+      '<button type="button" class="ai-cvop del" data-ai-del="' +
+      esc(c.id) + '" title="Delete chat" ' +
+      'aria-label="Delete ' + esc(t) + '">&times;</button>' +
+      '</span></div>';
   }).join('');
   return h;
 }
@@ -678,10 +746,11 @@ function paint() {
     var sum = byId('ai-usage-sum');
     if (sum) {
       sum.textContent = tot.exchanges
-        ? fmtTok(tot.prompt_t) + '/' + fmtTok(tot.completion_t) +
-          ' tok' + (tot.usd != null ? ' \u00b7 ~' + fmtUsd(tot.usd) : '')
+        ? 'tok ' + fmtTok((tot.prompt_t || 0) + (tot.completion_t || 0))
+          + (tot.usd != null ? ' \u00b7 ~' + fmtUsd(tot.usd) : '')
         : '';
-      sum.title = 'conversation usage: prompt/completion tokens' +
+      sum.title = 'conversation usage: ' + fmtTok(tot.prompt_t) +
+        ' in / ' + fmtTok(tot.completion_t) + ' out' +
         (tot.unpriced
           ? ' - ' + tot.unpriced + ' exchange(s) unpriced' : '');
     }
@@ -700,7 +769,11 @@ function paint() {
   }
   var rail = byId('ai-rail');
   if (rail) {
-    rail.hidden = !S.rail;
+    /* the panel floats left of the card: it must also hide when the
+       chat itself is minimized, and its own geometry tracks the card's
+       (compact vs expanded) via the 'exp' class */
+    rail.hidden = !S.rail || S.mode === 'closed';
+    rail.className = 'ai-rail' + (S.mode === 'expanded' ? ' exp' : '');
     var cl = byId('ai-convs');
     if (cl && S.rail) cl.innerHTML = railHtml();
   }
@@ -814,6 +887,74 @@ async function loadConvs() {
     S.convList = out.items || [];
   } catch (e) { S.convList = S.convList || []; }
   if (S.rail) paint();
+}
+
+function startRename(id) {
+  S.renaming = id;
+  paint();
+  var inp = document.querySelector &&
+    document.querySelector('[data-ai-renin="' + id + '"]');
+  if (inp && inp.focus) { inp.focus(); if (inp.select) inp.select(); }
+}
+
+async function renameConv(id, title) {
+  S.renaming = null;
+  try {
+    var out = await aapi('POST',
+      '/conversations/' + encodeURIComponent(id) + '/title',
+      { title: title });
+    var rec = out.conversation || out;
+    if (S.convList)
+      S.convList.forEach(function (c) {
+        if (c.id === id) c.title = rec.title || '';
+      });
+    if (S.conv && S.conv.id === id) S.conv.title = rec.title || '';
+  } catch (e) {
+    note('Rename failed: ' + (e.message || e));
+  }
+  paint();
+}
+
+async function delConv(id) {
+  var c = (S.convList || []).filter(function (r) {
+    return r.id === id; })[0] || {};
+  var label = c.title || '(untitled chat)';
+  /* real confirmation first (the dashboard's modal); where it does not
+     exist fall back to a two-click arm on the same button */
+  var ok = false;
+  if (typeof askConfirm === 'function') {
+    ok = await askConfirm('Delete "' + label + '" - its messages and ' +
+      'uploads are removed permanently.' + (c.size_bytes != null
+        ? ' (' + fmtKb(c.size_bytes) + ' stored)' : ''),
+      { danger: true, confirmText: 'Delete' });
+  } else if (S.delArm[id]) {
+    ok = true;
+  } else {
+    S.delArm[id] = true;
+    note('Click the \u00d7 on "' + label + '" again to delete it.',
+         false);
+    paint();
+    return;
+  }
+  delete S.delArm[id];
+  try {
+    await aapi('POST',
+      '/conversations/' + encodeURIComponent(id) + '/delete', {});
+  } catch (e) {
+    note('Delete failed: ' + (e.message || e));
+    return;
+  }
+  if (S.convList)
+    S.convList = S.convList.filter(function (r) { return r.id !== id; });
+  if (convId() === id) {               // the open chat is gone - reset
+    S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
+    S.usage = null; S.actions = {}; S.armed = {}; S.pollXid = null;
+    S.convRef = uid('conv');
+    store('ac-ai-conv', '');
+    var ta = byId('ai-text');
+    if (ta) ta.value = store(draftKey()) || '';
+  }
+  paint();
 }
 
 async function refreshExch() {
@@ -1501,24 +1642,38 @@ function settingsNotes() {
 function openSettings() {
   var w = byId('aisetwrap');
   if (!w) return;
+  /* open FIRST, fetch SECOND: /models can take seconds cold (a `devin
+     models list` subprocess server-side, cached ~10min there) - the old
+     version hid that lag behind a dead-looking click. The last catalog
+     is kept in localStorage so even a first-open-after-reload paints
+     real selects immediately and revalidates in the background */
+  w.hidden = false;
+  if (!S.catalog) {
+    try {
+      var cc = JSON.parse(store('ac-ai-catalog') || 'null');
+      if (cc && cc.data && cc.data.models) S.catalog = cc.data;
+    } catch (e) { /* corrupt cache - the network copy replaces it */ }
+  }
+  settingsForm();
+  var sel = byId('ais-model');
+  if (sel && sel.focus) sel.focus();
   var need = [];
-  if (!S.catalog) need.push(aapi('GET', '/models').then(function (o) {
+  need.push(aapi('GET', '/models').then(function (o) {
     S.catalog = o;
+    try { store('ac-ai-catalog', JSON.stringify({ data: o })); }
+    catch (e) {}
+  }).catch(function (e) {
+    if (!S.catalog || !S.catalog.models || !S.catalog.models.length) {
+      var m = byId('ais-msg');
+      if (m) { m.hidden = false; m.textContent =
+        'Could not load the model catalog: ' + (e.message || e); }
+    }
   }));
   if (!S.defaults) need.push(aapi('GET', '/settings').then(function (o) {
     S.defaults = (o && o.defaults) || {};
-  }));
-  Promise.all(need).catch(function (e) {
-    var m = byId('ais-msg');
-    if (m) { m.hidden = false; m.textContent =
-      'Could not load the model catalog: ' + (e.message || e); }
-    S.catalog = S.catalog || { models: [] };
-    S.defaults = S.defaults || {};
-  }).then(function () {
-    w.hidden = false;
-    settingsForm();
-    var sel = byId('ais-model');
-    if (sel && sel.focus) sel.focus();
+  }).catch(function () { S.defaults = S.defaults || {}; }));
+  Promise.all(need).then(function () {
+    if (!w.hidden) settingsForm();   // refresh the selects if still open
   });
 }
 
@@ -1673,6 +1828,7 @@ function openConv(id) {
   stashAttach();
   S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
   S.usage = null; S.actions = {}; S.armed = {};
+  S.renaming = null;
   S.pollXid = null;                    // orphan the old conv's poller
   paint();
   loadConv(id).catch(function (e) {
@@ -1687,6 +1843,7 @@ function newConv() {
   stashAttach();
   S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
   S.usage = null; S.actions = {}; S.armed = {};
+  S.renaming = null;
   S.pollXid = null;                    // the previous conv's poller dies
   S.convRef = uid('conv');           // fresh create, fresh dedupe ref
   store('ac-ai-conv', '');
@@ -1709,15 +1866,7 @@ function injectDom() {
       '<button type="button" id="ai-name" class="ai-name"></button>' +
       '<button type="button" id="ai-state" class="ai-pill ro">' +
         'read-only</button>' +
-      '<span id="ai-ctx" class="ai-ctx">about: dashboard</span>' +
       '<span class="ai-flex"></span>' +
-      '<details id="ai-usage" class="ai-usage">' +
-        '<summary id="ai-usage-sum" ' +
-          'title="conversation usage - expand for the breakdown">' +
-        '</summary>' +
-        '<div id="ai-useview" class="ai-useview" role="region" ' +
-          'aria-label="Conversation usage breakdown"></div>' +
-      '</details>' +
       '<button type="button" id="ai-hist" class="ai-hbtn" ' +
         'aria-label="Conversation history" ' +
         'title="Conversation history">&#9776;</button>' +
@@ -1728,16 +1877,24 @@ function injectDom() {
         'aria-label="Minimize chat" title="Minimize - the conversation ' +
         'keeps running">\u2014</button>' +
     '</div>' +
+    /* second header line: the view chip + usage chip could never share
+       the 400px title row without ellipsizing one of them into
+       uselessness - they get their own strip */
+    '<div class="ai-sub">' +
+      '<span id="ai-ctx" class="ai-ctx">about: dashboard</span>' +
+      '<span class="ai-flex"></span>' +
+      '<details id="ai-usage" class="ai-usage">' +
+        '<summary id="ai-usage-sum" ' +
+          'title="conversation usage - expand for the breakdown">' +
+        '</summary>' +
+        '<div id="ai-useview" class="ai-useview" role="region" ' +
+          'aria-label="Conversation usage breakdown"></div>' +
+      '</details>' +
+    '</div>' +
     '<div id="ai-note" class="ai-note" role="alert" hidden></div>' +
     '<div class="ai-main">' +
       '<div id="ai-list" class="ai-list" tabindex="0" ' +
         'aria-label="Conversation"></div>' +
-      '<div id="ai-rail" class="ai-rail" hidden ' +
-        'aria-label="Conversation history">' +
-        '<div class="ai-rail-h"><button type="button" id="ai-new">' +
-          '+ New chat</button></div>' +
-        '<div id="ai-convs" class="ai-convs"></div>' +
-      '</div>' +
     '</div>' +
     '<div class="ai-compose">' +
       '<div class="ai-cwrap">' +
@@ -1776,6 +1933,15 @@ function injectDom() {
     '</div>' +
     '<div id="ai-status" class="ai-sr" aria-live="polite"></div>' +
     '</div>' +
+    /* history panel: a SEPARATE surface docked to the chat's left, not
+       a column inside it - the 400px card keeps its full width for the
+       conversation while the list floats beside it */
+    '<div id="ai-rail" class="ai-rail" hidden ' +
+      'aria-label="Conversation history">' +
+      '<div class="ai-rail-h"><button type="button" id="ai-new">' +
+        '+ New chat</button></div>' +
+      '<div id="ai-convs" class="ai-convs"></div>' +
+    '</div>' +
     '<div id="aisetwrap" hidden>' +
     '<div id="aiset" role="dialog" aria-modal="true" ' +
       'aria-labelledby="aiset-t">' +
@@ -1804,6 +1970,48 @@ function injectDom() {
     '</div></div>');
 }
 
+/* the chat card and the history rail are sibling surfaces - one
+   delegated click handler serves both */
+function chatClick(e) {
+  var t = e.target && e.target.closest ? e.target : e.target;
+  if (!t || !t.closest) return;
+  var el;
+  if ((el = t.closest('#ai-send'))) { send(); return; }
+  if ((el = t.closest('#ai-stop'))) { stopReply(); return; }
+  if ((el = t.closest('#ai-attach'))) {
+    var fi = byId('ai-file');
+    if (fi && fi.click) fi.click();
+    return;
+  }
+  if ((el = t.closest('#ai-mic'))) { startDict(); return; }
+  if ((el = t.closest('[data-ai-atrm]'))) {
+    removeAtt(+el.getAttribute('data-ai-atrm')); return; }
+  if ((el = t.closest('#ai-min'))) { minimize(); return; }
+  if ((el = t.closest('#ai-size'))) {
+    setExpanded(S.mode !== 'expanded'); return; }
+  if ((el = t.closest('#ai-hist'))) {
+    S.rail = !S.rail; if (S.rail) loadConvs(); paint(); return; }
+  if ((el = t.closest('#ai-name'))) { openSettings(); return; }
+  if ((el = t.closest('#ai-state'))) { openSettings(); return; }
+  if ((el = t.closest('#ai-new'))) { newConv(); return; }
+  if ((el = t.closest('[data-ai-ren]'))) {
+    startRename(el.getAttribute('data-ai-ren')); return; }
+  if ((el = t.closest('[data-ai-del]'))) {
+    delConv(el.getAttribute('data-ai-del')); return; }
+  if ((el = t.closest('[data-ai-set]'))) { openSettings(); return; }
+  if ((el = t.closest('[data-ai-note-x]'))) { note(''); return; }
+  if ((el = t.closest('[data-ai-nav]'))) {
+    if (e.preventDefault) e.preventDefault();  // in-text nav links carry '#'
+    navSrc(el.getAttribute('data-ai-nav'),
+           el.getAttribute('data-ai-key')); return; }
+  if ((el = t.closest('[data-ai-conv]'))) {
+    openConv(el.getAttribute('data-ai-conv')); return; }
+  if ((el = t.closest('[data-ai-act]'))) {
+    var ap = String(el.getAttribute('data-ai-act')).split(':');
+    if (ap.length === 2 && !el.disabled) actDecide(ap[0], ap[1]);
+    return; }
+}
+
 function bind() {
   /* launchers live outside #aichat (page FAB + the modal shell's #dask);
      one delegated document listener covers both plus anything the host
@@ -1819,44 +2027,42 @@ function bind() {
     var ud = byId('ai-usage');
     if (ud && ud.open && !(t && t.closest && t.closest('#ai-usage')))
       ud.open = false;
+    /* the floating history panel dismisses the same way - but not when
+       the click is its own header toggle or inside the panel */
+    if (S.rail && t && t.closest &&
+        !t.closest('#ai-rail') && !t.closest('#ai-hist')) {
+      S.rail = false; paint();
+    }
   });
+  var rail = byId('ai-rail');
+  if (rail) {
+    rail.addEventListener('click', chatClick);
+    /* rename <input>: Enter commits, Escape cancels without letting the
+       chat-level Escape handler minimize; leaving the field commits */
+    rail.addEventListener('keydown', function (e) {
+      var inp = e.target && e.target.closest &&
+        e.target.closest('[data-ai-renin]');
+      if (!inp) return;
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        renameConv(inp.getAttribute('data-ai-renin'),
+                   inp.value || '');
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        if (e.stopPropagation) e.stopPropagation();
+        S.renaming = null; paint();
+      }
+    });
+    rail.addEventListener('focusout', function (e) {
+      var inp = e.target && e.target.closest &&
+        e.target.closest('[data-ai-renin]');
+      if (inp && S.renaming === inp.getAttribute('data-ai-renin'))
+        renameConv(inp.getAttribute('data-ai-renin'), inp.value || '');
+    });
+  }
   var chat = byId('aichat');
   if (chat) {
-    chat.addEventListener('click', function (e) {
-      var t = e.target && e.target.closest ? e.target : e.target;
-      if (!t || !t.closest) return;
-      var el;
-      if ((el = t.closest('#ai-send'))) { send(); return; }
-      if ((el = t.closest('#ai-stop'))) { stopReply(); return; }
-      if ((el = t.closest('#ai-attach'))) {
-        var fi = byId('ai-file');
-        if (fi && fi.click) fi.click();
-        return;
-      }
-      if ((el = t.closest('#ai-mic'))) { startDict(); return; }
-      if ((el = t.closest('[data-ai-atrm]'))) {
-        removeAtt(+el.getAttribute('data-ai-atrm')); return; }
-      if ((el = t.closest('#ai-min'))) { minimize(); return; }
-      if ((el = t.closest('#ai-size'))) {
-        setExpanded(S.mode !== 'expanded'); return; }
-      if ((el = t.closest('#ai-hist'))) {
-        S.rail = !S.rail; if (S.rail) loadConvs(); paint(); return; }
-      if ((el = t.closest('#ai-name'))) { openSettings(); return; }
-      if ((el = t.closest('#ai-state'))) { openSettings(); return; }
-      if ((el = t.closest('#ai-new'))) { newConv(); return; }
-      if ((el = t.closest('[data-ai-set]'))) { openSettings(); return; }
-      if ((el = t.closest('[data-ai-note-x]'))) { note(''); return; }
-      if ((el = t.closest('[data-ai-nav]'))) {
-        if (e.preventDefault) e.preventDefault();  // in-text nav links carry '#'
-        navSrc(el.getAttribute('data-ai-nav'),
-               el.getAttribute('data-ai-key')); return; }
-      if ((el = t.closest('[data-ai-conv]'))) {
-        openConv(el.getAttribute('data-ai-conv')); return; }
-      if ((el = t.closest('[data-ai-act]'))) {
-        var ap = String(el.getAttribute('data-ai-act')).split(':');
-        if (ap.length === 2 && !el.disabled) actDecide(ap[0], ap[1]);
-        return; }
-    });
+    chat.addEventListener('click', chatClick);
     /* Escape minimizes chat (never the modal behind it); Left/Right are
        swallowed so a focused chat control cannot drive modal sibling
        nav underneath */
@@ -2015,7 +2221,8 @@ var AskAI = {
   _s: S, _paint: paint, _aapi: aapi, _paintAtt: paintAtt,
   _attachFiles: attachFiles, _dictUI: dictUI,
   _msgHtml: msgHtml, _settingsForm: settingsForm,
-  _actHtml: actHtml, _actDecide: actDecide
+  _actHtml: actHtml, _actDecide: actDecide,
+  _railHtml: railHtml, _delConv: delConv, _renameConv: renameConv
 };
 if (typeof window !== 'undefined') {
   window.AskAI = AskAI;
