@@ -13038,6 +13038,9 @@ _DASH_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>agent-conductor</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2313161f'/%3E%3Cline x1='13' y1='19' x2='49' y2='7' stroke='%23e6edf3' stroke-width='2.6' stroke-linecap='round'/%3E%3Ccircle cx='13' cy='19' r='3' fill='%23e6edf3'/%3E%3Ccircle cx='12' cy='37' r='3' fill='%2358a6ff'/%3E%3Crect x='8.5' y='41' width='7' height='11' rx='2' fill='%2358a6ff'/%3E%3Ccircle cx='23.5' cy='31' r='3' fill='%23bc8cff'/%3E%3Crect x='20' y='35' width='7' height='17' rx='2' fill='%23bc8cff'/%3E%3Ccircle cx='35' cy='26' r='3' fill='%23d29922'/%3E%3Crect x='31.5' y='30' width='7' height='22' rx='2' fill='%23d29922'/%3E%3Ccircle cx='46.5' cy='34' r='3' fill='%233fb950'/%3E%3Crect x='43' y='38' width='7' height='14' rx='2' fill='%233fb950'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/api/assistant/static/chat.css">
+<script src="/api/assistant/static/md.js"></script>
+<script src="/api/assistant/static/chat.js" defer></script>
 <style>
 :root { color-scheme: dark; }
 body { background:#0d1117; color:#e6edf3; font:14px/1.45 ui-monospace,Consolas,monospace; margin:0; padding:16px; }
@@ -13186,7 +13189,7 @@ a { color:#58a6ff; text-decoration:none; }
 /* margin-bottom buys real clearance: a sticky first-child with the
    -18px top pull leaves the next line tucked ~6px under the bar's
    bottom edge in Chrome, so the nominal gap must exceed that drift */
-#detail .dnav { position:sticky; top:0; z-index:6; display:flex; align-items:center; gap:10px; margin:-18px -22px 26px; padding:7px 56px 7px 22px; background:#161b22; border-bottom:1px solid #30363d; border-radius:9px 9px 0 0; }
+#detail .dnav { position:sticky; top:0; z-index:6; display:flex; align-items:center; gap:10px; margin:-18px -22px 26px; padding:7px 140px 7px 22px; background:#161b22; border-bottom:1px solid #30363d; border-radius:9px 9px 0 0; }
 #detail .dnav-btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; min-width:38px; max-width:40%; background:#21262d; border:1px solid #30363d; color:#e6edf3; border-radius:6px; padding:4px 10px; font:inherit; font-size:12px; cursor:pointer; }
 #detail .dnav-btn.nav { min-width:130px; }
 #detail .dnav-btn span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -13497,7 +13500,7 @@ tr.ctxanchor td { background:#1c3041; }
 <div id="trashwrap" hidden></div>
 <h2>agents by project</h2><div id="agents"></div>
 <div id="ctxmenu" role="menu" aria-label="row actions" hidden></div>
-<div id="backdrop" hidden><div id="detail" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button type="button" class="x" id="dx">Close ×</button><div id="dbody"></div></div></div>
+<div id="backdrop" hidden><div id="detail" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button type="button" class="x" id="dx">Close ×</button><button type="button" id="dask" data-ask-ai hidden aria-label="Ask AI about this view" title="Ask AI about this view"><span class="ai-spark" aria-hidden="true">&#x2726;</span>Ask AI</button><div id="dbody"></div></div></div>
 <div id="askwrap" hidden><div id="askbox" role="alertdialog" aria-modal="true"><div id="asktitle"></div><div id="askmsg"></div><div id="askbtns" class="actions"></div></div></div>
 <div id="powerwrap" hidden><div id="powerbox" role="dialog" aria-modal="true"><h3>Dashboard power</h3><div id="pwbody"></div><div class="actions"><button type="button" class="btn secondary" id="pw-cancel">Cancel</button><button type="button" class="btn danger" id="pw-stop">Stop</button><button type="button" class="btn" id="pw-restart">Restart</button></div><div class="sub" id="pwstat"></div></div></div>
 <script>
@@ -18433,7 +18436,37 @@ function applySel(){
         want.has((agen?'a:':'r:') + k));
       x.classList.toggle('dlinked', !agen && link.has('r:'+k));
     });
+  // the assistant's "next question" view chip follows modal navigation;
+  // applySel fires on every open/close/re-render so the chip never polls
+  if (globalThis.aiSync){ try{ globalThis.aiSync(); }catch(e){} }
 }
+// --- assistant surface bridge ----------------------------------------
+// The chat client (assistant/static/chat.js) reads which view is on
+// screen through aiView() - the let-globals above are not reachable from
+// outside this script, so this is the one sanctioned channel (globalThis
+// instead of window keeps the vm test contexts working too). A citation
+// click calls back through aiNav, which reuses the same openers the
+// dashboard's own buttons use; the chat itself lives outside #detail.
+globalThis.aiView = () => ({
+  detailKey,
+  summaryView: summaryView && {key: summaryView.key},
+  runModalKey,
+  modalRequest: modalRequest && {id: modalRequest.id,
+    status: modalRequest.status},
+  modalQA: modalQA && {id: modalQA.id},
+  power: !document.getElementById('powerwrap').hidden,
+  only: [...only], facets: [...facets], projs: [...projs],
+  selectedRun,
+  agents: AGENTS
+});
+globalThis.aiNav = {
+  agent(k){ const j = AGENTS.findIndex(x=>agentKey(x)===k);
+    if (j>=0){ showDetail(j); return true; } return false; },
+  summary(k){ openSummary(k); return true; },
+  runSummary(k){ openRunSummary(k); return true; },
+  run(k){ showRunDetails(k); return true; },
+  request(id){ openRequest(id); return true; }
+};
 document.addEventListener('mouseover', e=>{
   // hovering a model option tracks it as the active descendant - the
   // mouse and Arrow keys then agree on what Enter would pick
@@ -18530,6 +18563,27 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     raise
                 raise RequestError("Invalid JSON request body") from exc
 
+        # The chat client's own assets ship with the assistant package
+        # and are served verbatim - whitelisted names only, and NO core
+        # dependency: a broken provider init must not take the UI shell
+        # down with it (the panel then renders 'assistant unavailable').
+        _AI_STATIC = {"chat.js": "text/javascript; charset=utf-8",
+                      "md.js": "text/javascript; charset=utf-8",
+                      "chat.css": "text/css; charset=utf-8"}
+        _AI_STATIC_DIR = Path(__file__).resolve().parent / \
+            "assistant" / "static"
+
+        def _assistant_static(self, path: str) -> None:
+            name = path.rsplit("/", 1)[-1]
+            ctype = self._AI_STATIC.get(name)
+            if ctype is None:
+                raise RequestError("Not found", 404)
+            try:
+                data = (self._AI_STATIC_DIR / name).read_bytes()
+            except OSError:
+                raise RequestError("Not found", 404)
+            self._send(data, ctype)
+
         def _assistant(self, method: str, path: str) -> None:
             """Route /api/assistant/* into the chat core's route table.
             POSTs pass the RAW body through - the attachments route takes
@@ -18549,7 +18603,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 if not 0 <= size <= max(ATTACH_MAX_BYTES, 524288):
                     raise RequestError("Request body is too large", 413)
                 raw = self.rfile.read(size)
-            status, body = http_api.dispatch(core, method, path, body=raw)
+            status, body = http_api.dispatch(
+                core, method, path, body=raw,
+                query=urllib.parse.parse_qs(
+                    urllib.parse.urlsplit(self.path).query))
             self._json(body, status)
 
         def do_PUT(self) -> None:                    # noqa: N802 - stdlib name
@@ -18663,6 +18720,8 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 elif path in ("/", "/index.html"):
                     self._send(_DASH_HTML.encode("utf-8"),
                                "text/html; charset=utf-8")
+                elif path.startswith("/api/assistant/static/"):
+                    self._assistant_static(path)
                 elif path.startswith("/api/assistant/"):
                     self._assistant("GET", path)
                 else:
@@ -18845,6 +18904,18 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
         def log_message(self, fmt: str, *a) -> None:
             LOG.debug("http %s", fmt % a)
 
+    def assistant_close() -> None:
+        """Release the lazily-opened assistant runtime (sqlite handles
+        matter on Windows; also the seam serve shutdown/tests use)."""
+        core = _assist.get("core")
+        if core is not None:
+            try:
+                core.store.close()
+            except Exception:                  # noqa: BLE001
+                pass
+            _assist["core"] = _assist["runtime"] = None
+
+    Handler.assistant_close = staticmethod(assistant_close)
     return Handler
 
 

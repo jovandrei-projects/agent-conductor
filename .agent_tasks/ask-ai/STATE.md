@@ -80,9 +80,9 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
       runtime.py` + `assistant/calc.py` + `assistant_host/modelpick.py`;
       schema v3 exchanges.requests; live-verified `devin -p -r` smoke
       2026-10-17 incl. resume + cumulative delta; contracts below)
-- [ ] persistent-chat-interface - surface, launchers, settings, history
-      (assistant/static/chat.js + md.js + route registration in
-      make_dashboard_handler -> assistant.http_api.dispatch)
+- [x] persistent-chat-interface - surface, launchers, settings, history
+      (assistant/static/{chat.js,md.js,chat.css} + #dask on #detail shell
+      + globalThis.aiView/aiNav bridge + /api/assistant/static/* serving)
 - [ ] images-and-dictation - attachments + webSpeech composer
       (server side done: POST /api/assistant/attachments + ref binding;
       client composer + SpeechRecognition belong here)
@@ -304,21 +304,110 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
   tests/fake_devin_chat.py real-subprocess binary + e2e) + modelpick +
   calc; full suite 632/632 green, 8 shards.
 
+## Implemented contracts (persistent-chat-interface)
+
+- `assistant/static/chat.js` (self-invoking, defer-loaded): injects the
+  launcher + panel DOM once - `#aifab` (page FAB) + `#aichat` (fixed,
+  non-modal dialog at z 62, above `.backdrop` 50, below askwrap 70) +
+  `#aisetwrap` (settings). The injected `<div id="dask">` stub already
+  inside `#detail` (sibling of `.x` and `#dbody`) gets revealed and
+  delegated through one document-level `[data-ask-ai]` click hook -
+  every modal variant (agent/run/summary/run-summary/request/questions)
+  is covered by the shell, never repainted, no per-view injection, and
+  duplicates cannot exist.
+- Modes: closed (FAB) / compact 380x560 / expanded ~920-wide x ~80vh,
+  persisted via `ac-ai-open`; last conversation via `ac-ai-conv`;
+  composer drafts per conversation via `ac-ai-draft[:<id>]` (restore
+  tested); browser window identity `ac-ai-win` in sessionStorage.
+- Send flow: `POST /conversations` (client_ref dedupe) on first message,
+  `POST .../messages` {text, client_msg_id (uid >=8 chars), client_ctx
+  = frozen view envelope snapshot}. Pending assistant placeholder
+  renders 'thinking'; exchange statuses queued/running/partial/done/
+  error/cancelled map to meta badges; `stop` -> POST
+  `/exchanges/<id>/cancel`. Exchange polling (1.1s, capped 10 min) is
+  independent of the dashboard's stateReqSeq refresh and guarded by
+  `S.pollXid` - only one poller, superseded polls die.
+- `client_ctx` view comes from `window.aiView()` (the bridge in
+  _DASH_HTML): agent/summary/run/run-summary/request/questions/power/
+  dashboard + filters (only/facets/projs) + selectedRun + selection -
+  the host enricher replaces it server-side anyway (trust boundary).
+  `ai-ctx` chip shows "about: <view>" and re-syncs via `globalThis.
+  aiSync` which the dashboard calls at the end of `applySel` - so modal
+  open/close/navigate/re-render keeps it honest with zero polling.
+- History rail (`#ai-hist` toggle, `.ai-rail` column inside `.ai-main`):
+  GET `/conversations?limit=30` + `open_conv` restore; per-item
+  origin-view chip + title/timestamp; `New chat` reuses the flow.
+  Per-user-message ctx chips (`aim-ctxm`) render the frozen envelope's
+  view label; per-reply model badge (`aim-modelb`, clickable -> settings)
+  shows THIS turn's settings_json snapshot, never current settings.
+- Citations: `exchanges.sources[]` render as `aim-src` chips;
+  `[data-ai-nav]` clicks dispatch through `window.aiNav.{agent,summary,
+  runSummary,run,request}` - the dashboard's own openers - with the
+  source's frozen `nav` descriptor (opaque to the client). A citation
+  click never resets the conversation.
+- Settings modal (nested dialog, Esc-in-dialog does not leak): GET
+  `/models` (annotated catalog) + `/settings` defaults; Model = family
+  select only listing live families; Effort select scoped to that
+  family's suffixes; Fast checkbox disabled (with note) when the family
+  has no fast marker; resolved-uid preview mirrors modelpick's
+  family+effort+marker composition; Save -> POST
+  `/conversations/<id>/settings` (or global `/settings` when no conv);
+  validation/catalog errors surface verbatim in `#ais-msg`.
+- `assistant/static/md.js` - escape-first markdown twin of
+  `_summary_body` plus tables: fence/heading/list/ol/ul/blockquote/hr/
+  bold/italic/inline-code/links (allowlisted http/https/mailto +
+  hash/slash anchors only; `javascript:` etc. never linkify), tables,
+  paragraphs. Everything else is HTML-escaped - assistant text is never
+  trusted markup.
+- `conductor.py` wiring: `_DASH_HTML` head links chat.css + md.js +
+  chat.js (defer); `#dask` launcher inside `#detail` before `#dbody`
+  (repaint-proof); `.dnav` right padding 56->140px for launcher room;
+  `globalThis.aiView/aiNav` bridge globals at the end of applySel's
+  block; `Handler._AI_STATIC` whitelist (`chat.js`,`md.js`,`chat.css`)
+  served from `assistant/static/` through `_check_origin` like every
+  other route (404 on anything else, path traversal included) with NO
+  core dependency (broken provider init can't take the shell down);
+  `_assistant` forwards parse_qs queries (pagination, attachments);
+  `Handler.assistant_close` staticmethod releases the lazily-opened
+  sqlite store (needed for Windows test tempdirs).
+- The chat surface itself is injected at `document.body` level -
+  `#detail` innerHTML rewrites on modal navigation can never destroy it,
+  and it stays interactive while a source modal is open.
+
+### Verified (persistent-chat-interface)
+
+- `node --check` on chat.js/md.js + the extracted inline script.
+- `tests/test_assistant_ui.py` (16 tests): markup/static-route serving +
+  whitelist + query forwarding; md.js escape/table/link tests; node-vm
+  launcher toggle + modal coverage + Escape handling, navigation
+  persistence (chat survives view changes + minimize/reopen with draft),
+  history restoration (stored conv id + draft reloaded), settings dialog
+  (catalog families, effort scoping, fast gating, POST shape, header
+  relabel, per-message snapshot badge), citation routing through aiNav,
+  send->queued->poll->done flow with client_msg_id + ctx envelope.
+- Live serve smoke on :8806 with a temp runs dir: index serves with the
+  chat assets; `/api/assistant/static/*` 200; `/api/assistant/
+  conversations?limit=5` -> `{"items":[]}`; `/settings` -> seeded
+  `gpt-6-luna/low/fast/readonly`; `/models` -> real 800-uid catalog with
+  `default_resolution` `gpt-6-luna-low-priority` + `vision:true`.
+- Full test_conductor suite needs a rerun (bridge initially used
+  `window.` which vm harnesses lack - now `globalThis.`).
+
 ## Where it stopped
 
-`assistant-runtime` is implemented, tested and live-smoke-verified:
-the `devin -p [-r]` provider, the dispatcher runtime (tool loop,
-proposals, usage deltas, reconcile/adopt), catalog-aware settings
-resolution with verified defaults, and `/api/assistant/*` route
-registration in `make_dashboard_handler` are all landed. Exchanges now
-drive real provider turns end to end. Remaining per the manifest:
-`persistent-chat-interface` (assistant/static/chat.js + md.js UI -
-launchers, composer, bubble/expand, settings modal, citations, exchange
-poll wiring), `images-and-dictation` (client composer + SpeechRecognition;
-server side is done), `guarded-dashboard-actions` (conductor
-ActionAdapter over conductor functions + confirm cards), then
-`usage-and-price-visibility` UI + `integration-and-design-review` +
-`follow-up-plan`.
+`persistent-chat-interface` is implemented and tested: the durable chat
+surface (launcher on page + every modal via shell-level `#dask`, FAB,
+compact/expanded panel, history rail, composer, settings dialog,
+citations, per-exchange polling, per-conv drafts) landed as
+`assistant/static/{chat.js,md.js,chat.css}` + the `_DASH_HTML` bridge +
+`/api/assistant/static/*` serving, all tested by
+`tests/test_assistant_ui.py` and the live :8806 smoke. Remaining per the
+manifest: `images-and-dictation` (client composer attach/mic UX +
+SpeechRecognition; server side done incl. raw-body route), `guarded-
+dashboard-actions` (conductor ActionAdapter over conductor functions +
+confirm cards), `usage-and-price-visibility` UI (client chips exist,
+usage/price display + rollup surfacing belong here), then
+`integration-and-design-review` + `follow-up-plan`.
 
 ## Deferred or blocked
 
