@@ -8454,8 +8454,9 @@ prompt = "four"
                     conductor.prompt_flag(d, s).unlink(missing_ok=True)
 
     def test_resume_notes_gate_and_clear(self):
-        """Notes attach to ran-but-unfinished steps; done/running 409 and
-        a pending step is told to use Edit prompt instead."""
+        """Notes attach to ran-but-unfinished steps and to steps still
+        waiting their first dispatch (queued/skipped/manifest-pending -
+        the 'additional instructions' channel); done/running 409."""
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             proj = make_project(base)
@@ -8470,14 +8471,33 @@ prompt = "one"
 name = "s2"
 project = "{proj.as_posix()}"
 prompt = "two"
+
+[[step]]
+name = "s3"
+project = "{proj.as_posix()}"
+prompt = "three"
+
+[[step]]
+name = "s4"
+project = "{proj.as_posix()}"
+prompt = "four"
 ''')
             d = self._run_dir(runs, m, {
                 "s1": {"name": "s1", "status": "done"},
-                "s2": {"name": "s2", "status": "stopped"}})
+                "s2": {"name": "s2", "status": "stopped"},
+                "s3": {"name": "s3", "status": "queued"}})
             try:
                 out = conductor.set_step_notes(
                     d.name, "s2", {"notes": "VPN is restored"}, runs)
                 self.assertEqual(out["resume_notes"], "VPN is restored")
+                # queued + never-dispatched (manifest-pending) steps take
+                # pre-start instructions through the same channel
+                out = conductor.set_step_notes(
+                    d.name, "s3", {"notes": "queued ctx"}, runs)
+                self.assertEqual(out["resume_notes"], "queued ctx")
+                out = conductor.set_step_notes(
+                    d.name, "s4", {"notes": "pending ctx"}, runs)
+                self.assertEqual(out["resume_notes"], "pending ctx")
                 with self.assertRaises(conductor.RequestError) as e:
                     conductor.set_step_notes(d.name, "s1",
                                              {"notes": "x"}, runs)
@@ -8491,7 +8511,8 @@ prompt = "two"
                 self.assertFalse(
                     conductor.rnote_flag(d, "s2").exists())
             finally:
-                conductor.rnote_flag(d, "s2").unlink(missing_ok=True)
+                for s in ("s2", "s3", "s4"):
+                    conductor.rnote_flag(d, s).unlink(missing_ok=True)
 
     def test_edit_and_notes_survive_clear_run_flags(self):
         """Resume clears halt sentinels only - a pending prompt override
@@ -8641,7 +8662,9 @@ prompt = "third"
                 self.assertTrue(by["s1"]["notes_enabled"])
                 self.assertEqual(by["s1"]["resume_notes"], "n-note")
                 self.assertTrue(by["s2"]["prompt_editable"])
-                self.assertFalse(by["s2"]["notes_enabled"])
+                # never-dispatched steps take 'additional instructions'
+                # through the same rnote channel
+                self.assertTrue(by["s2"]["notes_enabled"])
                 self.assertEqual(by["s2"]["task_full"], long_prompt)
                 self.assertGreater(len(by["s2"]["task_full"]), 160)
             finally:
@@ -10122,7 +10145,13 @@ prompt = "first"
                        "a.aux?' aux':''", "actzone", 'class="acth"',
                        'id="d-timeout-save" disabled',
                        '>Summary</button>', 'data-run-details=',
-                       'pre class="taskpre"'):
+                       'pre class="taskpre"',
+                       # waiting steps get additive instructions through
+                       # the notes channel; ran steps keep 'Resume notes'
+                       "'Additional instructions'", "'Resume notes'",
+                       # the power dialog flags what a restart orphans:
+                       # merges, in-flight generations and launches
+                       's.generating', 's.launching'):
             self.assertIn(needle, h)
         for gone in ('Open as page', 'req-open', 'tok-help',
                      'Session summary</a>', 'Back: '):
@@ -10131,9 +10160,10 @@ prompt = "first"
 
 class PowerDialogTests(unittest.TestCase):
     """The dashboard's Stop/Restart: a themed dialog backed by
-    /api/serve/power that flags live merges (restart orphans them) and
-    live steps before it acts, plus the askConfirm/showAlert replacement
-    for native confirm()/alert() chrome."""
+    /api/serve/power that flags live merges, this process's in-flight
+    proposal generations and run launches (a restart orphans all three),
+    and live steps before it acts, plus the askConfirm/showAlert
+    replacement for native confirm()/alert() chrome."""
 
     def _serve(self, td: str):
         runs = Path(td) / "runs"
@@ -10174,7 +10204,56 @@ class PowerDialogTests(unittest.TestCase):
                 status, out = self._call(server.server_port, "GET",
                                          "/api/serve/power")
             self.assertEqual(status, 200)
-            self.assertEqual(out, {"tasks": [], "merges": []})
+            self.assertEqual(out, {"tasks": [], "merges": [],
+                                   "generating": [], "launching": []})
+
+    def test_safety_flags_inflight_generation_and_launch(self):
+        """A restart kills the planner/launcher processes this server
+        owns - the dialog must name them so the operator knows a proposal
+        in creation or a launch in flight will be orphaned."""
+        with tempfile.TemporaryDirectory() as td:
+            runs, server = self._serve(td)
+            reqs = Path(td) / "reqs"
+            reqs.mkdir(exist_ok=True)
+            for rid in ("20261017-010000-aaaaaaaa",
+                        "20261017-010001-bbbbbbbb"):
+                (reqs / f"{rid}.json").write_text(json.dumps({
+                    "id": rid, "label": f"label-{rid.rsplit('-', 1)[-1]}",
+                    "status": "generating"}), encoding="utf-8")
+            gen = mock.Mock()
+            gen.poll.return_value = None          # planner still running
+            launcher = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"])
+            self.addCleanup(launcher.kill)
+            conductor._GEN_PROCS["20261017-010000-aaaaaaaa"] = gen
+            conductor._LAUNCH_PIDS["20261017-010001-bbbbbbbb"] = \
+                launcher.pid
+            (reqs / "20261017-010001-bbbbbbbb.json").write_text(
+                json.dumps({"id": "20261017-010001-bbbbbbbb",
+                            "label": "label-bbbbbbbb",
+                            "status": "launching",
+                            "launched_at": conductor.now_iso()}),
+                encoding="utf-8")
+            try:
+                with mock.patch.object(conductor, "_flag_dir",
+                                       lambda: Path(td) / "flags"), \
+                        mock.patch.object(conductor, "PROJECTS_FILE",
+                                          Path(td) / "none.toml"):
+                    status, out = self._call(server.server_port, "GET",
+                                             "/api/serve/power")
+            finally:
+                conductor._GEN_PROCS.pop("20261017-010000-aaaaaaaa", None)
+                conductor._LAUNCH_PIDS.pop("20261017-010001-bbbbbbbb",
+                                           None)
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                [g["id"] for g in out["generating"]],
+                ["20261017-010000-aaaaaaaa"])
+            self.assertEqual(out["generating"][0]["label"],
+                             "label-aaaaaaaa")
+            self.assertEqual(
+                [l["id"] for l in out["launching"]],
+                ["20261017-010001-bbbbbbbb"])
 
     def test_safety_reports_live_step_and_merge(self):
         with tempfile.TemporaryDirectory() as td:

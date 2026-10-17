@@ -10601,24 +10601,28 @@ def set_step_prompt(run_name: str, step_name: str, body: dict,
 
 def set_step_notes(run_name: str, step_name: str, body: dict,
                    runs_dir: Path = RUNS_DIR) -> dict:
-    """Dashboard 'resume notes': operator text in a tempdir sentinel that
-    run_step appends to the step's next dispatched prompt - the original
-    prompt itself is never edited post-dispatch. For steps that ran and
-    will re-run (stopped/failed/timed_out/lost/blocked/partial); a queued
-    orphan counts too, though a never-dispatched step wants Edit prompt.
-    {"notes": ""} clears the field."""
+    """Dashboard notes/instructions: operator text in a tempdir sentinel
+    that run_step appends to the step's next dispatched prompt - the
+    original prompt itself is never edited. For steps that ran and will
+    re-run (stopped/failed/timed_out/lost/blocked/partial) it is 'resume
+    notes'; for steps still waiting their first dispatch (queued, skipped,
+    or a manifest step with no record yet) it is 'additional instructions'
+    - same channel, so they land in the first prompt too. {"notes": ""}
+    clears the field."""
     if not RUN_DIR_RE.fullmatch(step_name):
         raise RequestError("Invalid step name", 404)
     d, st = _run_dir_checked(run_name, runs_dir)
     rec = (st.get("steps") or {}).get(step_name)
     if rec is None:
-        raise RequestError("Step not in this run", 404)
-    eff = effective_statuses(st).get(step_name, rec.get("status"))
-    if eff not in ("blocked", "partial", "failed", "timed_out",
-                   "stopped", "lost"):
-        raise RequestError(
-            f"Step is {eff} - resume notes apply to steps that already "
-            "ran; a pending step takes Edit prompt instead", 409)
+        if step_name not in _manifest_step_names(st):
+            raise RequestError("Step not in this run", 404)
+    else:
+        eff = effective_statuses(st).get(step_name, rec.get("status"))
+        if eff not in ("blocked", "partial", "failed", "timed_out",
+                       "stopped", "lost", "queued", "skipped"):
+            raise RequestError(
+                f"Step is {eff} - notes apply to steps still waiting or "
+                "re-running; a running step takes Interrupt + instruct", 409)
     flag = rnote_flag(d, step_name)
     try:
         _flag_dir().mkdir(exist_ok=True)
@@ -11747,12 +11751,15 @@ def _pending_merge_view(st: dict, eff: dict[str, str]) -> tuple[
     return groups, legacy
 
 
-def serve_safety(runs_dir: Path) -> dict:
+def serve_safety(runs_dir: Path, requests_dir: Path | None = None) -> dict:
     """What the dashboard's Stop/Restart dialog warns about: live merge
     activity (repo merge locks, MERGE_HEADs, run merge-claim flags -
-    a restart mid-merge can orphan the op) and still-live steps (a
+    a restart mid-merge can orphan the op), still-live steps (a
     restart does not kill workers, but queued launches and post-wave
-    merges stop until a new driver/serve takes over)."""
+    merges stop until a new driver/serve takes over), and this process's
+    own in-flight request work - planner generations and launches die
+    with the server, leaving the request 'generating'/'launching' until
+    the next sweep marks it interrupted."""
     tasks, merges = [], []
     for sj in sorted(runs_dir.glob("*/state.json")):
         try:
@@ -11801,7 +11808,34 @@ def serve_safety(runs_dir: Path) -> dict:
         if pid and pid != os.getpid() and pid_alive(pid):
             merges.append({"where": "run merge", "dir": "",
                            "why": f"claim {f.name} held by pid {pid}"})
-    return {"tasks": tasks, "merges": merges}
+    # In-process request work dies with this process: the planner child
+    # and its drain thread (a restart orphans the request mid-generation)
+    # and the `run --request-id` launcher (the run may start, but the
+    # record's 'launching' bookkeeping is lost).
+    generating, launching = [], []
+    def _req_rec(rid: str) -> dict:
+        if requests_dir is None:
+            return {}
+        try:
+            return _read_request(rid, requests_dir)
+        except Exception:
+            return {}
+    for rid, proc in list(_GEN_PROCS.items()):
+        if proc is not None and proc.poll() is None:
+            rec = _req_rec(rid)
+            generating.append({
+                "id": rid,
+                "label": str(rec.get("label") or rec.get("run") or rid)})
+    for rid, pid in list(_LAUNCH_PIDS.items()):
+        rec = _req_rec(rid)
+        # `since` guards Windows pid reuse, same as the launching-stage
+        # check on the record itself
+        if pid and pid_alive(pid, rec.get("launched_at")):
+            launching.append({
+                "id": rid,
+                "label": str(rec.get("label") or rec.get("run") or rid)})
+    return {"tasks": tasks, "merges": merges,
+            "generating": generating, "launching": launching}
 
 
 def _respawn_serve(args: argparse.Namespace) -> None:
@@ -12017,9 +12051,12 @@ def collect_dashboard(runs_dir: Path,
                 # original prompt is left untouched on purpose.
                 "prompt_editable": rec.get("status") in
                 ("queued", "skipped"),
+                # re-runnable outcomes take 'resume notes'; still-waiting
+                # steps (queued/skipped pre-spawn) take the same channel
+                # as 'additional instructions' for their first dispatch
                 "notes_enabled": status in
                 ("blocked", "partial", "failed", "timed_out", "stopped",
-                 "lost"),
+                 "lost", "queued", "skipped"),
                 "prompt_override": _flag_text(
                     prompt_flag(sj.parent, rec.get("name") or name)),
                 "resume_notes": _flag_text(
@@ -12105,7 +12142,9 @@ def collect_dashboard(runs_dir: Path,
             # must survive a save round-trip.
             row["task_full"] = mbodies.get(row["step"]) or row.get("task")
             row["prompt_editable"] = True
-            row["notes_enabled"] = False
+            # never-dispatched: 'additional instructions' appended to the
+            # first prompt via the same rnote channel resume notes use
+            row["notes_enabled"] = True
             row["prompt_override"] = _flag_text(
                 prompt_flag(sj.parent, row["step"]))
             row["resume_notes"] = _flag_text(
@@ -13354,19 +13393,22 @@ const showAlert = (msg, title) =>
 // --- dashboard power ----------------------------------------------------
 // The topbar power button opens #powerwrap with the server's own safety
 // report (/api/serve/power): live merges flagged red (a restart orphans
-// them mid-flight), live steps flagged amber (they survive but nothing
-// new launches and a merge firing mid-restart can miss). The SAME report
-// is re-fetched at button-press time - the dialog can sit open while a
-// merge starts behind it, so the open-time answer never authorizes the
-// click. An unsafe press re-renders the fresh report and arms once: a
-// second press on the same button is the informed override. Restart
-// respawns a detached `conductor.py serve --wait-port` child; the boot-id
-// check in refresh() reloads open tabs once it's back - the poll below
-// just makes it immediate.
+// them mid-flight), in-flight proposal generations and run launches
+// flagged red too (the planner/launcher IS this process - a restart
+// kills it outright), live steps flagged amber (they survive but
+// nothing new launches and a merge firing mid-restart can miss). The
+// SAME report is re-fetched at button-press time - the dialog can sit
+// open while work starts behind it, so the open-time answer never
+// authorizes the click. An unsafe press re-renders the fresh report and
+// arms once: a second press on the same button is the informed
+// override. Restart respawns a detached `conductor.py serve --wait-port`
+// child; the boot-id check in refresh() reloads open tabs once it's
+// back - the poll below just makes it immediate.
 let pwArmed = null;   // action the operator saw the fresh unsafe report
                       // for and still clicked again
 function powerBodyHtml(s){
-  const m = s.merges || [], t = s.tasks || [];
+  const m = s.merges || [], t = s.tasks || [],
+        g = s.generating || [], l = s.launching || [];
   return (m.length
       ? `<div class="notice error"><b>merge activity in progress</b>` +
         `<ul>${m.map(x => `<li>${esc(x.where)} - ${esc(x.why)}</li>`)
@@ -13374,6 +13416,20 @@ function powerBodyHtml(s){
         `restarting now can orphan a merge mid-flight and leave the ` +
         `repo's merge state or lock needing manual cleanup - waiting ` +
         `for it to finish is the safe choice</div>` : '') +
+    (g.length
+      ? `<div class="notice error"><b>proposal generation in ` +
+        `progress</b><ul>` +
+        `${g.map(x => `<li>${esc(x.label)}</li>`).join('')}</ul>` +
+        `the planner runs inside this dashboard process - restarting ` +
+        `now kills it mid-flight and the request lands in error ` +
+        `('Planning was interrupted'); the previous proposal is kept, ` +
+        `but the planning session's work is lost</div>` : '') +
+    (l.length
+      ? `<div class="notice error"><b>run launch in progress</b><ul>` +
+        `${l.map(x => `<li>${esc(x.label)}</li>`).join('')}</ul>` +
+        `restarting now orphans the launcher - the run may still start ` +
+        `but the request record can wedge in 'Starting run' until a ` +
+        `sweep</div>` : '') +
     (t.length
       ? `<div class="notice warn"><b>${t.length} task(s) live</b><ul>` +
         `${t.map(x => `<li>${esc(x.run)} / ${esc(x.step)} ` +
@@ -13381,9 +13437,9 @@ function powerBodyHtml(s){
         `workers keep running through a restart, but no new steps ` +
         `launch and a merge firing mid-restart can miss its ` +
         `window</div>` : '') +
-    (!m.length && !t.length
-      ? `<div class="notice ok">nothing merging or running - ` +
-        `safe to restart</div>` : '');
+    (!m.length && !t.length && !g.length && !l.length
+      ? `<div class="notice ok">nothing merging, planning or running ` +
+        `- safe to restart</div>` : '');
 }
 async function openPower(){
   pwArmed = null;
@@ -13416,7 +13472,12 @@ async function powerAct(action){
     return;
   }
   document.getElementById('pwbody').innerHTML = powerBodyHtml(s);
-  if (((s.merges||[]).length || (s.tasks||[]).length) && pwArmed!==action){
+  // merges + in-flight generations/launches die with this process;
+  // live steps survive but lose their driver windows - all four are
+  // 'see the warning, press again to confirm' conditions
+  if (((s.merges||[]).length || (s.tasks||[]).length ||
+       (s.generating||[]).length || (s.launching||[]).length) &&
+      pwArmed!==action){
     pwArmed = action;   // the warning is now on screen - a repeat click
                         // is an informed choice, not a stale-read accident
     stat.textContent = 'unsafe right now - press ' +
@@ -13736,10 +13797,11 @@ function renderSummaryFrame(a, frag, err){
       `<button type="button" class="linkbtn" ` +
       `data-run-details="${esc(runKey_)}">${esc(a.run||runKey_)}` +
       `</button></div>` : '') +
-    revBtn +
     (err!=null ? `<div class="notice error">${esc(err)}</div>`
       : frag==null ? `<div class="notice">Loading summary&hellip;</div>`
-      : `<div class="sumdoc">${frag}</div>`);
+      : `<div class="sumdoc">${frag}</div>`) +
+    // the mark sits under the document: read first, then acknowledge
+    revBtn;
   // the loading frame consumed modalScroll already, so a Back restore
   // keeps its offset through the async fetch below
   applyModalScroll();
@@ -14179,16 +14241,25 @@ function showDetail(i, keepStack){
           `</div><textarea disabled style="min-height:70px">` +
           `${esc(pd)}</textarea>` : '') +
       (a.notes_enabled
-        ? `<h3 style="margin-top:14px">Resume notes</h3>` +
+        // never dispatched -> additive pre-start instructions ('just
+        // like interrupt+instruct, minus the interrupt'); re-running
+        // -> the same channel labelled for the resume it feeds
+        ? `<h3 style="margin-top:14px">` +
+          (a.prompt_editable ? 'Additional instructions'
+                             : 'Resume notes') + `</h3>` +
           `<textarea id="d-rnotes" style="min-height:70px" ` +
-          `spellcheck="false" placeholder="context for the resume, ` +
-          `e.g. VPN is restored">${esc(nd!==undefined?nd:
+          `spellcheck="false" placeholder="` +
+          (a.prompt_editable
+            ? `extra context for the agent before this step starts`
+            : `context for the resume, e.g. VPN is restored`) +
+          `">${esc(nd!==undefined?nd:
             (a.resume_notes||''))}</textarea><div class="actions">` +
           `<button type="button" class="btn secondary" ` +
           `data-save-notes="${esc(base(a.run_dir))}" ` +
           `data-step="${esc(a.step)}">Save notes</button>` +
-          `<span class="sub">appended to this step's next dispatched ` +
-          `prompt - the original prompt is never edited. Empty + ` +
+          `<span class="sub">appended to this step's ` +
+          (a.prompt_editable ? 'first dispatched' : 'next dispatched') +
+          ` prompt - the original prompt is never edited. Empty + ` +
           `Save clears stored notes.</span></div>` : '')) : '';
   const genBit = (a.request_id && a.step==='plan-proposal' &&
     a.status==='running'
@@ -17728,8 +17799,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     self._send(data, ctype)
                 elif path == "/api/serve/power":
                     # the Stop/Restart dialog's safety report: live
-                    # merges (restart orphans them) + still-live steps
-                    self._json(serve_safety(runs_dir))
+                    # merges (restart orphans them), still-live steps,
+                    # and this process's in-flight generations/launches
+                    # (a restart kills those outright)
+                    self._json(serve_safety(runs_dir, requests_dir))
                 elif path in ("/", "/index.html"):
                     self._send(_DASH_HTML.encode("utf-8"),
                                "text/html; charset=utf-8")
