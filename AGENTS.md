@@ -233,27 +233,48 @@ status it replaces, `resolver` when a resolve-* session saved it),
 deferred pipeline, and `merged_at` on the step record for when the branch
 landed.
 
-Summaries: the step summary (`Session summary` in the task modal,
-`<step>.summary.md`) leads with `## Report` - the worker's OWN closing
-report, lifted from the trailing agent messages of its ATIF export with
-the `STATUS:`/`NEXT:` contract lines stripped (`final_report`); a step
-whose turn ended mid-report shows the forensic sections without it. The
-run-level equivalent is `run.summary.md`: with `[run] summarize = true`
-(or `= "<model>"` to pin a cheap model) the driver spawns a detached
-`conductor.py summarize` session after `run_end` that reads run stats +
-every step's closing report (never the projects themselves - cwd is a
-tempdir) and writes one executive summary; the same op runs via `python
-conductor.py summarize <run_dir>` or the run modal's **Generate LLM
-summary** (`POST /api/runs/<dir>/summarize`, refused while a step is
-live or one is already generating - `.summarizing` marker + `Run
-summary`/`has_summary` in the runs payload). `summarize.stdout.log` /
-`summarize.export.json` record the session, `run_summarized` /
-`run_summary_failed` land in events.jsonl, `state.run_summary` carries
-session/model/generated_at. The summarizer NEVER changes step or run
+Summaries: the step summary (`Summary` link beside the step name in the
+task modal, `<step>.summary.md`) leads with `## Report` - the worker's
+OWN closing report, lifted from the trailing agent messages of its ATIF
+export with the `STATUS:`/`NEXT:` contract lines stripped
+(`final_report`); a step whose turn ended mid-report shows the forensic
+sections without it. `## Task` carries the full prompt body in a
+fixed-size pre box (`task_display` strips the conductor-purpose marker;
+`.taskpre` gives small tasks the same slot). The run-level equivalent
+is `run.summary.md`: with `[run] summarize = true` (or `= "<model>"` to
+pin a cheap model) the driver spawns a detached `conductor.py summarize`
+session after `run_end` that reads run stats + every step's closing
+report (never the projects themselves - cwd is a tempdir) and writes one
+executive summary; the same op runs via `python conductor.py summarize
+<run_dir>` or the run modal's **Generate LLM summary** (`POST
+/api/runs/<dir>/summarize`, refused while a step is live or one is
+already generating - `.summarizing` marker + `Run summary`/`has_summary`
+in the runs payload). `summarize.stdout.log` / `summarize.export.json`
+record the session, `run_summarized` / `run_summary_failed` land in
+events.jsonl, `state.run_summary` carries the same bookkeeping a step
+record does (status, started/ended/elapsed, session, model, tokens,
+cost inputs, generated_at). The summarizer NEVER changes step or run
 status - when it fails or was never run, GET `/api/runs/<dir>/summary`
 serves the deterministic roll-up (`run_report_md`: stats + each step's
-closing report verbatim). The request form's `summarize` checkbox maps
-to `run.summarize` like the other guarantee checkboxes.
+closing report verbatim). On the dashboard it surfaces as one muted,
+italic `run-summary` aux row under its run (`summary_agent` - `seq` is
+null so it never counts as pipeline work, the context menu offers no
+step actions, and it stays hidden until the run is filtered into); its
+detail modal is where the summarizer's tokens/elapsed/session live. The
+request form's `summarize` checkbox maps to `run.summarize` like the
+other guarantee checkboxes.
+
+Modal chrome: one sticky `.dnav` bar - Back (`← Back`, destination on
+the tooltip) pins left, the pipeline counter `task X of Y` centers on
+the BAR (absolutely positioned so sibling names can't shift it), and
+prev/next arrows pin right (arrow-only in the summary view, named in the
+task modal at a fixed 130px). Every control that mutates task/run state
+lives in the `.actzone` "Actions" block at the bottom of the modal;
+view-only controls (trajectory expand/collapse) stay with their content.
+The timeout Save is disabled until the field differs from the applied
+value. The `run` kv row and the run modal's tasks table are
+`data-run-details`/`data-agent-detail` links - modal-to-modal jumps push
+the Back stack like everything else.
 
 `merge = "deferred"` (per-step or `[run]` default; implies
 `worktree = true`, incompatible with `cloud`) separates isolation from

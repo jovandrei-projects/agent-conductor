@@ -909,3 +909,24 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   run_step verify cap - this step's own verify times out on green.
   Manual-check remainder: a real-browser pass on the combined dashboard
   (node harnesses cover behavior, not painted pixels).
+- DONE 2026-10-16 (modal/summary UX batch, interactive): step summaries
+  show the full task body in a fixed .taskpre box and drop the
+  Trajectory/stdout-tail sections; LLM run.summary.md fragments render
+  under .llmsum with orange headings. The run summarizer now persists
+  state.run_summary (status/started/ended/elapsed/session/model/
+  tokens/cost inputs/generated_at) and collect_dashboard emits one
+  muted italic run-summary aux row per run - hidden until the run is
+  filtered, seq-less (never counted as pipeline work), no step actions
+  in its context menu; its detail modal carries the metrics. Modal
+  chrome: .dnav becomes a three-zone sticky bar ('<- Back' pins left,
+  destination on the tooltip; 'task X of Y' centers on the BAR via
+  absolute positioning so sibling-name length can't shift it; prev/next
+  pin right - arrows-only in the summary view, 130px named buttons in
+  the task modal); the step name gains an inline Summary link (the old
+  Session summary button is gone); the run kv row is a
+  data-run-details link and the run modal ends with a tasks hyperlink
+  table; '?' token-help widget removed (explainer survives as the
+  tokens cell tooltip); all mutating controls moved into a separated
+  'Actions' zone at the modal bottom; timeout Save is disabled until
+  the field differs from the applied value (data-timeout-orig +
+  input listener).
