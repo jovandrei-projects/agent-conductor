@@ -616,8 +616,8 @@ setRoute((url,opt)=>{
         ones - flex:none on them pushed the right-side icon buttons out
         of the fixed 400px card when the usage label grew."""
         css = (STATIC_DIR / "chat.css").read_text(encoding="utf-8")
-        self.assertRegex(css, r'\.ai-ctx \{[^}]*flex: 0 1 auto')
-        self.assertRegex(css, r'\.ai-ctx \{[^}]*min-width: 0')
+        self.assertRegex(css, r'\.ai-ctx[^{]*\{[^}]*flex: 0 1 auto')
+        self.assertRegex(css, r'\.ai-ctx[^{]*\{[^}]*min-width: 0')
         self.assertRegex(css, r'\.ai-usage \{[^}]*flex: 0 1 auto')
         self.assertRegex(css, r'\.ai-usage summary \{[^}]*max-width: 100%')
         self.assertRegex(css, r'\.ai-name \{[^}]*min-width: 0')
