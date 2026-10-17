@@ -2394,43 +2394,27 @@ def step_summary_md(rec: dict, st: dict, run_name: str) -> str:
     if rec.get("next"):
         L.append(f"- **worker says next:** {rec['next']}")
     L.append("")
-    if rec.get("task"):
-        L += ["## Task", "", task_display(rec["task"]), ""]
+    # The FULL task body (task_label reads it back out of the prompt
+    # file), fenced so _summary_body draws the same fixed-size box the
+    # task modal's 'task prompt' row uses - a one-line 'follow-up-plan'
+    # body shouldn't collapse the layout. task_display is the marker
+    # safety net for the no-prompt-file path, where task_label hands
+    # back the stored summary with its purpose comment still embedded.
+    task_full = task_display(task_label(rec, full=True)
+                             or rec.get("task"))
+    if task_full:
+        L += ["## Task", "", "```", task_full, "```", ""]
     report = final_report(rec.get("export"))
     if report:
         # the worker's own closing message - the same end-of-session
         # wrap-up Devin prints in a chat, lifted verbatim from the export
         L += ["## Report", "", report, ""]
-    arc = cached_arc(rec.get("export"))
-    if arc and arc.get("groups"):
-        L += [f"## Trajectory ({arc['steps']} turns, times UTC)", ""]
-        for g in arc["groups"]:
-            bits = [f"`{g['span']}` **{g['phase']}**"]
-            t0, t1 = g.get("t0"), g.get("t1")
-            if t0:
-                bits.append(str(t0)[11:19] +
-                            (f"-{str(t1)[11:19]}" if t1 and t1 != t0
-                             else ""))
-            if g["n"] > 1:
-                bits.append(f"{g['n']} turns")
-            if g.get("tin") or g.get("tout"):
-                billed_g = max(0, (g["tin"] or 0) - (g["tcached"] or 0))
-                bits.append(f"in {_fmtK(billed_g)} · out "
-                            f"{_fmtK(g['tout'] or 0)} · cached "
-                            f"{_fmtK(g['tcached'] or 0)}")
-            head = (g.get("head") or "").strip()
-            L.append("- " + " · ".join(bits) +
-                     (f" — {head[:110]}" if head else ""))
-        L.append("")
     commits = _branch_commits(rec.get("project") or rec.get("work_dir"),
                               branch, rec.get("merge_target"))
     if commits:
         L += [f"## Commits ({len(commits)})", ""]
         L += [f"- {c}" for c in commits]
         L.append("")
-    tail = stdout_tail(rec.get("stdout_log"), 15)
-    if tail:
-        L += ["## stdout tail", "", "```", tail, "```", ""]
     return "\n".join(L)
 
 
@@ -2665,6 +2649,29 @@ def _summary_prompt(st: dict) -> str:
     return "\n".join(parts) + "\n"
 
 
+def _summary_result(st: dict, run_dir: Path, status: str, t0: float,
+                    export_path: Path, model: str, rc: int,
+                    note: str | None = None,
+                    session: str | None = None) -> None:
+    """Terminal bookkeeping for a summarizer session - the same metric
+    shape a step record carries (status, interval, ATIF token sums,
+    requested vs resolved model, session id) so the dashboard can show
+    it as a first-class bookkeeping row instead of a log path."""
+    st["run_summary"] = {
+        "status": status,
+        "started_at": (st.get("run_summary") or {}).get("started_at"),
+        "ended_at": now_iso(),
+        "elapsed_s": round(time.time() - t0, 1),
+        "model": model or None,
+        "model_actual": tail_agent_model(export_path),
+        "session": session or tail_session_id(export_path),
+        "tokens": tail_metrics(export_path),
+        "exit_code": rc,
+        "generated_at": now_iso() if status == "done" else None,
+        "note": note}
+    save_state(run_dir, st)
+
+
 def summarize_run(run_dir: Path, devin_argv: list[str] | None = None,
                   model: str = "") -> bool:
     """One fresh `devin -p` session whose only job is prose: it reads the
@@ -2694,6 +2701,14 @@ def summarize_run(run_dir: Path, devin_argv: list[str] | None = None,
         marker.write_text(str(os.getpid()), encoding="utf-8")
     except OSError:
         pass
+    # The dashboard reads state.run_summary for its bookkeeping row, so
+    # stamp it BEFORE the session spawns - 'running' until the terminal
+    # write below replaces it. save_state while the run has ended is
+    # safe: the live-step guard above already refused an active run.
+    st["run_summary"] = {"status": "running", "started_at": now_iso(),
+                         "model": model or None}
+    save_state(run_dir, st)
+    t0 = time.time()
     try:
         log = run_dir / "summarize.stdout.log"
         export_path = run_dir / "summarize.export.json"
@@ -2719,12 +2734,18 @@ def summarize_run(run_dir: Path, devin_argv: list[str] | None = None,
             if timed_out or rc != 0:
                 print(f"[summary] session exited rc={rc}"
                       + (" (timed out)" if timed_out else ""))
+                _summary_result(st, run_dir, "failed", t0,
+                                export_path, model, rc,
+                                "timed out" if timed_out else None)
                 log_event(run_dir, event="run_summary_failed",
                           exit_code=rc, timed_out=timed_out)
                 return False
         report = final_report(export_path)
         if not report:
             print("[summary] session produced no closing report")
+            _summary_result(st, run_dir, "failed", t0,
+                            export_path, model, rc,
+                            "no closing report in export")
             log_event(run_dir, event="run_summary_failed",
                       reason="no closing report in export")
             return False
@@ -2734,9 +2755,8 @@ def summarize_run(run_dir: Path, devin_argv: list[str] | None = None,
                   + (f" · session `{sid}`" if sid else "") + "_\n\n")
         (run_dir / "run.summary.md").write_text(
             header + report.rstrip() + "\n", encoding="utf-8")
-        st["run_summary"] = {"generated_at": now_iso(),
-                             "model": model or None, "session": sid}
-        save_state(run_dir, st)
+        _summary_result(st, run_dir, "done", t0, export_path, model, rc,
+                        session=sid)
         log_event(run_dir, event="run_summarized",
                   model=model or None, session=sid)
         print(f"[summary] wrote {run_dir / 'run.summary.md'}")
@@ -2817,6 +2837,9 @@ def _summary_body(md: str) -> str:
         return re.sub(r"`(.+?)`", r"<code>\1</code>", s)
 
     body, in_ul, in_ol, in_pre = [], False, False, False
+    # '## Task' fences render as the same fixed-size prompt box the task
+    # modal shows - tracked via the last heading seen.
+    cur_h = ""
 
     def close_ul() -> None:
         nonlocal in_ul
@@ -2844,13 +2867,15 @@ def _summary_body(md: str) -> str:
             continue
         if ln.strip() == "```":
             close_lists()
-            body.append("<pre>")
+            body.append('<pre class="taskpre">' if cur_h == "Task"
+                        else "<pre>")
             in_pre = True
             continue
         m = re.match(r"^(#{1,4}) ", ln)
         if m:
             close_lists()
             lvl = len(m.group(1))
+            cur_h = ln[lvl + 1:].strip()
             body.append(f"<h{lvl}>{inline(ln[lvl + 1:])}</h{lvl}>")
         elif re.fullmatch(r"-{3,}", ln.strip()):
             close_lists()
@@ -11098,6 +11123,60 @@ def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
     return out
 
 
+def summary_agent(st: dict, key: str, run_dir: Path,
+                  prices: dict) -> list[dict]:
+    """The bookkeeping row for a run's detached summarizer session -
+    `aux` so the dashboard can render it muted and out of the pipeline
+    nav. Emitted whenever a summarize session ran or is running (the
+    .summarizing marker covers the launch window before the record's
+    'running' write lands). Like the planner rows: not a pipeline step,
+    never in counts, never runnable - but its tokens/session/elapsed
+    deserve the same visibility the workers get."""
+    rs = st.get("run_summary") or {}
+    live = _summarizing(run_dir)
+    if not rs and not live:
+        return []
+    status = ("running" if live else
+              (rs.get("status") or ("done" if rs.get("generated_at")
+                                    else "failed")))
+    model = rs.get("model")
+    tokens = rs.get("tokens")
+    log = run_dir / "summarize.stdout.log"
+    exp = run_dir / "summarize.export.json"
+    return [{
+        "run": st.get("run"), "run_dir": str(run_dir), "run_key": key,
+        "request_id": st.get("request_id"),
+        "step": "run-summary", "slug": "conductor",
+        "aux": True, "seq": None,
+        "work_dir": "tempdir (auto-cleaned)",
+        "status": status, "created_at": rs.get("started_at"),
+        "started_at": rs.get("started_at"),
+        "ended_at": rs.get("ended_at"),
+        "elapsed_s": rs.get("elapsed_s"),
+        "alive": live, "pid": None,
+        "session_id": rs.get("session"), "session_gone": False,
+        "model": model, "model_actual": rs.get("model_actual"),
+        "effort": None, "mode": "summarizer", "cloud": False,
+        "verify_ok": None,
+        "task": "Write this run's executive summary (run.summary.md)",
+        "task_full": None, "purpose": None,
+        "note": rs.get("note"), "next": None,
+        "exit_code": rs.get("exit_code"),
+        "outcome": ("wrote run.summary.md"
+                    if rs.get("generated_at") else None),
+        "outcomes": None,
+        "branch": None, "merged": None,
+        "tokens": tokens, "wt": False,
+        "cost": estimate_cost(tokens, model, None, prices,
+                              rs.get("model_actual")),
+        "stdout_log": str(log) if log.is_file() else None,
+        "tail": stdout_tail(str(log)) if log.is_file() else None,
+        "export": str(exp) if exp.is_file() else None,
+        "arc": cached_arc(str(exp)) if exp.is_file() else None,
+        "prompt": None, "prompt_editable": False,
+        "notes_enabled": False, "skipped_by_user": False}]
+
+
 def _manifest_pending(st: dict, projects: dict) -> list[dict]:
     """Steps the run's manifest declares but state.json has no record for -
     CLI-launched runs get the same pending placeholder rows request runs
@@ -11502,6 +11581,11 @@ def collect_dashboard(runs_dir: Path,
                 request, key, generating=False,
                 log_path=requests_dir / f"{request['id']}.gen.log",
                 prices=prices))
+        # The detached summarizer session rides the same task list as an
+        # aux row - bookkeeping, not a pipeline step (seq=None keeps it
+        # out of prev/next; the client hides it until the run is
+        # filtered into).
+        agents.extend(summary_agent(st, key, sj.parent, prices))
         # Run-level review mark, same sentinel/folded layering as the
         # steps'. A tombstone shows at once; a seq mismatch only reads as
         # 'new completion to review' once the run actually ended (a
@@ -11795,16 +11879,14 @@ body.compact td.wrap, body.compact td.res {
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 body.compact td .sub { display:none; }
 body.compact td br { display:none; }
-/* .toksub looks like .sub but survives compact: the labeled
-   planner:/steps:/est token lines in a run's steps cell are meant to
-   render there (fmtTc is their compact form). The <br> that stacks
-   them at full density hides in compact, so block gives each label
-   its own line. .rlabels is a plain block box keeping the run row's
-   chips on their own line under the name in both densities (a <br>
-   would disappear in compact and let them clip inline after the
-   name); its one rule is below. */
+/* .toksub carries the labeled planner:/steps:/est token lines in a
+   run's steps cell - compact density hides them entirely (the numbers
+   stay reachable at full density and in the run modal). .rlabels is a
+   plain block box keeping the run row's chips on their own line under
+   the name in both densities (a <br> would disappear in compact and
+   let them clip inline after the name); its one rule is below. */
 .toksub { color:#8b949e; font-size:12px; }
-body.compact td .toksub { display:block; }
+body.compact td .toksub { display:none; }
 /* Chips on the .rlabels line must never clip invisibly at the td edge:
    compact squeezes td.wrap to nowrap, which pins every chip to one line -
    a pill starting mid-line can shrink to max-width:100% yet still
@@ -11827,10 +11909,6 @@ body.compact td .genline { display:inline-block; max-width:100%;
 .counts span { background:#161b22; border-radius:8px; padding:1px 8px; margin-right:5px; font-size:12px; }
 a { color:#58a6ff; text-decoration:none; }
 [hidden] { display:none !important; }
-.tok-help { display:inline-block; position:relative; margin-left:6px; vertical-align:middle; }
-.tok-help summary { display:inline-grid; place-items:center; width:18px; height:18px; border:1px solid #6e7681; border-radius:50%; color:#58a6ff; cursor:pointer; list-style:none; }
-.tok-help summary::-webkit-details-marker { display:none; }
-.tok-help .explain { padding:10px 12px; margin-top:7px; border:1px solid #30363d; background:#0d1117; border-radius:6px; font-size:12px; line-height:1.6; }
 #backdrop { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:50; }
 #detail { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); width:min(780px,92vw); max-height:82vh; background:#161b22; border:1px solid #30363d; border-radius:10px; padding:18px 22px; overflow:auto; z-index:51; font-size:13px; box-sizing:border-box; }
 #detail h3 { margin:0 80px 10px 0; font-size:14px; }
@@ -11842,23 +11920,51 @@ a { color:#58a6ff; text-decoration:none; }
    #detail's padding so it pins flush over the scroll gap. The right pad
    leaves room for the Close X which overlays the bar. */
 #detail .dnav { position:sticky; top:0; z-index:6; display:flex; align-items:center; gap:10px; margin:-18px -22px 12px; padding:7px 56px 7px 22px; background:#161b22; border-bottom:1px solid #30363d; border-radius:9px 9px 0 0; }
-#detail .dnav-btn { display:inline-flex; align-items:center; gap:6px; max-width:40%; background:#21262d; border:1px solid #30363d; color:#e6edf3; border-radius:6px; padding:4px 10px; font:inherit; font-size:12px; cursor:pointer; }
+#detail .dnav-btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; min-width:38px; max-width:40%; background:#21262d; border:1px solid #30363d; color:#e6edf3; border-radius:6px; padding:4px 10px; font:inherit; font-size:12px; cursor:pointer; }
+#detail .dnav-btn.nav { min-width:130px; }
 #detail .dnav-btn span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #detail .dnav-btn:hover:not(:disabled) { border-color:#58a6ff; }
 #detail .dnav-btn:disabled { opacity:.4; cursor:default; }
-#detail .dnav-pos { margin:0 auto; color:#8b949e; font-size:12px; white-space:nowrap; }
+/* three zones - Back pins left, the pipeline arrows pin right, and the
+   counter centers on the BAR, not the leftover space, so it never
+   shifts when sibling names differ in length */
+#detail .dnav-l { display:flex; align-items:center; gap:10px; flex:1; min-width:0; }
+#detail .dnav-r { display:flex; align-items:center; gap:6px; flex:1; justify-content:flex-end; min-width:0; }
+#detail .dnav-pos { position:absolute; left:50%; transform:translateX(-50%); color:#8b949e; font-size:12px; white-space:nowrap; }
 /* the Back button sits in the same sticky .dnav bar as prev/next (or
    alone in a bar of its own on modals without pipeline nav) */
 #detail .dnav-back { flex:none; }
 /* the summary modal embeds _summary_body's fragment (?frag=1) - the same
    escaped markup the standalone page wraps, themed to the dialog */
-#detail .sumdoc h1 { font-size:16px; border-bottom:1px solid #21262d; padding-bottom:6px; margin:2px 80px 10px 0; }
-#detail .sumdoc h2 { font-size:13px; color:#58a6ff; margin:14px 0 5px; }
+#detail .sumdoc { color:#c9d1d9; }
+#detail .sumdoc h1 { font-size:15px; font-weight:600; color:#e6edf3; border-bottom:1px solid #21262d; padding-bottom:5px; margin:2px 80px 10px 0; }
+#detail .sumdoc h2 { font-size:13px; font-weight:600; color:#79b8ff; margin:14px 0 5px; }
+#detail .sumdoc h3, #detail .sumdoc h4 { font-size:12px; font-weight:600; color:#8b949e; margin:12px 0 4px; }
+/* an LLM-written run.summary.md gets accent headings so it reads as a
+   generated report, not as more conductor chrome */
+#detail .sumdoc .llmsum h1, #detail .sumdoc .llmsum h2,
+#detail .sumdoc .llmsum h3, #detail .sumdoc .llmsum h4 { color:#ffa657; }
 #detail .sumdoc ul { padding-left:20px; margin:6px 0; }
 #detail .sumdoc li { margin:3px 0; }
 #detail .sumdoc p { margin:8px 0; }
 #detail .sumdoc code { background:#0d1117; border-radius:4px; padding:1px 5px; font-size:12px; }
 #detail .sumdoc strong { color:#e6edf3; }
+/* the summary modal's own title - quiet, like the doc header under it */
+#detail h3.sumtitle { font-size:13px; font-weight:500; color:#8b949e; margin:0 80px 4px 0; }
+/* the task prompt box: a fixed visual slot in modal and summary alike,
+   so a one-line task doesn't collapse the layout */
+#detail pre.taskpre, #detail .sumdoc pre.taskpre { min-height:110px; }
+/* bookkeeping rows (the detached run summarizer) sit under their run's
+   filter, muted and italic so they never read as pipeline work */
+tr.agen.aux { opacity:.6; }
+tr.agen.aux td.step > span { font-style:italic; }
+/* the Actions zone: every control that mutates task/run state sits
+   below one rule under one header - IntelliJ-style, view-only
+   controls (trajectory expand/collapse) stay with their content */
+#detail .actzone { border-top:1px solid #30363d; margin-top:16px; }
+#detail .acth { margin:12px 0 4px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:#8b949e; }
+#detail .actzone .actions { margin:10px 0; }
+#detail .actzone .actions .sub { font-size:12px; }
 .arc { font-size:12px; border:1px solid #21262d; border-radius:6px; padding:6px 8px; max-height:280px; overflow-y:auto; background:#0d1117; }
 .arcspan { color:#8b949e; min-width:44px; text-align:right; flex:none; }
 .arcphase { flex:none; width:78px; }
@@ -12165,28 +12271,8 @@ function setDensity(d){
 const TOK_HELP = 'tokens: in (billed, uncached) / out / cached ' +
   '(cache-served share) · turns = LLM steps; compact view reads ' +
   '"in/out/cached NL"; select an agent for details';
-const tokenHelp = `<details class="tok-help"><summary aria-label="Explain tokens and cost">?</summary>` +
-  `<div class="explain"><b>What the numbers mean</b><br>` +
-  `<b>in</b>: uncached input tokens - the part billed at the input ` +
-  `rate, same number Devin Desktop's card reports. The raw export ` +
-  `counts the WHOLE prompt each turn (in + cached); the cell tooltip ` +
-  `still shows it.<br>` +
-  `<b>out</b>: output (completion) tokens.<br>` +
-  `<b>cached</b>: the share of the prompt served from cache - billed ` +
-  `at the (cheaper) cache-read rate, never added on top of ` +
-  `<b>in</b>.<br>` +
-  `<b>turns</b>: LLM steps - model turns, not manifest steps. ` +
-  `<b>M</b> in prices means one million tokens.<br><br>` +
-  `<b>Estimated cost</b> = (prompt - cached) × input rate + ` +
-  `cached × cache rate + completion × output rate, each rate per token ` +
-  `for that model and effort.<br><br>` +
-  `<b>Example (illustrative rates, not a quote):</b> 10,000 prompt, ` +
-  `6,000 cached, 1,000 completion; at $2/M input, $0.50/M cached, ` +
-  `$8/M output: 4,000 × $2/M + 6,000 × $0.50/M + 1,000 × $8/M ` +
-  `= $0.008 + $0.003 + $0.008 = <b>$0.019</b>. ` +
-  `Rates come from the self-serve table at docs.devin.ai/desktop/chat/` +
-  `models, refetched every few hours; a model with no listed rate ` +
-  `shows n/a.</div></details>`;
+const tokenHelp = '';  // the '?' explainer widget was removed; TOK_HELP
+// survives as the hover tooltip on tokens cells
 // Cumulative contract: elapsed_s is the sum of CLOSED execution
 // intervals (each dispatch banks its own); while a row is running the
 // live interval adds now - started_at on top. A queued resumed row
@@ -12645,9 +12731,10 @@ function backBtnHTML(){
   const top=modalHist[modalHist.length-1];
   if (!top) return '';
   const lbl=histLabel(top);
+  // 'Back' only - the destination stays on the tooltip so the bar's
+  // free space belongs to the position counter + nav arrows
   return `<button type="button" class="dnav-btn dnav-back" ` +
-    `data-modal-back title="return to ${esc(lbl)}">` +
-    `&larr; <span>Back: ${esc(lbl)}</span></button>`;
+    `data-modal-back title="return to ${esc(lbl)}">&larr; Back</button>`;
 }
 function applyModalScroll(){
   if (modalScroll==null) return;
@@ -12691,6 +12778,9 @@ async function openSummary(key, push=true){
     return openRunSummary(key.slice(4), push);   // run-level summary view
   const a=AGENTS.find(x=>agentKey(x)===key);
   if (!a) return;
+  // the bookkeeping row's "session summary" IS the run summary - the
+  // summarizer has no per-step report of its own
+  if (a.aux) return openRunSummary(a.run_key||a.run_dir, push);
   const snap = push ? snapshotModal() : null;
   if (!closeDetail(false, true)) return;   // the stack is managed here
   if (snap && !(snap.kind==='summary'&&snap.key===key)) pushHist(snap);
@@ -12716,34 +12806,36 @@ async function openSummary(key, push=true){
   renderSummaryFrame(a, frag, err);
 }
 function renderSummaryFrame(a, frag, err){
-  // same chrome as the task modal's .dnav: arrows name their sibling step,
-  // 'task N of M' marks position, the buttons disable at the chain ends
+  // same chrome as the task modal's .dnav, but the summary view's
+  // buttons carry arrows only (names live on the tooltips) and the
+  // counter centers on the bar
   const sibs=pipeSibs(a);
   const pos=summaryView ? sibs.findIndex(x=>agentKey(x)===summaryView.key) : -1;
   const sbtn=(b,dir)=> b
     ? `<button type="button" class="dnav-btn" ` +
       `data-snav="${esc(agentKey(b))}" title="summary: ${esc(b.step)}">` +
-      (dir<0 ? `&larr; <span>${esc(b.step)}</span>`
-             : `<span>${esc(b.step)}</span> &rarr;`) + `</button>`
+      (dir<0?'&larr;':'&rarr;') + `</button>`
     : `<button type="button" class="dnav-btn" disabled>` +
       (dir<0?'&larr;':'&rarr;') + `</button>`;
-  const nav = (pos>=0 && sibs.length>1)
-    ? sbtn(sibs[pos-1],-1) +
-      `<span class="dnav-pos">task ${pos+1} of ${sibs.length}</span>` +
-      sbtn(sibs[pos+1],1) : '';
-  const bar = backBtnHTML()+nav;
+  const bar = (modalHist.length || (pos>=0 && sibs.length>1))
+    ? `<div class="dnav"><span class="dnav-l">${backBtnHTML()}</span>` +
+      (pos>=0 && sibs.length>1
+        ? `<span class="dnav-pos">task ${pos+1} of ${sibs.length}` +
+          `</span><span class="dnav-r">${sbtn(sibs[pos-1],-1)}` +
+          `${sbtn(sibs[pos+1],1)}</span>` : '') +
+      `</div>` : '';
+  const runKey_ = a.run_key||a.run_dir;
   document.getElementById('dbody').innerHTML =
-    (bar?`<div class="dnav">${bar}</div>`:'') +
-    `<h3 id="modal-title">Session summary - ${esc(a.slug)} / ${esc(a.step)}</h3>` +
+    bar +
+    `<h3 id="modal-title" class="sumtitle">Session summary - ` +
+    `${esc(a.slug)} / ${esc(a.step)}</h3>` +
+    (runKey_ ? `<div class="sub" style="margin-bottom:8px">run ` +
+      `<button type="button" class="linkbtn" ` +
+      `data-run-details="${esc(runKey_)}">${esc(a.run||runKey_)}` +
+      `</button></div>` : '') +
     (err!=null ? `<div class="notice error">${esc(err)}</div>`
       : frag==null ? `<div class="notice">Loading summary&hellip;</div>`
-      : `<div class="sumdoc">${frag}</div>`) +
-    (a.run_dir
-      ? `<div class="actions"><a class="btn secondary" target="_blank" ` +
-        `href="/api/runs/${encodeURIComponent(base(a.run_dir))}/steps/` +
-        `${encodeURIComponent(a.step)}/summary" title="the same report ` +
-        `as a standalone page - the shareable URL">Open as page ↗</a></div>`
-      : '');
+      : `<div class="sumdoc">${frag}</div>`);
   // the loading frame consumed modalScroll already, so a Back restore
   // keeps its offset through the async fetch below
   applyModalScroll();
@@ -12762,15 +12854,13 @@ async function openRunSummary(key, push=true){
     pushHist(snap);
   summaryView={key:'run|'+key};
   if (modalScroll==null) modalScroll=0;
-  const head=`<h3 id="modal-title">Run summary - ${esc(r.run||key)}</h3>`;
-  const link=`<div class="actions"><a class="btn secondary" ` +
-    `target="_blank" href="/api/runs/` +
-    `${encodeURIComponent(base(r.dir))}/summary" title="the same ` +
-    `report as a standalone page - the shareable URL">` +
-    `Open as page ↗</a></div>`;
+  const bar = modalHist.length
+    ? `<div class="dnav"><span class="dnav-l">${backBtnHTML()}</span>` +
+      `</div>` : '';
+  const head=`<h3 id="modal-title" class="sumtitle">Run summary - ` +
+    `${esc(r.run||key)}</h3>`;
   document.getElementById('dbody').innerHTML =
-    (modalHist.length?`<div class="dnav">${backBtnHTML()}</div>`:'') +
-    head + `<div class="notice">Loading summary&hellip;</div>` + link;
+    bar + head + `<div class="notice">Loading summary&hellip;</div>`;
   document.getElementById('backdrop').hidden=false;
   applySel();          // the run summary keeps the run's row marked
   let frag=null, err=null;
@@ -12783,13 +12873,12 @@ async function openRunSummary(key, push=true){
   }catch(e){ err='Summary unavailable: '+(e.message||e); }
   if (!summaryView || summaryView.key!=='run|'+key) return;
   document.getElementById('dbody').innerHTML =
-    (modalHist.length?`<div class="dnav">${backBtnHTML()}</div>`:'') +
-    head +
+    bar + head +
     (r.summarizing?`<div class="notice">A summary session is running - ` +
       `reopen this view when it finishes; the deterministic roll-up ` +
       `below is the interim answer.</div>`:'') +
     (err!=null ? `<div class="notice error">${esc(err)}</div>`
-      : `<div class="sumdoc">${frag}</div>`) + link;
+      : `<div class="sumdoc">${frag}</div>`);
   applyModalScroll();
 }
 function summaryNav(d){
@@ -12964,148 +13053,160 @@ function showDetail(i, keepStack){
   const sibs = pipeSibs(a);
   const pos = sibs.findIndex(x=>agentKey(x)===detailKey);
   const navBtn = (b,dir)=> b
-    ? `<button type="button" class="dnav-btn" ` +
+    ? `<button type="button" class="dnav-btn nav" ` +
       `data-nav="${esc(agentKey(b))}" title="${esc(b.step)}">` +
       (dir<0 ? `&larr; <span>${esc(b.step)}</span>`
              : `<span>${esc(b.step)}</span> &rarr;`) + `</button>`
-    : `<button type="button" class="dnav-btn" disabled>` +
+    : `<button type="button" class="dnav-btn nav" disabled>` +
       (dir<0 ? '&larr;' : '&rarr;') + `</button>`;
   const navBar = (pos>=0 && sibs.length>1)
-    ? `<div class="dnav">${backBtnHTML()}${navBtn(sibs[pos-1],-1)}` +
+    ? `<div class="dnav"><span class="dnav-l">${backBtnHTML()}</span>` +
       `<span class="dnav-pos">task ${pos+1} of ${sibs.length}</span>` +
-      `${navBtn(sibs[pos+1],1)}</div>`
-    : (modalHist.length ? `<div class="dnav">${backBtnHTML()}</div>` : '');
+      `<span class="dnav-r">${navBtn(sibs[pos-1],-1)}` +
+      `${navBtn(sibs[pos+1],1)}</span></div>`
+    : (modalHist.length
+       ? `<div class="dnav"><span class="dnav-l">${backBtnHTML()}` +
+         `</span></div>` : '');
+  // the step name carries the summary link - the aux bookkeeping row's
+  // report IS the run summary
+  const sumKey = a.aux ? 'run|'+(a.run_key||base(a.run_dir))
+                       : agentKey(a);
+  const runKey_ = a.run_key||a.run_dir;
+  // Every control that mutates the task or its run lives in ONE zone at
+  // the end of the modal - review, lifecycle, prompt/notes edits, the
+  // timeout editor - under one rule + header, IntelliJ-style. View-only
+  // controls (trajectory expand/collapse) stay with their content.
+  const actBits = (a.run_dir && !a.aux)
+    ? (`<div class="actions"><button type="button" ` +
+      `class="btn${a.needs_review?'':' secondary'}" ` +
+      `data-review-step="${esc(base(a.run_dir))}" ` +
+      `data-step="${esc(a.step)}" ` +
+      `data-review-set="${a.needs_review?1:0}" ` +
+      `data-review-seq="${a.completion_seq??''}" ` +
+      `title="a private 'you looked at this' flag - it changes nothing ` +
+      `about the outcome and never marks the run itself">` +
+      `${a.needs_review?'Mark as reviewed':'Mark as needing review'}` +
+      `</button><span class="sub">` +
+      `a personal review mark for this task only - the run keeps its ` +
+      `own mark, and a re-run completion flags it again.</span></div>` +
+      (a.status==='running'
+        ? `<div class="actions"><button type="button" class="btn danger" ` +
+          `data-stop-agent="${esc(base(a.run_dir))}" ` +
+          `data-step="${esc(a.step)}" ` +
+          `title="kill this agent's process tree now - the run ` +
+          `proceeds to the next step">Stop this step</button>` +
+          `<span class="sub">tree-kills the ` +
+          `devin process; committed work stays. The run continues; ` +
+          `Resume re-runs the step.</span></div>` +
+          `<div class="actions"><button type="button" ` +
+          `class="btn secondary" ` +
+          `data-intr-open="${esc(agentKey(a))}" ` +
+          `title="stop the worker, then immediately resume this same ` +
+          `step with added instructions/screenshots - committed work ` +
+          `and the worktree stay; the run keeps going">` +
+          `Interrupt + instruct</button>` +
+          `<span class="sub">opens a composer ` +
+          `first - the same step resumes with your text; nothing is ` +
+          `skipped and the run does not pause.</span></div>` : '') +
+      intrComposerHTML(a) +
+      (((a.status==='queued'||a.status==='waiting') && !a.skipped_by_user)
+        ? `<div class="actions"><button type="button" ` +
+          `class="btn secondary" ` +
+          `data-skip-step="${esc(base(a.run_dir))}" ` +
+          `data-step="${esc(a.step)}" ` +
+          `title="never launch this step while marked - it keeps its ` +
+          `queue position and stays skipped (even across resume) ` +
+          `until you Unskip">Skip step</button>` +
+          `<span class="sub">the step records ` +
+          `'skipped' when its turn comes - nothing is launched.</span>` +
+          `</div>` : '') +
+      (a.skipped_by_user
+        ? `<div class="actions"><button type="button" class="btn" ` +
+          `data-unskip-step="${esc(base(a.run_dir))}" ` +
+          `data-step="${esc(a.step)}" ` +
+          `title="remove the skip mark - the step runs in its original ` +
+          `queue position (if its turn already passed, on the next ` +
+          `resume)">Unskip step</button></div>` : '') +
+      ((a.status==='running'||a.status==='queued')
+        ? `<div class="actions"><label for="d-timeout" ` +
+          `style="margin:0">timeout (min)</label>` +
+          `<input id="d-timeout" type="number" min="1" max="1440" ` +
+          `value="${a.timeout_min??''}" style="width:90px" ` +
+          `data-timeout-orig="${a.timeout_min??''}">` +
+          `<button type="button" class="btn secondary" ` +
+          `id="d-timeout-save" disabled ` +
+          `data-set-timeout="${esc(base(a.run_dir))}" ` +
+          `data-step="${esc(a.step)}">Save</button>` +
+          `<span class="sub">moves the live deadline on the next poll ` +
+          `(&lt;15s); a value under elapsed ends the step early, ` +
+          `retries use it too.</span></div>` : '') +
+      (a.prompt_editable
+        ? `<h3 style="margin-top:14px">Edit prompt` +
+          (a.prompt_edited || a.prompt_override!=null
+            ? ` <span class="sub">(override saved - the manifest ` +
+              `itself is unchanged)</span>` : '') + `</h3>` +
+          `<textarea id="d-prompt" style="min-height:120px" ` +
+          `spellcheck="false">${esc(pd!==undefined?pd:
+            (a.prompt_override ?? a.task_full ?? a.task ?? ''))}` +
+          `</textarea><div class="actions">` +
+          `<button type="button" class="btn secondary" ` +
+          `data-save-prompt="${esc(base(a.run_dir))}" ` +
+          `data-step="${esc(a.step)}">Save prompt</button>` +
+          (a.prompt_override!=null
+            ? `<button type="button" class="btn secondary" ` +
+              `data-revert-prompt="${esc(base(a.run_dir))}" ` +
+              `data-step="${esc(a.step)}">Revert to manifest</button>` : '') +
+          `<span class="sub">what this step's next session is ` +
+          `dispatched with; locks the moment the step starts.</span>` +
+          `</div>` : '') +
+      (!a.prompt_editable && pd!==undefined
+        ? `<div class="notice warn">This step started while the edit ` +
+          `was open - its prompt was already dispatched, so the edit ` +
+          `was NOT applied. The unsaved text is kept below` +
+          (a.notes_enabled ? ` - put follow-up context in resume ` +
+            `notes instead.` : ` - copy it out before closing.`) +
+          `</div><textarea disabled style="min-height:70px">` +
+          `${esc(pd)}</textarea>` : '') +
+      (a.notes_enabled
+        ? `<h3 style="margin-top:14px">Resume notes</h3>` +
+          `<textarea id="d-rnotes" style="min-height:70px" ` +
+          `spellcheck="false" placeholder="context for the resume, ` +
+          `e.g. VPN is restored">${esc(nd!==undefined?nd:
+            (a.resume_notes||''))}</textarea><div class="actions">` +
+          `<button type="button" class="btn secondary" ` +
+          `data-save-notes="${esc(base(a.run_dir))}" ` +
+          `data-step="${esc(a.step)}">Save notes</button>` +
+          `<span class="sub">appended to this step's next dispatched ` +
+          `prompt - the original prompt is never edited. Empty + ` +
+          `Save clears stored notes.</span></div>` : '')) : '';
+  const genBit = (a.request_id && a.step==='plan-proposal' &&
+    a.status==='running'
+    ? `<div class="actions"><button type="button" class="btn danger" ` +
+      `data-stop-gen="${esc(a.request_id)}" ` +
+      `title="cancel this planning pass - the request stays editable ` +
+      `and any previous proposal is kept">Stop proposal</button></div>`
+    : '');
+  const actHtml = (actBits || genBit)
+    ? `<div class="actzone"><div class="acth">Actions</div>` +
+      actBits + genBit + `</div>` : '';
   const html =
     navBar +
-    `<h3 id="modal-title">${esc(a.slug)} / ${esc(a.step)}</h3><div class="kv">` +
+    `<h3 id="modal-title">${esc(a.slug)} / ${esc(a.step)}` +
+    (a.run_dir ? ` &middot; <button type="button" class="linkbtn" ` +
+      `data-summary="${esc(sumKey)}" title="human-readable ` +
+      `end-of-step report from the ATIF export - opens in this dialog ` +
+      `with prev/next navigation">Summary</button>` : '') +
+    `</h3><div class="kv">` +
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">` +
-      (k==='task prompt' ? `<pre>${esc(v??'-')}</pre>`
+      (k==='task prompt' ? `<pre class="taskpre">${esc(v??'-')}</pre>`
+        : k==='run' && runKey_
+        ? `<button type="button" class="linkbtn" ` +
+          `data-run-details="${esc(runKey_)}">${esc(v??'-')}</button>`
         : k==='outcome' && !v
         ? `<span class="sub">not reported - the step predates the ` +
           `OUTCOME: line or ended before printing it</span>`
-        : esc(v??'-')) +
-      (k==='tokens'?tokenHelp:'') + '</div>').join('') +
+        : esc(v??'-')) + '</div>').join('') +
     `</div>` +
-    (a.run_dir
-      ? (`<div class="actions"><a class="btn secondary" ` +
-        `data-summary="${esc(agentKey(a))}" target="_blank" ` +
-        `href="/api/runs/${encodeURIComponent(base(a.run_dir))}/steps/` +
-        `${encodeURIComponent(a.step)}/summary" title="human-readable ` +
-        `end-of-step report, generated from the ATIF export - opens in ` +
-        `this dialog with prev/next navigation (Ctrl/middle-click opens ` +
-        `the standalone page); also saved as <step>.summary.md in the ` +
-        `run dir once the step ends">` +
-        `Session summary</a><span class="sub" style="margin-left:10px">` +
-        `status, elapsed, tokens, trajectory, commits, stdout tail - ` +
-        `readable markdown instead of a raw log.</span></div>` +
-        `<div class="actions"><button type="button" ` +
-        `class="btn${a.needs_review?'':' secondary'}" ` +
-        `data-review-step="${esc(base(a.run_dir))}" ` +
-        `data-step="${esc(a.step)}" ` +
-        `data-review-set="${a.needs_review?1:0}" ` +
-        `data-review-seq="${a.completion_seq??''}" ` +
-        `title="a private 'you looked at this' flag - it changes nothing ` +
-        `about the outcome and never marks the run itself">` +
-        `${a.needs_review?'Mark as reviewed':'Mark as needing review'}` +
-        `</button><span class="sub" style="margin-left:10px">` +
-        `a personal review mark for this task only - the run keeps its ` +
-        `own mark, and a re-run completion flags it again.</span></div>` +
-        (a.status==='running'
-          ? `<div class="actions"><button type="button" class="btn danger" ` +
-            `data-stop-agent="${esc(base(a.run_dir))}" ` +
-            `data-step="${esc(a.step)}" ` +
-            `title="kill this agent's process tree now - the run ` +
-            `proceeds to the next step">Stop this step</button>` +
-            `<span class="sub" style="margin-left:10px">tree-kills the ` +
-            `devin process; committed work stays. The run continues; ` +
-            `Resume re-runs the step.</span></div>` +
-            `<div class="actions"><button type="button" ` +
-            `class="btn secondary" ` +
-            `data-intr-open="${esc(agentKey(a))}" ` +
-            `title="stop the worker, then immediately resume this same ` +
-            `step with added instructions/screenshots - committed work ` +
-            `and the worktree stay; the run keeps going">` +
-            `Interrupt + instruct</button>` +
-            `<span class="sub" style="margin-left:10px">opens a composer ` +
-            `first - the same step resumes with your text; nothing is ` +
-            `skipped and the run does not pause.</span></div>` : '') +
-        intrComposerHTML(a) +
-        (((a.status==='queued'||a.status==='waiting') && !a.skipped_by_user)
-          ? `<div class="actions"><button type="button" ` +
-            `class="btn secondary" ` +
-            `data-skip-step="${esc(base(a.run_dir))}" ` +
-            `data-step="${esc(a.step)}" ` +
-            `title="never launch this step while marked - it keeps its ` +
-            `queue position and stays skipped (even across resume) ` +
-            `until you Unskip">Skip step</button>` +
-            `<span class="sub" style="margin-left:10px">the step records ` +
-            `'skipped' when its turn comes - nothing is launched.</span>` +
-            `</div>` : '') +
-        (a.skipped_by_user
-          ? `<div class="actions"><button type="button" class="btn" ` +
-            `data-unskip-step="${esc(base(a.run_dir))}" ` +
-            `data-step="${esc(a.step)}" ` +
-            `title="remove the skip mark - the step runs in its original ` +
-            `queue position (if its turn already passed, on the next ` +
-            `resume)">Unskip step</button></div>` : '') +
-        ((a.status==='running'||a.status==='queued')
-          ? `<div class="actions"><label for="d-timeout" ` +
-            `style="margin:0">timeout (min)</label>` +
-            `<input id="d-timeout" type="number" min="1" max="1440" ` +
-            `value="${a.timeout_min??''}" style="width:90px">` +
-            `<button type="button" class="btn secondary" ` +
-            `data-set-timeout="${esc(base(a.run_dir))}" ` +
-            `data-step="${esc(a.step)}">Save</button>` +
-            `<span class="sub">moves the live deadline on the next poll ` +
-            `(&lt;15s); a value under elapsed ends the step early, ` +
-            `retries use it too.</span></div>` : '') +
-        (a.prompt_editable
-          ? `<h3 style="margin-top:14px">Edit prompt` +
-            (a.prompt_edited || a.prompt_override!=null
-              ? ` <span class="sub">(override saved - the manifest ` +
-                `itself is unchanged)</span>` : '') + `</h3>` +
-            `<textarea id="d-prompt" style="min-height:120px" ` +
-            `spellcheck="false">${esc(pd!==undefined?pd:
-              (a.prompt_override ?? a.task_full ?? a.task ?? ''))}` +
-            `</textarea><div class="actions">` +
-            `<button type="button" class="btn secondary" ` +
-            `data-save-prompt="${esc(base(a.run_dir))}" ` +
-            `data-step="${esc(a.step)}">Save prompt</button>` +
-            (a.prompt_override!=null
-              ? `<button type="button" class="btn secondary" ` +
-                `data-revert-prompt="${esc(base(a.run_dir))}" ` +
-                `data-step="${esc(a.step)}">Revert to manifest</button>` : '') +
-            `<span class="sub">what this step's next session is ` +
-            `dispatched with; locks the moment the step starts.</span>` +
-            `</div>` : '') +
-        (!a.prompt_editable && pd!==undefined
-          ? `<div class="notice warn">This step started while the edit ` +
-            `was open - its prompt was already dispatched, so the edit ` +
-            `was NOT applied. The unsaved text is kept below` +
-            (a.notes_enabled ? ` - put follow-up context in resume ` +
-              `notes instead.` : ` - copy it out before closing.`) +
-            `</div><textarea disabled style="min-height:70px">` +
-            `${esc(pd)}</textarea>` : '') +
-        (a.notes_enabled
-          ? `<h3 style="margin-top:14px">Resume notes</h3>` +
-            `<textarea id="d-rnotes" style="min-height:70px" ` +
-            `spellcheck="false" placeholder="context for the resume, ` +
-            `e.g. VPN is restored">${esc(nd!==undefined?nd:
-              (a.resume_notes||''))}</textarea><div class="actions">` +
-            `<button type="button" class="btn secondary" ` +
-            `data-save-notes="${esc(base(a.run_dir))}" ` +
-            `data-step="${esc(a.step)}">Save notes</button>` +
-            `<span class="sub">appended to this step's next dispatched ` +
-            `prompt - the original prompt is never edited. Empty + ` +
-            `Save clears stored notes.</span></div>` : '')) : '') +
-    (a.request_id ? `<div class="actions">` +
-      (a.step==='plan-proposal' && a.status==='running'
-        ? `<button type="button" class="btn danger" ` +
-          `data-stop-gen="${esc(a.request_id)}" ` +
-          `title="cancel this planning pass - the request stays editable ` +
-          `and any previous proposal is kept">Stop proposal</button>` : '') +
-      `<button type="button" class="btn secondary" ` +
-      `data-open-request="${esc(a.request_id)}">View request / runbook</button></div>` : '') +
     (a.tail ? `<h3 style="margin-top:14px">stdout tail</h3><pre id="dtail">${esc(a.tail)}</pre>` : '') +
     (a.arc && a.arc.groups && a.arc.groups.length
       ? `<h3 style="margin-top:14px">trajectory` +
@@ -13162,7 +13263,8 @@ function showDetail(i, keepStack){
             `(the list caps at ${a.arc.groups.length} - their full text ` +
             `is still in the export)</div>`
           : '') +
-        `</div>` : '');
+        `</div>` : '') +
+    actHtml;
   if (sameView && html===detailHTML){
     // identical repaint (most refresh ticks while nothing visible
     // changed) - leave the live DOM alone: scroll offset, selection,
@@ -13257,6 +13359,23 @@ function showRunDetails(key, keepStack){
   const liveSteps = ctl.liveSteps;
   const interrupted = ctl.interrupted;
   const executing = ctl.executing;
+  // the run's task list as links into each task's modal - pipeline seq
+  // order, aux bookkeeping rows last and marked
+  const tasks = AGENTS.filter(a=>(a.run_key||a.run_dir)===key)
+    .slice().sort((x,y)=>((x.seq??1e9)-(y.seq??1e9)) ||
+      String(x.started_at||'').localeCompare(String(y.started_at||'')));
+  const taskTbl = tasks.length
+    ? `<h3 style="margin-top:14px">tasks</h3>` +
+      `<div class="wrapw"><table>` +
+      `<tr><th>step</th><th>status</th><th>elapsed</th></tr>` +
+      tasks.map(t=>`<tr>` +
+        `<td><button type="button" class="linkbtn" ` +
+        `data-agent-detail="${esc(agentKey(t))}">${esc(t.step)}` +
+        `</button>${t.aux?' <span class="sub">aux</span>':''}</td>` +
+        `<td><span style="color:${COLORS[t.status]||'#8b949e'}">` +
+        `${esc(t.status)}</span></td>` +
+        `<td>${elapsed(t, Date.now())}</td></tr>`).join('') +
+      `</table></div>` : '';
   const notice = (r.aborted==='paused' && canResume)
     ? `<div class="notice warn">Paused - in-flight steps finished and ` +
       `nothing new launched. Resume continues where it left off ` +
@@ -13266,13 +13385,15 @@ function showRunDetails(key, keepStack){
       `gone (crash or machine restart). Resume picks up unfinished ` +
       `steps from committed state.</div>` : '';
   document.getElementById('dbody').innerHTML =
-    (modalHist.length ? `<div class="dnav">${backBtnHTML()}</div>` : '') +
+    (modalHist.length ? `<div class="dnav"><span class="dnav-l">${backBtnHTML()}</span></div>` : '') +
     `<h3 id="modal-title">${esc(r.run)}</h3>` +
     (r.stage ? `<span class="stage ${esc(r.stage)}">${esc(STAGES[r.stage]||r.stage)}</span>` : '') +
     notice +
     `<div class="kv" style="margin-top:12px">` +
-    kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">${esc(v??'-')}` +
-      (k==='tokens'?tokenHelp:'') + `</div>`).join('') + '</div>' +
+    kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">` +
+      (k==='tokens'
+        ? `<span title="${esc(TOK_HELP)}">${esc(v??'-')}</span>`
+        : esc(v??'-')) + `</div>`).join('') + '</div>' +
     `<div class="actions"><button type="button" class="btn secondary" ` +
     `data-filter-run="${esc(key)}">Show only this run</button>` +
     (r.stage ? '' : `<button type="button" class="btn secondary" ` +
@@ -13349,7 +13470,7 @@ function showRunDetails(key, keepStack){
         : 'move this run record - state, logs, prompts, exports - to ' +
           'Trash; recoverable for 48h, Empty trash deletes it for good'}">` +
       `Delete run</button>`) +
-    '</div>';
+    '</div>' + taskTbl;
   applyModalScroll();
   document.getElementById('backdrop').hidden = false;
   applySel();        // mark this run's row while its modal is open
@@ -13448,9 +13569,12 @@ function ctxAgentItems(a){
   it.push({label:'Open details', attrs:ctxAttrs({'agent-detail':key}),
     title:'task details - same as the step name'});
   if (a.run_dir)
-    it.push({label:'Session summary', attrs:ctxAttrs({'summary':key}),
-      title:'the end-of-session report for this step, opened in this ' +
-        'dialog'});
+    it.push({label:a.aux?'Run summary':'Session summary',
+      attrs:ctxAttrs({'summary':key}),
+      title:a.aux
+        ? "this run's executive summary, opened in this dialog"
+        : 'the end-of-session report for this step, opened in this ' +
+          'dialog'});
   it.push({label:'Filter by this item',
     attrs:ctxAttrs({'filter-run':a.run_key||a.run_dir||''}),
     title:'show only the run this task belongs to'});
@@ -13458,6 +13582,9 @@ function ctxAgentItems(a){
     it.push({label:'View request / runbook',
       attrs:ctxAttrs({'open-request':a.request_id})});
   const act = [];
+  // aux bookkeeping rows (the run summarizer) aren't pipeline steps -
+  // no stop/skip/review/prompt controls exist for them
+  if (!a.aux){
   if (a.status==='running' && a.run_dir){
     act.push({label:'Interrupt + instruct',
       attrs:ctxAttrs({'intr-open':key}),
@@ -13489,6 +13616,7 @@ function ctxAgentItems(a){
   if (a.prompt_editable && a.run_dir)
     act.push({label:'Edit prompt', attrs:ctxAttrs({'edit-prompt':key}),
       title:'open the task and jump to the prompt editor'});
+  }
   if (act.length) it.push({sep:1}, ...act);
   return it;
 }
@@ -13719,7 +13847,7 @@ function showRequestForm(rec){
   const steps=rec.proposed_steps||[];
   const canEdit=editable && stage!=='new';
   document.getElementById('dbody').innerHTML =
-    (modalHist.length ? `<div class="dnav">${backBtnHTML()}</div>` : '') +
+    (modalHist.length ? `<div class="dnav"><span class="dnav-l">${backBtnHTML()}</span></div>` : '') +
     `<h3 id="modal-title">${stage==='new'?'New request':
       stage==='ready'?'Review proposed run':
       stage==='launched'?'Original request': 'Request details'}</h3>` +
@@ -14208,7 +14336,7 @@ async function openRequest(id, keepStack){
   if (snap && !(snap.kind==='request' && snap.id===id)) pushHist(snap);
   modalRequest={id,status:'loading',dirty:false,originalManifest:''};
   document.getElementById('dbody').innerHTML =
-    (modalHist.length ? `<div class="dnav">${backBtnHTML()}</div>` : '') +
+    (modalHist.length ? `<div class="dnav"><span class="dnav-l">${backBtnHTML()}</span></div>` : '') +
     '<h3 id="modal-title">Loading request…</h3>';
   document.getElementById('backdrop').hidden = false;
   applySel();          // the request's run row stays marked while open
@@ -14220,7 +14348,7 @@ async function openRequest(id, keepStack){
     showRequestForm(rec);
   } catch(err){
     document.getElementById('dbody').innerHTML =
-      (modalHist.length ? `<div class="dnav">${backBtnHTML()}</div>` : '') +
+      (modalHist.length ? `<div class="dnav"><span class="dnav-l">${backBtnHTML()}</span></div>` : '') +
       `<h3 id="modal-title">Request unavailable</h3><div class="notice error">` +
       `${esc(err.message)}</div>`;
     applyModalScroll();
@@ -14489,10 +14617,15 @@ function render(d){
   lastSig = sig;
 
   // status filter chips (click toggles)
-  const scope = d.agents.filter(a=>!selectedRun ||
-    (a.run_key||a.run_dir)===selectedRun);
+  // aux bookkeeping rows (the run summarizer) are hidden in the default
+  // view - they only appear as children of their run once you filter
+  // into it, so they never read as pipeline work
+  const scope = d.agents.filter(a=>a.aux
+    ? selectedRun===(a.run_key||a.run_dir)
+    : (!selectedRun || (a.run_key||a.run_dir)===selectedRun));
   const byStatus = {};
-  for (const a of scope) byStatus[a.status]=(byStatus[a.status]||0)+1;
+  for (const a of scope) if (!a.aux)
+    byStatus[a.status]=(byStatus[a.status]||0)+1;
   const selected = d.runs.find(r=>runKey(r)===selectedRun);
   const facetCounts = Object.fromEntries(FACETS.map(f=>
     [f,scope.filter(a=>matchesFacet(a,f)).length]));
@@ -14852,7 +14985,8 @@ function render(d){
           `${esc(sess)}…</td>`
         : `<td class="hide-s"${sess==='…'?' title="recorded when the step ends"':''}>${esc(sess)}</td>`;
       const aRk = a.run_key||a.run_dir||'';
-      h += `<tr class="agen${a.needs_review?' unreviewed':''}" ` +
+      h += `<tr class="agen${a.needs_review?' unreviewed':''}` +
+        `${a.aux?' aux':''}" ` +
         `data-i="${a._i}" ` +
         `data-run-key="${esc(aRk)}" data-akey="${esc(agentKey(a))}" ` +
         `tabindex="0" ` +
@@ -15149,7 +15283,14 @@ document.addEventListener('click', async e=>{
   const adEl = t.closest && t.closest('[data-agent-detail]');
   if (adEl){
     const j = AGENTS.findIndex(x=>agentKey(x)===adEl.dataset.agentDetail);
-    if (j>=0) showDetail(j);
+    if (j>=0){
+      // a modal->modal jump (e.g. the run modal's task table) stacks the
+      // view it leaves so Back restores it; from the bare table snap is
+      // null and nothing changes
+      const snap = snapshotModal();
+      if (snap) pushHist(snap);
+      showDetail(j, true);
+    }
     return; }
   const epEl = t.closest && t.closest('[data-edit-prompt]');
   if (epEl){
@@ -15637,6 +15778,13 @@ document.addEventListener('input', e=>{
     (e.target.id==='d-prompt'?promptDrafts:
       e.target.id==='d-rnotes'?notesDrafts:intrDrafts)[detailKey]=
       e.target.value;
+  // timeout Save stays disabled until the field actually differs from
+  // the applied value - a no-op click would just rewrite the flag
+  if (e.target.id==='d-timeout'){
+    const sv=document.getElementById('d-timeout-save');
+    if (sv) sv.disabled =
+      e.target.value===(e.target.dataset.timeoutOrig||'');
+  }
   if (modalRequest && e.target.id?.startsWith('rq-')){
     modalRequest.dirty=true;
     const msg=document.getElementById('form-msg');
@@ -16002,13 +16150,15 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                         self._send(md.encode("utf-8"),
                                    "text/markdown; charset=utf-8")
                     elif q.get("frag", [""])[0] in ("1", "true"):
-                        self._send(_summary_body(md).encode("utf-8"),
+                        # an LLM-written run.summary.md gets the accent
+                        # headings - the deterministic roll-up keeps the
+                        # default chrome so the difference is visible
+                        _d, _st = _run_dir_checked(m.group(1), runs_dir)
+                        frag = _summary_body(md)
+                        if (_d / "run.summary.md").is_file():
+                            frag = '<div class="llmsum">' + frag + '</div>'
+                        self._send(frag.encode("utf-8"),
                                    "text/html; charset=utf-8")
-                    else:
-                        self._send(summary_html(
-                            md, f"{m.group(1)} / run summary")
-                            .encode("utf-8"),
-                            "text/html; charset=utf-8")
                 elif (m := re.fullmatch(
                         r"/api/runs/([^/]+)/steps/([^/]+)/trajectory",
                         path)):

@@ -1277,8 +1277,12 @@ const row={dataset:{runKey:'/first'}};
   assert.match(elem('runs').innerHTML,/A separate run/);
   assert.match(elem('agents').innerHTML,/>beta</);
   vm.runInContext('showDetail(0)',ctx);
-  assert.match(elem('dbody').innerHTML,/Explain tokens and cost/);
-  assert.match(elem('dbody').innerHTML,/\$0\.019/);
+  // the task modal no longer carries the '?' token explainer (its
+  // worked-example $0.019 went with it) - the header tooltips on the
+  // tables still do; the kv rows carry the real numbers
+  assert.doesNotMatch(elem('dbody').innerHTML,/Explain tokens and cost/);
+  assert.match(elem('dbody').innerHTML,/billed in 4000/);
+  assert.match(elem('dbody').innerHTML,/no token data yet/);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
@@ -4541,7 +4545,7 @@ const open=step=>vm.runInContext(
   body=elem('dbody').innerHTML;
   assert.match(body,/p \/ s1/);
   assert.match(body,/task 1 of 3/);
-  assert.match(body,/class="dnav-btn" disabled>/);
+  assert.match(body,/class="dnav-btn nav" disabled>/);
   assert.equal(elem('detail').scrollTop,0);  // nav lands at the task top
   // arrow keys walk the same chain: Right, Right, Right (clamps), Left
   await key('ArrowRight'); assert.match(elem('dbody').innerHTML,/p \/ s2/);
@@ -4713,8 +4717,8 @@ assert.match(elem('runs').innerHTML,
         self.assertEqual(p.returncode, 0, p.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
-    def test_compact_run_row_labels_stay_visible(self):
-        """Regression: two compact-density losses in the runs table.
+    def test_compact_run_row_labels_and_toksub_policy(self):
+        """Compact density in the runs table, two rules.
 
         (a) Compact hides td <br> and squeezes td.wrap to one ellipsized
         line, so a run row's chips collapsed INLINE after the run name
@@ -4723,15 +4727,14 @@ assert.match(elem('runs').innerHTML,
         a plain block box keeps the chips (+ 'Needs review') on their
         own line under the name in both densities.
 
-        (b) The planner:/steps:/est token lines were .sub spans, hidden
-        by the blanket 'td .sub' compact rule even though fmtTc() was
-        written as their compact form (dead branch since the compact
-        counter change). They carry .toksub now - same look, exempt
-        from the hide, block-stacked in compact because their <br> is
-        gone - and 'not planned' follows the same rule."""
+        (b) The planner:/steps:/est token lines carry .toksub and are
+        HIDDEN at compact density - the leaner table drops them, and
+        the numbers stay reachable at full density and in the run
+        modal. The markup itself is still emitted in fmtTc short form,
+        so toggling densities needs no refetch."""
         html = conductor._DASH_HTML
         self.assertRegex(
-            html, r'body\.compact td \.toksub \{[^}]*display:\s*block')
+            html, r'body\.compact td \.toksub \{[^}]*display:\s*none')
         self.assertRegex(html, r'\.toksub \{[^}]*color:#8b949e')
         self.assertRegex(
             html, r'body\.compact td \.sub \{[^}]*display:\s*none')
@@ -8898,8 +8901,9 @@ prompt = "<!-- conductor-purpose: housekeeping -->\\nFILE.txt - tidy it"
 
 class StepSummaryTests(unittest.TestCase):
     """GET /api/runs/<run>/steps/<step>/summary renders a markdown
-    report per step (status/elapsed/tokens/trajectory/commits/stdout
-    tail) and persists <step>.summary.md once the step is not live."""
+    report per step (status/elapsed/tokens/fenced task/closing report/
+    commits) and persists <step>.summary.md once the step is not
+    live."""
 
     def _run(self, td: str, step: dict, **st_extra):
         runs = Path(td) / "runs"
@@ -8941,10 +8945,13 @@ class StepSummaryTests(unittest.TestCase):
             self.assertEqual((rd / "s1.summary.md").read_text(
                 encoding="utf-8"), md)
 
-    def test_trajectory_and_tail_rendered(self):
+    def test_summary_drops_forensic_sections(self):
+        """The session summary is the worker's report + full task +
+        commits - the trajectory table and stdout tail live on the task
+        modal's forensic view now, so the doc no longer repeats them."""
         with tempfile.TemporaryDirectory() as td:
             runs, rd = self._run(td, {
-                "status": "done", "elapsed_s": 60,
+                "status": "done", "elapsed_s": 60, "task": "do it",
                 "tokens": {"prompt": 5, "completion": 1,
                            "cached": 0, "llm_steps": 2}})
             exp = self._export(rd)
@@ -8955,9 +8962,12 @@ class StepSummaryTests(unittest.TestCase):
             st["steps"]["s1"]["stdout_log"] = str(log)
             (rd / "state.json").write_text(json.dumps(st))
             md = conductor.step_summary(rd.name, "s1", runs)
-            self.assertIn("## Trajectory (2 turns", md)
-            self.assertIn("## stdout tail", md)
-            self.assertIn("STATUS: done", md)
+            self.assertNotIn("## Trajectory", md)
+            self.assertNotIn("## stdout tail", md)
+            self.assertNotIn("STATUS: done", md)
+            # the task body renders fenced - the fixed-size box the task
+            # modal's 'task prompt' row uses
+            self.assertIn("## Task\n\n```\ndo it\n```", md)
 
     def test_live_step_serves_but_never_writes(self):
         """trap 5: a file write into data/runs mid-step can kill a
@@ -9013,7 +9023,7 @@ class StepSummaryTests(unittest.TestCase):
             md = conductor.step_summary(rd.name, "s1", runs)
             self.assertIn("- **purpose:** `resolve-merge` "
                           "(merge conflict resolution)", md)
-            self.assertIn("## Task\n\nA git merge is in progress "
+            self.assertIn("## Task\n\n```\nA git merge is in progress "
                           "in this repo", md)
             self.assertNotIn("conductor-purpose", md)
             self.assertNotIn("<!--", md)
@@ -9035,14 +9045,15 @@ class StepSummaryTests(unittest.TestCase):
             md = conductor.step_summary(rd.name, "s1", runs)
             self.assertIn("- **purpose:** `resolve-merge` "
                           "(merge conflict resolution)", md)
-            self.assertIn("## Task\n\nA git merge is in progress", md)
+            self.assertIn("## Task\n\n```\nA git merge is in progress",
+                          md)
 
     def test_summary_marker_only_task_gets_purpose_label(self):
         with tempfile.TemporaryDirectory() as td:
             runs, rd = self._run(td, {"status": "done", "task": self.MARK})
             md = conductor.step_summary(rd.name, "s1", runs)
             self.assertIn("- **purpose:** `resolve-merge`", md)
-            self.assertIn("## Task\n\nconductor task: "
+            self.assertIn("## Task\n\n```\nconductor task: "
                           "merge conflict resolution", md)
             self.assertNotIn("<!--", md)
 
@@ -9206,14 +9217,40 @@ prompt = "first"
             self.assertIn("Executive summary (mock)", out)
             st = json.loads((rd / "state.json").read_text())
             self.assertIn("run_summary", st)
-            self.assertTrue(st["run_summary"]["session"]
-                            .startswith("mock-"))
+            rs = st["run_summary"]
+            self.assertTrue(rs["session"].startswith("mock-"))
+            # the same bookkeeping shape a step record carries: status,
+            # interval, elapsed, exit code, requested model
+            self.assertEqual(rs["status"], "done")
+            self.assertIsNotNone(rs["started_at"])
+            self.assertIsNotNone(rs["ended_at"])
+            self.assertIsInstance(rs["elapsed_s"], (int, float))
+            self.assertEqual(rs["exit_code"], 0)
+            self.assertTrue(rs["generated_at"])
             ev = (rd / "events.jsonl").read_text(encoding="utf-8")
             self.assertIn('"run_summarized"', ev)
             # marker is cleaned up; the endpoint now serves the file
             self.assertFalse((rd / ".summarizing").exists())
             self.assertIn("Executive summary (mock)",
                           conductor.run_summary_doc(rd.name, runs))
+            # the dashboard emits one muted aux row under the run - not
+            # a pipeline step (no seq, no counts share)
+            d = conductor.collect_dashboard(
+                runs, ["no-such-devin"], base / "requests")
+            aux = [a for a in d["agents"] if a.get("aux")]
+            self.assertEqual(len(aux), 1)
+            aux = aux[0]
+            self.assertEqual(aux["step"], "run-summary")
+            self.assertEqual(aux["status"], "done")
+            self.assertIsNone(aux["seq"])
+            self.assertEqual(aux["session_id"], rs["session"])
+            self.assertEqual(aux["elapsed_s"], rs["elapsed_s"])
+            self.assertIn("run.summary.md", aux["outcome"])
+            self.assertEqual(aux["stdout_log"],
+                             str(rd / "summarize.stdout.log"))
+            run_row = next(r for r in d["runs"]
+                           if r["dir"].endswith(rd.name))
+            self.assertEqual(run_row["counts"], {"done": 1})
 
     def test_summarize_manifest_autospawns(self):
         """[run] summarize = true fires the detached `conductor.py
@@ -9273,12 +9310,76 @@ prompt = "first"
         self.assertIn("<strong>bold</strong>", frag)
         self.assertIn("&lt;x&gt;", frag)
 
+    def test_task_fence_gets_taskpre_class(self):
+        """A fence under '## Task' draws the fixed-size prompt box; any
+        other fence stays a plain pre."""
+        frag = conductor._summary_body(
+            "## Task\n\n```\nshort task\n```\n\n## Report\n\n"
+            "```\nworker code\n```\n")
+        self.assertIn('<pre class="taskpre">short task</pre>', frag)
+        self.assertIn('<pre>worker code</pre>', frag)
+
+    def test_llm_frag_gets_llmsum_class(self):
+        """?frag=1 wraps an LLM-written run.summary.md in .llmsum so the
+        modal can accent its headings; the deterministic roll-up keeps
+        the default chrome."""
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run_state(td, {
+                "s1": {"status": "done", "task": "t"}})
+            handler = conductor.make_dashboard_handler(
+                runs, ["no-such-devin"], Path(td) / "reqs",
+                Path(td) / "manifests")
+            server = conductor.http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0), handler)
+            threading.Thread(target=server.serve_forever, daemon=True) \
+                .start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            port = server.server_port
+
+            def get(path):
+                conn = http.client.HTTPConnection("127.0.0.1", port,
+                                                  timeout=5)
+                conn.request("GET", path, headers={
+                    "Origin": f"http://127.0.0.1:{port}"})
+                res = conn.getresponse()
+                data = res.read().decode("utf-8")
+                conn.close()
+                return res.status, data
+
+            base = "/api/runs/20261015-000000-sum/summary"
+            status, frag = get(base + "?frag=1")
+            self.assertEqual(status, 200)
+            self.assertNotIn("llmsum", frag)          # roll-up: default
+            (rd / "run.summary.md").write_text(
+                "# sum - run summary\n\n## LLM said\n\ndone\n",
+                encoding="utf-8")
+            status, frag = get(base + "?frag=1")
+            self.assertIn('<div class="llmsum">', frag)
+            self.assertIn("<h2>LLM said</h2>", frag)
+
     def test_run_summary_buttons_wired(self):
         self.assertIn('data-run-summary="', conductor._DASH_HTML)
         self.assertIn('data-summarize-run="', conductor._DASH_HTML)
         self.assertIn("Run summary", conductor._DASH_HTML)
         self.assertIn("Generate LLM summary", conductor._DASH_HTML)
         self.assertIn("/summary?frag=1", conductor._DASH_HTML)
+
+    def test_modal_ux_wiring(self):
+        """The modal-revamp bits the layout depends on: three-zone nav
+        bar, muted aux rows, the Actions zone, a disabled-until-dirty
+        timeout Save, 'Summary' as a step-name link, and no 'Open as
+        page' / token '?' / 'View request' controls."""
+        h = conductor._DASH_HTML
+        for needle in ('dnav-l', 'dnav-r', 'dnav-pos',
+                       "a.aux?' aux':''", "actzone", 'class="acth"',
+                       'id="d-timeout-save" disabled',
+                       '>Summary</button>', 'data-run-details=',
+                       'pre class="taskpre"'):
+            self.assertIn(needle, h)
+        for gone in ('Open as page', 'req-open', 'tok-help',
+                     'Session summary</a>', 'Back: '):
+            self.assertNotIn(gone, h)
 
 
 class ModalDetailNavTests(unittest.TestCase):
@@ -9403,11 +9504,11 @@ const el=(sel,ds)=>({dataset:{},closest:s=>s===sel?{dataset:ds}:null});
 const flush=()=>new Promise(r=>setTimeout(r,0));
 const body=()=>elem('dbody').innerHTML;
 (async()=>{
-  // task modal -> in-app summary (the link keeps its real URL + _blank)
+  // task modal -> in-app summary (the step name carries a 'Summary'
+  // link - the standalone /summary page stays reachable on disk as
+  // <step>.summary.md, no 'Open as page' control anymore)
   await open('s2');
   assert.match(body(),/data-summary="request:req1\|s2"/);
-  assert.match(body(),/href="\/api\/runs\/r\/steps\/s2\/summary"/);
-  assert.match(body(),/target="_blank"/);
   elem('detail').scrollTop=42;                 // task modal was scrolled
   await click(el('[data-summary]',{summary:'request:req1|s2'}));
   await flush();
@@ -9440,13 +9541,14 @@ const body=()=>elem('dbody').innerHTML;
   await open('s1');
   await click(el('[data-open-request]',{openRequest:'req1'})); await flush();
   assert.match(body(),/Original request/);
-  assert.match(body(),/Back: s1/);
+  assert.match(body(),/return to s1/);       // destination lives on the
+                                             // Back button's tooltip now
   await click(el('[data-run-details]',{runDetails:'request:req1'}));
   assert.match(body(),/<h3 id="modal-title">r<\/h3>/);
-  assert.match(body(),/Back: request/);
+  assert.match(body(),/return to request/);
   await click(el('[data-modal-back]',{})); await flush();
   assert.match(body(),/Original request/);
-  assert.match(body(),/Back: s1/);               // older entry survived
+  assert.match(body(),/return to s1/);       // older entry survived
   await click(el('[data-modal-back]',{})); await flush();
   assert.match(body(),/p \/ s1/);
   assert.doesNotMatch(body(),/data-modal-back/);
