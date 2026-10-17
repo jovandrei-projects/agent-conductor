@@ -73,6 +73,13 @@ def run_manifest(manifest: Path, runs_dir: Path, resume=None) -> int:
     return rc
 
 
+# `python run_tests.py --quick` sets QUICK_TESTS before discovery; classes
+# marked @slow run real conductor invocations end-to-end and cost minutes,
+# so a smoke pass can opt out of them.
+QUICK = bool(os.environ.get("QUICK_TESTS"))
+slow = unittest.skipIf(QUICK, "skipped by --quick (real conductor e2e)")
+
+
 class ProjectsRegistryTests(unittest.TestCase):
     def test_projects_local_toml_merges_over_base(self):
         """A worktree checkout breaks '../other-project' relatives - an
@@ -344,6 +351,7 @@ class GitTests(unittest.TestCase):
             self.assertTrue(conductor.git_dirty_tracked(proj))
 
 
+@slow
 class RunTests(unittest.TestCase):
     def test_two_step_run(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1570,8 +1578,12 @@ prompt = "Review the catalog tests."
             text = conductor._planner_response(rec, {}, ["devin"])
         self.assertEqual(text.strip(), proposal.strip())
         self.assertIn("--model", seen["cmd"])
+        pm = rec.get("plan_model") or rec["model"]
+        pe = rec.get("plan_effort")
+        if pe is None:
+            pe = rec["effort"]
         self.assertEqual(seen["cmd"][seen["cmd"].index("--model") + 1],
-                         "swe-2-max")
+                         f"{pm}-{pe}")
         self.assertEqual(seen["cmd"][seen["cmd"].index("--permission-mode") + 1],
                          "normal")
         self.assertEqual(seen["prompt"].parent, Path(seen["cwd"]))
@@ -1662,7 +1674,8 @@ prompt = "Review the catalog tests."
 
     def test_questions_park_generation_until_answered(self):
         rec = conductor.create_request(
-            {"raw": "Tidy the catalog", "project": "proj", "ask": True},
+            {"raw": "Tidy the catalog", "project": "proj",
+             "model": "swe-2", "effort": "max", "ask": True},
             self.requests, self.runs)
         calls = []
 
@@ -1737,7 +1750,8 @@ prompt = "Review the catalog tests."
 
     def test_skip_all_refines_immediately(self):
         rec = conductor.create_request(
-            {"raw": "Tidy", "project": "proj", "ask": True},
+            {"raw": "Tidy", "project": "proj",
+             "model": "swe-2", "effort": "max", "ask": True},
             self.requests, self.runs)
         seen = []
 
@@ -1777,7 +1791,8 @@ prompt = "Review the catalog tests."
 
     def test_regenerate_clears_a_parked_questionnaire(self):
         rec = conductor.create_request(
-            {"raw": "Tidy", "project": "proj", "ask": True},
+            {"raw": "Tidy", "project": "proj",
+             "model": "swe-2", "effort": "max", "ask": True},
             self.requests, self.runs)
         with mock.patch.object(
                 conductor, "_planner_response",
@@ -7242,6 +7257,7 @@ class _RunControlBase(unittest.TestCase):
         self.fail(f"{step} never reached running")
 
 
+@slow
 class PauseRunTests(_RunControlBase):
     """Run-level controls - 'Pause run' is a GRACEFUL hold: in-flight
     steps finish, nothing new launches, the run records aborted='paused'
@@ -7425,6 +7441,7 @@ prompt = "second"
             self.assertFalse(conductor.stop_flag(d).exists())
 
 
+@slow
 class StepControlTests(_RunControlBase):
     """Step-level controls - 'Stop this step' ends one task while the run
     proceeds; 'Skip step' marks a pending step so it never launches
@@ -11148,6 +11165,7 @@ prompt = "the manifest was already written; say done"
         self.assertEqual(st["followup"]["status"], "registered")
 
 
+@slow
 class DeviceOwnershipTests(unittest.TestCase):
     """The `device` step key leases ONE adb serial machine-wide for a
     step's whole life: explicit serial assignment, cross-run ownership,
@@ -12117,6 +12135,7 @@ assert.match(row('req'),/class="stage wt"[^>]*>wt</);
             self.runs, watched / "manifests")     # must not raise
 
 
+@slow
 class ReviewWorkflowTests(_RunControlBase):
     """Review acknowledgment for finalized runs + tasks: completion_seq
     bumps once per terminal-outcome write; review-* sentinels carry the
@@ -12659,6 +12678,7 @@ const open=async(step)=>{ const i=vm.runInContext(
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+@slow
 class CumulativeElapsedTests(_RunControlBase):
     """Elapsed time is CUMULATIVE across dispatches. Every run_step
     dispatch appends one exec_interval {start,end} to the step record and

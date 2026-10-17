@@ -35,7 +35,7 @@ sys.path.insert(0, str(HERE))   # sibling helper module test_conductor
 
 import conductor  # noqa: E402
 from test_conductor import MOCK, git, make_project, write_manifest, \
-    run_manifest  # noqa: E402
+    run_manifest, slow  # noqa: E402
 
 
 def state_of(runs_dir: Path) -> dict:
@@ -757,6 +757,7 @@ prompt = "first"
             self.assertEqual(out["skipped"], [])
 
 
+@slow
 class ManualMergeGuardTests(unittest.TestCase):
     """'Merge pending branches' must stay out of a run that is still
     executing: the pending branches ARE the run's live work surface, so a
@@ -1080,6 +1081,7 @@ timeout_min = 0.02
                 drv.wait()
 
 
+@slow
 class StopControlTests(unittest.TestCase):
     """Dashboard stop controls: tempdir sentinels (never inside run_dir -
     trap 5) polled by wait_worker + the wave loop. Per-step stop, run stop,
@@ -1491,6 +1493,7 @@ class TimeoutOverrideTests(unittest.TestCase):
                     missing_ok=True)
 
 
+@slow
 class DeferredMergeTests(unittest.TestCase):
     """merge="deferred": worktree isolation WITHOUT the automatic merge-back.
 
@@ -2103,6 +2106,7 @@ def add_branch(proj: Path, name: str, commits: dict[str, str] | None = None):
     return main
 
 
+@slow
 class MergeTargetTests(unittest.TestCase):
     """merge_target: a worktree step's branch is created from and merged
     back into an explicitly chosen local branch, not blindly into whatever
