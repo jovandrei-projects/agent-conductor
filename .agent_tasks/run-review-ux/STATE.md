@@ -62,10 +62,19 @@ See `DESIGN.md` for full reasoning + sources. Headlines:
       (landed on master, merge d99c4e4)
 - [x] execution-context-labels - run-level wt chip + watcher identity
       (landed on master, merge 6b1418c)
-- [ ] manual-merge-guard - disable/refuse while run live (driver included)
+- [x] manual-merge-guard - disable/refuse while run live (driver included)
+      (landed on master, merge e5b470d)
 - [ ] integration-verification + follow-up-plan
 
 ## Where it stopped
+
+`manual-merge-guard` merged to master 2026-10-16 (merge e5b470d) via
+merge-resolver session — conflicts were QUEUE.md bookkeeping appends,
+the clear_run_flags sentinel exemption ('review-' vs 'merge-', union
+kept), the cmd_run resume stamp (claim try/finally + live-driver
+refusal wrapping the exec_intervals/prev_end seeding), and the
+dashboard 'alive' payload var; 22/22 touched-path tests green.
+Details in `.agent_tasks/manual-merge-guard/STATE.md`.
 
 `cumulative-elapsed-time` merged to master 2026-10-16 (merge d99c4e4)
 via merge-resolver session — conflicts were QUEUE.md bookkeeping
@@ -111,8 +120,11 @@ green on the merge). It was implemented + verified on the branch
   resume re-completion re-flag, HTTP endpoint statuses, Node JS badge/
   modal/ctx/dispatch regression.
 
-Next session = any other Phase-2 step (none started). Do NOT implement
-their scopes here.
+Next session = integration-verification finalization (its work is
+parked on branch conductor/20261016-100852-run-review-ux/
+integration-verification, 31ee57f - already union-merges the other
+four; per the follow-up-plan DONE entry it verified 457/457
+in-worktree). Do NOT implement other scopes here.
 
 ## Deferred or blocked
 

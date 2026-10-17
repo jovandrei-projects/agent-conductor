@@ -44,9 +44,16 @@ starting concurrently can never overlap a merge in flight.
 
 ## Where it stopped
 
-Complete; regression tests in `ManualMergeGuardTests`
-(tests/test_worktrees.py) + `test_merge_pending_disabled_while_run_executing`
-(ContextMenuTests). Verification: `python run_tests.py`.
+DONE — merged to master 2026-10-16 (merge e5b470d) via merge-resolver
+session. Conflicts: QUEUE.md DONE-list appends (kept both),
+clear_run_flags sentinel exemption ('review-' + 'merge-' union), the
+cmd_run resume stamp (branch's merge-claim try/finally + live-driver
+refusal now wraps HEAD's exec_intervals/prev_end seeding), and the
+dashboard 'alive' payload (shared var, fed by the precomputed drv).
+22/22 touched-path tests green on the merge. Regression tests in
+`ManualMergeGuardTests` (tests/test_worktrees.py) +
+`test_merge_pending_disabled_while_run_executing` (ContextMenuTests).
+Verification: `python run_tests.py`.
 
 ## Deferred or blocked
 
