@@ -17153,9 +17153,9 @@ function render(d){
         'cumulative driver execution time'}">${runElapsed(r,now)}</td>` +
       `<td class="counts">` +
       `${counts||'<span class="toksub">not planned</span>'}` +
-      (unrev ? `<button type="button" class="chip" `
-        `data-facet="unreviewed" style="color:#39c5cf" `
-        `title="${unrev} task(s) finished but not marked reviewed`
+      (unrev ? `<button type="button" class="chip" ` +
+        `data-facet="unreviewed" style="color:#39c5cf" ` +
+        `title="${unrev} task(s) finished but not marked reviewed` +
         ` - click to filter">${unrev} unreviewed</button>` : '') +
       // the run table shows token lines at full density only (compact
       // hides .toksub); they always render in fmtTc short form - the
