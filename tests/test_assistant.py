@@ -95,9 +95,10 @@ class StoreMigrationTests(unittest.TestCase):
                 (1, []),                 # baseline already applied
                 (2, []),                 # exchanges.sources (applied too)
                 (3, []),                 # exchanges.requests (applied too)
-                (4, ["ALTER TABLE conversations ADD COLUMN note TEXT"]),
+                (4, []),                 # actions.explain (applied too)
+                (5, ["ALTER TABLE conversations ADD COLUMN note TEXT"]),
             ])
-            self.assertEqual(st.user_version(), 4)
+            self.assertEqual(st.user_version(), 5)
             row = st.query_one("SELECT * FROM conversations")
             self.assertEqual(row["title"], "t")
             self.assertIn("note", row)   # new column, old row intact

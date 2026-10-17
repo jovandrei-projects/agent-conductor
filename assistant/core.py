@@ -339,10 +339,16 @@ class AssistantCore:
             frozen_ctx = ctxmod.freeze(env)
         except ctxmod.ContextError as exc:
             raise AssistantError(str(exc)) from exc
+        per_msg = _clean_settings(settings or {})
+        # `readonly` is a conversation-level capability - a message can
+        # override the model snapshot but must never claim a permission
+        # the conversation does not have (the stored snapshot feeds the
+        # reply badge AND the runtime's read-only prompt line).
+        per_msg.pop("readonly", None)
         snap = {**{k: conv[k] for k in ("model", "effort")},
                 "fast": bool(conv["fast"]),
                 "readonly": bool(conv["readonly"]),
-                **_clean_settings(settings or {})}
+                **per_msg}
         self._validate_settings(snap)
         now = self._iso()
 
@@ -802,41 +808,88 @@ class AssistantCore:
         return data, ctype
 
     # ------------------------------------------------------------ actions
-    def propose_action(self, conv_id: str, kind: str, payload: dict, *,
-                       exchange_id=None) -> dict:
-        """Record a model-emitted proposal. The adapter whitelist decides
-        if the kind exists and what confirmation it needs - no adapter,
-        no proposals."""
-        self._conv(conv_id)
-        if self._actions is None:
-            raise AssistantError("Actions not enabled", 409)
-        if not re.fullmatch(KIND_RE, str(kind or "")):
-            raise AssistantError("Invalid action kind")
-        spec = self._actions.spec_for(kind)
-        if spec is None:
-            raise AssistantError(f"Action kind {kind!r} is not allowed", 403)
-        clean = self._actions.validate(kind, payload or {})
+    def _record_action(self, conv_id: str, kind: str, payload,
+                       exchange_id, *, explain=None, state="proposed",
+                       requires_confirm=1, confirm_text=None,
+                       result=None, decided_at=None) -> dict:
+        """Insert one audited action row. `payload` is JSON-capped so a
+        rejected proposal can't stash an unbounded blob as 'audit'."""
+        try:
+            packed = json.dumps(payload or {}, ensure_ascii=False)
+        except (TypeError, ValueError):
+            packed = json.dumps({"unserializable": True})
+        # 150KB: the largest legit payload is edit_request carrying a
+        # republished proposal TOML (validate caps it at 120KB + fields).
+        if len(packed) > 150_000:
+            packed = json.dumps({"truncated": True, "bytes": len(packed)})
         now = self._iso()
-        rec = {"id": new_id("act", self._now()), "conversation_id": conv_id,
-               "exchange_id": exchange_id, "kind": kind,
-               "payload": json.dumps(clean, ensure_ascii=False),
-               "state": "proposed",
-               "requires_confirm": int(spec.requires_confirm
-                                       or kind in LAUNCH_TIER_KINDS),
-               "confirm_text": spec.confirm_text or None,
-               "result": None, "created_at": now,
-               "decided_at": None, "executed_at": None}
+        rec = {"id": new_id("act", self._now()),
+               "conversation_id": conv_id, "exchange_id": exchange_id,
+               "kind": kind, "payload": packed, "state": state,
+               "requires_confirm": int(requires_confirm),
+               "confirm_text": confirm_text,
+               "result": (json.dumps(result, ensure_ascii=False)
+                          if result is not None else None),
+               "explain": (str(explain)[:500] if explain else None),
+               "created_at": now, "decided_at": decided_at,
+               "executed_at": None}
         self._guarded(self.store.path.parent)
         with self.store.txn() as conn:
             self.store.insert_action(conn, rec)
         return self.store.get_action(rec["id"])
 
+    def propose_action(self, conv_id: str, kind: str, payload: dict, *,
+                       exchange_id=None, explain=None,
+                       record_failure: bool = False) -> dict:
+        """Record a model-emitted proposal. The adapter whitelist decides
+        if the kind exists and what confirmation it needs - no adapter,
+        no proposals. ``record_failure`` is the runtime's proposal path:
+        instead of raising, a rejected proposal lands as a 'failed' row
+        so it stays visible + audited and can never be executed."""
+        self._conv(conv_id)
+        if self._actions is None:
+            raise AssistantError("Actions not enabled", 409)
+        kind = str(kind or "").strip()
+        try:
+            if not re.fullmatch(KIND_RE, kind):
+                raise AssistantError("Invalid action kind")
+            spec = self._actions.spec_for(kind)
+            if spec is None:
+                raise AssistantError(
+                    f"Action kind {kind!r} is not allowed", 403)
+            clean = self._actions.validate(kind, payload or {})
+        except Exception as exc:                  # noqa: BLE001 - audit
+            if not record_failure:
+                if isinstance(exc, AssistantError):
+                    raise
+                # duck-typed status passthrough - the host's RequestError
+                # carries one; this module never imports the host.
+                raise AssistantError(
+                    str(exc)[:400],
+                    getattr(exc, "status", None) or 400) from exc
+            return self._record_action(
+                conv_id, kind or "(malformed)", payload, exchange_id,
+                explain=explain, state="failed", requires_confirm=1,
+                result={"error": f"{type(exc).__name__}: {exc}"[:400],
+                        "refused": "proposal rejected at validation"},
+                decided_at=self._iso())
+        return self._record_action(
+            conv_id, kind, clean, exchange_id, explain=explain,
+            requires_confirm=int(spec.requires_confirm
+                                 or kind in LAUNCH_TIER_KINDS),
+            confirm_text=spec.confirm_text or None)
+
     def decide_action(self, aid: str, approve: bool) -> dict:
         """Human decision on the confirm card: proposed -> confirmed or
-        denied. A confirmed action still re-checks read-only at execute
-        time - 'turn read-only back on' must invalidate pending writes."""
+        denied. A 'confirmed' row can still be retracted (nothing has
+        executed yet) but never goes back to proposed; terminal rows are
+        idempotent no-ops. A confirmed action still re-checks read-only
+        at execute time - 'turn read-only back on' must invalidate
+        pending writes."""
         a = self._action(aid)
-        if a["state"] != "proposed":
+        if a["state"] == "confirmed" and approve:
+            return a
+        if a["state"] not in ("proposed", "confirmed"):
             return a
         self._guarded(self.store.path.parent)
         with self.store.txn() as conn:
@@ -845,12 +898,17 @@ class AssistantCore:
                 decided_at=self._iso())
         return self.store.get_action(aid)
 
-    def execute_action(self, aid: str) -> dict:
+    def execute_action(self, aid: str, *, ack: str | None = None) -> dict:
         """Run a proposed/confirmed action through the host adapter.
         Read-only is re-read HERE - never earlier - and model output,
-        retrieved text, and prompt text are not in its authority."""
+        retrieved text, and prompt text are not in its authority.
+
+        Launch-tier kinds additionally demand `ack`: the adapter's
+        expected exact-target string, echoed by the client from the
+        separate confirmation step that showed target + effect. A bare
+        execute on a launch class always refuses."""
         a = self._action(aid)
-        if a["state"] in ("denied", "executed"):
+        if a["state"] in ("denied", "executed", "failed"):
             return a
         self._guarded(self.store.path.parent)
         conv = self._conv(a["conversation_id"])
@@ -866,6 +924,12 @@ class AssistantCore:
             raise AssistantError("Actions not enabled", 409)
         if a["requires_confirm"] and a["state"] != "confirmed":
             raise AssistantError("Action needs confirmation first", 409)
+        if a["kind"] in LAUNCH_TIER_KINDS:
+            expected = self.expected_ack(aid)
+            if expected is not None and ack != expected:
+                raise AssistantError(
+                    "Confirm the exact target first - this action needs "
+                    "a separate explicit confirmation", 409)
         try:
             result = self._actions.execute(a)
         except Exception as exc:                 # noqa: BLE001 - audit it
@@ -888,9 +952,36 @@ class AssistantCore:
             raise AssistantError("Action not found", 404)
         return a
 
+    def _expected_ack_for(self, a: dict) -> str | None:
+        if a["kind"] not in LAUNCH_TIER_KINDS or self._actions is None:
+            return None
+        try:
+            return self._actions.expected_ack(dict(a))
+        except Exception:                          # noqa: BLE001
+            return None
+
+    def expected_ack(self, aid: str) -> str | None:
+        """The exact-target string a launch-tier action must see echoed
+        at execute time; the client's second confirmation step displays
+        it verbatim. None for non-launch kinds / missing adapter."""
+        a = self.store.get_action(aid)
+        return None if a is None else self._expected_ack_for(a)
+
+    def action_catalog(self) -> str:
+        """The adapter's prompt-facing whitelist text ('' = none)."""
+        if self._actions is None:
+            return ""
+        try:
+            return self._actions.describe() or ""
+        except Exception:                          # noqa: BLE001
+            return ""
+
     def list_actions(self, conv_id: str) -> list[dict]:
         self._conv(conv_id)
-        return self.store.list_actions(conv_id)
+        rows = self.store.list_actions(conv_id)
+        for a in rows:
+            a["expected_ack"] = self._expected_ack_for(a)
+        return rows
 
     # ------------------------------------------------------------- misc
     def catalog(self) -> dict:

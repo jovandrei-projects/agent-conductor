@@ -119,6 +119,7 @@ var S = {
   exch: {},                    // user_msg_id -> exchange view
   exchByAid: {},               // assistant_msg_id -> exchange view
   actions: {},                 // exchange id -> action rows
+  armed: {},                   // action id -> launch-tier confirm armed
   sending: false,
   convList: null,
   catalog: null,
@@ -331,14 +332,7 @@ function msgHtml(m) {
   }
   var acts = xa ? (S.actions[xa.id] || []) : [];
   for (var k = 0; k < acts.length; k++) {
-    var ac = acts[k];
-    var spec = thaw(ac.spec_json);
-    h += '<div class="aim-card"><span class="k">proposed action: ' +
-      esc(spec.kind || '?') + '</span><div>' +
-      esc(spec.explain || '') + '</div><div class="sub">state: ' +
-      esc(ac.status) +
-      ' - action confirmation lands with the guarded-actions step' +
-      '</div></div>';
+    h += actHtml(acts[k]);
   }
   if (xa && TERMINAL[xa.status] && xa.status !== 'cancelled' &&
       (xa.prompt_t != null || xa.completion_t != null || xa.usd != null)) {
@@ -355,6 +349,100 @@ function msgHtml(m) {
       (xa.model_uid || xa.model_label || '?')) + '">' +
       esc(use + (xa.usd != null ? ' \u00b7 ~' + fmtUsd(xa.usd) : '')) +
       '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+
+/* --------------------------------------------------- action cards
+ * A model proposal renders as a card under the reply that emitted it.
+ * Every state transition is a server POST - the card is a display of the
+ * audited row, never the authority. Launch-tier kinds need the armed
+ * second step (the card shows the adapter's exact-target ack verbatim);
+ * read-only renders every button inert with a hint instead of hiding it.
+ */
+function actTarget(ac) {
+  var ack = ac.expected_ack || '';
+  return ack.indexOf(':') >= 0 ? ack.slice(ack.indexOf(':') + 1) : '';
+}
+
+function paramLine(payload) {
+  var bits = [];
+  Object.keys(payload || {}).forEach(function (k) {
+    var v = payload[k];
+    if (v === null || v === undefined || v === '') return;
+    if (k === 'raw' || k === 'manifest' || k === 'prompt' ||
+        k === 'notes' || k === 'instructions')
+      v = String(v).slice(0, 60) + (v.length > 60 ? '\u2026' : '');
+    else if (Array.isArray(v)) v = v.join(', ');
+    else if (typeof v === 'object') v = JSON.stringify(v).slice(0, 60);
+    bits.push(k + '=' + String(v));
+  });
+  return bits.join('  ');
+}
+
+function actHtml(ac) {
+  var st = ac.state || 'proposed';
+  var ro = S.conv ? !!S.conv.readonly : true;
+  var armed = !!S.armed[ac.id];
+  var launch = !!ac.expected_ack;      // launch-tier rows carry an ack
+  var res = thaw(ac.result);
+  var h = '<div class="aim-card st-' + esc(st) + '">';
+  h += '<div class="k">proposed: ' +
+    esc(String(ac.kind || '?').replace(/_/g, ' ')) + '</div>';
+  if (ac.explain)
+    h += '<div class="act-why">' + esc(ac.explain) + '</div>';
+  var pline = paramLine(thaw(ac.payload));
+  if (pline) h += '<div class="act-params">' + esc(pline) + '</div>';
+  if (st === 'proposed' || st === 'confirmed') {
+    if (st === 'confirmed')
+      h += '<div class="sub">approved - still needs the run click' +
+        '</div>';
+    if (launch && armed) {
+      /* the second, separate confirmation: exact target + effect,
+         verbatim from the adapter's ack + confirm text */
+      h += '<div class="act-armed">' +
+        '<div class="act-warn">' + esc(ac.confirm_text || ac.kind) +
+        '</div>' +
+        '<div class="act-tgt">target: ' + esc(actTarget(ac) || '?') +
+        '</div>' +
+        '<div class="act-btns">' +
+        '<button type="button" class="act-btn danger" data-ai-act="' +
+        esc(ac.id) + ':exec">Confirm &amp; run</button>' +
+        '<button type="button" class="act-btn" data-ai-act="' +
+        esc(ac.id) + ':disarm">Cancel</button>' +
+        '</div></div>';
+    } else {
+      h += '<div class="act-btns">';
+      if (launch)
+        h += '<button type="button" class="act-btn" data-ai-act="' +
+          esc(ac.id) + ':arm"' + (ro ? ' disabled' : '') +
+          '>Review &amp; run</button>';
+      else
+        h += '<button type="button" class="act-btn" data-ai-act="' +
+          esc(ac.id) + ':exec"' + (ro ? ' disabled' : '') +
+          '>Run</button>';
+      h += '<button type="button" class="act-btn" data-ai-act="' +
+        esc(ac.id) + ':deny">' +
+        (st === 'confirmed' ? 'Retract' : 'Deny') + '</button>';
+      h += '</div>';
+      if (ro)
+        h += '<div class="sub">read-only is on - turn it off in ' +
+          'settings to run actions</div>';
+      if (res && res.refused)
+        h += '<div class="sub">' + esc(res.refused) + '</div>';
+    }
+  } else if (st === 'denied') {
+    h += '<div class="sub">dismissed</div>';
+  } else if (st === 'executed') {
+    h += '<div class="act-ok">done</div>';
+    if (res && Object.keys(res).length)
+      h += '<div class="act-params">' +
+        esc(JSON.stringify(res).slice(0, 300)) + '</div>';
+  } else if (st === 'failed') {
+    h += '<div class="act-err">failed</div>';
+    h += '<div class="sub">' +
+      esc((res && (res.error || res.refused)) || 'rejected') + '</div>';
   }
   h += '</div>';
   return h;
@@ -566,6 +654,54 @@ async function loadActions() {
     });
     S.actions = by;
   } catch (e) { S.actions = {}; }
+}
+
+function findAction(aid) {
+  var found = null;
+  Object.keys(S.actions || {}).forEach(function (k) {
+    (S.actions[k] || []).forEach(function (a) {
+      if (a.id === aid) found = a;
+    });
+  });
+  return found;
+}
+
+async function actDecide(aid, op) {
+  var ac = findAction(aid);
+  if (!ac) { note('That action is gone - reload the conversation.'); return; }
+  var cid = ac.conversation_id;
+  if (op === 'arm') { S.armed[aid] = true; paint(); return; }
+  if (op === 'disarm') { delete S.armed[aid]; paint(); return; }
+  delete S.armed[aid];
+  var body = { approve: op === 'exec' };
+  if (op === 'exec') {
+    body.execute = true;
+    if (ac.expected_ack) body.ack = ac.expected_ack;
+  }
+  try {
+    statusLine(op === 'exec' ? 'Running action' : 'Updating action');
+    var out = await aapi('POST',
+      '/conversations/' + encodeURIComponent(cid) + '/actions/' +
+      encodeURIComponent(aid) + '/confirm', body);
+    ac = out || ac;
+    // reflect the fresh row in the cached list so the card repaints
+    // with the audited state even before loadActions returns
+    Object.keys(S.actions || {}).forEach(function (k) {
+      var i = (S.actions[k] || []).findIndex(function (x) {
+        return x.id === ac.id; });
+      if (i >= 0) S.actions[k][i] = ac;
+    });
+    if (op === 'exec' && ac.state === 'executed')
+      note('Action ran: ' + String(ac.kind).replace(/_/g, ' '), false);
+    else if (ac.state === 'failed')
+      note('Action failed: ' +
+        (thaw(ac.result).error || 'see the card'));
+  } catch (e) {
+    note('Action failed: ' + (e.message || e));
+  }
+  await loadActions();
+  statusLine('');
+  paint();
 }
 
 /* ------------------------------------------------------------- send */
@@ -1285,7 +1421,7 @@ function openConv(id) {
   if (ta) store(draftKey(), ta.value);
   stashAttach();
   S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
-  S.usage = null; S.actions = {};
+  S.usage = null; S.actions = {}; S.armed = {};
   S.pollXid = null;                    // orphan the old conv's poller
   paint();
   loadConv(id).catch(function (e) {
@@ -1299,7 +1435,7 @@ function newConv() {
   if (ta) store(draftKey(), ta.value);   // stash before switching
   stashAttach();
   S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
-  S.usage = null; S.actions = {};
+  S.usage = null; S.actions = {}; S.armed = {};
   S.pollXid = null;                    // the previous conv's poller dies
   S.convRef = uid('conv');           // fresh create, fresh dedupe ref
   store('ac-ai-conv', '');
@@ -1450,6 +1586,10 @@ function bind() {
                el.getAttribute('data-ai-key')); return; }
       if ((el = t.closest('[data-ai-conv]'))) {
         openConv(el.getAttribute('data-ai-conv')); return; }
+      if ((el = t.closest('[data-ai-act]'))) {
+        var ap = String(el.getAttribute('data-ai-act')).split(':');
+        if (ap.length === 2 && !el.disabled) actDecide(ap[0], ap[1]);
+        return; }
     });
     /* Escape minimizes chat (never the modal behind it); Left/Right are
        swallowed so a focused chat control cannot drive modal sibling
@@ -1579,7 +1719,8 @@ var AskAI = {
   ctx: curCtx, ctxLabel: ctxLabel, syncView: syncView,
   _s: S, _paint: paint, _aapi: aapi, _paintAtt: paintAtt,
   _attachFiles: attachFiles, _dictUI: dictUI,
-  _msgHtml: msgHtml, _settingsForm: settingsForm
+  _msgHtml: msgHtml, _settingsForm: settingsForm,
+  _actHtml: actHtml, _actDecide: actDecide
 };
 if (typeof window !== 'undefined') {
   window.AskAI = AskAI;

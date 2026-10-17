@@ -643,7 +643,11 @@ class AssistantRuntime:
         """```proposed_action blocks in the model's OWN final text ->
         schema-validated Action rows (inert while read-only; human
         confirm only). Retrieved text is never scanned - it is a quoted
-        evidence channel, not a reply."""
+        evidence channel, not a reply.
+
+        Rejected proposals still land as 'failed' rows (record_failure):
+        the card stays visible, the audit keeps what the model asked for,
+        and the row can never execute."""
         x = self.core.store.get_exchange(xid) or {}
         conv_id = x.get("conversation_id")
         names = []
@@ -652,13 +656,28 @@ class AssistantRuntime:
                 break
             try:
                 spec = json.loads(m.group(1).strip())
-                kind, params = spec.get("kind"), spec.get("params") or {}
-                if not kind or not isinstance(params, dict):
-                    raise ValueError("needs kind+params")
-                self.core.propose_action(conv_id, kind, params,
-                                         exchange_id=xid)
-                names.append(str(kind))
+                a = self.core.propose_action(
+                    conv_id,
+                    spec.get("kind") if isinstance(spec, dict) else None,
+                    (spec.get("params") or {})
+                    if isinstance(spec, dict) else {},
+                    exchange_id=xid,
+                    explain=(spec.get("explain")
+                             if isinstance(spec, dict) else None),
+                    record_failure=True)
+                names.append(
+                    str(a["kind"]) +
+                    (" (rejected)" if a["state"] == "failed" else ""))
             except Exception as exc:                # noqa: BLE001
+                # A completely malformed block still earns an audit row -
+                # the kind slot records the raw text, never executes.
+                try:
+                    self.core.propose_action(
+                        conv_id, "(malformed)",
+                        {"raw": m.group(1)[:2000]},
+                        exchange_id=xid, record_failure=True)
+                except Exception:                   # noqa: BLE001
+                    pass
                 names.append(f"dropped:{type(exc).__name__}")
         return names
 
@@ -667,7 +686,13 @@ class AssistantRuntime:
                         attachments, *, fresh, session_note) -> str:
         parts = []
         if fresh:
-            parts += [self._preamble.strip(), "", _CONTRACT]
+            contract = _CONTRACT
+            catalog = (self.core.action_catalog()
+                       if self.core else "") or ""
+            if catalog:
+                contract += ("\n## Whitelisted actions you may propose\n"
+                             + catalog)
+            parts += [self._preamble.strip(), "", contract]
         else:
             parts += [_RESUME_REMINDER]
         parts.append("## Session settings\n"

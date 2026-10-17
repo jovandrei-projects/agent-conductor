@@ -141,15 +141,25 @@ def _seed_defaults(core: AssistantCore) -> None:
 def open_runtime(*, data_dir: Path = ASSISTANT_DIR,
                  runs_dir: Path = conductor.RUNS_DIR,
                  requests_dir: Path = conductor.REQUESTS_DIR,
-                 projects=None, devin_argv=None, actions=None,
+                 manifests_dir: Path = conductor.MANIFESTS_DIR,
+                 trash_dir: Path | None = None, projects=None,
+                 devin_argv=None, actions=None, power=None,
                  provider=None, reconcile=True) -> tuple:
-    """The full host stack: core + provider + dispatcher, wired together.
-    Returns (core, runtime). `reconcile` re-owns inflight exchanges after
-    a serve restart; tests inject a fake provider and reconcile=False."""
+    """The full host stack: core + provider + dispatcher + actions,
+    wired together. Returns (core, runtime). `reconcile` re-owns inflight
+    exchanges after a serve restart; tests inject a fake provider and
+    reconcile=False. `power` is the optional serve_power seam (serve
+    passes the bound server; tests/standalone leave it unwired)."""
     argv = list(devin_argv or default_devin_argv())
     data_dir = Path(data_dir)
     workspace = data_dir / "workspace"
     spool = data_dir / "spool"
+    if actions is None:
+        from assistant_host.actions import ConductorActions
+        actions = ConductorActions(
+            runs_dir=runs_dir, requests_dir=requests_dir,
+            manifests_dir=manifests_dir, trash_dir=trash_dir,
+            devin_argv=argv, power=power)
     provider = provider or DevinPrintProvider(
         argv, env=conductor.clean_devin_env,
         spawn_kwargs=conductor.hidden_subprocess_kwargs(),
