@@ -54,9 +54,9 @@ UI - those are the later manifest steps.
   tiny unseen count in /api/state (conductor.py tour_ctx block before
   collect_dashboard + routes in make_dashboard_handler; 18 tests in
   tests/test_tour_api.py)
-- [ ] tour-dashboard - vanilla-JS walkthrough in _DASH_HTML. The
-  What's-new button MUST use id `tour-btn` - TOUR_STOPS["tour"] selects
-  `#tour-btn, #power-btn` (degrades to the power button until it exists).
+- [x] tour-dashboard - vanilla-JS walkthrough in _DASH_HTML (#tour-btn +
+  #tour-badge in the topbar, #tourwrap/#tourring/#tourcard spotlight
+  overlay, tourSt state, 9 tests in tests/test_tour_dash.py)
 - [ ] tour-llm-polish - optional cached LLM enrichment (off by default)
 - [ ] tour-validation - end-to-end verify
 
@@ -112,15 +112,43 @@ kwarg and exposes the ctx as `Handler.tour_ctx`).
 - GET paths are read-only end to end (`tour_state.load` never writes);
   the state file appears only on the first mutation.
 
+## tour dashboard UI surface (for tour-validation)
+
+All client state is `tourSt` (null = closed). `#tour-btn` lives in the
+topbar beside `#power-btn`; `#tour-badge` inside it is the unread pill,
+painted ONLY from `d.tour_unseen` in `render()` (before the sig early-
+return so sig-identical polls still refresh it) - null keeps it hidden,
+no GET /api/tour is ever issued for the badge. POST responses repaint it
+via `tourBadge(r.unseen_count)`.
+
+- `#tourwrap` (z60, between modal z50/51 and dialogs z70) is the one
+  overlay; `#tourring`'s `box-shadow: 0 0 0 9999px` IS the page dim and
+  its transparent center pops the anchor through (unanchored cards get
+  `#tourwrap.dim` + centered card). `#tourcard` carries `Update i of N`,
+  escaped title/blurb/commits/related chips, Prev/Next + Skip +
+  Mark viewed, and a `<details class="tourhist">` viewed section fed by
+  `feed.history` (reopens entries behind the watermark, `unview` pulls
+  one back into the deck and re-GETs the feed).
+- Related chips reuse `data-run-details`/`data-open-request`, so the
+  normal click dispatch opens the existing modals; `applySel` toggles
+  `#tourwrap.suspended` whenever `#backdrop` is visible, so a modal owns
+  the screen and closing it resumes the same card.
+- Skip/Escape/backdrop-click all land in `tourClose()` - no POST ever;
+  Escape order is askwrap -> powerwrap -> backdrop(modal) -> tour.
+  Mark viewed POSTs first, only advances + repaints the badge on
+  success, stays put with a retryable error on failure.
+- scroll(capture)/resize listeners bind on open and unbind on close;
+  reduced-motion disables the ring pulse and scrolls 'auto'.
+
 ## Where it stopped
 
-tour-api landed: conductor.py `tour_ctx`/`_tour_build`/`tour_feed`/
-`tour_unseen`/`tour_transition` + routes, tests/test_tour_api.py (18
-tests; 72/72 tour tests green; full --jobs 8 suite: 1 unrelated
-StopControl flake, green in isolation). Next: tour-dashboard - the
-vanilla-JS walkthrough in _DASH_HTML. The What's-new button MUST use
-id `tour-btn` (TOUR_STOPS['tour'] falls back to #power-btn); badge
-reads `tour_unseen` from /api/state, never GET /api/tour for it.
+tour-dashboard landed: _DASH_HTML tour button/badge/overlay/walkthrough
++ tests/test_tour_dash.py (9 node-harness tests; 81/81 tour tests
+green; 42/42 modal/dashboard regression classes green; live :8806
+smoke verified badge + feed + viewed POST). Next: tour-llm-polish -
+optional cached enrichment in data/tour-cache.json keyed by range.
+The UI already renders whatever the feed gives it - no dashboard
+changes needed for enrichment.
 
 ## Verification
 
