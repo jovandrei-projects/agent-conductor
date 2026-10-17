@@ -149,12 +149,42 @@ var S = {
   pendAtt: {},                 // conv id -> stashed pending uploads
   renaming: null,              // conv id whose rail row is an <input>
   delArm: {},                  // conv id -> delete confirm-armed (fallback)
-  dict: null                   // live dictation {rec,base,final} or null
+  dict: null,                  // live dictation {rec,base,final} or null
+  msgCache: {},                // conv id -> {conv,msgs,exch,usage,actions}
+  msgCacheN: []                // cache eviction order (oldest first)
 };
 
 var TERMINAL = { done: 1, partial: 1, error: 1, cancelled: 1 };
 
 function convId() { return S.conv && S.conv.id; }
+
+/* conv switching keeps the last few threads fully cached: reopening
+   one paints instantly (no blank list, no delayed selection mark)
+   while a background loadConv reconciles anything that changed. The
+   cache holds REFERENCES - send()/pollX() mutations stay visible in
+   it without extra bookkeeping; loadConv re-anchors after replacing
+   the objects wholesale. */
+var MSGCACHE_MAX = 8;
+function cacheConv() {
+  var id = convId();
+  if (!id) return;
+  S.msgCache[id] = { conv: S.conv, msgs: S.msgs, exch: S.exch,
+    exchByAid: S.exchByAid, usage: S.usage, actions: S.actions };
+  var i = S.msgCacheN.indexOf(id);
+  if (i >= 0) S.msgCacheN.splice(i, 1);
+  S.msgCacheN.push(id);
+  while (S.msgCacheN.length > MSGCACHE_MAX) {
+    var old = S.msgCacheN.shift();
+    if (old !== convId()) delete S.msgCache[old];
+  }
+}
+function restoreConv(id) {
+  var c = S.msgCache[id];
+  if (!c) return false;
+  S.conv = c.conv; S.msgs = c.msgs; S.exch = c.exch;
+  S.exchByAid = c.exchByAid; S.usage = c.usage; S.actions = c.actions;
+  return true;
+}
 function draftKey() {
   return 'ac-ai-draft' + (convId() ? ':' + convId() : '');
 }
@@ -775,6 +805,14 @@ function paint() {
     var uv = byId('ai-useview');
     if (uv) uv.innerHTML = usageViewHtml();
   }
+  var tt = byId('ai-title');
+  if (tt) {
+    var ttxt = S.conv && S.conv.title;
+    tt.textContent = S.conv ? (ttxt || '(untitled chat)') : 'New chat';
+    tt.title = ttxt ? 'chat: ' + ttxt
+      : 'this conversation has no title yet';
+    tt.hidden = !(S.conv || S.mode !== 'closed');
+  }
   var histBtn = byId('ai-hist');
   if (histBtn) histBtn.className = 'ai-hbtn' + (S.rail ? ' on' : '');
   var sizeBtn = byId('ai-size');
@@ -893,6 +931,7 @@ async function loadConv(id) {
   store('ac-ai-conv', convId());
   var ta = byId('ai-text');
   if (ta) ta.value = store(draftKey()) || '';
+  cacheConv();                    // re-anchor on the fresh objects
   refreshExch().catch(function () {});
   refreshUsage().catch(function () {});
   loadActions().catch(function () {});
@@ -964,6 +1003,9 @@ async function delConv(id) {
   }
   if (S.convList)
     S.convList = S.convList.filter(function (r) { return r.id !== id; });
+  delete S.msgCache[id];
+  var ci = S.msgCacheN.indexOf(id);
+  if (ci >= 0) S.msgCacheN.splice(ci, 1);
   if (convId() === id) {               // the open chat is gone - reset
     S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
     S.usage = null; S.actions = {}; S.armed = {}; S.pollXid = null;
@@ -1855,8 +1897,12 @@ function openConv(id) {
   var ta = byId('ai-text');
   if (ta) store(draftKey(), ta.value);
   stashAttach();
-  S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
-  S.usage = null; S.actions = {}; S.armed = {};
+  cacheConv();                       // keep the outgoing thread warm
+  if (!restoreConv(id)) {
+    S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
+    S.usage = null; S.actions = {};
+  }
+  S.armed = {};
   S.renaming = null;
   S.pollXid = null;                    // orphan the old conv's poller
   paint();
@@ -1870,6 +1916,7 @@ function newConv() {
   var ta = byId('ai-text');
   if (ta) store(draftKey(), ta.value);   // stash before switching
   stashAttach();
+  cacheConv();
   S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
   S.usage = null; S.actions = {}; S.armed = {};
   S.renaming = null;
@@ -1910,6 +1957,7 @@ function injectDom() {
        the 400px title row without ellipsizing one of them into
        uselessness - they get their own strip */
     '<div class="ai-sub">' +
+      '<span id="ai-title" class="ai-tt" title=""></span>' +
       '<span id="ai-ctx" class="ai-ctx">about: dashboard</span>' +
       '<span class="ai-flex"></span>' +
       '<details id="ai-usage" class="ai-usage">' +
@@ -1967,8 +2015,8 @@ function injectDom() {
        conversation while the list floats beside it */
     '<div id="ai-rail" class="ai-rail" hidden ' +
       'aria-label="Conversation history">' +
-      '<div class="ai-rail-h"><button type="button" id="ai-new">' +
-        '+ New chat</button></div>' +
+      '<div class="ai-rail-h"><span class="ai-rail-t">Chats</span>' +
+      '<button type="button" id="ai-new">+ New chat</button></div>' +
       '<div id="ai-convs" class="ai-convs"></div>' +
     '</div>' +
     '<div id="aisetwrap" hidden>' +

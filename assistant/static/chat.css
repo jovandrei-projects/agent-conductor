@@ -79,7 +79,9 @@
   padding: 0 10px 7px; border-bottom: 1px solid #30363d;
   background: #161b22;
 }
-#aichat .ai-sub .ai-ctx { max-width: 62%; }
+#aichat .ai-sub .ai-ctx { max-width: 38%; }
+#aichat .ai-sub .ai-tt { max-width: 40%; color: #c9d1d9;
+  font-weight: 600; }
 #aichat .ai-sub .ai-usage { flex: none; max-width: none; }
 #aichat .ai-name {
   background: transparent; border: 0; color: #e6edf3; font: inherit;
@@ -101,8 +103,8 @@
 /* the text cells (name/ctx/usage) shrink+ellipsis first, the icon
    buttons are flex:none - a wide usage label can never push the
    header controls out of the 400px card */
-#aichat .ai-ctx {
-  flex: 0 1 auto; min-width: 0; max-width: 40%; overflow: hidden;
+#aichat .ai-ctx, #aichat .ai-tt {
+  flex: 0 1 auto; min-width: 0; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; font-size: 11px;
   color: #8b949e;
   border: 1px solid #30363d; border-radius: 9px; padding: 1px 8px;
@@ -417,8 +419,10 @@
   top: 24px; bottom: 24px; height: auto;
 }
 #ai-rail .ai-rail-h { flex: none; padding: 8px; border-bottom: 1px solid
-  #21262d; }
-#ai-rail #ai-new { width: 100%; background: #21262d; color: #e6edf3;
+  #21262d; display: flex; align-items: center; gap: 8px; }
+#ai-rail .ai-rail-t { flex: none; font-size: 10px; font-weight: 600;
+  color: #8b949e; text-transform: uppercase; letter-spacing: .5px; }
+#ai-rail #ai-new { flex: 1; background: #21262d; color: #e6edf3;
   border: 1px solid #30363d; border-radius: 6px; font: inherit;
   font-size: 12px; padding: 5px 8px; cursor: pointer; }
 #ai-rail #ai-new:hover { border-color: #58a6ff; }
@@ -432,7 +436,8 @@
 #ai-rail .ai-conv:hover { background: #161b22; }
 #ai-rail .ai-conv:focus-visible { background: #161b22;
   outline: 2px solid #58a6ff; }
-#ai-rail .ai-conv.on { background: #1c3041; }
+#ai-rail .ai-conv.on { background: #1c3041; color: #e6edf3;
+  box-shadow: inset 3px 0 0 #58a6ff; }
 #ai-rail .ai-conv .t { display: block; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
 #ai-rail .ai-conv .s { display: block; color: #6e7681; font-size: 10px;
