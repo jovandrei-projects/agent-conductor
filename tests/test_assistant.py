@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -546,6 +547,134 @@ class AttachmentTests(unittest.TestCase):
                 c.save_upload(cv["id"], b"\x89PNG fake")
             c.close()
 
+    def _real_saver(self, td):
+        """The seam the host wires (conductor.save_attachment) confined
+        to this test's tempdir - real magic-byte/size validation."""
+        import conductor
+        adir = Path(td) / "attachments"
+        return lambda data: conductor.save_attachment(data, adir)
+
+    def test_real_saver_validates_content_and_records_ctype(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td, attachment_saver=self._real_saver(td))
+            cv = conv(c)
+            png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+            a = c.save_upload(cv["id"], png)
+            self.assertEqual(a["ctype"], "image/png")
+            self.assertTrue(Path(a["path"]).is_file())
+            # non-image bytes are refused by CONTENT (magic bytes), and
+            # an empty upload is a 400 - never by filename or header
+            with self.assertRaises(AssistantError) as e:
+                c.save_upload(cv["id"], b"MZ" + b"x" * 64)
+            self.assertEqual(e.exception.status, 415)
+            with self.assertRaises(AssistantError) as e:
+                c.save_upload(cv["id"], b"")
+            self.assertEqual(e.exception.status, 400)
+            c.close()
+
+    def test_oversized_upload_is_413(self):
+        import conductor
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td, attachment_saver=self._real_saver(td))
+            cv = conv(c)
+            big = b"\x89PNG\r\n\x1a\n" + \
+                b"x" * conductor.ATTACH_MAX_BYTES
+            with self.assertRaises(AssistantError) as e:
+                c.save_upload(cv["id"], big)
+            self.assertEqual(e.exception.status, 413)
+            c.close()
+
+    def test_saver_errors_keep_their_http_status(self):
+        """The host's RequestError is translated to AssistantError with
+        the SAME status instead of escaping dispatch as a 500."""
+        with tempfile.TemporaryDirectory() as td:
+            import conductor
+
+            def saver(data):
+                raise conductor.RequestError("way too big", 413)
+            c = make_core(td, attachment_saver=saver)
+            cv = conv(c)
+            with self.assertRaises(AssistantError) as e:
+                c.save_upload(cv["id"], b"\x89PNG fake")
+            self.assertEqual(e.exception.status, 413)
+            self.assertIn("way too big", str(e.exception))
+            c.close()
+
+    def test_per_conversation_upload_cap(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td, attachment_saver=self._saver(td))
+            cv = conv(c)
+            with mock.patch("assistant.core.ATTACH_PER_CONV_MAX", 3):
+                for _ in range(3):
+                    c.save_upload(cv["id"], b"\x89PNG fake")
+                with self.assertRaises(AssistantError) as e:
+                    c.save_upload(cv["id"], b"\x89PNG fake")
+                self.assertEqual(e.exception.status, 409)
+            c.close()
+
+    def test_message_attachment_count_cap(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td, attachment_saver=self._saver(td))
+            cv = conv(c)
+            ids = [c.save_upload(cv["id"], b"\x89PNG fake")["id"]
+                   for _ in range(21)]
+            with self.assertRaises(AssistantError) as e:
+                ask(c, cv["id"], "x", attachments=ids)
+            self.assertEqual(e.exception.status, 400)
+            c.close()
+
+    def test_bound_attachment_cannot_be_rebound(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td, attachment_saver=self._saver(td))
+            cv = conv(c)
+            a = c.save_upload(cv["id"], b"\x89PNG fake")
+            ask(c, cv["id"], "one", attachments=[a["id"]])
+            with self.assertRaises(AssistantError) as e:
+                ask(c, cv["id"], "two", attachments=[a["id"]])
+            self.assertEqual(e.exception.status, 409)
+            c.close()
+
+    def test_read_upload_round_trip_and_gates(self):
+        """The preview route's backing call: bytes come back by row id
+        with the recorded image type; bad ids, foreign paths, missing
+        files and non-image ctype rows are all refused."""
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td, attachment_saver=self._real_saver(td))
+            cv = conv(c)
+            png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+            a = c.save_upload(cv["id"], png)
+            data, ctype = c.read_upload(a["id"])
+            self.assertEqual(data, png)
+            self.assertEqual(ctype, "image/png")
+            for bad in ("att-nope", "att-../../x", "", "x" * 200, None):
+                with self.assertRaises(AssistantError) as e:
+                    c.read_upload(bad)
+                self.assertEqual(e.exception.status, 404)
+            # a tampered ctype can never turn the route into an
+            # html/script-serving endpoint
+            c.store.execute(
+                "UPDATE attachments SET ctype='text/html' WHERE id=?",
+                (a["id"],))
+            _, ctype = c.read_upload(a["id"])
+            self.assertEqual(ctype, "application/octet-stream")
+            # a row pointing outside the attachments dir is refused
+            outside = Path(td) / "secret.txt"
+            outside.write_text("nope")
+            c.store.execute(
+                "UPDATE attachments SET path=? WHERE id=?",
+                (str(outside), a["id"]))
+            with self.assertRaises(AssistantError):
+                c.read_upload(a["id"])
+            # a missing file is a clean 404, not a 500
+            c.store.execute(
+                "UPDATE attachments SET path=? WHERE id=?",
+                (a["path"], a["id"]))
+            Path(a["path"]).unlink()
+            with self.assertRaises(AssistantError) as e:
+                c.read_upload(a["id"])
+            self.assertEqual(e.exception.status, 404)
+            c.close()
+
 
 class ModelHistoryTests(unittest.TestCase):
     def test_bounded_model_view_full_store_kept(self):
@@ -659,6 +788,49 @@ class HttpApiTests(unittest.TestCase):
             code, m = http_api.dispatch(c, "GET", "/api/assistant/models")
             self.assertEqual(m["models"][0]["uid"],
                              "gpt-6-luna-low-priority")
+            c.close()
+
+    def test_attachment_upload_route(self):
+        """POST /api/assistant/attachments takes RAW image bytes (the
+        JSON decoder is skipped for it), records the row against the
+        ?conversation= id, dedupes on ?ref=, and validates content."""
+        with tempfile.TemporaryDirectory() as td:
+            import conductor
+            adir = Path(td) / "attachments"
+            c = make_core(
+                td, attachment_saver=lambda d:
+                    conductor.save_attachment(d, adir))
+            code, cv = self.post(c, "/api/assistant/conversations",
+                                 {"origin": {"view": "dashboard"}})
+            cid = cv["id"]
+            png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+            code, a = http_api.dispatch(
+                c, "POST", "/api/assistant/attachments", body=png,
+                query={"conversation": [cid], "ref": ["r1"]})
+            self.assertEqual(code, 201)
+            self.assertEqual(a["ctype"], "image/png")
+            self.assertEqual(a["conversation_id"], cid)
+            self.assertIsNone(a["message_id"])       # bound at send
+            code, a2 = http_api.dispatch(
+                c, "POST", "/api/assistant/attachments", body=png,
+                query={"conversation": [cid], "ref": ["r1"]})
+            self.assertTrue(a2["deduped"])
+            code, b = http_api.dispatch(
+                c, "POST", "/api/assistant/attachments", body=png)
+            self.assertEqual(code, 400)            # no conversation
+            code, b = http_api.dispatch(
+                c, "POST", "/api/assistant/attachments", body=png,
+                query={"conversation": ["conv-nope"]})
+            self.assertEqual(code, 404)
+            code, b = http_api.dispatch(
+                c, "POST", "/api/assistant/attachments",
+                body=b"MZ" + b"x" * 64,
+                query={"conversation": [cid]})
+            self.assertEqual(code, 415)
+            code, b = http_api.dispatch(
+                c, "POST", "/api/assistant/attachments", body=b"",
+                query={"conversation": [cid]})
+            self.assertEqual(code, 400)
             c.close()
 
     def test_cancel_route(self):

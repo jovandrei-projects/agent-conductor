@@ -42,6 +42,7 @@ function mkEl(id){return {id,innerHTML:'',hidden:true,textContent:'',
   scrollHeight:0,clientHeight:0,_h:{},
   setAttribute(k,v){this.attrs[k]=v;},getAttribute(k){return this.attrs[k];},
   addEventListener(ev,h){this._h[ev]=h;},
+  click(){this._clicked=(this._clicked||0)+1;},
   focus(){this._focused=(this._focused||0)+1;},
   remove(){}};}
 const document={
@@ -207,6 +208,64 @@ class StaticRouteTests(unittest.TestCase):
         self.assertEqual(status, 200)
         out = json.loads(body.decode("utf-8"))
         self.assertEqual(out["items"], [])
+
+    def _post(self, port, path, body, ctype="application/json"):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("POST", path, body=body,
+                     headers={"Content-Type": ctype})
+        res = conn.getresponse()
+        payload = res.read()
+        status, hdr = res.status, res.getheader("Content-Type")
+        conn.close()
+        return status, hdr, payload
+
+    def test_assistant_attachment_upload_and_bytes_route(self):
+        """POST stores raw image bytes as a conversation-scoped row;
+        GET <id> serves the bytes back through the row-id boundary -
+        never a client-supplied path. Non-image bodies are refused by
+        content, bad ids are 404."""
+        srv = self._server()
+        port = srv.server_port
+        st, _, payload = self._post(
+            port, "/api/assistant/conversations",
+            json.dumps({"origin": {"view": "dashboard"}}))
+        self.assertEqual(st, 201)
+        cid = json.loads(payload)["id"]
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        st, _, payload = self._post(
+            port, f"/api/assistant/attachments?conversation={cid}",
+            png, "application/octet-stream")
+        self.assertEqual(st, 201)
+        att = json.loads(payload)
+        self.assertEqual(att["conversation_id"], cid)
+        self.assertEqual(att["ctype"], "image/png")
+        status, ctype, body = self._get(
+            port, f"/api/assistant/attachments/{att['id']}")
+        self.assertEqual(status, 200)
+        self.assertIn("image/png", ctype)
+        self.assertEqual(body, png)
+        # non-image bytes refused by content; bad ids -> 404; the id is
+        # a row key - no filesystem path is ever taken from the client
+        st, _, _ = self._post(
+            port, f"/api/assistant/attachments?conversation={cid}",
+            b"MZ" + b"x" * 64, "application/octet-stream")
+        self.assertEqual(st, 415)
+        status, _, _ = self._get(
+            port, "/api/assistant/attachments/att-nope")
+        self.assertEqual(status, 404)
+        status, _, _ = self._get(
+            port, "/api/assistant/attachments/..%2Fconductor.py")
+        self.assertEqual(status, 404)
+
+    def test_assistant_json_posts_keep_the_small_body_cap(self):
+        """The 20 MB allowance is scoped to the attachments route -
+        ordinary JSON POSTs stay at the dashboard's 512KB bound."""
+        srv = self._server()
+        st, _, body = self._post(
+            srv.server_port, "/api/assistant/conversations",
+            json.dumps({"origin": {"view": "dashboard"},
+                        "pad": "x" * 600_000}))
+        self.assertEqual(st, 413)
 
 
 @unittest.skipUnless(shutil.which("node"), "Node unavailable")
@@ -488,6 +547,337 @@ setRoute((url,opt)=>{
   // conversation untouched, chat still open
   assert.equal(S.msgs.length,2);
   assert.equal(nodes.get('aichat').hidden,false);
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js="setRoute(()=>({items:[]}));")
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_paste_image_uploads_text_paste_untouched(self):
+        """Clipboard handling: an image item becomes an eager upload +
+        thumbnail (default paste suppressed only for it), while a
+        text-only clipboard falls through to the browser's normal
+        paste - and the upload created the conversation first, since
+        attachments are conversation-scoped."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const ta=nodes.get('ai-text');
+  let prevented=0;
+  const pd=()=>{prevented++;};
+  // text-only paste: untouched - no preventDefault, no upload, no conv
+  ta._h.paste({clipboardData:{items:[
+    {kind:'string',type:'text/plain',getAsFile:()=>null},
+    {kind:'string',type:'text/html',getAsFile:()=>null}]},
+    preventDefault:pd});
+  assert.equal(prevented,0);
+  assert(!fetches.some(f=>f.url.includes('/attachments')),
+    'no upload for text');
+  // image item -> suppressed + uploaded; conversation materializes
+  const img={name:'shot.png',type:'image/png',size:64};
+  ta._h.paste({clipboardData:{items:[
+    {kind:'file',type:'image/png',getAsFile:()=>img}]},
+    preventDefault:pd});
+  assert.equal(prevented,1);
+  await flush();
+  const up=fetches.find(f=>f.url.includes('/attachments?'));
+  assert(up,'attachment POST happened');
+  assert(up.opt.body===img,'raw file bytes posted, not JSON');
+  assert.match(up.url,/conversation=conv-9/);
+  const convPost=fetches.findIndex(f=>f.url.endsWith('/conversations')&&
+    f.opt&&f.opt.method==='POST');
+  assert(convPost>=0&&convPost<fetches.indexOf(up),
+    'conversation created before the upload');
+  const strip=nodes.get('ai-ats');
+  assert.equal(strip.hidden,false);
+  assert.match(strip.innerHTML,
+    /api\/assistant\/attachments\/att-1/);
+  assert.match(strip.innerHTML,/data-ai-atrm="0"/);
+  // a second paste with a NON-image file is skipped with a note
+  ta._h.paste({clipboardData:{items:[
+    {kind:'file',type:'application/pdf',
+     getAsFile:()=>({name:'doc.pdf',type:'application/pdf',size:10})}]},
+    preventDefault:pd});
+  await flush();
+  assert.match(nodes.get('ai-note').innerHTML,/Skipped/);
+  assert.equal(fetches.filter(f=>f.url.includes('/attachments?'))
+    .length,1);
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js=r'''
+setRoute((url,opt)=>{
+  if(url.endsWith('/conversations')&&opt&&opt.method==='POST')
+    return{id:'conv-9',client_ref:'w',title:'',model:'gpt-6-luna',
+      effort:'low',fast:1,readonly:1,origin_view:{}};
+  if(url.includes('/attachments?'))
+    return{id:'att-1',conversation_id:'conv-9',message_id:null,
+      name:'shot.png',ctype:'image/png',bytes:64};
+  return{items:[]};
+});
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_file_picker_remove_and_send_binds_ids(self):
+        """The paperclip opens the hidden file input; picked images
+        upload + thumbnail; the remove control drops a pending image;
+        send posts the surviving attachment ids and clears the strip."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const fi=nodes.get('ai-file');
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='#ai-attach'?nodes.get('ai-attach'):null}});
+  assert.equal(fi._clicked,1,'attach button opens the file picker');
+  const S=window.AskAI._s;
+  S.conv={id:'conv-9',model:'gpt-6-luna',effort:'low',fast:1,
+    readonly:1};
+  const a={name:'a.png',type:'image/png',size:10};
+  const b={name:'b.png',type:'image/png',size:10};
+  fi.files=[a,b];
+  fi._h.change({target:fi});
+  await flush();
+  assert.equal(S.attach.length,2);
+  // remove the first pending image; the second (att-3) survives
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='[data-ai-atrm]'?{getAttribute:k=>'0'}:null}});
+  assert.equal(S.attach.length,1);
+  assert.equal(S.attach[0].name,'att-3.png');
+  // an in-flight upload gates send with an explanation
+  S.attach.push({id:null,name:'c.png',status:'uploading'});
+  nodes.get('ai-text').value='look';
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='#ai-send'?nodes.get('ai-send'):null}});
+  await flush();
+  assert(!fetches.some(f=>f.url.endsWith('/messages')),
+    'send waits for uploads');
+  assert.match(nodes.get('ai-note').innerHTML,/in flight/);
+  // upload settles; send carries the surviving ids + clears the strip
+  S.attach.pop();
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='#ai-send'?nodes.get('ai-send'):null}});
+  await flush();
+  const post=fetches.find(f=>f.url.endsWith('/messages'));
+  const body=JSON.parse(post.opt.body);
+  assert.deepEqual(body.attachments,['att-3']);
+  assert.equal(S.attach.length,0);
+  assert.equal(nodes.get('ai-ats').hidden,true);
+  // attachments-only send is legal (text optional)
+  S.attach=[{id:'att-7',name:'c.png',ctype:'image/png',bytes:9,
+    status:''}];
+  nodes.get('ai-text').value='';
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='#ai-send'?nodes.get('ai-send'):null}});
+  await flush();
+  const post2=fetches.filter(f=>f.url.endsWith('/messages'))[1];
+  const b2=JSON.parse(post2.opt.body);
+  assert.equal(b2.text,'');
+  assert.deepEqual(b2.attachments,['att-7']);
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js=r'''
+let n=0;
+setRoute((url,opt)=>{
+  if(url.includes('/attachments?'))
+    return{id:'att-'+(++n+1),conversation_id:'conv-9',
+      message_id:null,name:'att-'+(n+1)+'.png',ctype:'image/png',
+      bytes:10};
+  if(url.endsWith('/messages')&&opt&&opt.method==='POST')
+    return{message:{id:'mu'+n,conversation_id:'conv-9',
+      client_msg_id:'m-x',role:'user',text:'',
+      attachments:'[]',ctx_ref:'{}',settings_json:'{}',
+      status:'complete'},
+      assistant_message:{id:'ma'+n,conversation_id:'conv-9',
+        role:'assistant',text:'',ctx_ref:'{}',settings_json:'{}',
+        status:'pending'},
+      exchange:{id:'xch-'+n,conversation_id:'conv-9',
+        user_msg_id:'mu'+n,assistant_msg_id:'ma'+n,
+        status:'done',text:'ok'}};
+  return{items:[]};
+});
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_message_attachments_render_thumbnails(self):
+        """A user message's attachments JSON renders as previews served
+        by the id-gated binary route - including on reopened
+        conversations - and the stored path never reaches the markup."""
+        p = run_node(
+            r'''
+(async()=>{
+  const S=window.AskAI._s;
+  S.conv={id:'conv-1',model:'m',readonly:1};
+  S.msgs=[{id:'u1',role:'user',text:'look',
+    attachments:'[{"id":"att-9","name":"shot.png","ctype":"image/png",'+
+      '"bytes":12,"path":"D:/data/attachments/x.png"}]',
+    ctx_ref:'',settings_json:'{}'},
+    {id:'u2',role:'user',text:'',
+     attachments:'[{"id":"att-8","name":"only.png"}]',ctx_ref:'',
+     settings_json:'{}'},
+    {id:'a1',role:'assistant',text:'nice image',status:'complete',
+     ctx_ref:'',settings_json:'{}'}];
+  window.AskAI._paint();
+  const html=nodes.get('ai-list').innerHTML;
+  assert.match(html,/class="aim-ats"/);
+  assert.match(html,/api\/assistant\/attachments\/att-9/);
+  assert.match(html,/api\/assistant\/attachments\/att-8/);
+  assert.match(html,/shot\.png/);
+  assert(!html.includes('D:/data'),'server path stays out of markup');
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js="setRoute(()=>({items:[]}));")
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_vision_refusal_note_points_to_settings(self):
+        """When the exchange errors with the vision refusal, the note
+        names the explanation AND points at the model settings."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  nodes.get('ai-text').value='what is this';
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='#ai-send'?nodes.get('ai-send'):null}});
+  await flush();
+  assert(timers.length>0,'poll scheduled');
+  timers.shift()();
+  await flush();
+  const n=nodes.get('ai-note').innerHTML;
+  assert.match(n,/no verified image support/);
+  assert.match(n,/vision-capable model/);
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js=r'''
+setRoute((url,opt)=>{
+  if(url.endsWith('/conversations')&&opt&&opt.method==='POST')
+    return{id:'conv-9',client_ref:'w',model:'swe-2',readonly:1};
+  if(url.endsWith('/messages')&&opt&&opt.method==='POST')
+    return{message:{id:'mu',conversation_id:'conv-9',role:'user',
+      text:'what is this',ctx_ref:'{}',settings_json:'{}'},
+      assistant_message:{id:'ma',conversation_id:'conv-9',
+        role:'assistant',text:'',ctx_ref:'{}',settings_json:'{}',
+        status:'pending'},
+      exchange:{id:'xch-9',user_msg_id:'mu',assistant_msg_id:'ma',
+        status:'queued'}};
+  if(url.includes('/exchanges/xch-9'))
+    return{id:'xch-9',user_msg_id:'mu',assistant_msg_id:'ma',
+      status:'error',text:'',
+      error:'image attachment refused - the selected model `swe-2-max` '+
+        'has no verified image support on this provider; verified '+
+        'alternatives: gpt-6-luna-low-priority'};
+  return{items:[]};
+});
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_mic_unsupported_browser_explains(self):
+        """No SpeechRecognition (the harness default = the Firefox
+        case): the mic renders visibly inert with an explanatory
+        tooltip, and clicking surfaces the honest note - it never
+        pretends to work."""
+        p = run_node(
+            r'''
+const mic=nodes.get('ai-mic');
+assert(mic,'mic button exists');
+assert(mic.className.indexOf('na')>=0,'inert state painted at init');
+assert.equal(mic.getAttribute('aria-pressed'),'false');
+assert.match(mic.title,/Firefox does not/i);
+nodes.get('aichat')._h.click({target:{closest:s=>
+  s==='#ai-mic'?mic:null}});
+assert.match(nodes.get('ai-note').innerHTML,
+  /not available in this browser/);
+assert.equal(window.AskAI._s.dict,null);
+process.exitCode=0;
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_dictation_lifecycle(self):
+        """With a stub SpeechRecognition: explicit start paints the
+        recording state, interim+final results land in the box (typed
+        text intact, nothing auto-sent), the transcript stays
+        editable, permission denial produces a visible note, and
+        close/switch aborts the session."""
+        p = run_node(
+            r'''
+(async()=>{
+  const recs=[];
+  window.SpeechRecognition=function(){
+    const r={continuous:null,interimResults:null,onresult:null,
+      onerror:null,onend:null,started:0,stopped:0,aborted:0,
+      start(){this.started++;},stop(){this.stopped++;},
+      abort(){this.aborted++;}};
+    recs.push(r);return r;};
+  window.AskAI._dictUI();
+  window.AskAI.open();
+  await flush();
+  const mic=nodes.get('ai-mic');
+  assert(!/na/.test(mic.className),'mic live where supported');
+  nodes.get('ai-text').value='typed bit';
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='#ai-mic'?mic:null}});
+  assert.equal(recs.length,1);
+  const rec=recs[0];
+  assert.equal(rec.started,1);
+  assert.equal(rec.continuous,true);
+  assert.equal(rec.interimResults,true);
+  assert.match(mic.className,/rec/);
+  assert.equal(mic.getAttribute('aria-pressed'),'true');
+  // the once-per-tab external-processing disclosure landed
+  assert.match(nodes.get('ai-note').innerHTML,/speech service/i);
+  assert.match(nodes.get('ai-status').textContent,/Listening/);
+  // interim + final append after the typed text (results carries the
+  // whole list; resultIndex marks where the changed run begins)
+  rec.onresult({resultIndex:0,results:[
+    {isFinal:true,0:{transcript:'hello'}},
+    {isFinal:false,0:{transcript:'wor'}}]});
+  assert.equal(nodes.get('ai-text').value,'typed bit hello wor');
+  // interim refines without losing the final part
+  rec.onresult({resultIndex:1,results:[
+    {isFinal:true,0:{transcript:'hello'}},
+    {isFinal:false,0:{transcript:'world'}}]});
+  assert.equal(nodes.get('ai-text').value,'typed bit hello world');
+  // dictation NEVER posts the message
+  assert(!fetches.some(f=>f.url.endsWith('/messages')));
+  // transcript stays editable
+  nodes.get('ai-text').value+='!';
+  // explicit stop -> rec.stop, onend clears state
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='#ai-mic'?mic:null}});
+  assert.equal(rec.stopped,1);
+  rec.onend();
+  assert.equal(window.AskAI._s.dict,null);
+  // permission denial -> visible actionable note + abort
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='#ai-mic'?mic:null}});
+  const rec2=recs[1];
+  rec2.onerror({error:'not-allowed'});
+  assert.match(nodes.get('ai-note').innerHTML,/permission denied/i);
+  assert.equal(rec2.aborted,1);
+  assert.equal(window.AskAI._s.dict,null);
+  // conversation switch aborts a live session too
+  const S=window.AskAI._s;
+  S.conv={id:'conv-1',model:'m',readonly:1};
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='#ai-mic'?mic:null}});
+  const rec3=recs[2];
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='[data-ai-conv]'?{getAttribute:k=>'conv-2'}:null}});
+  assert.equal(rec3.aborted,1);
+  assert.equal(S.dict,null);
+  // and minimize() kills it - a closed composer never keeps recording
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='#ai-mic'?mic:null}});
+  const rec4=recs[3];
+  window.AskAI.close();
+  assert.equal(rec4.aborted,1);
 })().then(()=>process.exitCode=0).catch(e=>{console.error(e);
   process.exitCode=1;});
 ''',

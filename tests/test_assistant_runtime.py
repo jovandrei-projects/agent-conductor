@@ -645,6 +645,37 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(p.sends, [])
             core.close()
 
+    def test_attachment_paths_reach_the_provider_prompt(self):
+        """On the verified transport images reach the model via the
+        path-based read tool: the attachment's real location is written
+        into the prompt file the session spawns on - never silently
+        dropped and never inlined as bytes."""
+        with tempfile.TemporaryDirectory() as td:
+            att_dir = Path(td) / "atts"
+            att_dir.mkdir()
+            img = att_dir / "img-1.png"
+            img.write_bytes(b"\x89PNG fake")
+
+            def saver(data):
+                return {"name": "img-1.png", "path": str(img)}
+            p = ScriptedProvider()
+            core, rt = self._open(td, p, attachment_saver=saver,
+                                  attachments_dir=att_dir)
+            cv = core.create_conversation({"view": "dashboard"})
+            a = core.save_upload(cv["id"], b"\x89PNG fake")
+            r = ask(core, cv, "describe this",
+                    attachments=[a["id"]])
+            x = wait_x(core, r["exchange"]["id"])
+            self.assertEqual(x["status"], "done")
+            self.assertEqual(len(p.sends), 1)
+            prompt = p.sends[0]["prompt"]
+            self.assertIn("Attachments", prompt)
+            self.assertIn(str(img), prompt)
+            # the message row carries the durable reference too
+            msg = core.store.get_message(r["message"]["id"])
+            self.assertIn(a["id"], msg["attachments"])
+            core.close()
+
     def test_action_proposal_is_recorded_and_stripped(self):
         with tempfile.TemporaryDirectory() as td:
             def on_send(rec):
