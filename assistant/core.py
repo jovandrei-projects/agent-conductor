@@ -103,12 +103,18 @@ class AssistantCore:
       `enriched` block for each posted message; a failure is recorded
       honestly in the envelope, never silently dropped or fatal.
     - catalog: callable -> {models:[{uid,label,prices...}]} for /models.
+    - settings_validator: callable(effective {model,effort,fast,readonly})
+      that raises AssistantError when the combination cannot be dispatched
+      (unknown family, effort/fast variant the family never published,
+      vision-less model + images). Server-side validation per the manifest;
+      None = shape-only checking (tests, standalone).
     - now: epoch clock seam (tests inject; host passes conductor._now).
     """
 
     def __init__(self, store: Store, *, guard=None, attachment_saver=None,
                  attachments_dir=None, dispatcher=None, actions=None,
-                 retrieval=None, enricher=None, catalog=None, now=None):
+                 retrieval=None, enricher=None, catalog=None,
+                 settings_validator=None, now=None):
         self.store = store
         self._guard = guard
         self._save_attach = attachment_saver
@@ -119,6 +125,7 @@ class AssistantCore:
         self.retrieval = retrieval
         self._enricher = enricher
         self._catalog = catalog
+        self._validator = settings_validator
         self._now = now or time.time
 
     # ---------------------------------------------------------- plumbing
@@ -128,6 +135,18 @@ class AssistantCore:
     def _guarded(self, *paths: Path) -> None:
         if self._guard:
             self._guard(*paths)
+
+    def guard_paths(self, *paths) -> None:
+        """Public guard entry for the runtime: spool/workspace writes under
+        the data dir take the same trap-5 check as row writes."""
+        self._guarded(*paths)
+
+    def _validate_settings(self, effective: dict) -> None:
+        """Server-side settings check against the host's live catalog.
+        Runs on EFFECTIVE settings (stored + patch merged), so a patch
+        that only flips `fast` still validates the real combination."""
+        if self._validator:
+            self._validator(dict(effective))
 
     def _conv(self, conv_id: str) -> dict:
         conv = self.store.get_conversation(conv_id)
@@ -153,6 +172,7 @@ class AssistantCore:
     def set_defaults(self, patch: dict) -> dict:
         self._guarded(self.store.path.parent)
         vals = _clean_settings(patch)
+        self._validate_settings({**self.defaults(), **vals})
         with self.store.txn():
             for k, v in vals.items():
                 self.store.set_setting(f"default.{k}", v)
@@ -173,6 +193,7 @@ class AssistantCore:
         except ctxmod.ContextError as exc:
             raise AssistantError(str(exc)) from exc
         vals = {**self.defaults(), **_clean_settings(settings or {})}
+        self._validate_settings(vals)
         title = str(title or "").strip()[:TITLE_MAX]
         now = self._iso()
         rec = {"id": new_id("conv", self._now()),
@@ -245,6 +266,10 @@ class AssistantCore:
         snapshots."""
         conv = self._conv(conv_id)
         vals = _clean_settings(patch)
+        self._validate_settings(
+            {"model": conv["model"], "effort": conv["effort"],
+             "fast": bool(conv["fast"]), "readonly": bool(conv["readonly"]),
+             **vals})
         self._guarded(self.store.path.parent)
         now = self._iso()
         fields = {"updated_at": now, "last_active_at": now}
@@ -316,6 +341,7 @@ class AssistantCore:
                 "fast": bool(conv["fast"]),
                 "readonly": bool(conv["readonly"]),
                 **_clean_settings(settings or {})}
+        self._validate_settings(snap)
         now = self._iso()
 
         self._guarded(self.store.path.parent)
@@ -361,7 +387,8 @@ class AssistantCore:
                 "llm_steps": None, "model_uid": None, "model_label": None,
                 "price_in": None, "price_cached": None, "price_out": None,
                 "price_fetched_at": None, "price_source": None,
-                "usd": None, "error": None, "sources": None})
+                "usd": None, "error": None, "sources": None,
+                "requests": None})
             conn.execute(
                 "UPDATE conversations SET last_active_at=?, updated_at=?"
                 " WHERE id=?", (now, now, conv_id))
@@ -395,7 +422,8 @@ class AssistantCore:
 
     # -------------------------------------------------------- exchanges
     def begin_exchange(self, xid: str, *, pid=None, provider_session_id=None,
-                       prompt_path=None, export_path=None) -> dict:
+                       prompt_path=None, export_path=None,
+                       model_uid=None) -> dict:
         x = self._xid(xid)
         if x["status"] != "queued":
             return x
@@ -406,7 +434,8 @@ class AssistantCore:
                 pid=pid,
                 provider_session_id=provider_session_id
                 or x.get("provider_session_id"),
-                prompt_path=prompt_path, export_path=export_path)
+                prompt_path=prompt_path, export_path=export_path,
+                model_uid=model_uid or x.get("model_uid"))
         return self.store.get_exchange(xid)
 
     def claim_request(self, xid: str, provider_session_id: str,
@@ -426,6 +455,70 @@ class AssistantCore:
                 conn, xid, provider_session_id=provider_session_id,
                 request_id=request_id)
         return {**self.store.get_exchange(xid), "dup": False}
+
+    def note_dispatch(self, xid: str, *, pid=None, prompt_path=None,
+                      export_path=None, model_uid=None) -> dict:
+        """Record the live dispatch of a later hop (begin_exchange covers
+        the queued->running first hop only). The resolved model_uid is
+        stamped at dispatch so session-continuity checks compare against
+        what actually launched, not only completed rows."""
+        x = self._xid(xid)
+        self._guarded(self.store.path.parent)
+        with self.store.txn() as conn:
+            self.store.update_exchange(
+                conn, xid, pid=pid, prompt_path=prompt_path,
+                export_path=export_path,
+                model_uid=model_uid or x.get("model_uid"))
+        return self.store.get_exchange(xid)
+
+    def note_provider_session(self, xid: str, session_id: str) -> dict:
+        """Record the provider session a dispatch landed on - on the
+        exchange AND the conversation (its resume handle for later turns).
+        Called as soon as the provider reports the id, live or terminal."""
+        x = self._xid(xid)
+        if not session_id:
+            return x
+        self._guarded(self.store.path.parent)
+        with self.store.txn() as conn:
+            self.store.update_exchange(
+                conn, xid, provider_session_id=session_id)
+            conn.execute(
+                "UPDATE conversations SET provider_session_id=? WHERE id=?",
+                (session_id, x["conversation_id"]))
+        return self.store.get_exchange(xid)
+
+    def record_request(self, xid: str, entry: dict) -> dict:
+        """Append one internal request-boundary record (a provider dispatch
+        hop: spawn ids, timing, per-hop usage delta + cumulative snapshot)
+        to exchanges.requests. Audit data - appended even on terminal rows
+        so a crash mid-finalize never loses a boundary."""
+        x = self._xid(xid)
+        self._guarded(self.store.path.parent)
+        with self.store.txn() as conn:
+            cur = self.store.get_exchange(xid) or {}
+            try:
+                reqs = json.loads(cur["requests"]) \
+                    if isinstance(cur.get("requests"), str) else []
+            except ValueError:
+                reqs = []
+            reqs.append(entry)
+            self.store.update_exchange(
+                conn, xid, requests=json.dumps(reqs, ensure_ascii=False))
+        return self.store.get_exchange(xid)
+
+    def session_totals(self, provider_session_id: str,
+                       exclude_xid: str | None = None) -> dict | None:
+        """Last recorded cumulative provider counters for a session - the
+        baseline a resumed dispatch's usage delta is measured against."""
+        return self.store.last_session_totals(provider_session_id,
+                                              exclude_xid)
+
+    def inflight_exchanges(self) -> list[dict]:
+        """Exchanges stuck in a live state - the reconcile pass on runtime
+        start re-owns them (adopt a live pid, re-dispatch a dead one)."""
+        return self.store.query(
+            "SELECT * FROM exchanges WHERE status IN ('queued','running')"
+            " ORDER BY seq")
 
     def update_partial(self, xid: str, text: str,
                        usage: dict | None = None) -> dict:
@@ -461,7 +554,7 @@ class AssistantCore:
 
     def complete_exchange(self, xid: str, text: str, *, usage=None,
                           model=None, price=None, usd="auto",
-                          request_id=None, sources=None,
+                          request_id=None, sources=None, error=None,
                           status="done") -> dict:
         """Terminal write: assistant text + token/price snapshot, one
         transaction. Repeating a completion is a no-op - usage can never
@@ -501,6 +594,7 @@ class AssistantCore:
                 price_source=price.get("source", x.get("price_source")),
                 sources=(json.dumps(sources, ensure_ascii=False)
                          if sources is not None else x.get("sources")),
+                error=(str(error)[:800] if error else x.get("error")),
                 usd=usd)
             conn.execute(
                 "UPDATE conversations SET last_active_at=?, updated_at=? "
@@ -564,24 +658,26 @@ class AssistantCore:
                  if x.get("assistant_msg_id") else None)
         out["text"] = (reply or {}).get("text", "")
         out["message_status"] = (reply or {}).get("status")
-        try:    # the stored JSON list -> ready-to-render citation dicts
-            out["sources"] = (json.loads(out["sources"])
-                              if isinstance(out.get("sources"), str)
-                              else (out.get("sources") or []))
-        except ValueError:
-            out["sources"] = []
+        for col in ("sources", "requests"):
+            try:    # stored JSON lists -> ready-to-render dicts
+                out[col] = (json.loads(out[col])
+                            if isinstance(out.get(col), str)
+                            else (out.get(col) or []))
+            except ValueError:
+                out[col] = []
         return out
 
     def list_exchanges(self, conv_id: str) -> list[dict]:
         self._conv(conv_id)
         rows = self.store.list_exchanges(conv_id)
-        for r in rows:      # citation sources thaw for the whole page
-            try:
-                r["sources"] = (json.loads(r["sources"])
-                                if isinstance(r.get("sources"), str)
-                                else (r.get("sources") or []))
-            except ValueError:
-                r["sources"] = []
+        for r in rows:      # citation + request-boundary JSON thaws
+            for col in ("sources", "requests"):
+                try:
+                    r[col] = (json.loads(r[col])
+                              if isinstance(r.get(col), str)
+                              else (r.get(col) or []))
+                except ValueError:
+                    r[col] = []
         return rows
 
     def usage(self, conv_id: str) -> dict:
@@ -756,7 +852,10 @@ class AssistantCore:
         adapter (model_options + price_table merge)."""
         if self._catalog is None:
             return {"models": []}
-        return {"models": self._catalog()}
+        c = self._catalog()
+        # the host may return the full annotated payload (models +
+        # default_resolution) or a bare models list
+        return c if isinstance(c, dict) else {"models": c}
 
     def close(self):
         self.store.close()

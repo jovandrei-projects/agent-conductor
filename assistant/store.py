@@ -22,7 +22,7 @@ import threading
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Chat entity ids look like the project's request ids with a short type
 # prefix: ``msg-20261017-051359-1ab2c3d4``. The regex is the authorization
@@ -156,10 +156,18 @@ _SCHEMA_V1 = [
 # time it was recorded.
 _SCHEMA_V2 = ["ALTER TABLE exchanges ADD COLUMN sources TEXT"]
 
+# Schema v3: exchanges.requests - the JSON list of INTERNAL request
+# boundaries the runtime drove for one exchange (each provider dispatch /
+# tool hop: {n, kind, pid, session_id, request_id, started_at, ended_at,
+# exit_code, usage{delta+cum}}). Usage accounting expands these for the
+# "internal request" detail view; nothing is recomputed later.
+_SCHEMA_V3 = ["ALTER TABLE exchanges ADD COLUMN requests TEXT"]
+
 # Ordered additive migrations: (new user_version, statements). v1 is the
-# baseline above; append (3, [...]) for the next change - never edit v1/v2.
+# baseline above; append (N, [...]) for the next change - never edit v1/v2.
 MIGRATIONS: tuple[tuple[int, list[str]], ...] = ((1, _SCHEMA_V1),
-                                               (2, _SCHEMA_V2))
+                                               (2, _SCHEMA_V2),
+                                               (3, _SCHEMA_V3))
 
 
 def _row(r: sqlite3.Row | None) -> dict | None:
@@ -339,13 +347,14 @@ class Store:
             " pid, prompt_path, export_path, started_at, ended_at,"
             " prompt_t, completion_t, cached_t, llm_steps, model_uid,"
             " model_label, price_in, price_cached, price_out,"
-            " price_fetched_at, price_source, usd, error, sources)"
+            " price_fetched_at, price_source, usd, error, sources,"
+            " requests)"
             " VALUES(:id,:conversation_id,:user_msg_id,:assistant_msg_id,"
             " :provider_session_id,:request_id,:status,:pid,:prompt_path,"
             " :export_path,:started_at,:ended_at,:prompt_t,:completion_t,"
             " :cached_t,:llm_steps,:model_uid,:model_label,:price_in,"
             " :price_cached,:price_out,:price_fetched_at,:price_source,"
-            " :usd,:error,:sources)", rec)
+            " :usd,:error,:sources,:requests)", rec)
         return rec
 
     def get_exchange(self, xid: str) -> dict | None:
@@ -380,6 +389,33 @@ class Store:
         cols = ", ".join(f"{k}=?" for k in fields)
         conn.execute(f"UPDATE exchanges SET {cols} WHERE id=?",
                      (*fields.values(), xid))
+
+    def last_session_totals(self, provider_session_id: str,
+                            exclude_xid: str | None = None) -> dict | None:
+        """The newest recorded cumulative provider counters for a session -
+        the `cum` snapshot on the last internal request of the newest
+        exchange that ran on it. This is the record-of-record baseline the
+        next resumed dispatch's usage delta is measured against (provider
+        exports are cumulative per session). None when nothing recorded."""
+        if not provider_session_id:
+            return None
+        sql = ("SELECT requests FROM exchanges WHERE provider_session_id=?"
+               " AND requests IS NOT NULL")
+        params: list = [provider_session_id]
+        if exclude_xid:
+            sql += " AND id != ?"
+            params.append(exclude_xid)
+        sql += " ORDER BY seq DESC LIMIT 12"
+        for row in self.query(sql, params):
+            try:
+                reqs = json.loads(row["requests"] or "[]")
+            except ValueError:
+                continue
+            for ent in reversed(reqs):
+                cum = ent.get("cum") if isinstance(ent, dict) else None
+                if isinstance(cum, dict) and cum:
+                    return cum
+        return None
 
     # ------------------------------------------------------------ actions
     def insert_action(self, conn, rec: dict) -> dict:
