@@ -15228,7 +15228,13 @@ function showRunDetails(key, keepStack){
     `<h3>Pending merges (${pmCount})</h3>` +
     `<div class="sub" style="margin-bottom:8px">finished work still ` +
     `sitting on worktree branches - tick entries to merge them into ` +
-    `the target branch now. Unticked entries stay parked untouched; ` +
+    `the target branch now, or ` +
+    `<a href="#" data-pm-all="1" ` +
+    `title="tick every mergeable entry - disabled (unverified/live) ` +
+    `entries stay unticked and each alternative group keeps one ` +
+    `pick">select all</a> · ` +
+    `<a href="#" data-pm-clear="1" title="untick every entry">clear</a>. ` +
+    `Unticked entries stay parked untouched; ` +
     `unverified entries are never merged.</div>` +
     (r.merge_busy ? `<div class="notice warn">A merge is in progress ` +
       `for this run - new clicks are ignored.</div>`:'') +
@@ -15248,8 +15254,7 @@ function showRunDetails(key, keepStack){
           'branches - verified entries are staged, re-verified and ' +
           'merged atomically; unticked entries stay parked')}">` +
     `Merge selected pending work</button>` +
-    `<span class="sub" id="pm-msg" style="margin-left:8px">` +
-    `${sel.size?'':'tick the work to merge'}</span>` +
+    `<span class="sub" id="pm-msg" style="margin-left:8px"></span>` +
     `</div></div>` : '';
   // Run control is its own panel too: resume re-runs every non-done step
   // in a fresh session (parked branches get another merge attempt first)
@@ -17521,6 +17526,38 @@ document.addEventListener('click', async e=>{
     const d = document.getElementById('detail');
     if (d) d.scrollTop = 0;
     return; }
+  // pending-merge 'select all' / 'clear': ticks every mergeable box -
+  // disabled (unverified/live) entries stay unticked, and each
+  // alternative group keeps exactly one pick (a ticked member wins the
+  // slot, else the first enabled variant)
+  const pmSelEl = t.closest && t.closest('[data-pm-all],[data-pm-clear]');
+  if (pmSelEl){
+    e.preventDefault();
+    if (modalRunKey==null) return;
+    const sel = mergeSel[modalRunKey] || (mergeSel[modalRunKey] = new Set());
+    const boxes=[...document.querySelectorAll('#detail input[data-pm]')];
+    if (pmSelEl.dataset.pmClear!==undefined){
+      boxes.forEach(b=>{ b.checked=false; sel.delete(b.dataset.pm); });
+    } else {
+      const groups={};
+      boxes.forEach(b=>{ const alt=b.dataset.pmAlt;
+        if (alt!==undefined && alt!=='') (groups[alt]??=[]).push(b); });
+      const keep=new Set(Object.values(groups).map(g=>
+        g.find(b=>b.checked && !b.disabled) ||
+        g.find(b=>!b.disabled)).filter(Boolean));
+      boxes.forEach(b=>{
+        if (b.disabled) return;
+        const alt=b.dataset.pmAlt;
+        const ok = alt===undefined || alt==='' || keep.has(b);
+        b.checked=ok;
+        if (ok) sel.add(b.dataset.pm); else sel.delete(b.dataset.pm);
+      });
+    }
+    const pb=document.getElementById('pm-go');
+    if (pb) pb.classList.toggle('idle', !sel.size);
+    const pmMsg=document.getElementById('pm-msg');
+    if (pmMsg && !sel.size) pmMsg.textContent='';
+    return; }
   // context-menu task entries - keyed by agentKey so a re-sorted table
   // can't open the wrong row (same keying the modal refresh uses)
   const adEl = t.closest && t.closest('[data-agent-detail]');
@@ -18172,7 +18209,7 @@ document.addEventListener('change', e=>{
   const pb=document.getElementById('pm-go');
   if (pb) pb.classList.toggle('idle', !sel.size);
   const pmMsg=document.getElementById('pm-msg');
-  if (pmMsg && !sel.size) pmMsg.textContent='tick the work to merge';
+  if (pmMsg && !sel.size) pmMsg.textContent='';
 });
 document.addEventListener('keydown', e=>{
   // the open row menu owns the keyboard: Esc dismisses (focus returns to

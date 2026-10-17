@@ -6793,7 +6793,8 @@ const tgt=o=>Object.assign({closest:()=>null,preventDefault:()=>{},
 const document={getElementById:elem,querySelector:()=>null,
   querySelectorAll:sel=>sel.includes('data-pm-alt')
     ?boxes.filter(b=>b.dataset.pmAlt===sel.split('"')[1])
-    :sel.includes('[data-pm]')?boxes.filter(b=>b.checked&&!b.disabled):[],
+    :sel.includes(':checked')?boxes.filter(b=>b.checked&&!b.disabled)
+    :sel.includes('[data-pm]')?boxes.slice():[],
   activeElement:null,addEventListener:(ev,fn)=>{handlers[ev]=fn;}};
 const state={serve_boot:'b',generated_at:'x',agents:[
     {run_key:'rk',run_dir:'runs/r1',step:'seq1',status:'done',slug:'proj'}],
@@ -6877,6 +6878,22 @@ vm.runInContext(src,ctx);
     disabled:false})});
   assert.equal(posts.length,1);   // unchanged
   assert.match(elem('pm-msg').textContent,/Tick at least one/);
+  // 'select all' ticks every enabled entry; an alternative group keeps
+  // exactly one pick (nothing ticked = the first enabled variant);
+  // 'clear' unticks everything
+  await handlers.click({target:tgt({closest:s=>
+    s.includes('pm-all')?{dataset:{pmAll:'1'}}:null})});
+  assert.equal(boxes[0].checked,true);
+  assert.equal(boxes[1].checked,true);    // altA: first enabled in group
+  assert.equal(boxes[2].checked,false);
+  assert.equal(boxes[3].checked,false);   // disabled never ticks
+  assert.equal(boxes[4].checked,true);
+  const selAll=[...vm.runInContext('mergeSel["rk"]',ctx)];
+  assert.deepEqual([...selAll].sort(),['altA','legacy','seq1']);
+  await handlers.click({target:tgt({closest:s=>
+    s.includes('pm-clear')?{dataset:{pmClear:'1'}}:null})});
+  boxes.forEach(b=>assert.equal(b.checked,false));
+  assert.equal(vm.runInContext('mergeSel["rk"].size',ctx),0);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
