@@ -8744,7 +8744,7 @@ STATUS: done
             # empty log is NOT proof of a dead planner).
             try:
                 jf = log.parent / "job.json"
-                if jf.is_file():
+                if jf.is_file() and getattr(proc, "pid", None):
                     job = json.loads(jf.read_text(encoding="utf-8"))
                     job["planner_pid"] = proc.pid
                     jf.write_text(json.dumps(job), encoding="utf-8")
