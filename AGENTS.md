@@ -833,7 +833,20 @@ Append as they are hit.
     endpoints (pid-targeted `taskkill /T`) or Ctrl+C inside a terminal that
     ran `conductor.py run` directly should kill work. Caveat: `taskkill /T`
     on the SERVER pid still walks into its children - do not tree-kill the
-    dashboard.
+    dashboard. The dashboard's power button (top bar) wraps this safely:
+    **Stop** shuts `serve` down, **Restart** spawns a detached replacement
+    on the same port (the new process retries the bind until the old one
+    frees it) - live runs survive either way per the rule above. The
+    confirmation dialog previews `GET /api/serve/power`: active merges
+    (per-repo `.git/conductor-merge.lock` + machine-global claims) render
+    RED since a restart mid-merge can strand a checkout, live runs/steps
+    render as a note (they keep going; only in-flight launches or merges
+    a serve driver was about to fire are delayed). The dialog never
+    blocks - it warns. All dashboard confirms/alerts route through
+    `askConfirm`/`askAlert` (themed overlays, not native `confirm()`/
+    `alert()`); `closeDetail` stays synchronous for clean transitions and
+    returns a Promise only when a dirty form needs the prompt, so
+    callers use `closeThen`/`await` accordingly.
 16. **Every backslash inside `_DASH_HTML` is double-trapped.** The dashboard
     HTML/JS lives in a plain Python `"""` string, so a `\\` written in the
     source reaches the browser as a single `\`. Hit 2026-10-15: the JS
@@ -843,7 +856,12 @@ Append as they are hit.
     the mangled-but-valid JS. When a JS/regex/CSS literal in
     `_DASH_HTML` needs a backslash, either write `\\\\` (browser sees `\\`)
     or dodge the literal entirely - `String.fromCharCode(92)` is what
-    `base()` uses. Verify with `grep -n '\\\\' conductor.py` and mentally
+    `base()` uses. The same rule eats `\'`: Python delivers a bare
+    apostrophe into a single-quoted JS string (hit 2026-10-17 - one
+    `\'` broke every node-harness test at once). Prefer double-quoted
+    JS strings for prose with apostrophes, and always `node --check`
+    the EXTRACTED `<script>` (parse `_DASH_HTML`, not the raw source).
+    Verify with `grep -n '\\\\' conductor.py` and mentally
     halve what you see; the Node harness tests catch breakage only if a
     test exercises that code path.
 

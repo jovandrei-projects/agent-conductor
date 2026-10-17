@@ -1,0 +1,159 @@
+# Follow-up proposal drafted by the proposal-ui-fixes run's closing
+# follow-up-plan step (run dir: data/runs/20261016-013703-proposal-ui-fixes,
+# request 20261016-013407-5309ee1a). Reviewed but NOT launched - a human
+# reviews this file, then `python conductor.py run` or dashboard Start run.
+#
+# Reviewed evidence: state.json + events.jsonl, both step stdout/verify logs,
+# both workers' .agent_tasks edits, `git merge-tree --write-tree` preview of
+# the parked branch vs master.
+#
+# Run outcome vs the human request (two planner-UI fixes):
+#   fix-regenerate-label   done + merged (e1eaa7c, merge c32a731): 'Needs
+#                          review' chip + modal nag now gate on stage not
+#                          being generating/questions; stale still gates
+#                          launch. 210/210 in-worktree + verify green.
+#   compact-live-output    work COMPLETE but parked unmerged on
+#                          conductor/20261016-013703-proposal-ui-fixes/compact-live-output
+#                          (fd86225 feature+test, a7a3da9 bookkeeping). A
+#                          `.genline` span now renders `gen_last` inline
+#                          after the stage chip under body.compact with the
+#                          existing `.fresh` flash, mirroring the full-view
+#                          `.sub` line. Worker ran 211/211 green; the step
+#                          recorded `failed` ONLY because the post-step
+#                          verify gate hit a flaky test -
+#                          test_queued_step_flag_skips_without_spawning
+#                          (tests/test_worktrees.py:884, rc 0 != 1 at ~306s
+#                          into the suite; passes standalone).
+#
+# Zero-agent alternative for the merge: the run modal's "Merge pending
+# branches" button (or `run <orig manifest> --resume <run dir>`) finalizes
+# parked branches and the manifest had merge_resolver = true. The step
+# below exists anyway because the merge is only half the job - the combined
+# tree still needs a green suite, and bookkeeping conflicts want a
+# deliberate union-merge.
+#
+# New issue found: a SECOND timing flake in the _flag_soon sentinel-poll
+#   test family (tests/test_worktrees.py:764). Same class as the
+#   test_step_stop_kills_worker_and_marks_stopped flake from run
+#   20261015-182057-ux-controls - possibly a real race where a flag raised
+#   between the pre-spawn sentinel check and subprocess spawn is dropped.
+#
+# Deliberately NOT proposed (already drafted in
+#   manifests/ux-controls-followup.toml, still awaiting review - do not
+#   launch both blindly):
+#   - verify_timeout_s (the hard-coded 600s gate cap)  -> its step
+#     verify-timeout-config
+#   - .agent_tasks merge-conflict safety               -> its step
+#     agent-tasks-merge-safety
+#   - planner draft/generate/ask live smoke            -> its step
+#     planner-ask-live-smoke
+#   The harden step below deliberately SUPERSEDES that file's narrow
+#   flake-stop-flag-test step (family-wide instead of one test); if both
+#   manifests are launched, reconcile rather than duplicate.
+#
+# Launch only when no other agent-conductor run is live - the merge step
+# works the shared main checkout (two sibling runs were mid-flight at draft
+# time).
+#
+#   python conductor.py plan manifests\proposal-ui-fixes-followup.toml
+#   python conductor.py run  manifests\proposal-ui-fixes-followup.toml
+
+[run]
+name = "proposal-ui-fixes-followup"
+description = "Land the parked compact-live-output branch, harden the flaky sentinel-flag test family (second flake seen), and live-smoke both planner-UI fixes from the parent run."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 60
+max_attempts = 3
+verify = 'python run_tests.py'
+
+# Step 1 runs in the MAIN checkout on purpose: landing a parked worktree
+# branch on master is checkout-level work (same shape as
+# ux-controls-followup's merge step). verify="" because the hard-coded 600s
+# gate cap is a known, still-unfixed hazard for a ~300-500s suite - green is
+# enforced via the prompt instead.
+[[step]]
+name = "merge-compact-live-output"
+project = "agent-conductor"
+timeout_min = 45
+verify = ""
+prompt = '''
+Land the parked worktree branch conductor/20261016-013703-proposal-ui-fixes/compact-live-output (run 20261016-013703-proposal-ui-fixes) on master in THIS (main) checkout. The feature work is complete and was verified by its worker (211/211 green in-worktree) - the step recorded `failed` only because the post-step verify gate hit a flaky unrelated test, so the conductor never attempted the merge. Your job is the merge plus re-verification of the combined tree, not re-doing the feature.
+
+What the branch ships (for conflict judgment, not re-implementation): conductor.py dashboard changes only - a `.genline` span rendering `gen_last` inline after the proposal row's stage chip under `body.compact` (display:none at full density), `.fresh` flash keyed `genline|<runkey>` in the existing prevTail diff map, last-160-chars truncation of newline-less blobs, plus `test_compact_genline_live_output` in DashboardJsFilterTests and .agent_tasks bookkeeping.
+
+Procedure:
+1. SAFETY GATE FIRST: refuse to merge into a checkout another run is using. Check every data/runs/*/state.json - if any run has a live driver (recent heartbeat, no ended_at, steps still running) other than the run driving this step, finish `blocked` with a note naming the live run; merging into a checkout mid-merge is damage.
+2. `git merge --no-edit conductor/20261016-013703-proposal-ui-fixes/compact-live-output`. At review time `git merge-tree --write-tree` showed exactly one conflict - .agent_tasks/efficiency_stats.md (both-append stats table: union-merge, keep every row from both sides, drop exact duplicates, keep chronological order) - while QUEUE.md, conductor.py and tests auto-merged clean. Other runs may have landed since: treat ANY conflict beyond .agent_tasks/QUEUE.md and .agent_tasks/efficiency_stats.md as a real merge - read both sides and reconcile deliberately; never blanket -Xours/-Xtheirs on code.
+3. Inspect the staged diff for leftover <<<<<<< / ======= / >>>>>>> markers, then commit the merge.
+4. `git worktree remove --force data/worktrees/20261016-013703-proposal-ui-fixes/compact-live-output` and `git branch -d conductor/20261016-013703-proposal-ui-fixes/compact-live-output` (it is merged - use -d, not -D).
+5. `python run_tests.py` to green (~300-500s is normal). A lone failure in a flag-timing test (test_queued_step_flag_skips_without_spawning, test_step_stop_kills_worker_and_marks_stopped, or other _flag_soon users) is the known flake class: rerun that single test standalone - if it passes, record the flake in your report and treat the suite as green; if it fails standalone too, that is a REAL regression - investigate and fix, do not just rerun.
+6. `python conductor.py demo` as the end-to-end smoke.
+7. Update .agent_tasks (QUEUE.md note that the branch landed; efficiency_stats row) and commit bookkeeping separately.
+
+NEVER finish with a merge in progress: each merge ends committed or `git merge --abort`ed.
+'''
+
+[[step]]
+name = "harden-flag-timing-tests"
+project = "agent-conductor"
+worktree = true
+timeout_min = 60
+prompt = '''
+The _flag_soon sentinel-poll test family has now flaked twice inside full-suite runs, each time green standalone:
+
+- run 20261016-013703-proposal-ui-fixes: test_queued_step_flag_skips_without_spawning (tests/test_worktrees.py:870) - `run_manifest` returned 0 instead of 1 at ~306s in, meaning the stop flag landed after the queued step's pre-spawn gate read it (or the helper's 30s poll window expired under load) and step `b` ran to completion instead of recording `skipped`.
+- run 20261015-182057-ux-controls: test_step_stop_kills_worker_and_marks_stopped - same wall-clock race shape.
+
+Answer two questions IN ORDER:
+
+(a) Is there a REAL race in conductor.py's flag path? A stop/skip sentinel raised between run_step's pre-spawn flag check and the actual subprocess spawn is silently dropped - decide whether that window matters (the step spawns anyway although the operator asked to stop/skip it) and close it if so, e.g. re-check under whatever serialization the dispatch path already holds, or have the spawn path honor flags observed while the step sat queued. Keep the fix minimal.
+
+(b) Whether or not (a) is real, harden the tests: replace _flag_soon's 600x50ms wall-clock polling (tests/test_worktrees.py:764 and any twin in test_conductor.py) with deterministic synchronization - e.g. a threading.Event fired from a monkeypatched save_state/flag-poll hook so the flag raises exactly when the watched state exists, not "probably by now". Apply it to EVERY _flag_soon user (stop/skip/drain/timeout-flag tests), not just the one that flaked. Suite wall time must not grow meaningfully.
+
+Reproduce first (loop the failing test while a second full suite instance runs concurrently - load is the repro), then fix, then prove: `python run_tests.py` green PLUS 20 consecutive passes of test_queued_step_flag_skips_without_spawning AND test_step_stop_kills_worker_and_marks_stopped under that same concurrent load.
+
+NOTE: manifests/ux-controls-followup.toml contains a narrower version of this work (step flake-stop-flag-test, one test only) still awaiting human review - this step supersedes it. If that manifest also runs, reconcile instead of duplicating. Update .agent_tasks and commit in logical groups.
+'''
+
+[[step]]
+name = "proposal-ui-live-smoke"
+project = "agent-conductor"
+worktree = true
+timeout_min = 45
+verify = ""
+prompt = '''
+Both planner-UI fixes from run 20261016-013703-proposal-ui-fixes are only mock-tested (the node-vm harness in tests) - they have never been observed against a real planner generation. Smoke them live from THIS checkout (the merge-compact-live-output step landed the second fix on master; worktree bases include it).
+
+Setup: start `python conductor.py serve --port <a free 87xx port>` in the background from this checkout.
+
+Then exercise the real flow - generation only, NEVER POST .../run or otherwise launch implementation:
+
+1. POST /api/requests a small request (e.g. "minor tooltip wording tweak on the agents table"), POST /api/requests/<id>/generate.
+2. WHILE the request is in stage generating: poll GET /api/state and confirm the run row carries a live-updating gen_last; fetch the served page and confirm the `.genline` markup/CSS exists and the compact-density path renders it (body.compact). If a headless browser is available (playwright has been used by past sessions here), screenshot the compact row mid-generation - the indicator + brief flash is the deliverable being verified.
+3. After the proposal lands (stage ready), edit the request's raw text via the same endpoint the form uses (check the api handlers in conductor.py for exact path/fields) so the proposal goes stale - 'Needs review' SHOULD show now.
+4. POST /api/requests/<id>/generate again (regenerate) and watch: while stage is generating, the row must show the planning chip WITHOUT 'Needs review' (the first fix) and .genline must keep updating under compact density (the second fix). 'Needs review' returning only if planning finishes and the proposal still mismatches is correct behavior.
+5. POST /api/requests/<id>/discard {confirm:true} to clean up. The generated manifest under manifests/ may be deleted - it is a throwaway.
+
+Kill the serve process you spawned BEFORE printing STATUS - a live child keeps this CLI session from exiting (trap 12). If devin auth is missing or the planner stalls >15 minutes, finish `partial` with exactly what you observed rather than hanging. Report what the flow actually did: did gen_last stream, did the compact indicator/flash appear, did 'Needs review' stay suppressed during regeneration. Update .agent_tasks and commit bookkeeping only - no code changes belong in this step.
+'''
+
+[[step]]
+name = "follow-up-plan"
+project = "agent-conductor"
+worktree = true
+timeout_min = 30
+verify = ""
+prompt = '''
+Review what this run accomplished against the work it targeted: landing the parked compact-live-output branch, hardening the flaky sentinel-flag test family, and live-verifying both planner-UI fixes (regenerate-label gating + compact live-output indicator).
+
+Per-step logs, STATUS/NEXT lines and notes are under C:/Projects/agent-conductor/data/runs in the newest dir ending in 'proposal-ui-fixes-followup', alongside the project's .agent_tasks files. Read them to judge what is done, what failed or was skipped, and what new issues were discovered. Also check whether the sibling proposal manifests/ux-controls-followup.toml was launched in the meantime - overlapping items (flaky-flag hardening, verify timeout cap) should not be re-proposed twice.
+
+Then write a NEW conductor TOML manifest proposing only the still-unfinished or newly discovered work, saved as 'C:/Projects/agent-conductor/manifests/proposal-ui-fixes-followup-2.toml' using forward slashes. Follow the same manifest conventions as this run (registered project slugs, worktree = true per step except deliberate main-checkout merge steps, verify commands, a follow-up-plan closing step named appropriately). Do NOT launch or implement the follow-up - a human reviews it. If nothing remains, make that explicit in the manifest's header comment without inventing work.
+'''

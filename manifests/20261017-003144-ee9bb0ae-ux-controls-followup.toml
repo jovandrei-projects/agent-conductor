@@ -1,0 +1,72 @@
+# Follow-up proposal drafted by the ux-controls run's closing
+# follow-up-plan step (run dir: data/runs/20261015-182057-ux-controls,
+# request 20261015-180255-8b1a5aea). Reviewed but NOT launched - a human
+# reviews this file, then `python conductor.py run` or dashboard Start run.
+#
+# Run outcome vs the human request: all six requested features were
+# implemented; 6 of 8 steps merged clean (run-control-taxonomy,
+# task-prompt-editing, steps-counters-clarity, run-lifecycle-cleanup,
+# planner-questions, run-link-affordance). Two branches are parked:
+#   conductor/20261015-182057-ux-controls/image-attachments    (work done +
+#     verify green; merge-back conflicted only on .agent_tasks bookkeeping)
+#   conductor/20261015-182057-ux-controls/task-modal-navigation (work done,
+#     200/200 in-worktree; conductor verify hit the hard-coded 600s cap ->
+#     recorded failed -> merge never attempted; same bookkeeping conflicts)
+# Zero-agent alternative for the merges: the run modal's
+# "Merge pending branches" button replays the merge loop; the resolver
+# guard that silently refused (untracked files counted dirty) is fixed on
+# master since f261937.
+
+[run]
+name = "ux-controls-followup"
+description = "Land the two parked ux-controls branches, then fix what the run exposed: 600s verify cap vs a ~300-500s suite, recurring .agent_tasks bookkeeping merge conflicts, a flaky stop-flag test, and a never-live-tested planner questions flow."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 60
+max_attempts = 2
+
+# Step 1 runs in the MAIN checkout on purpose: merging parked branches is
+# checkout-level work. Conflicts are confined to two append-only
+# bookkeeping files. verify="" because the 600s gate cap is the known
+# bug the next step fixes - the suite must still be green per the prompt.
+[[step]]
+name = "merge-ux-controls-branches"
+project = "agent-conductor"
+timeout_min = 60
+verify = ""
+prompt = "Two worktree branches from run 20261015-182057-ux-controls are parked unmerged. Finish landing them on master in THIS (main) checkout - the feature work on both is complete and was already verified by its worker, so your job is the merges, not re-doing the features. Branches, in this order: (1) conductor/20261015-182057-ux-controls/image-attachments, (2) conductor/20261015-182057-ux-controls/task-modal-navigation. Both conflict ONLY on .agent_tasks/QUEUE.md and .agent_tasks/efficiency_stats.md - append-only bookkeeping where each side added different DONE lines/rows; conductor.py and tests/test_conductor.py auto-merge cleanly (pre-verified via `git merge-tree --write-tree`). For each branch: `git merge --no-edit <branch>`; resolve the two bookkeeping files by union-merging (keep every DONE bullet and every stats row from both sides, drop only exact-duplicate lines, keep chronological order); check the staged diff for leftover <<<<<<< markers; commit the merge; then `git worktree remove --force data/worktrees/20261015-182057-ux-controls/<step-name>` and `git branch -d <branch>` (it is merged - use -d, not -D). After both land, run `python run_tests.py` to green (the suite takes ~300-500s - that is normal) and `python conductor.py demo`. If the combined tree genuinely fails, investigate and fix - do not just rerun. NEVER finish with a merge in progress: each merge ends committed or `git merge --abort`ed."
+
+[[step]]
+name = "verify-timeout-config"
+project = "agent-conductor"
+worktree = true
+timeout_min = 60
+prompt = "The post-step verify gate in run_step (conductor.py, the `subprocess.run(step.verify, ...)` call around line 1628) has a hard-coded `timeout=600`. The mock suite now takes 300-500s, and on 2026-10-15 it false-failed a green step: task-modal-navigation's worker ran 200/200 green but the gate timed out at 600s, the step recorded `failed`, and its branch was parked unmerged. Make the verify timeout configurable: add an optional `verify_timeout_s` key honored per [[step]] and in [defaults] (integer seconds, sane floor, raise the default to 1200), record the effective value on the step record, and make the 'verify timed out after Ns' log line print the configured N. Update the annotated examples/night.example.toml and the verify mention in AGENTS.md, and add mock tests covering parsing, validation bounds, and the default. Gate: `python run_tests.py` green."
+
+[[step]]
+name = "agent-tasks-merge-safety"
+project = "agent-conductor"
+worktree = true
+timeout_min = 60
+prompt = "Every worktree step appends to .agent_tasks/QUEUE.md and .agent_tasks/efficiency_stats.md, so anything else landing on master between a worktree's creation and its merge-back guarantees a conflict on exactly those files - the ux-controls run parked 2 branches this way (code auto-merged clean both times). Reduce this class of conflict with the simplest mechanism that survives unattended runs; two candidate shapes, pick on merit (union-merging markdown tables is safe for pure appends but check the 'Not yet filed' bullet region for interleaving weirdness): (a) a .gitattributes `merge=union` driver scoped to the append-only bookkeeping files, or (b) teach worktree_merge (conductor.py ~line 776) to auto-resolve when ALL conflicted paths are on a small whitelist (.agent_tasks/QUEUE.md, .agent_tasks/efficiency_stats.md) and fail/park as today the moment any other file conflicts. Whatever ships, cover it with a mock test (see tests/test_worktrees.py fixtures for the merge-matrix style) and document the behavior in AGENTS.md where wave merges are described. Gate: `python run_tests.py` green."
+
+[[step]]
+name = "flake-stop-flag-test"
+project = "agent-conductor"
+worktree = true
+timeout_min = 45
+prompt = "`test_step_stop_kills_worker_and_marks_stopped` in tests/test_conductor.py is timing-flaky under load: it failed inside the full suite during run 20261015-182057-ux-controls but passes standalone in ~1.5s - a stop-flag sentinel / wait_worker poll race. Reproduce (loop the test, or run the suite while the box is busy), then either harden the test with deterministic synchronization instead of sleeps, or fix the underlying race if it turns out to be a real bug in the sentinel path (flag files live under %TEMP%/agent-conductor-flags, polled by wait_worker - see AGENTS.md run-controls section). The suite's wall time must not grow meaningfully. Gate: `python run_tests.py` green plus 20 consecutive passes of the single test."
+
+[[step]]
+name = "planner-ask-live-smoke"
+project = "agent-conductor"
+worktree = true
+timeout_min = 45
+verify = ""
+prompt = "The planner 'ask me questions' flow (request checkbox -> BEGIN_QUESTIONS -> parked 'questions' stage -> per-question answer endpoint -> refine pass -> manifest) merged this run and has never been exercised against a REAL planner - same for the draft/generate/review path from the earlier request-drafts task. Live-smoke both from THIS checkout: (1) start `python conductor.py serve --port <a free 87xx port>` in the background; (2) POST /api/requests a small request WITHOUT ask (e.g. 'minor tooltip improvement on the agents table'), POST /api/requests/<id>/generate, poll GET /api/requests/<id> until it leaves generating - confirm a manifest TOML lands under manifests/ and the request shows planned steps - then POST /api/requests/<id>/discard {confirm:true}; (3) repeat with ask=true on a deliberately ambiguous raw ('improve the dashboard'); if the request parks at stage 'questions', answer through POST /api/requests/<id>/answer ({\"skip_all\":true} is acceptable) and let the refine pass produce the manifest, then discard it too. NEVER POST .../run or otherwise launch implementation - generation only. Kill the serve process you spawned BEFORE printing STATUS: a live child keeps this CLI session from exiting (trap 12). Report what the flow actually did (questions surfaced? refine pass ran? TOML sane?) in your closing report. If devin auth is missing or the planner stalls >15 minutes, record partial with what you saw and move on - do not hang the step."
