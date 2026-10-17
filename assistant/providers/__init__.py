@@ -75,10 +75,14 @@ class ProviderAdapter(ABC):
 
     @abstractmethod
     def send(self, prompt_path: str, *, session_id: str | None,
-             model_uid: str, export_path: str,
-             workspace) -> ProviderHandle:
+             model_uid: str, export_path: str, workspace,
+             readonly: bool = True) -> ProviderHandle:
         """Dispatch one turn. `session_id` resumes a session (settings are
-        then the session's own - a model change must spawn fresh)."""
+        then the session's own - a model change must spawn fresh).
+        `readonly` is the conversation's capability flag: adapters that
+        can widen provider permissions honor it (a False value means the
+        session may write/exec); a transport that is structurally
+        read-only ignores it."""
 
     @abstractmethod
     def poll(self, handle: ProviderHandle) -> PollResult:

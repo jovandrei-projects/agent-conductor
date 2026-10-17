@@ -742,7 +742,15 @@ Two-layer enforcement (each independently sufficient):
 - Provider layer: `--permission-mode auto` => mutation/exec/scope
   tools auto-rejected non-interactively (VERIFIED 3.5); only reads
   run. So even a prompt-injected reply can't make the SESSION mutate
-  anything.
+  anything. UPDATE 2026-10-17 (readonly-off dispatch): when the
+  conversation's readonly flag is OFF the dispatch runs
+  `--permission-mode dangerous` instead - non-interactive `-p` cannot
+  answer tool confirmations, so anything short of dangerous surfaces
+  'rejected a tool call' warnings (seen live on a rw exchange that
+  only wanted to write a file). The contract + resume reminder swap
+  their capability paragraph to match; the proposed_action channel is
+  unchanged - dashboard mutations still never ride provider
+  permissions.
 - Application layer: dashboard mutations never go through the
   provider. The model MAY emit an action proposal as structured JSON
   in its reply (`proposed_action{kind, params, explain}`); the server

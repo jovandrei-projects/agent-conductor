@@ -108,7 +108,7 @@ class ScriptedProvider(ProviderAdapter):
         self._n = 0
 
     def send(self, prompt_path, *, session_id, model_uid, export_path,
-             workspace):
+             workspace, readonly=True):
         body = Path(prompt_path).read_text(encoding="utf-8")
         self._n += 1
         sid = session_id or f"sess-{self._n}"
@@ -116,7 +116,8 @@ class ScriptedProvider(ProviderAdapter):
                            prompt_path=str(prompt_path),
                            export_path=str(export_path))
         rec = {"prompt": body, "session_id": session_id, "model_uid":
-               model_uid, "export_path": str(export_path), "handle": h}
+               model_uid, "export_path": str(export_path), "handle": h,
+               "readonly": readonly}
         self.sends.append(rec)
         script = (self.on_send(rec) if self.on_send
                   else [PollResult(done=True, text="ok answer",
@@ -993,6 +994,63 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("stop_run", p.sends[0]["prompt"])
             core.close()
 
+    def test_readonly_off_dispatches_read_write_session(self):
+        """readonly=false on the conversation must reach provider.send:
+        the transport widens permissions (devin_print maps it to
+        --permission-mode dangerous) and the contract swaps its
+        capability paragraph so the model knows tools are live."""
+        with tempfile.TemporaryDirectory() as td:
+            p = ScriptedProvider()
+            core, rt = self._open(td, p)
+            cv = core.create_conversation(
+                {"view": "dashboard"}, settings={"readonly": False})
+            r = ask(core, cv, "do it")
+            x = wait_x(core, r["exchange"]["id"])
+            self.assertEqual(x["status"], "done")
+            self.assertIs(p.sends[0]["readonly"], False)
+            self.assertIn("READ-WRITE", p.sends[0]["prompt"])
+            self.assertIn("read-only: off", p.sends[0]["prompt"])
+            self.assertNotIn("no write tools", p.sends[0]["prompt"])
+            core.close()
+
+    def test_readonly_on_dispatches_read_only_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = ScriptedProvider()
+            core, rt = self._open(td, p)
+            cv = core.create_conversation({"view": "dashboard"})
+            r = ask(core, cv, "hi")
+            x = wait_x(core, r["exchange"]["id"])
+            self.assertEqual(x["status"], "done")
+            self.assertIs(p.sends[0]["readonly"], True)
+            self.assertIn("no write tools", p.sends[0]["prompt"])
+            self.assertNotIn("READ-WRITE", p.sends[0]["prompt"])
+            core.close()
+
+    def test_readonly_flip_follows_the_message_snapshot(self):
+        """Flipping readonly between exchanges changes the very next
+        dispatch's flag AND its reminder text - settings are frozen per
+        message, so an older reply never silently widens."""
+        with tempfile.TemporaryDirectory() as td:
+            p = ScriptedProvider()
+            core, rt = self._open(td, p)
+            cv = core.create_conversation({"view": "dashboard"})
+            r1 = ask(core, cv, "one")
+            x1 = wait_x(core, r1["exchange"]["id"])
+            p.sessions_v = {x1["provider_session_id"]}
+            self.assertIs(p.sends[0]["readonly"], True)
+            core.update_settings(cv["id"], {"readonly": False})
+            r2 = ask(core, cv, "two")
+            wait_x(core, r2["exchange"]["id"])
+            self.assertIs(p.sends[1]["readonly"], False)
+            self.assertIn("READ-WRITE", p.sends[1]["prompt"])
+            # and back: the reminder re-tightens immediately
+            core.update_settings(cv["id"], {"readonly": True})
+            r3 = ask(core, cv, "three")
+            wait_x(core, r3["exchange"]["id"])
+            self.assertIs(p.sends[2]["readonly"], True)
+            self.assertIn("Read-only session", p.sends[2]["prompt"])
+            core.close()
+
     def test_prompt_stays_bounded_under_huge_input(self):
         """A 60KB user message must not blow up the provider request:
         the prompt file is capped and the clip is marked."""
@@ -1138,6 +1196,18 @@ class DevinPrintAdapterTests(unittest.TestCase):
                     break
                 time.sleep(0.05)
             p.cancel(h)
+
+    def test_permission_mode_follows_readonly(self):
+        """readonly=False must widen the spawn to `dangerous` -
+        non-interactive `-p` can't answer tool confirmations, so `auto`
+        would reject every write/exec call (the warning spam users saw).
+        readonly=True stays on the `auto` structural gate."""
+        for ro, mode in ((True, "auto"), (False, "dangerous")):
+            p = DevinPrintProvider(FAKE_DEVIN)
+            argv = p.argv_for("p.md", session_id=None, model_uid="m",
+                              export_path="e.json", readonly=ro)
+            i = argv.index("--permission-mode")
+            self.assertEqual(argv[i + 1], mode)
 
     def test_sessions_listing(self):
         with tempfile.TemporaryDirectory() as td:

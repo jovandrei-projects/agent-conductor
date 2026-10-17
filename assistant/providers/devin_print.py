@@ -2,12 +2,13 @@
 (DESIGN.md sections 3.x/6.7).
 
 One dispatch = one `devin --print --prompt-file <f> [--model uid]
-[-r session] --permission-mode auto --export <f>` child process running
-in the assistant workspace dir (its own cwd-scoped `devin list` registry,
-isolated from every project's sessions). The ATIF export is the source of
-truth for the reply text (trailing tool-less agent messages), the session
-id, the resolved model label, and CUMULATIVE token counters - the runtime
-turns those into per-exchange deltas via `usage_delta`.
+[-r session] --permission-mode auto|dangerous --export <f>` child
+process running in the assistant workspace dir (its own cwd-scoped
+`devin list` registry, isolated from every project's sessions). The
+ATIF export is the source of truth for the reply text (trailing
+tool-less agent messages), the session id, the resolved model label,
+and CUMULATIVE token counters - the runtime turns those into
+per-exchange deltas via `usage_delta`.
 
 Transport facts this adapter is built on (research probes 2026-10-17):
 - `--model` is ignored when resuming (`-r`), so a settings change must
@@ -15,7 +16,11 @@ Transport facts this adapter is built on (research probes 2026-10-17):
   `--model` on a resume (avoids the CLI warning too).
 - `--permission-mode auto` hard-rejects mutation/exec/scope tools
   non-interactively while read tools still run - the provider-side half
-  of the read-only capability gate.
+  of the read-only capability gate. With the conversation's readonly
+  flag OFF the dispatch runs `--permission-mode dangerous` instead
+  (non-interactive mode can't answer confirmation prompts, so anything
+  short of dangerous surfaces as 'rejected a tool call' warnings) -
+  same auto-approve-all posture conductor workers run under as `bypass`.
 - There is no token streaming on this transport (the ACP upgrade path is
   blocked on a devin 3000.6.2 session-db defect): progressive text comes
   from the export when it exists, else the tail of the child's stdout
@@ -152,7 +157,7 @@ class DevinPrintProvider(ProviderAdapter):
 
     # ----------------------------------------------------------- spawn
     def argv_for(self, prompt_path, *, session_id=None, model_uid=None,
-                 export_path=None) -> list[str]:
+                 export_path=None, readonly=True) -> list[str]:
         cmd = list(self._argv) + ["--print", "--prompt-file",
                                   str(prompt_path)]
         if session_id:
@@ -160,15 +165,22 @@ class DevinPrintProvider(ProviderAdapter):
             # `--model` is ignored on resume - don't emit the warning
         elif model_uid:
             cmd += ["--model", str(model_uid)]
-        cmd += ["--permission-mode", "auto",
+        # Non-interactive mode can't answer tool confirmations: `auto`
+        # keeps the session read-only (the structural gate); the
+        # conversation's readonly-off opt-in needs `dangerous` or every
+        # write/exec tool call is rejected with warnings.
+        cmd += ["--permission-mode",
+                "auto" if readonly else "dangerous",
                 "--export", str(export_path),
                 "--respect-workspace-trust", "false"]
         return cmd
 
     def send(self, prompt_path: str, *, session_id: str | None,
-             model_uid: str, export_path: str, workspace) -> ProviderHandle:
+             model_uid: str, export_path: str, workspace,
+             readonly: bool = True) -> ProviderHandle:
         cmd = self.argv_for(prompt_path, session_id=session_id,
-                            model_uid=model_uid, export_path=export_path)
+                            model_uid=model_uid, export_path=export_path,
+                            readonly=readonly)
         kw = dict(self._spawn_kwargs)
         env = self._env() if self._env else None
         proc = self._spawn(

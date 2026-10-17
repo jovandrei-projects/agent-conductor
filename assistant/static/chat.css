@@ -160,13 +160,25 @@
   font-size: 13px; color: #79b8ff; margin: 10px 0 4px;
   font-weight: 600;
 }
-#aichat .aim-body code { background: #0d1117; border-radius: 4px;
-  padding: 1px 5px; font-size: 12px; }
-#aichat .aim-u .aim-body code { background: rgba(0, 0, 0, .3); }
-#aichat .aim-body .mdpre { background: #0d1117; border-radius: 6px;
+/* inline code: a soft tinted chip, not a hard black box - muted
+   translucent fill + hairline border + accent-tinted text, so it reads
+   as a token inside prose instead of a highlight slab */
+#aichat .aim-body code {
+  background: rgba(110, 118, 129, .16);
+  border: 1px solid rgba(110, 118, 129, .32);
+  border-radius: 5px;
+  padding: .5px 5px; font-size: .92em; color: #a5d6ff;
+}
+#aichat .aim-u .aim-body code {
+  background: rgba(255, 255, 255, .15);
+  border-color: rgba(255, 255, 255, .3); color: #fff;
+}
+#aichat .aim-body .mdpre { background: #0d1117;
+  border: 1px solid #30363d; border-radius: 6px;
   padding: 8px 10px; font-size: 12px; overflow-x: auto;
   white-space: pre-wrap; }
-#aichat .aim-body .mdpre code { background: none; padding: 0; }
+#aichat .aim-body .mdpre code { background: none; border: 0; padding: 0;
+  color: inherit; font-size: inherit; }
 #aichat .aim-body .mdtable { border-collapse: collapse; width: 100%;
   margin: 8px 0; font-size: 12px; }
 #aichat .aim-body .mdtable th, #aichat .aim-body .mdtable td {

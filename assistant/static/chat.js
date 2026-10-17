@@ -419,6 +419,7 @@ function reqLine(r) {
      Billable retries and failed hops stay listed - 'internal' never
      means 'free'. */
   var bits = ['#' + (r.n || '?') + ' ' + (r.kind || 'request')];
+  if (r.readonly === false) bits.push('rw');
   if (r.request_id) bits.push(r.request_id);
   if (r.started_at != null && r.ended_at != null)
     bits.push(Math.max(0, Math.round(r.ended_at - r.started_at)) + 's');
@@ -2034,8 +2035,8 @@ function injectDom() {
         'Fast mode <span class="sub" id="ais-fast-note"></span></label>' +
       '<label class="check"><input type="checkbox" id="ais-ro" checked> ' +
         'Read-only <span class="sub">the assistant can look but not ' +
-        'touch; turning this off still requires your confirmation per ' +
-        'action</span></label>' +
+        'touch; turning this off gives it real file/command access on ' +
+        'this machine - dashboard actions still ask first</span></label>' +
       '<div id="ais-price" class="sub"></div>' +
       '<div id="ais-msg" class="notice" hidden></div>' +
       '<div class="actions">' +

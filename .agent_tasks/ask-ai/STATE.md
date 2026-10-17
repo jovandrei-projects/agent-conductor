@@ -226,9 +226,13 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
 - `assistant/providers/devin_print.py` - `DevinPrintProvider(argv, env=,
   spawn=, spawn_kwargs=, kill=, alive=, run_list=)`: one dispatch = one
   `devin --print --prompt-file <f> [-r sid] [--model uid]
-  --permission-mode auto --export <f> --respect-workspace-trust false`
-  child in the assistant workspace (`devin list` there is
-  assistant-only). `--model` is emitted ONLY on fresh spawns (ignored +
+  --permission-mode auto|dangerous --export <f>
+  --respect-workspace-trust false` child in the assistant workspace
+  (`devin list` there is assistant-only). The mode follows the
+  conversation's readonly flag via `send(readonly=)` - `auto` while ON
+  (structural gate), `dangerous` when OFF (a rw exchange otherwise
+  spams 'rejected a tool call' warnings; live-verified 2026-10-17 both
+  ways). `--model` is emitted ONLY on fresh spawns (ignored +
   warned on `-r`). Poll: export first (sid/agent.model_name/
   final_metrics/answer tail), else bounded stdout narration tail with
   \r-frame collapse; done = process exit, nonzero = error, missing
