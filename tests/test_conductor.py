@@ -1529,6 +1529,62 @@ assert.match(elem('runs').innerHTML,/data-proj="agent-conductor"/);
         self.assertEqual(p.returncode, 0, p.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_pool_modal_holder_details_and_untracked(self):
+        """The agent-pool modal: a holder with no matching run record
+        renders 'untracked' + its run dir and the lease's owner/parent
+        cmdlines; a holder matching a live agent stays a linked row with
+        its real status."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map();
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',parentElement:{classList:{toggle(){}}}}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  addEventListener:()=>{}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const d={serve_boot:'b',generated_at:'2026-10-17T19:00:00',cpu_count:16,
+  free_ram_gb:4.9,agents:[
+  {step:'s2',run:'known',run_dir:'/data/runs/1-known',slug:'p',
+   status:'running',started_at:'2026-10-17T18:30:00'}],runs:[
+  {run:'known',dir:'/data/runs/1-known',projects:['p'],counts:{running:1}}],
+  slot_pool:{cap:9,in_use:2,holders:[
+    {slot:1,run:'t',step:'one',run_dir:'20261017-192709-t',
+     run_dir_full:'C:/Temp/xyz/runs/20261017-192709-t',
+     leased_at:'2026-10-17T19:00:00',owner_pid:30040,
+     owner_cmd:'python -m unittest test_conductor',
+     owner_ppid:12345,owner_pcmd:'python run_tests.py'},
+    {slot:2,run:'known',step:'s2',run_dir:'1-known',
+     run_dir_full:'/data/runs/1-known',leased_at:'2026-10-17T18:40:00',
+     owner_pid:44,owner_cmd:'python conductor.py run m.toml',
+     worker_pid:55,worker_cmd:'devin -p do it'}]}};
+vm.runInContext('render('+JSON.stringify(d)+')',ctx);
+vm.runInContext('poolView=true;renderPool()',ctx);
+const html=elem('dbody').innerHTML;
+// untracked holder: labeled, run dir surfaced, owner+parent cmdlines
+assert.match(html,/>untracked</);
+assert.match(html,/python -m unittest/);
+assert.match(html,/run_tests\.py/);
+assert.match(html,/20261017-192709-t/);
+assert.match(html,/no run in this dashboard's list claims it/);
+// matched holder: still links to its run/task, shows the live status
+assert.match(html,/data-run-details="\/data\/runs\/1-known"/);
+assert.match(html,/data-agent-detail/);
+assert.match(html,/>running</);
+assert.match(html,/held by/);
+// the old bare 'leased' status chip is gone - the word only survives
+// as the lease-time column head
+assert.doesNotMatch(html,/st-other">leased</);
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_draft_and_review_modal_never_start_implementation(self):
         js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
             "</script>", 1)[0]
