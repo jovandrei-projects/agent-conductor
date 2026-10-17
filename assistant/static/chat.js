@@ -95,6 +95,16 @@ function timeShort(iso) {
   return d.toLocaleString([], { month: 'numeric', day: 'numeric',
     hour: '2-digit', minute: '2-digit' });
 }
+function timeCompact(iso) {
+  /* '10/17 16:25' - the rail's sub line is too narrow for the
+     locale '10/17, 04:25 PM' once model + size join it */
+  if (!iso) return '';
+  var d = new Date(iso);
+  if (isNaN(d)) return '';
+  var pad = function (n) { return String(n).padStart(2, '0'); };
+  return (d.getMonth() + 1) + '/' + d.getDate() + ' ' +
+    pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
 
 async function aapi(method, path, body, raw) {
   /* the dashboard api() shape, but attachments-ready: `raw` sends the
@@ -698,14 +708,17 @@ function railHtml() {
         esc(t === '(untitled chat)' ? '' : t) + '" maxlength="120" ' +
         'aria-label="Rename this chat" placeholder="chat title">' +
         '</div>';
-    var sub = esc(timeShort(c.last_active_at)) +
-      (c.model ? ' \u00b7 ' + esc(c.model) : '') +
+    var subRaw = timeCompact(c.last_active_at) +
+      (c.model ? ' \u00b7 ' + c.model : '') +
       (c.size_bytes != null ? ' \u00b7 ' + fmtKb(c.size_bytes) : '');
+    /* the sub line ellipsizes on narrow panels - the full string sits
+       on the row tooltip so the KB count is always hoverable */
     return '<div class="ai-conv-row' + on + '">' +
       '<button type="button" class="ai-conv" data-ai-conv="' +
-      esc(c.id) + '" title="' + esc(t) + '">' +
+      esc(c.id) + '" title="' + esc(t) + '\n' + esc(subRaw) + '">' +
       '<span class="t">' + esc(t) + '</span>' +
-      '<span class="s">' + sub + '</span></button>' +
+      '<span class="s" title="' + esc(subRaw) + '">' + esc(subRaw) +
+      '</span></button>' +
       '<span class="ai-cvops">' +
       '<button type="button" class="ai-cvop" data-ai-ren="' +
       esc(c.id) + '" title="Rename chat" ' +
