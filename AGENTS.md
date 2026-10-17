@@ -215,9 +215,11 @@ bounded by the cap. Steps on the *same* project in a wave need
 never merge; the conductor waits for the whole wave, then merges each
 branch itself, sequentially, in manifest order. A conflict fails the step
 but keeps the worktree for manual merge - or, with `merge_resolver =
-true` ([run] or per-step), spawns a `resolve-<step>` session in the main
-checkout *mid-merge* to finish it (refused on a dirty checkout; a
-resolver that can't finish -> same abort+keep path). `--resume`
+true` ([run] or per-step), spawns a `resolve-<step>` session where the
+merge is open *mid-merge* to finish it (the main checkout, or the step's
+merge worktree for a non-checked-out merge_target; refused on a dirty
+location; a resolver that can't finish -> same abort+keep path).
+`--resume`
 finalizes unmerged branches instead of re-running them (a conflicted
 branch can't be fixed by re-running - it shares the merge base), and
 aborts a stale `conductor/*` merge-in-progress first - a human's merge is
@@ -293,6 +295,20 @@ of 8773. The step record keeps `service_port`/`service_url` for review
 and notes when the port is still bound after the worker exits (a leaked
 dev server - reported, never port-killed: a bound port doesn't prove who
 owns it). Cloud steps get nothing - they bind nothing local.
+
+Merge targets: `merge_target = "<branch>"` ([[step]], `[defaults]`, or
+[run] as the worktree-steps default) makes the step branch fork from and
+merge back into that existing local branch instead of the checkout's
+HEAD. Merges into a branch the checkout doesn't have out run in a
+conductor-owned merge worktree `data/worktrees/<run>/<step>.merge`, so
+the main checkout never moves; a target checked out in another worktree
+fails actionably (conductor never merges into a checkout it doesn't
+own). The resolved target is recorded in state.json per step, so resume,
+merge_resolver sessions (which run in the merge worktree, not the
+checkout) and the dashboard's manual Merge all honor it. A step-level
+target without `worktree = true` is a manifest error; a missing or
+never-existing branch fails at plan/proposal validation - nothing is
+substituted and nothing is created.
 
 `manifests/` holds real manifests (hand-written `<project>-<what>.toml` and
 UI-generated `<YYYYMMDD-HHMMSS>-<random>-<run>.toml`, flat; see its README);
@@ -402,7 +418,14 @@ applied to `cloud=true` steps; wave-required members always keep
 `worktree = true`); Review's `Apply` button is the deterministic path -
 `_apply_fields_to_toml` syncs run-level keys + per-step overrides the
 form owns, so an unchecked `worktrees` strips planner-added flags except
-where a same-project wave requires them.
+where a same-project wave requires them. The `Merge target` field's
+datalist comes from `GET /api/projects/<slug>/branches` of the SELECTED
+project's repo (conductor/* excluded); untouched it defaults to the
+checkout's branch (`main` editable while the project is inferred);
+Apply writes it project-scoped - per-step keys on that project's
+worktree steps when a project is chosen, `[run].merge_target` as the
+inferred default - and it joins the stale-on-change set with the other
+guaranteed fields.
 The `Ask me questions` checkbox (`ask`) is a generation-time permission,
 never a TOML key: the planner may answer with `BEGIN_QUESTIONS`/JSON/
 `END_QUESTIONS` instead of a manifest, which parks the request at stage
