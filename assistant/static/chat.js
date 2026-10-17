@@ -16,8 +16,13 @@
  *   never executed markup. Citations navigate the dashboard via
  *   window.aiNav without touching chat state.
  * - The model name in the header and each reply badge opens the
- *   settings dialog (model / effort / fast / read-only with capability
- *   + price notes); settings changes apply to the NEXT exchange only.
+ *   settings dialog (model / effort / fast / transport / read-only
+ *   with capability + price notes); settings changes apply to the NEXT
+ *   exchange only.
+ * - Replies carry a small transport chip: which provider transport
+ *   answered (cli = the devin -p spawn; fast = the read-only fast
+ *   transport). A requested transport that could not handle the turn
+ *   renders as a fallback ('fast->cli'), never silently.
  *
  * Host bridge (provided by the dashboard's inline script):
  *   window.aiView() -> {detailKey, summaryView, runModalKey,
@@ -286,6 +291,76 @@ function srcLabel(src, i) {
   return '[' + (i + 1) + '] ' + label;
 }
 
+/* -------------------------------------------------------- transport
+ * Which provider transport answered a reply. The exchange row names it
+ * (`transport` - 'cli' = the per-question `devin -p` spawn, 'fast' =
+ * the read-only fast transport), and `fallback` carries the reroute
+ * audit {from,to,reason} when the requested transport could not handle
+ * the turn (init failure, unavailable adapter, read-write routing).
+ * The turn's frozen settings snapshot says what was requested.
+ * A fallback renders honestly ('fast->cli' on an amber chip) - it is
+ * never disguised as the transport that was asked for. Rows that
+ * predate the field carry no chip at all (back-compat: cli). */
+var TRANSPORT_LABELS = {
+  cli: 'cli', devin_print: 'cli', print: 'cli',
+  fast: 'fast', direct: 'direct', http: 'direct',
+  warm: 'warm', warm_session: 'warm',
+  acp: 'acp', devin_acp: 'acp', 'devin-acp': 'acp'
+};
+
+function transportOf(x) {
+  return (x && (x.transport || x.transport_used)) || '';
+}
+
+function transportLabel(t) {
+  var s = String(t || '');
+  return TRANSPORT_LABELS[s.toLowerCase()] || s.slice(0, 16);
+}
+
+function transportFallback(x) {
+  /* the reroute audit on the exchange row: {from,to,reason} - thawed
+     here because exchange_view ships it as the raw JSON string it was
+     stored as */
+  var f = thaw(x && x.fallback);
+  if (f && (f.from || f.to || f.reason)) return f;
+  /* tolerate alternate spellings while the sibling contract lands */
+  return (x && (x.transport_fallback || x.fell_back))
+    ? { from: '', to: transportOf(x), reason: '' } : null;
+}
+
+function transportHtml(xa, snap) {
+  var tp = transportOf(xa);
+  if (!tp) return '';
+  var lab = transportLabel(tp);
+  var fb = transportFallback(xa);
+  var req = String((fb && fb.from) || (snap && snap.transport) || '');
+  var fellBack = !!fb;
+  if (!fellBack && req && req !== 'auto') {
+    /* derivation, not decoration: 'fast' is a capability class, so cli
+       answering it always reads as the documented fallback; a concrete
+       id only falls back when the answerer's label differs */
+    if (req === 'fast') fellBack = lab === 'cli';
+    else fellBack = transportLabel(req) !== lab;
+  }
+  var tip = 'answered via the ' + lab + ' transport';
+  if (fellBack) {
+    tip += fb && fb.reason ? ' - ' + fb.reason
+      : (req === 'fast' && snap && snap.readonly === false)
+        ? ' - the fast transport is read-only by construction, so ' +
+          'this read-write turn ran on ' + lab + ' instead'
+        : ' - the requested ' +
+          (req && req !== 'auto' ? transportLabel(req) : 'preferred') +
+          ' transport could not handle this turn, so ' + lab +
+          ' answered instead';
+  }
+  var text = fellBack
+    ? (req && req !== 'auto' ? transportLabel(req) + '\u2192' : '') +
+      lab
+    : lab;
+  return ' <span class="aim-tp' + (fellBack ? ' fb' : '') +
+    '" title="' + esc(tip) + '">' + esc(text) + '</span>';
+}
+
 function msgHtml(m) {
   var x = S.exch[m.id];                 // exchange OWNED by this user msg
   var xa = S.exchByAid[m.id];           // exchange this reply belongs to
@@ -322,7 +397,8 @@ function msgHtml(m) {
       esc(blabel) + '</button>' +
       (snap.readonly === false
         ? ' <span class="aim-st err" title="this answer ran with ' +
-          'mutations allowed">rw</span>' : '');
+          'mutations allowed">rw</span>' : '') +
+      transportHtml(xa, snap);
   }
   var atts = thaw(m.attachments);
   var attHtml = '';
@@ -389,6 +465,7 @@ function reqLine(r) {
      Billable retries and failed hops stay listed - 'internal' never
      means 'free'. */
   var bits = ['#' + (r.n || '?') + ' ' + (r.kind || 'request')];
+  if (r.transport) bits.push('via ' + transportLabel(r.transport));
   if (r.request_id) bits.push(r.request_id);
   if (r.started_at != null && r.ended_at != null)
     bits.push(Math.max(0, Math.round(r.ended_at - r.started_at)) + 's');
@@ -454,6 +531,10 @@ function usageHtml(xa, snap) {
   sb.push(snap.readonly === false ? 'read-write' : 'read-only');
   h += '<div class="um-l">model ' + esc(mb) + ' \u00b7 ' +
     esc(sb.join(' ')) + ' \u00b7 status ' + esc(xa.status) +
+    (transportOf(xa)
+      ? ' \u00b7 transport ' + esc(transportLabel(transportOf(xa))) +
+        (transportFallback(xa) ? ' (fell back)' : '')
+      : '') +
     (xa.provider_session_id
       ? ' \u00b7 session ' + esc(xa.provider_session_id) : '') + '</div>';
   var reqs = (xa.requests || []).filter(function (r) {
@@ -743,7 +824,7 @@ function paint() {
       : (S.defaults || {});
     nameEl.textContent = snap.model || 'default';
     nameEl.title = 'assistant settings - ' + settingsLabel(snap) +
-      ' - model, effort, fast, read-only';
+      ' - model, effort, fast, transport, read-only';
   }
   var pill = byId('ai-state');
   if (pill) {
@@ -1536,10 +1617,50 @@ function roBool(v) {
   return v !== false && v !== 0;
 }
 
+/* The transport select is feature-detected: the server advertises a
+   choice either as a `transport` key on settings/conversation records
+   ('cli' | 'fast') or a `transports` list on the /models catalog or
+   /settings payload. None present = a pre-transport server, and the
+   select renders disabled with the honest note rather than a control
+   that would save a field the server rejects. */
+function _transportList() {
+  /* advertised transports: {id,label,available} rows from
+     core.transport_options on the /models catalog or /settings payload
+     (whichever the server extends); strings tolerated */
+  var cat = (S.catalog && S.catalog.transports) ||
+            (S.defaults && S.defaults.transports) || [];
+  var out = [];
+  if (Array.isArray(cat)) cat.forEach(function (t) {
+    var id = (t && typeof t === 'object') ? (t.id || t.name) : t;
+    if (id) out.push({ id: String(id),
+      label: (t && (t.label || t.title)) || transportLabel(id),
+      available: !(t && t.available === false) });
+  });
+  return out;
+}
+
+function transportChoices() {
+  /* the valid setting values are 'cli' and 'fast' (server
+     TRANSPORTS) - advertised entries extend, never replace them */
+  var out = _transportList();
+  if (!out.some(function (o) { return o.id === 'cli'; }))
+    out.unshift({ id: 'cli', label: 'CLI transport (devin -p)',
+      available: true });
+  if (!out.some(function (o) { return o.id === 'fast'; }))
+    out.push({ id: 'fast', label: 'Fast transport', available: true });
+  return out;
+}
+
+function transportSupported() {
+  return _transportList().length > 0 ||
+    (S.conv && S.conv.transport != null) ||
+    (S.defaults && S.defaults.transport != null);
+}
+
 function settingsForm() {
   var cur = S.conv
     ? { model: S.conv.model, effort: S.conv.effort, fast: S.conv.fast,
-        readonly: S.conv.readonly }
+        readonly: S.conv.readonly, transport: S.conv.transport }
     : (S.defaults || {});
   var fams = famList();
   var fam = cur.model || (fams[0] || '');
@@ -1547,7 +1668,7 @@ function settingsForm() {
   /* draft selection lives in S.sel - the dialog never re-reads control
      values, so partial DOMs cannot desync it */
   S.sel = { model: fam, effort: cur.effort || '', fast: !!cur.fast,
-    readonly: roBool(cur.readonly) };
+    readonly: roBool(cur.readonly), transport: cur.transport || 'cli' };
   var catDown = !fams.length;
   var sel = byId('ais-model');
   if (sel) {
@@ -1571,6 +1692,24 @@ function settingsForm() {
   var fast = byId('ais-fast'), ro = byId('ais-ro');
   if (fast) fast.checked = !!cur.fast;
   if (ro) ro.checked = S.sel.readonly;
+  var tsel = byId('ais-transport');
+  if (tsel) {
+    var opts = transportChoices();
+    /* a stored transport id the server no longer advertises still
+       round-trips as itself - a save must not silently rewrite it */
+    if (S.sel.transport &&
+        !opts.some(function (o) { return o.id === S.sel.transport; }))
+      opts.push({ id: S.sel.transport, label: S.sel.transport,
+        available: true });
+    tsel.innerHTML = opts.map(function (o) {
+      return '<option value="' + esc(o.id) + '"' +
+        (o.id === S.sel.transport ? ' selected' : '') + '>' +
+        esc(o.label + (o.available === false ? ' (unavailable)' : '')) +
+        '</option>';
+    }).join('');
+    tsel.disabled = !transportSupported();
+    tsel.value = S.sel.transport;
+  }
   settingsNotes();
 }
 
@@ -1613,6 +1752,26 @@ function resolvedUid() {
 function settingsNotes() {
   var fam = (S.sel || {}).model;
   var fast = byId('ais-fast');
+  var tn = byId('ais-transport-note');
+  if (tn) {
+    var tsp = (S.sel || {}).transport;
+    var tav = transportChoices().some(function (o) {
+      return o.id === tsp && o.available === false; });
+    tn.textContent = !transportSupported()
+      ? 'this server does not advertise a transport choice - replies ' +
+        'run on the CLI transport (devin -p)'
+      : tsp === 'cli'
+        ? 'CLI transport only - one devin -p spawn per exchange; the ' +
+          'only transport allowed to propose actions'
+        : tav
+          ? 'that transport is not wired on this server - exchanges ' +
+            'answer on cli automatically'
+        : !S.sel.readonly
+          ? 'read-write conversations still run on the CLI transport ' +
+            '- the fast transport is read-only by construction'
+          : 'fast answers read-only questions in seconds; a failed ' +
+            'start falls back to CLI automatically';
+  }
   var markers = fastMarkersFor(fam);
   if (fast) {
     var hasFast = markers.length > 0 || famIsFastBrand(fam);
@@ -1724,6 +1883,11 @@ async function saveSettings() {
   try {
     var body = { model: fam, effort: eff || '', fast: !!fast,
       readonly: !!ro };
+    /* transport is sent only when the server advertised the field - an
+       older core 400s on unknown settings keys, and a hidden control
+       must never silently break saving everything else */
+    if (transportSupported())
+      body.transport = sel.transport || 'cli';
     if (convId()) {
       var out = await aapi('POST',
         '/conversations/' + encodeURIComponent(convId()) + '/settings',
@@ -1984,6 +2148,9 @@ function injectDom() {
       '<select id="ais-effort"></select>' +
       '<label class="check"><input type="checkbox" id="ais-fast"> ' +
         'Fast mode <span class="sub" id="ais-fast-note"></span></label>' +
+      '<label for="ais-transport">Transport</label>' +
+      '<select id="ais-transport"></select>' +
+      '<div id="ais-transport-note" class="sub"></div>' +
       '<label class="check"><input type="checkbox" id="ais-ro" checked> ' +
         'Read-only <span class="sub">the assistant can look but not ' +
         'touch; turning this off still requires your confirmation per ' +
@@ -2188,7 +2355,9 @@ function bind() {
         settingsNotes();
       } else if (id === 'ais-effort') { S.sel.effort = v; settingsNotes(); }
       else if (id === 'ais-fast') { S.sel.fast = ck; settingsNotes(); }
-      else if (id === 'ais-ro') { S.sel.readonly = ck; }
+      else if (id === 'ais-transport') { S.sel.transport = v;
+        settingsNotes(); }
+      else if (id === 'ais-ro') { S.sel.readonly = ck; settingsNotes(); }
     });
     setw.addEventListener('keydown', function (e) {
       if (e.key === 'Escape') {
@@ -2248,6 +2417,7 @@ var AskAI = {
   _s: S, _paint: paint, _aapi: aapi, _paintAtt: paintAtt,
   _attachFiles: attachFiles, _dictUI: dictUI,
   _msgHtml: msgHtml, _settingsForm: settingsForm,
+  _transportHtml: transportHtml, _transportLabel: transportLabel,
   _actHtml: actHtml, _actDecide: actDecide,
   _railHtml: railHtml, _delConv: delConv, _renameConv: renameConv
 };

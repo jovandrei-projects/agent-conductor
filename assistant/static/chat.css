@@ -193,6 +193,12 @@
 #aichat .aim-meta .aim-modelb:hover { color: #79c0ff; }
 #aichat .aim-st { color: #d29922; }
 #aichat .aim-st.err { color: #f85149; }
+/* which transport answered a reply - tiny chip beside the model badge;
+   .fb marks a fallback (the requested transport could not handle the
+   turn) in the same amber family as the other honest-warn chips */
+#aichat .aim-meta .aim-tp { color: #8b949e; border: 1px solid #30363d;
+  border-radius: 8px; padding: 0 6px; white-space: nowrap; }
+#aichat .aim-meta .aim-tp.fb { color: #d29922; border-color: #9e6a03; }
 
 /* in-flight reply: a bare gray "thinking" line - the bubble chrome is
    stripped by .think and the ellipsis dots pulse */
