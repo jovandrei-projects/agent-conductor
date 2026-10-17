@@ -1319,6 +1319,7 @@ const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}}
 vm.runInContext(src,ctx);
 const data={serve_boot:'b',generated_at:'2026-10-14T00:00:00',agents:[
   {step:'alpha',run:'first',run_dir:'/first',slug:'p',status:'done',wt:true,merged:true,
+   needs_review:true,
    task:'implement one',tokens:{prompt:10000,cached:6000,completion:1000,llm_steps:2}},
   {step:'beta',run:'second',run_dir:'/second',slug:'p',status:'done',wt:false,
    task:'implement two'}],runs:[
@@ -1350,6 +1351,16 @@ const row={dataset:{runKey:'/first'}};
   await click({dataset:{facet:'merged'}});   // toggles the tag back off
   assert.match(elem('runs').innerHTML,/A separate run/);
   assert.match(elem('agents').innerHTML,/>beta</);
+  // the 'unreviewed' tag chip counts needs_review tasks and filters
+  // both tables the same way the merge-state tags do
+  assert.match(elem('filters').innerHTML,/1 unreviewed/);
+  await click({dataset:{facet:'unreviewed'}});
+  assert.match(elem('filters').innerHTML,/unreviewed ×/);
+  assert.doesNotMatch(elem('agents').innerHTML,/>beta</);
+  assert.doesNotMatch(elem('runs').innerHTML,/A separate run/);
+  await click({dataset:{facet:'unreviewed'}});   // off again
+  assert.match(elem('agents').innerHTML,/>beta</);
+  assert.match(elem('runs').innerHTML,/A separate run/);
   vm.runInContext('showDetail(0)',ctx);
   // the task modal no longer carries the '?' token explainer (its
   // worked-example $0.019 went with it) - the header tooltips on the
