@@ -14882,6 +14882,9 @@ function showRequestForm(rec){
   mtTouched=!!rec.merge_target;
   mtImplied='';
   loadBranches(rec.project||'');
+  // the record only arrived now - mark the source run's row .dlinked
+  // without waiting out the next refresh tick
+  applySel();
 }
 
 // --- proposal pending state ---------------------------------------------
