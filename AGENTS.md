@@ -776,6 +776,43 @@ last computed count (null = never computed) and re-arms ONE daemon
 pattern as `_SESS_BUSY`, so the paint path never runs git log.
 Endpoint tests are tests/test_tour_api.py.
 
+Ask-AI assistant transports: exchanges answer on one of two provider
+transports (`settings.transport` = `cli` | `fast`; frozen on each
+message's settings snapshot; decision record `assistant/TRANSPORT.md`,
+design contract DESIGN.md section 11). `cli` is the verified baseline -
+one `devin --print [-r]` spawn per dispatch, the ONLY transport that
+carries a mutation tool channel and may therefore propose actions.
+`fast` is `assistant/providers/devin_acp.py` - one warm `devin acp`
+process per active conversation locked to `session/set_mode ask`, so
+read-only is structural (mutation tools absent) and replies stream as
+`agent_message_chunk` deltas through the same exchange_view partial
+text the poll loop already repaints. Selection rules the runtime
+enforces: a fast-transport init/credential/spawn failure reroutes the
+exchange to CLI and records `fallback` {from,to,reason} on the
+exchange row - never a failed question; a read-write conversation on
+`fast` routes through CLI; `cli` pins the baseline. Exchange rows name
+the answerer via `transport`; the chat client shows a small chip per
+reply (amber `requested->answered` on a fallback, tooltip carries the
+recorded reason) and a feature-detected Transport select in settings -
+a pre-transport server just gets the disabled control, and rows
+without the field render no chip.
+
+Ops notes for the transports: credential expiry looks like ordinary
+answers silently landing on `cli` (the amber `fast->cli` chip with an
+auth-shaped `fallback.reason`) - check `devin auth status`, not the
+UI; the baseline's own auth failure is louder ('provider is not
+authenticated' on the exchange, plus trap 3/4's stale-file fix:
+`devin auth logout` then `auth login` in a real terminal). Warm-pool
+cleanup: the adapter reaps ACP children idle > ~30min (the provider
+session persists on disk - the next turn `session/load`s with
+history), kills the pool on serve shutdown, and skips `isLocked`
+sessions in favor of a fresh session + history digest. Orphaned
+provider sessions register in the assistant workspace's own cwd-scoped
+`devin list` - never in `conductor.py sessions`, which whitelists
+only run-recorded ids - so leaks surface there and die by
+`devin rm <id>` (the id is in `exchanges.provider_session_id`), while
+a crashed serve leaves live children adoptable via reconcile() by pid.
+
 ## Traps
 
 Append as they are hit.
