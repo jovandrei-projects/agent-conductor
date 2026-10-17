@@ -290,6 +290,11 @@ browser/mcp/... - the full worker toolset).
 
 ### 3.4 ACP transport - PARTIALLY VERIFIED, BLOCKED TODAY
 
+*(Superseded 2026-10-17 by `assistant/TRANSPORT.md`: the migration
+error proved non-fatal in later probes - session/new, prompt, load,
+cancel, ask-mode and image blocks all verified live. The decision
+record is authoritative; this section kept for history.)*
+
 `devin acp` (stdio JSON-RPC, ACP v1) answers `initialize` with:
 `loadSession:true`, `promptCapabilities{image:true, audio:false,
 embeddedContext:true}`, `sessionCapabilities{list,delete,
@@ -732,9 +737,9 @@ Baseline `devin_print` (VERIFIED):
 
 Future `devin_acp` adapter: same ProviderAdapter contract; unblocks
 real token streaming (session/update->SSE) + image blocks + embedded
-context + permission-callback gating. Blocked by the 3000.6.2
-session-db migration defect (3.4) - do not write around it; retry
-after a CLI update.
+context + permission-callback gating. ~~Blocked by the 3000.6.2
+session-db migration defect (3.4)~~ **unblocked 2026-10-17 - see
+`assistant/TRANSPORT.md` for the verified contract.**
 
 ### 6.8 Read-only gate + controlled actions
 
@@ -873,11 +878,15 @@ state onto modalHist (chat is outside the stack by design).
 
 ## 9. Open items / blockers
 
-- **ACP `session/new` stalls** - devin 3000.6.2 session-db missing
-  `V17__subagent_heads` migration (found in cli logs). Blocks true
-  streaming + image blocks + permission-callback gate. Workaround:
-  `-p -r` baseline (verified). Recheck after `devin update`; report
-  upstream if it persists. Does NOT block the feature.
+- ~~**ACP `session/new` stalls**~~ **RESOLVED 2026-10-17** - the
+  `V17__subagent_heads` migration error still logs at session-db open
+  but is non-fatal on every path probed: `session/new`, `session/list`,
+  `session/load` (cross-process resume with history), `session/prompt`
+  (+image blocks), `session/set_mode ask` (structural read-only gate),
+  `session/set_config_option model` (mid-session switch), and the
+  `session/cancel` notification all verified live on 3000.6.2. The
+  transport decision record in `assistant/TRANSPORT.md` selects the
+  warm ACP session pool as the fast transport with `-p` as fallback.
 - **`session/load` on -r keeps original model** - model changes start
   a new provider session (verified warning). Digest-based continuity;
   flag for user if they expect same-session switching.
@@ -908,3 +917,26 @@ state onto modalHist (chat is outside the stack by design).
 - Intercom Fin design: https://ideas.fin.ai/p/designing-the-front-door
 - Anvil2 agentic shell: https://anvil.servicetitan.com/docs/kits/ai-kit/patterns/agentic-experience-shell
 - Web Speech support: https://caniuse.com/speech-recognition
+
+---
+
+## 11. Transport decision record (2026-10-17, later run)
+
+The faster-transport investigation (run
+`20261017-164321-assistant-fast-transport`, step
+`transport-investigation`) is recorded in **`assistant/TRANSPORT.md`**:
+it re-verified the ACP surface live and selected the **warm ACP
+session pool** (`devin acp` stdio JSON-RPC, one long-lived process per
+active conversation, `session/new` + `session/load` resume) as the
+fast transport, rejecting direct HTTP to
+`server.codeium.com/.../ApiServerService` (undocumented Connect-RPC,
+reverse-engineered schema, versioned metadata gates) and the
+`api.devin.ai` v3 REST API (documented but a cloud-sessions surface
+with a different credential and no uid vocabulary). `devin -p -r`
+remains the fallback and the only transport for non-readonly
+conversations. The doc carries the full ProviderAdapter mapping
+(send/poll/cancel/sessions/attach, per-turn-usage -> cumulative
+`raw_metrics` bridge, `llm_steps` honestly unreported, native image
+blocks + path fallback, `session/cancel` notification semantics,
+`set_mode ask` read-only gate, warm-pool lifecycle, fallback-to-CLI
+story, risk table).
