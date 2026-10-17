@@ -1068,3 +1068,26 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   (mixed isolation the form can't express - merge step must run in the
   checkout it merges); do NOT Apply-options it (would force worktree onto
   the merge step) - launch via `conductor.py run` post-review.
+- DONE 2026-10-17 (follow-up links + review cascade batch, interactive):
+  follow-up indicators are neutral .fulink chips (grey, underline on
+  hover only; 'follow-up of <run>' collapsed to a compact 'follow-up'
+  chip whose tooltip keeps the run name) and a bad outcome colors just
+  the status word red (.fu-bad on error/invalid/missing/absent).
+  Bidirectional links: the follow-up proposal modal names the source run
+  with a data-run-details link, the source run modal + its task modals
+  link forward to the proposal, and a launched follow-up run's payload
+  gained followup_src so its modal/tasks link back. applySel's new
+  linkKeys() marks the related row .dlinked (lighter inset, grey) while
+  .dsel stays on the open view's own row. Review marks now cascade
+  (_set_review): run-level marks propagate to every recorded step,
+  never to steps that never completed (_REVIEWABLE_ST gate); a step mark
+  re-derives the run's - reviewed only when ALL steps are covered, else
+  tombstone. seed_review_flags runs at every serve start and tombstones
+  completions that predate completion_seq (no mark + no seq) so every
+  finished task reads unreviewed until looked at - idempotent, never
+  overwrites an existing mark; ran once against live data (15 legacy
+  runs seeded, ~100 tasks flagged). The needs-review note now frames the
+  changed field/checkbox in amber (.pendchg via PEND_EL map in
+  refreshPending, suppressed mid-planning like the note). The run
+  modal's tasks table gained a review column (unreviewed pill /
+  reviewed / -).

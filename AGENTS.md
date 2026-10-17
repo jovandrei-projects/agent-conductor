@@ -278,6 +278,23 @@ value. The `run` kv row and the run modal's tasks table are
 `data-run-details`/`data-agent-detail` links - modal-to-modal jumps push
 the Back stack like everything else.
 
+Review marks cascade parent <-> children (`_set_review` writes the
+sentinels): a run-level 'Mark as reviewed'/'Mark as needing review'
+propagates to every recorded step (steps that never completed - no
+completion_seq, no `_REVIEWABLE_ST` outcome - are skipped so a tombstone
+never invents work), and every step mark re-derives the run's mark:
+reviewed only once ALL recorded steps are covered, tombstone otherwise.
+`seed_review_flags` at `serve` start backfills completions that predate
+completion_seq (a seq-less record only flags on an explicit tombstone);
+it writes marks only where NONE exists, so it's idempotent and can
+never undo an ack. Follow-up links are both ways: `state.followup`
+links the run row forward to the proposal, `followup_src` (request
+record AND launched-run payload) links back to the source run, and
+`linkKeys()`/`applySel()` marks the related row `.dlinked` while
+`.dsel` stays on the open view's own row. Changed request fields get an
+amber `.pendchg` frame from `refreshPending` (the `PEND_EL` key->element
+map), suppressed mid-planning like the pend-note itself.
+
 `merge = "deferred"` (per-step or `[run]` default; implies
 `worktree = true`, incompatible with `cloud`) separates isolation from
 merging: nothing lands after the wave - branch, worktree, commits and
