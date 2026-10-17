@@ -31,6 +31,13 @@ class PollResult:
     text: str = ""                      # newest agent text so far
     usage: "UsageDelta | None" = None
     error: str | None = None
+    # Raw provider-side detail (devin_print fills these; the runtime turns
+    # raw_metrics' CUMULATIVE counters into per-exchange deltas):
+    raw_metrics: dict | None = None     # provider's cumulative counters
+    model_label: str | None = None      # model the session actually ran
+    session_id: str | None = None       # provider session (discovered live)
+    request_id: str | None = None       # provider request id, when reported
+    exit_code: int | None = None
 
 
 @dataclass
@@ -86,3 +93,18 @@ class ProviderAdapter(ABC):
     def sessions(self, workspace) -> set[str] | None:
         """Live provider session ids for the assistant workspace, or None
         when the listing failed (callers must not read that as 'gone')."""
+
+    def alive_pid(self, pid) -> bool:
+        """Is this provider pid still running? reconcile() uses it to
+        adopt in-flight dispatches orphaned by a serve restart."""
+        return False
+
+    def attach(self, exchange: dict) -> ProviderHandle:
+        """Rebuild a handle for an in-flight dispatch from its persisted
+        row (pid/session_id/prompt_path/export_path) - no live Popen.
+        Poll then works off pid liveness + the export file."""
+        return ProviderHandle(
+            pid=exchange.get("pid"),
+            session_id=exchange.get("provider_session_id"),
+            prompt_path=exchange.get("prompt_path"),
+            export_path=exchange.get("export_path"))

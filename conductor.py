@@ -18466,6 +18466,27 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
     attachments_dir = attachments_dir or runs_dir.parent / "attachments"
     trash_dir = trash_dir or runs_dir.parent / "trash"
 
+    # The assistant surface: one lazily-opened host runtime per serve
+    # process. Errors are cached - a broken provider init degrades to a
+    # 503 payload on /api/assistant/*, never a dead dashboard.
+    _assist = {"core": None, "runtime": None, "err": None}
+
+    def assistant_open():
+        with STATE_LOCK:
+            if _assist["core"] is None and _assist["err"] is None:
+                try:
+                    from assistant_host.conductor_adapters import (
+                        open_runtime)
+                    core, rt = open_runtime(
+                        data_dir=runs_dir.parent / "assistant",
+                        runs_dir=runs_dir, requests_dir=requests_dir,
+                        devin_argv=devin_argv)
+                    _assist.update(core=core, runtime=rt)
+                except Exception as exc:                # noqa: BLE001
+                    LOG.exception("assistant runtime init failed")
+                    _assist["err"] = f"{type(exc).__name__}: {exc}"
+        return _assist["core"], _assist["err"]
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def _send(self, body: bytes, ctype: str, status: int = 200) -> None:
             self.send_response(status)
@@ -18508,6 +18529,42 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 if isinstance(exc, RequestError):
                     raise
                 raise RequestError("Invalid JSON request body") from exc
+
+        def _assistant(self, method: str, path: str) -> None:
+            """Route /api/assistant/* into the chat core's route table.
+            POSTs pass the RAW body through - the attachments route takes
+            an image body, everything else is JSON parsed by dispatch."""
+            from assistant import http_api
+            core, err = assistant_open()
+            if core is None:
+                self._json({"error": f"assistant unavailable: {err}"},
+                           503)
+                return
+            raw = b""
+            if method != "GET":
+                try:
+                    size = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    raise RequestError("Missing request body")
+                if not 0 <= size <= max(ATTACH_MAX_BYTES, 524288):
+                    raise RequestError("Request body is too large", 413)
+                raw = self.rfile.read(size)
+            status, body = http_api.dispatch(core, method, path, body=raw)
+            self._json(body, status)
+
+        def do_PUT(self) -> None:                    # noqa: N802 - stdlib name
+            path = urllib.parse.urlsplit(self.path).path
+            try:
+                self._check_origin()
+                if path.startswith("/api/assistant/"):
+                    self._assistant("PUT", path)
+                    return
+                self.send_error(404)
+            except RequestError as exc:
+                self._json({"error": str(exc)}, exc.status)
+            except Exception:
+                LOG.exception("dashboard PUT failed")
+                self._json({"error": "Dashboard request failed"}, 500)
 
         def do_GET(self) -> None:                    # noqa: N802 - stdlib name
             path = urllib.parse.urlsplit(self.path).path
@@ -18606,6 +18663,8 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 elif path in ("/", "/index.html"):
                     self._send(_DASH_HTML.encode("utf-8"),
                                "text/html; charset=utf-8")
+                elif path.startswith("/api/assistant/"):
+                    self._assistant("GET", path)
                 else:
                     self.send_error(404)
             except RequestError as exc:
@@ -18618,6 +18677,9 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
             path = urllib.parse.urlsplit(self.path).path
             try:
                 self._check_origin()
+                if path.startswith("/api/assistant/"):
+                    self._assistant("POST", path)
+                    return
                 if path == "/api/attachments":
                     # Raw image bytes (screenshot paste / file drop), NOT the
                     # JSON envelope _body() expects. data/attachments can sit
