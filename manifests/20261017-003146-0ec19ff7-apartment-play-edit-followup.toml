@@ -1,0 +1,135 @@
+# Follow-up manifest for run 'apartment-play-edit'
+# (data/runs/20261014-235630-apartment-play-edit, generated 2026-10-16 by its
+#  follow-up-plan step — human review required before launch).
+#
+# Reviewed evidence: all 26 run steps' stdout logs + state.json + events.jsonl,
+# every .agent_tasks/<task>/STATE.md, both gates, BUGS.md, ACCEPTANCE.md,
+# ARTIFACTS.md, SESSION_LOG.md.
+#
+# What the run actually accomplished:
+#  - 22/25 implementation steps recorded `done`; the two timeout-retried steps
+#    (reference-geometry-corrections, mobile-parity-validation) ended `done`.
+#  - 4 steps recorded `failed` only because the worker never emitted a literal
+#    "STATUS:" line (wall-and-supported-placement, object-variants-and-artwork,
+#    mobile-editor-and-placement, mobile-performance-and-interactions — the
+#    last wrote "STATUS done" without the colon). Their logs + commits +
+#    STATE.md files show the work landed and every later step re-ran those
+#    suites green, so they are treated as DONE, not re-proposed.
+#  - Desktop gate READY, phone gate PASS (23/23 + 18/18 on BOTH the real
+#    SM-S948U handset and the emulator), RC APK staged + sideloaded.
+#
+# Remaining actionable work proposed below (all apartment-3d, sequential):
+#   1. wall-embed polish        — BUGS #35, the only OPEN defect
+#   2. deferred editor gaps     — recorded follow-ups in variants STATE
+#   3. stale harness + doc sync — mobile-test.mjs exits 1, superseded
+#   4. release hardening        — WebView debugging gate (ARTIFACTS blocker #3)
+#   5. device residual checks   — recorded unverified edges; handset attached
+#   6. escalate release blockers— human decisions posted to the phone queue
+#
+# Deliberately NOT proposed (recorded, not actionable by a worker):
+#  - Release signing key, store/publication authorization, version identity —
+#    user decisions; step 6 escalates them via pc-bridge instead.
+#  - Phase 6 Postshot splat + floorplan image drop — wait on user actions.
+#  - Cloud sync — explicitly unauthorized (audit-baseline AUDIT.md §8).
+#  - Conductor STATUS-line tolerance: 4 workers lost `failed` annotations on
+#    completed work (missing/malformed STATUS) — an agent-conductor fix that
+#    belongs in the pending ux-controls-2 batch, not here.
+#
+# Launch:
+#   python conductor.py plan manifests\apartment-play-edit-followup.toml
+#   python conductor.py run  manifests\apartment-play-edit-followup.toml
+
+[run]
+name = "apartment-play-edit-followup"
+description = "Close the recorded leftovers of the apartment-play-edit run: open BUGS #35 wall embeds, deferred editor niceties, stale device harness, debuggable-WebView release blocker, on-device residual verification, and human-decision escalation."
+on_failure = "continue"
+checkpoint = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 60
+max_attempts = 3
+
+[[step]]
+name = "wall-embed-polish"
+project = "apartment-3d"
+timeout_min = 75
+prompt = '''
+Fix docs/BUGS.md row #35 — the only OPEN defect: seven authored bound props (entryCart, pantryDivider, trackKitB, desk x2, ladderShelf, wicShelfS) tuck 4-55cm into wall slabs. They are hidden inside opaque wall mass today; the integration-test `penetration-audit` was frozen as a tripwire baseline over them (.agent_tasks/desktop-integration/GATE.md "Known issues").
+
+Nudge each prop so its back sits flush against the wall face instead of embedding inside the slab. Keep colliders, interact labels, and room readability correct — check each spot visually at eye level and from bird/plan views (the ladderShelf leans on the corner pilaster; preserve that read while removing slab penetration). Update the tripwire baseline in tools/integration-test.mjs so the audit asserts the new no-embed set, then close BUGS #35 with fix notes.
+
+Run the project's real verification commands (npm run verify, the touched suites, python run_tests.py), update .agent_tasks and docs/SESSION_LOG.md, and commit in logical groups. End your final message with exactly two lines: "STATUS: done|partial|blocked" then "NEXT: <one line>" — the conductor parses your stdout, not STATE.md.
+'''
+
+[[step]]
+name = "editor-deferred-completeness"
+project = "apartment-3d"
+timeout_min = 75
+prompt = '''
+Close the two deferred editor items recorded in .agent_tasks/object-variants-and-artwork/STATE.md "Known edges":
+
+1. Variant delete UI — `state.removeVariant` already exists and refuses while instances reference it, but no UI surfaces it. Add a delete affordance for custom `variant:true` catalog entries (confirm + refuse-with-reason when referenced; built-in defs stay non-deletable).
+2. Post-placement artwork edit — the inspector currently edits dims only. Let a placed `decor.art-panel` instance swap its image/dims from the inspector through the same media pipeline (mediaPut validation, `media:` refs, fit modes, mirror-correct orientation).
+
+Stay in scope: do NOT implement `surface:'ceiling'` mounts or furniture-side wall-mount faces — both are recorded out-of-scope in wall-and-supported-placement/STATE.md.
+
+Extend the existing browser suites (variants-art-test.mjs / editor-test.mjs) rather than inventing a new harness; run npm run verify + the affected suites + python run_tests.py. Update .agent_tasks and docs, commit in logical groups. End with exactly "STATUS: done|partial|blocked" then "NEXT: <one line>".
+'''
+
+[[step]]
+name = "stale-harness-and-doc-sync"
+project = "apartment-3d"
+timeout_min = 45
+prompt = '''
+tools/mobile-test.mjs is a stale harness: it uses Playwright connectOverCDP, which cannot reach the Android WebView endpoint — it exits 1 and is documented as superseded by the raw-CDP device suites (device-accept-test.mjs, device-persist-test.mjs, device-perf-test.mjs) in mobile-performance-and-interactions and mobile-save-versions-and-recovery STATE files. It still sits in tools/ and pollutes suite sweeps.
+
+Either port it onto the shared raw-CDP client so its remaining unique checks work on-device, or retire it cleanly: rename/mark deprecated with a header comment pointing at the device-* suites, and remove it from any battery/all-suite runners that invoke it (check scratch/run-battery.mjs and similar).
+
+Also sync docs/BUGS.md's "Verification suites" block — its suite names and counts predate the run (e.g. walktest says 10/10 but is 11/11, mobile-test describes the dead harness, device-* suites are missing). Update docs/SESSION_LOG.md + .agent_tasks, run python run_tests.py, commit. End with exactly "STATUS: done|partial|blocked" then "NEXT: <one line>".
+'''
+
+[[step]]
+name = "release-build-hardening"
+project = "apartment-3d"
+timeout_min = 60
+prompt = '''
+Address the one agent-actionable release blocker in .agent_tasks/mobile-release-staging/ARTIFACTS.md §"What blocks a real deployment" (item 3): mobile/app/src/main/java/com/apt3d/app/MainActivity.java calls WebView.setWebContentsDebuggingEnabled(true) unconditionally. Gate it on BuildConfig.DEBUG so any future distributed build is not debuggable.
+
+While in the manifest: review whether `usesCleartextTraffic=true` in AndroidManifest.xml is actually needed (the app serves https://appassets.androidplatform.net/ via WebViewAssetLoader and is offline); remove it if unneeded, or record why it stays in DECISIONS.md.
+
+Do NOT create a signing config, keystore, or release buildType, and do NOT bump versionCode/versionName — those are recorded human decisions, escalated by the escalate-release-decisions step. Rebuild the debug APK (node tools/bundle-mobile.mjs; gradle assembleDebug — see ARTIFACTS.md for the gradle path), confirm the staged payload still boots (`scratch/boot-rc.mjs` pattern), update ARTIFACTS.md blocker 3 and docs, commit. End with exactly "STATUS: done|partial|blocked" then "NEXT: <one line>".
+'''
+
+[[step]]
+name = "device-residual-verification"
+project = "apartment-3d"
+timeout_min = 120
+prompt = '''
+Close the recorded on-device evidence gaps using the handset if it is attached (adb devices — SM-S948U RFGL11NN0QV was left attached after the run; if no device is attached, mark the affected checks UNVERIFIED and report STATUS: partial — never substitute emulator results for device evidence).
+
+Reinstall the freshly built APK first so the device tests the current tree (bundle-mobile + assembleDebug + adb install -r per .agent_tasks/mobile-release-staging/ARTIFACTS.md). Then:
+
+1. Physical-handset perf spot-check — the recorded NEXT item in .agent_tasks/mobile-performance-and-interactions/STATE.md: run tools/device-perf-test.mjs with ANDROID_SERIAL pointing at the handset and record real-hardware numbers (emulator results were SwiftShader-bound).
+2. Real file-chooser end-to-end — the gap recorded in mobile-customization-and-media + mobile-save-versions-and-recovery STATEs: drive the art-upload picker on the Samsung (chooser is hosted by Chrome's ChromeTabbedActivity) far enough to select a real photo if automatable via adb/UI-driving, and confirm a `media:` ref lands in the layout doc; if a full pick cannot be automated, verify cancel-path integrity and record precisely what remains manual.
+3. OSK + lifecycle edges recorded as untested: real on-screen keyboard input on the save-variant name field if feasible via `input text`/UI driving, and OOM-adjacent behavior via `am send-trim-memory`/`am kill` and `cmd deviceidle` doze — confirm stash/recovery still works.
+4. Re-run tools/device-accept-test.mjs on the handset as a regression pass over the final tree.
+
+Keep the device awake during runs (documented: screen_off_timeout pin, svc power stayon, KEYCODE_WAKEUP) and restore settings afterwards. Update mobile-parity-validation/ACCEPTANCE.md notes + GATE.md residual section truthfully, .agent_tasks, SESSION_LOG; kill any spawned servers/forwards. End with exactly "STATUS: done|partial|blocked" then "NEXT: <one line>".
+'''
+
+[[step]]
+name = "escalate-release-decisions"
+project = "apartment-3d"
+timeout_min = 20
+verify = ""
+prompt = '''
+This step makes the remaining release blockers visible to the human — it posts ONE consolidated question, implements nothing.
+
+Read .agent_tasks/mobile-release-staging/ARTIFACTS.md §"What blocks a real deployment" and post a single phone-queue ask listing the decisions needed from the user: (a) create an upload/release signing key + Gradle signing config, (b) authorize any publication channel (none exists today — the app is debug-signed sideload-only), (c) decide version identity (versionCode 1 / '1.0' still), (d) whether a physical device-farm or extra handsets are wanted for wider coverage. Use:
+  python C:\Projects\mobile-apps\pc-bridge\task.py ask --project apartment-3d --title "apartment-3d release decisions" --body "<the four items, one line each, pointing at ARTIFACTS.md>"
+
+Then append a short entry to docs/SESSION_LOG.md noting the follow-up manifest was authored by the run's follow-up-plan step at C:/Projects/agent-conductor/manifests/apartment-play-edit-followup.toml and that release remains blocked on those user decisions. Commit docs only. End with exactly "STATUS: done|partial|blocked" then "NEXT: <one line>".
+'''
