@@ -1,0 +1,88 @@
+"""Provider transport contract (DESIGN.md sections 6.7/3.x).
+
+A ProviderAdapter owns one way of getting an assistant turn answered:
+spawning/resuming a provider session, polling it for progressive text,
+cancelling it, and reporting usage. The `devin -p [-r]` print transport
+(verified baseline, research probes) and the future ACP transport both
+implement this ABC; `core` only ever sees the contract.
+
+Usage is reported as a *delta* per exchange: the provider's ATIF export
+carries cumulative session counters, so the runtime subtracts the
+session's previous totals - `usage_delta` is that pure function.
+"""
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ProviderHandle:
+    """One in-flight provider dispatch."""
+    pid: int | None = None
+    session_id: str | None = None       # provider session (resumable)
+    request_id: str | None = None       # provider request, when reported
+    prompt_path: str | None = None
+    export_path: str | None = None
+
+
+@dataclass
+class PollResult:
+    """Progressive state of a dispatched exchange."""
+    done: bool = False
+    text: str = ""                      # newest agent text so far
+    usage: "UsageDelta | None" = None
+    error: str | None = None
+
+
+@dataclass
+class UsageDelta:
+    prompt_t: int = 0
+    completion_t: int = 0
+    cached_t: int = 0                   # cached tokens are a SHARE of input
+    llm_steps: int = 0
+    model_uid: str = ""
+    model_label: str = ""
+    extra: dict = field(default_factory=dict)
+
+
+def usage_delta(prev: dict | None, cur: dict | None) -> UsageDelta:
+    """Cumulative export counters -> this exchange's share. `prev` is the
+    session's metrics snapshot taken before this dispatch (None = fresh
+    session), `cur` the metrics at turn end. Counter keys follow the ATIF
+    final_metrics naming."""
+    cur = cur or {}
+    prev = prev or {}
+
+    def d(key):
+        return max(0, int(cur.get(key) or 0) - int(prev.get(key) or 0))
+
+    return UsageDelta(
+        prompt_t=d("total_prompt_tokens"),
+        completion_t=d("total_completion_tokens"),
+        cached_t=d("total_cached_tokens"),
+        llm_steps=d("total_steps"))
+
+
+class ProviderAdapter(ABC):
+    """The `devin_print` adapter (assistant-runtime step) and the future
+    `devin_acp` adapter both implement this."""
+
+    @abstractmethod
+    def send(self, prompt_path: str, *, session_id: str | None,
+             model_uid: str, export_path: str,
+             workspace) -> ProviderHandle:
+        """Dispatch one turn. `session_id` resumes a session (settings are
+        then the session's own - a model change must spawn fresh)."""
+
+    @abstractmethod
+    def poll(self, handle: ProviderHandle) -> PollResult:
+        """Non-blocking state read: partial text, done flag, usage when
+        finished, error when failed/cancelled."""
+
+    @abstractmethod
+    def cancel(self, handle: ProviderHandle) -> None:
+        """Best-effort kill of the in-flight dispatch."""
+
+    @abstractmethod
+    def sessions(self, workspace) -> set[str] | None:
+        """Live provider session ids for the assistant workspace, or None
+        when the listing failed (callers must not read that as 'gone')."""

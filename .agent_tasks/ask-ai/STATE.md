@@ -66,22 +66,93 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
 
 ### Phase 2 - implementation (manifest steps, later sessions)
 
-- [ ] persistent-chat-core - sqlite schema + conversation/exchange store
+- [x] persistent-chat-core - sqlite schema + conversation/exchange store
+      (shipped `assistant/` + `assistant_host/conductor_adapters.py`;
+      contracts below)
 - [ ] view-context-and-retrieval - host context + retrieval adapters
+      (envelope + RetrievalAdapter contract already exist - implement
+      search()/fetch() vs runs/requests + ctx enrichment + static
+      preamble `host_conductor_static.md`)
 - [ ] assistant-runtime - provider adapter + gate + usage capture
+      (implement ProviderAdapter as `assistant/providers/devin_print.py`;
+      wire dispatcher.launch/cancel; `usage_delta` + price snapshot
+      helpers already exist; `/exchanges/<id>` poll returns partial text)
 - [ ] persistent-chat-interface - surface, launchers, settings, history
+      (assistant/static/chat.js + md.js + route registration in
+      make_dashboard_handler -> assistant.http_api.dispatch)
 - [ ] images-and-dictation - attachments + webSpeech composer
+      (server side done: POST /api/assistant/attachments + ref binding;
+      client composer + SpeechRecognition belong here)
 - [ ] guarded-dashboard-actions - action proposals + confirmations
+      (audit flow + readonly recheck done; implement ActionAdapter over
+      conductor functions + proposal parsing + confirm cards)
 - [ ] usage-and-price-visibility - per-exchange + session rollups
+      (usage/price snapshot columns + rollup endpoint exist; needs
+      provider-side capture + UI)
 - [ ] integration-and-design-review
 - [ ] follow-up-plan
 
+## Implemented contracts (persistent-chat-core)
+
+- `assistant/` package, stdlib-only, never imports conductor. Host seams
+  are injected callables: `guard` (trap-5 `_assert_unwatched`),
+  `attachment_saver`, `attachments_dir` confinement, `dispatcher`
+  (launch/cancel), `actions` (ActionAdapter), `catalog`, `now` clock.
+- `assistant/store.py` - `Store(path, now=, migrations=)`: sqlite WAL db,
+  `PRAGMA user_version` additive migrations (v1 = conversations/messages/
+  exchanges/actions/attachments/settings + indexes). Entities use
+  `<type>-YYYYMMDD-HHMMSS-<8hex>` ids (ID_RE is the lookup boundary).
+  Multi-row writes go through `store.txn()` (BEGIN IMMEDIATE).
+- `AssistantCore` interface: `create_conversation` (origin envelope +
+  client_ref dedupe), `list_conversations` (keyset before=cursor on
+  last_active_at+id), `get_conversation`, `open_conversation` (bump +
+  message page), `last_active_conversation` (settings KV pointer +
+  recency fallback), `list_messages` (seq-cursor pages, chronological
+  items), `post_message` (user msg + queued exchange + pending assistant
+  placeholder atomically; client_msg_id resend dedupes - an
+  error/cancelled prior exchange re-queues a fresh turn on the SAME user
+  message), `begin/update_partial/complete/fail/cancel_exchange`
+  (terminal states sticky - usage can never double-land),
+  `claim_request` (UNIQUE provider_session_id+request_id dedupe),
+  `exchange_view` (poll payload incl. partial text), `usage` (per-exchange
+  rows + rollup with `unpriced` count - NULL usd never reads as $0),
+  `model_history` (bounded chronological tail; store keeps everything,
+  `truncated` flag is honest), `update_settings`/`set_defaults`/
+  `defaults` (snapshot lands on each message's settings_json),
+  `save_upload` (+client_ref dedupe, attachments-dir confinement),
+  `propose/decide/execute_action` + `list_actions` (audit rows; readonly
+  re-checked AT execute time - a refusal keeps the proposal).
+- `assistant/context.py` - ContextEnvelope {view, window, refs, filters,
+  selection, enriched, at}: sanitized recursively (credential-shaped keys
+  dropped), selection <=2KB, frozen envelope <=16KB stored on
+  messages.ctx_ref. Per-turn frozen provenance; origin on the conv row.
+- `assistant/http_api.py` - `dispatch(core, method, path, body, query)`
+  -> (status, payload); ROUTES table per DESIGN 6.2; JSON 400 /
+  AssistantError status / IntegrityError->409 mapping.
+- `assistant/actions.py` / `retrieval.py` / `providers/__init__.py` -
+  ActionSpec/ActionAdapter, Source+RetrievalAdapter (12 sources/64KB),
+  ProviderAdapter/ProviderHandle/PollResult/UsageDelta + `usage_delta`
+  (cumulative ATIF counters -> per-exchange delta).
+- `assistant_host/conductor_adapters.py` - `open_core()`: db at
+  data/assistant/assistant.db, workspace/ + spool/ dirs created (the db
+  is a sibling of the provider session cwd, per trap 5), guard =
+  conductor._assert_unwatched, saver = save_attachment, catalog =
+  model_options()+price_table() merge.
+
 ## Where it stopped
 
-Research + design complete and recorded in `DESIGN.md`. Next session =
-`persistent-chat-core`: build `assistant/` module skeleton + sqlite
-store per DESIGN.md sections 6-8. First thing: confirm schema + the
-`_assert_unwatched` write guard, then migrations + store tests.
+`persistent-chat-core` is implemented and green: `assistant/` package +
+host adapter + 37 focused tests in `tests/test_assistant.py` (migrations,
+reopen persistence, conv+message pagination, origin/ctx freeze, settings
+snapshots, client_msg_id/provider-request/usage dedupe, readonly-at-
+execute, attachment confinement, http dispatch). NOT yet wired into
+`serve` - `make_dashboard_handler` does not register the routes yet and
+no dispatcher/provider exists, so exchanges stay `queued` (honest state;
+assistant-runtime step owns dispatch). Next session =
+`view-context-and-retrieval` per the manifest: implement the
+RetrievalAdapter + ctx enrichment + static preamble, or reorder per
+QUEUE. If picking up runtime instead: `providers/devin_print.py` +
+dispatcher seam in open_core.
 
 ## Deferred or blocked
 
