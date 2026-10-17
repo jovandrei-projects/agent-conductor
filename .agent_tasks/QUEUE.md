@@ -23,7 +23,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 10 | Verify the three proposal-flow changes together (stop / retain-session / compact labels) in the merged state | done | verify-proposal-flow/ | both parked branches merged, 4 integration regressions fixed (same-second publish race, stale overlay, drain records, chip wrap); 232/232 + demo + live probe green |
 | 11 | Interrupt + instruct: stop+resume a running step with added instructions/screenshots, exactly-once across races/restarts | done | interrupt-with-instructions/ | intrq sentinel -> rnote fold -> same-step respawn (not a retry); late/stop-wins banking, restart exactly-once; composer+ctx UI, attach reuse; 303/303 + demo green |
 | 12 | Run/task review UX: ack state + outcome summaries + nav/timing/merge-guard pass | in progress | run-review-ux/ | manifest run 20261016-100852-run-review-ux; design in run-review-ux/DESIGN.md; all impl steps merged incl. integration-verification (merge e6655ad), 1 step left (follow-up-plan) |
-| 13 | Project-aware merge targets: merge_target key + conductor merge worktree + persisted target + dashboard branch selector | done | project-merge-targets/ | 247/247 mock tests + demo green; wave step of run 20261016-013719-workflow-ux-safety |
+| 13 | Project-aware merge targets: merge_target key + conductor merge worktree + persisted target + dashboard branch selector | done | project-merge-targets/ | 247/247 mock tests + demo green; wave step of run 20261016-013719-workflow-ux-safety; landed on master via merge 6a40935 |
 
 ## Not yet filed as tasks
 

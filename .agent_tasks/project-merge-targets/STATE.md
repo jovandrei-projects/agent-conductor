@@ -1,6 +1,6 @@
 # Task: project-merge-targets
 
-**Status:** done (247/247 mock tests + demo green; awaiting wave merge)
+**Status:** done (merged to master as 6a40935; awaiting wave merge no more)
 **Started:** 2026-10-16   **Last touched:** 2026-10-16
 
 ## Objective
@@ -65,6 +65,21 @@ resolution and manual merges never fall back silently.
 - AGENTS.md: merge-target paragraph + form-field note + resolver-location
   wording fix.
 
+## Where it stopped
+
+DONE - merged into master as `6a40935` by a resolver session
+(2026-10-16). The merge unioned this task's merge_target work with
+master's deferred-merge / pending-state / run-review changes: combined
+the merge pipeline into `merge_step_branch` + `_RepoMergeLock`,
+`resolve_merge_conflict` gained `merge_dir`/`target` while keeping
+`remove_on_success`/`dirty_guard`, deferred staging honors recorded
+targets, both `PendingStateTests` and `MergeTargetRequestTests` classes
+kept whole (shared setUp/proposal/ready split per class), dashboard JS
+init (`refreshPending` + `loadBranches`) unioned, `merge_target` added
+to `OPTION_FIELDS`/client `OPT_KEYS`/`PEND_LABEL`, and `updateMtHint`
+made stub-tolerant (`inp.value` may be absent on node:vm stubs). Two
+pre-merge test fixtures gained `merge_target` in their baselines/fill.
+
 ## Verification
 
 `python run_tests.py` -> 247/247 OK (~428s); `python conductor.py demo`
@@ -75,3 +90,9 @@ conflict-park -> merge_run/--resume on recorded target, resolver session in
 the merge worktree, backcompat recording, branch helpers; request-side
 format/existence validation, apply scoping, publish guarantee, stale,
 proposal validation, branches endpoint.
+
+Post-merge (6a40935): full suite 497 tests - 2 node-harness failures
+(updateMtHint stub read, baseline fixture missing merge_target) fixed in
+the resolution, 3 StopProposal flakes green on rerun; focused rerun of
+the merged merge-path classes (MergeTarget/DeferredMerge/MergeRun/
+ManualMergeGuard/MergeTargetRequest/PendingState) = 72/72 green.
