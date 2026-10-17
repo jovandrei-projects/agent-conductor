@@ -84,3 +84,4 @@ accounted for.
 | agent-conductor / resolve-mobile-relaunch-handling (merge resolution: both-append on efficiency_stats.md only - kept HEAD's execution-context-labels row AND the branch's mobile-relaunch-handling row; merge 2e6888e) | n/a | n/a | n/a | n/a |
 
 | agent-conductor / follow-up-plan (run-review-ux review + followup manifest: 4/9 steps merged+verified, 5 parked-with-work branches confirmed ancestors of the integration-verification union branch (457/457 combined); 600s verify cap = guaranteed false-fail; drafted manifests/run-review-ux-followup.toml validated by plan; not launched) | n/a | n/a | n/a | n/a |
+| agent-conductor / inspect-and-design (run-review-ux design: completion_seq+review-mark model over trap-5 sentinels, accent eval, per-step touchpoints + test gaps -> .agent_tasks/run-review-ux/DESIGN.md; 276/276 suite green, no code changed) | n/a | n/a | n/a | n/a |
