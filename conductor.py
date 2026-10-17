@@ -19571,6 +19571,16 @@ async function tourMark(){
     if (!tourSt) return;
     tourSt.pending = false;
     tourSt.notice = 'Mark viewed failed: ' + (err.message || err);
+    // 'unknown tour entry' means the card was renamed/absorbed since the
+    // deck was pulled (a new commit re-grouped it): a retry can never
+    // land, so resync the deck to the server's current feed instead
+    if (/unknown tour entry/i.test(String(err && err.message || err))){
+      await tourLoad();
+      if (!tourSt) return;
+      const deck = tourDeck();
+      const ni = deck.findIndex(x=>x.state!=='viewed');
+      tourSt.idx = ni<0 ? deck.length : ni;
+    }
     tourShow(); return;
   }
   if (!tourSt) return;                          // closed mid-flight

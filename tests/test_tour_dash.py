@@ -263,6 +263,32 @@ assert.ok(!fetches.some(u=>u.includes('/api/tour')));   // badge never GETs the 
 ''')
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_mark_unknown_entry_resyncs_the_deck(self):
+        """A card renamed/absorbed since the deck was pulled (a new
+        commit re-grouped its area) 404s 'unknown tour entry' on mark -
+        a retry could never land, so the tour re-pulls the feed and
+        lands on the first still-unviewed card, keeping the failure
+        notice for context."""
+        self._node(r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  queue.push({ok:true,json:async()=>FEED});
+  await open();
+  queue.push({ok:false,json:async()=>({
+    error:'unknown tour entry: area:power:aaa111bbb222'})});
+  const f2=JSON.parse(JSON.stringify(FEED));
+  f2.entries=[f2.entries[1]];                       // card 1 renamed away
+  f2.unseen_count=1;
+  queue.push({ok:true,json:async()=>f2});
+  await click(act('mark'));
+  assert.equal(fetches.filter(u=>u==='/api/tour').length,2); // open+resync
+  assert.match(card(),/Mark viewed failed: unknown tour entry/);
+  assert.match(card(),/Update 1 of 1/);              // resynced deck
+  assert.match(card(),/Mixed bag/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_skip_escape_backdrop_never_post(self):
         """Skip, Escape and a click on the dim all close the walkthrough
         via the same path - the entry stays unread and no viewed/snooze
