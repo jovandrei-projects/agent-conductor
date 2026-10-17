@@ -18721,11 +18721,15 @@ function applySel(){
       x.classList.toggle('dlinked', !agen && link.has('r:'+k));
     });
   // a What's-new tour suspends beneath an open details modal - the
-  // dialog is the stronger layer; closing it resumes the same card
+  // dialog is the stronger layer; closing it resumes the same card,
+  // re-placed against whatever the page did behind it
   const tw = document.getElementById('tourwrap');
-  if (tourSt && tw && tw.classList)
-    tw.classList.toggle('suspended',
-      !document.getElementById('backdrop').hidden);
+  if (tourSt && tw && tw.classList){
+    const susp = !document.getElementById('backdrop').hidden;
+    const was = tw.classList.contains('suspended');
+    tw.classList.toggle('suspended', susp);
+    if (!susp && was) tourPlace(true);   // resume, not every poll
+  }
   // the assistant's "next question" view chip follows modal navigation;
   // applySel fires on every open/close/re-render so the chip never polls
   if (globalThis.aiSync){ try{ globalThis.aiSync(); }catch(e){} }
@@ -18884,7 +18888,7 @@ function tourShow(){
   }
   card.innerHTML = inner;
   card.classList.toggle('busy', !!tourSt.pending);
-  tourPlace();
+  tourPlace(true);
 }
 function tourAnchorEl(e){
   const sel = e && e.anchor;
@@ -18898,11 +18902,14 @@ function tourAnchorEl(e){
   if (!r || r.width<=0 || r.height<=0) return null;
   return {el, rect:r};
 }
-function tourPlace(){
+function tourPlace(reveal){
   const wrap = document.getElementById('tourwrap');
   const ring = document.getElementById('tourring');
   const card = document.getElementById('tourcard');
   if (!tourSt || !wrap || !ring || !card || wrap.hidden) return;
+  // while suspended under a modal the layer is display:none - don't
+  // re-place (and especially don't scrollIntoView) behind the dialog
+  if (wrap.classList && wrap.classList.contains('suspended')) return;
   const a = tourAnchorEl(tourCur());
   const vw = (typeof window!=='undefined' && window.innerWidth) || 1024;
   const vh = (typeof window!=='undefined' && window.innerHeight) || 768;
@@ -18912,15 +18919,14 @@ function tourPlace(){
     card.style.top = card.style.left = '';
     return;
   }
-  // scroll an offscreen anchor into view first, then land ring+card on
-  // the fresh rect ('nearest' only - never a jump to the element)
   let r = a.rect;
-  const bot = () => r.bottom!=null ? r.bottom : r.top+r.height;
-  if (r.top<0 || bot()>vh || r.left<0 ||
-      (r.right!=null?r.right:r.left+r.width)>vw){
-    if (a.el.scrollIntoView)
-      a.el.scrollIntoView({block:'nearest',
-        behavior:tourReduced()?'auto':'smooth'});
+  // reveal - only when a card is (re)shown, never on a scroll/resize
+  // re-place: scrollIntoView there would fight the user's own scrolling
+  const off = r.top<0 || (r.bottom!=null?r.bottom:r.top+r.height)>vh ||
+    r.left<0 || (r.right!=null?r.right:r.left+r.width)>vw;
+  if (reveal && off && a.el.scrollIntoView){
+    a.el.scrollIntoView({block:'nearest',
+      behavior:tourReduced()?'auto':'smooth'});
     r = a.el.getBoundingClientRect();
   }
   wrap.classList.remove('dim'); ring.hidden = false;
@@ -18946,7 +18952,7 @@ function tourPlace(){
 // removes them so nothing keeps firing on a dead overlay
 function tourBind(on){
   if (on){
-    const sc = () => { if (tourSt) tourPlace(); };
+    const sc = () => { if (tourSt) tourPlace(false); };
     tourSt._sc = sc;
     document.addEventListener('scroll', sc, true);
     if (typeof window!=='undefined' && window.addEventListener)
