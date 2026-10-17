@@ -30,9 +30,12 @@
 
 /* #dask: the in-modal launcher, pinned into #detail's title chrome next
    to the Close X. It lives outside #dbody so a view repaint never
-   rebuilds it and every modal view is covered with no per-view markup. */
+   rebuilds it and every modal view is covered with no per-view markup.
+   position:fixed (not absolute): #detail's translate() transform makes
+   the modal the containing block, so the button does not scroll away
+   with the modal's content. */
 #dask {
-  position: absolute; top: 11px; right: 72px; z-index: 7;
+  position: fixed; top: 11px; right: 72px; z-index: 7;
   background: #21262d; color: #e6edf3; border: 1px solid #30363d;
   border-radius: 6px; padding: 3px 9px; font: inherit; font-size: 12px;
   cursor: pointer;
