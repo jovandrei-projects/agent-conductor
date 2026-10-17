@@ -57,7 +57,8 @@ UI - those are the later manifest steps.
 - [x] tour-dashboard - vanilla-JS walkthrough in _DASH_HTML (#tour-btn +
   #tour-badge in the topbar, #tourwrap/#tourring/#tourcard spotlight
   overlay, tourSt state, 9 tests in tests/test_tour_dash.py)
-- [ ] tour-llm-polish - optional cached LLM enrichment (off by default)
+- [x] tour-llm-polish - optional cached LLM enrichment (off by default;
+  tour_polish.py + 24 tests, conductor wiring, build_feed polish= hook)
 - [ ] tour-validation - end-to-end verify
 
 ## tour_feeds contract (for tour-api)
@@ -140,15 +141,51 @@ via `tourBadge(r.unseen_count)`.
 - scroll(capture)/resize listeners bind on open and unbind on close;
   reduced-motion disables the ring pulse and scrolls 'auto'.
 
+## tour_polish contract (for tour-validation)
+
+- Module `tour_polish.py` (stdlib-only, no conductor import). Off unless
+  `CONDUCTOR_TOUR_POLISH` env is truthy; model = `MODEL` constant
+  (`gpt-6-luna-low-priority`, env `CONDUCTOR_TOUR_POLISH_MODEL`), bounds:
+  `MAX_COMMITS` 30, `PROMPT_MAX_CHARS` 32k, `MAX_CARDS` 24,
+  `REPLY_MAX_CHARS` 16k, `TIMEOUT_S` 120 (`CONDUCTOR_TOUR_POLISH_TIMEOUT_S`).
+- Provider = `devin -p` print session (same spawn pattern as the run
+  summarizer, `--permission-mode auto`, tempdir cwd); credentials stay in
+  the devin CLI's credentials.toml. Tests inject `provider=(prompt)->str`.
+- `Polisher(cache_path, repo_dir, devin_argv=, provider=, enabled=, ...)`:
+  `range_key(rng)` = `"<base.commit>..<tip.commit>"` (at-bounds excluded -
+  model input is commits only); `attempt(rng)` synchronous coalesced
+  generate+persist; `kick(rng, on_done=)` async; `cards_for(rng)` ->
+  validated card list | None (fallback/miss => None); `record(rng)`,
+  `generating(rng)`. Cache `data/tour-cache.json` = `{version, ranges:
+  {key: {status: ok|fallback, cards, error, model, at}}}`, atomic
+  tmp+os.replace, 40-range cap.
+- Feed integration: `build_feed(..., polish=callable)` ->
+  `_collect_window(polish=)`; polished cards REPLACE the deterministic
+  area grouping for claimed commits, keep `area:<stop>:<newest12>` ids,
+  get `"polished": True`; curated fold-ins still override generated text;
+  runs/requests re-filtered against the window's real records; leftovers
+  group deterministically. History re-materialization consults the same
+  cache keyed by the descriptor's stored range.
+- conductor: `tour_ctx(..., devin_argv=)` gains `"devin_argv"`;
+  `_tour_polisher(ctx)` builds one Polisher per serve (None when module
+  absent); `_tour_build` applies `cards_for` + kicks `kick(on_done=
+  invalidate feed)` only when enabled+uncached; payload gains
+  `enrichment: {enabled, status: ok|fallback|generating|pending}`.
+- Everything degrades to deterministic commit-subject cards: disabled,
+  no provider, timeout, malformed/invalid reply, or a persisted fallback
+  record. GET paths never generate inline and never write tour state.
+
 ## Where it stopped
 
-tour-dashboard landed: _DASH_HTML tour button/badge/overlay/walkthrough
-+ tests/test_tour_dash.py (9 node-harness tests; 81/81 tour tests
-green; 42/42 modal/dashboard regression classes green; live :8806
-smoke verified badge + feed + viewed POST). Next: tour-llm-polish -
-optional cached enrichment in data/tour-cache.json keyed by range.
-The UI already renders whatever the feed gives it - no dashboard
-changes needed for enrichment.
+tour-validation picked up the two parked sibling branches: merged
+conductor/.../tour-dashboard (2 _DASH_HTML conflicts: .notice selector
+set + topbar button row, both kept) and conductor/.../tour-llm-polish
+(docs-only conflicts) into this branch so the assembled feature can be
+verified end to end. tour-dashboard landed: _DASH_HTML walkthrough +
+tests/test_tour_dash.py (9 node-harness tests). tour-llm-polish
+landed: tour_polish.py + polish= feed hook + conductor wiring +
+tests/test_tour_polish.py (24 tests; its full-suite failures were
+shared-box flakes per its STATE note).
 
 ## Verification
 

@@ -12852,17 +12852,21 @@ TOUR_FEED_TTL_S = 60.0      # ~60s feed cache: the badge polls /api/state
 
 def tour_ctx(runs_dir: Path, requests_dir: Path | None = None,
              manifests_dir: Path = MANIFESTS_DIR,
-             repo_dir: Path | None = None) -> dict:
+             repo_dir: Path | None = None,
+             devin_argv: list[str] | None = None) -> dict:
     """The dirs the tour reads plus its caches. ``repo_dir`` is the repo
     the change feed runs `git log` on - the conductor checkout itself in
     production (the tour covers THIS tool's changes), a fixture repo in
     tests. The state file sits next to the served runs/ dir, matching
-    tour_state's data/tour-state.json."""
+    tour_state's data/tour-state.json; the OPTIONAL LLM enrichment cache
+    is the sibling tour-cache.json (tour_polish, off unless
+    CONDUCTOR_TOUR_POLISH is set)."""
     return {"repo_dir": Path(repo_dir) if repo_dir is not None else ROOT,
             "runs_dir": runs_dir,
             "requests_dir": requests_dir or runs_dir.parent / "requests",
             "manifests_dir": manifests_dir,
             "state_path": runs_dir.parent / "tour-state.json",
+            "devin_argv": list(devin_argv or ["devin"]),
             "feed": None,     # {"at": epoch, "payload": GET /api/tour body}
             "count": None,    # {"at": epoch, "value": int}
             "busy": False,    # a background build owns the refresh
@@ -12878,28 +12882,68 @@ def _tour_mods():
     return tour_state, tour_feeds
 
 
+def _tour_polisher(ctx: dict):
+    """The ctx's tour_polish.Polisher, built once so its in-flight set
+    coalesces this serve's attempts. None when the module is absent (an
+    old checkout) or init somehow failed - the tour then simply serves
+    deterministic cards forever."""
+    if "polisher" not in ctx:
+        try:
+            import tour_polish                          # noqa: E402
+            ctx["polisher"] = tour_polish.Polisher(
+                cache_path=ctx["state_path"].with_name("tour-cache.json"),
+                repo_dir=ctx["repo_dir"],
+                devin_argv=ctx.get("devin_argv"))
+        except Exception:                                # noqa: BLE001
+            ctx["polisher"] = None
+    return ctx["polisher"]
+
+
 def _tour_build(ctx: dict, *, now: float | None = None) -> dict:
     """One feed build, cached as both the GET payload and the unseen
     count. Pure reads (tour_state.load never writes): nothing on the
-    GET path can mark an entry or move the watermark."""
+    GET path can mark an entry or move the watermark. Optional LLM
+    enrichment applies ONLY from the persisted tour-cache.json (never
+    generated inline); an uncached range kicks one coalesced background
+    attempt that invalidates the cache when it lands."""
     tour_state, tour_feeds = _tour_mods()
     ts = time.time() if now is None else now
+    polisher = _tour_polisher(ctx)
+    polish_on = polisher is not None and polisher.enabled()
     state = tour_state.load(ctx["state_path"])
     boundary = tour_state.capture_boundary(ctx["repo_dir"], now=now)
     feed = tour_feeds.build_feed(
         state, boundary, repo_dir=ctx["repo_dir"],
         runs_dir=ctx["runs_dir"], requests_dir=ctx["requests_dir"],
-        manifests_dir=ctx["manifests_dir"])
+        manifests_dir=ctx["manifests_dir"],
+        polish=polisher.cards_for if polish_on else None)
     payload = {"generated_at": (_iso_from(now) if now is not None
                                 else now_iso()),
                "boundary": feed["boundary"], "range": feed["range"],
                "entries": feed["entries"], "history": feed["history"],
                "unseen_count": feed["unseen_count"],
-               "warnings": feed["warnings"]}
+               "warnings": feed["warnings"],
+               "enrichment": {"enabled": polish_on}}
+    if polish_on:
+        rec = polisher.record(feed["range"])
+        payload["enrichment"]["status"] = (
+            "generating" if polisher.generating(feed["range"])
+            else (rec or {}).get("status") or "pending")
+        if rec is None:
+            polisher.kick(feed["range"],
+                          on_done=lambda _r: _tour_invalidate(ctx))
     with ctx["lock"]:
         ctx["feed"] = {"at": ts, "payload": payload}
         ctx["count"] = {"at": ts, "value": feed["unseen_count"]}
     return payload
+
+
+def _tour_invalidate(ctx: dict) -> None:
+    """A background polish attempt finished (ok or fallback): drop the
+    cached feed so the next poll rebuilds with the outcome instead of
+    waiting out the TTL."""
+    with ctx["lock"]:
+        ctx["feed"] = None
 
 
 def tour_feed(ctx: dict, *, now: float | None = None,
@@ -19656,7 +19700,8 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
     trash_dir = trash_dir or runs_dir.parent / "trash"
     # The 'What's new' tour endpoints share one ctx: its feed/count caches
     # are per-serve so a fixture or second dashboard never sees another's.
-    tour = tour_ctx(runs_dir, requests_dir, manifests_dir, tour_repo)
+    tour = tour_ctx(runs_dir, requests_dir, manifests_dir, tour_repo,
+                    devin_argv=devin_argv)
 
     # The assistant surface: one lazily-opened host runtime per serve
     # process. Errors are cached - a broken provider init degrades to a

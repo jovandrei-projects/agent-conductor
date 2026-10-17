@@ -505,9 +505,15 @@ def _resolve_curated(records: list[dict], commits: list[dict],
 
 def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
                     requests_dir: Path, manifests_dir: Path,
-                    warnings: list[str]) -> list[dict]:
+                    warnings: list[str], polish=None) -> list[dict]:
     """Raw feed entries for one {base,tip} window - no state annotation.
-    Reused by build_feed (live window) and history (stored windows)."""
+    Reused by build_feed (live window) and history (stored windows).
+
+    ``polish`` is an optional callable ``(rng) -> validated card list``
+    (tour_polish.Polisher.cards_for): when it returns cards for this
+    range, its commit groupings replace the deterministic area grouping
+    for the commits they claim; everything else - run/request/follow-up/
+    curated cards, leftover commits - stays deterministic."""
     base, tip = rng.get("base") or {}, rng.get("tip") or {}
     commits, warn = collect_commits(repo_dir, base.get("commit"),
                                     tip.get("commit"))
@@ -638,15 +644,71 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
                 "runs": [launched] if launched else [],
                 "at": rec.get("created_at"), "range": rng})
 
-    # ---- commit cards by area over unclaimed commits
+    # ---- commit cards: validated LLM groupings first (they claim the
+    # commits they name), then deterministic area grouping for the rest.
+    # A polished card keeps the deterministic id scheme
+    # (area:<stop>:<newest-sha>) so persisted viewed/snoozed descriptors
+    # re-resolve identically; curated fold-ins still win over generated
+    # text, and record links are re-filtered against this window's real
+    # records.
+    grouped: set[str] = set()
+    aug_used: set[str] = set()
+    try:
+        polished = polish(rng) if callable(polish) else None
+    except Exception:                                    # noqa: BLE001
+        polished = None         # a broken enrichment hook never breaks
+        #                       # the deterministic feed
+    if polished:
+        free = {c["sha"]: c for c in commits
+                if c["sha"] not in claimed and c["sha"] not in claim_to_run}
+        for card in polished:
+            if not isinstance(card, dict):
+                continue
+            stop, title, blurb = (card.get("stop"), card.get("title"),
+                                  card.get("blurb"))
+            if not isinstance(stop, str) or not stop \
+                    or not isinstance(title, str) \
+                    or not isinstance(blurb, str):
+                continue
+            want = {s for s in (card.get("commits") or [])
+                    if isinstance(s, str)}
+            cs = [c for c in commits
+                  if c["sha"] in want and c["sha"] in free
+                  and c["sha"] not in grouped]
+            if not cs:
+                continue
+            grouped.update(c["sha"] for c in cs)
+            aug = augments.get(stop) if stop != "records" \
+                and stop not in aug_used else None
+            if aug:
+                aug_used.add(stop)
+            tag = card.get("tag")
+            entries.append({
+                "id": f"area:{stop}:{cs[0]['sha'][:_CARD_KM]}",
+                "kind": "change", "stop": stop,
+                "title": (aug["title"] if aug and aug["title"]
+                          else _short(title, _TITLE_MAX)),
+                "blurb": aug["blurb"] if aug
+                         else _short(blurb, _BLURB_MAX),
+                "tag": _card_tag(cs, (aug["tag"] if aug else
+                                      (tag if tag in TAGS else None))),
+                "commits": [{"sha": c["sha"], "subject": c["subject"]}
+                            for c in cs],
+                "runs": [r for r in (card.get("runs") or [])
+                         if r in win_runs],
+                "requests": [r for r in (card.get("requests") or [])
+                             if r in win_reqs],
+                "at": cs[0]["at"], "range": rng, "polished": True})
     groups: dict[str, list[dict]] = {}
     for c in commits:
-        if c["sha"] in claimed or c["sha"] in claim_to_run:
+        if c["sha"] in claimed or c["sha"] in claim_to_run \
+                or c["sha"] in grouped:
             continue
         groups.setdefault(_commit_area(c["subject"], c["files"]),
                           []).append(c)
     for area, cs in groups.items():
-        aug = augments.get(area) if area != "records" else None
+        aug = augments.get(area) if area != "records" \
+            and area not in aug_used else None
         subjects = [c["subject"] for c in cs]
         title = (aug["title"] if aug and aug["title"]
                  else (_short(subjects[0], _TITLE_MAX) if len(cs) == 1
@@ -709,19 +771,25 @@ def build_feed(state: dict | None = None, boundary: dict | None = None,
                runs_dir: Path = DEFAULT_RUNS_DIR,
                requests_dir: Path = DEFAULT_REQUESTS_DIR,
                manifests_dir: Path = DEFAULT_MANIFESTS_DIR,
-               now: float | None = None) -> dict:
+               now: float | None = None, polish=None) -> dict:
     """The full tour feed for the current watermark + boundary.
 
     ``entries`` = window cards plus re-injected snoozed/unviewed
     descriptors (each annotated with its persisted state); ``history`` =
     re-materialized viewed cards; ``unseen_count`` = entries still
-    'new'. Pure reads only - nothing here mutates persisted state."""
+    'new'. Pure reads only - nothing here mutates persisted state.
+
+    ``polish`` is an optional ``(rng) -> cards|None`` hook (the tour
+    enrichment cache, tour_polish.Polisher.cards_for): it is consulted
+    per window - including the stored ranges history re-materializes -
+    so polished cards reproduce the same ids a descriptor recorded."""
     state = state or {"watermark": None, "viewed": [], "snoozed": []}
     boundary = boundary or tour_state.capture_boundary(repo_dir, now=now)
     rng = tour_state.feed_range(state, boundary)
     warnings: list[str] = []
     kw = dict(repo_dir=repo_dir, runs_dir=runs_dir,
-              requests_dir=requests_dir, manifests_dir=manifests_dir)
+              requests_dir=requests_dir, manifests_dir=manifests_dir,
+              polish=polish)
 
     wm_status = tour_state.watermark_status(state, repo_dir)
     base_commit = rng["base"].get("commit")
