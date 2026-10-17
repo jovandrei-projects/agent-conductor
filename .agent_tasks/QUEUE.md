@@ -27,6 +27,18 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-17 (resolve-obs-merge-telemetry, merge resolution): unioned
+  `obs-merge-telemetry` onto master (merge 89c7b3a) - the dashboard
+  power/themed-dialogs batch meets deferred-merge-controls. conductor.py
+  kept BOTH `_pending_merge_view` and `serve_safety`/`_respawn_serve`
+  (adjacent additions), the run-modal merge handler keeps HEAD's
+  ticked-selection flow with its remaining native confirm/alert rerouted
+  through `askConfirm`/`showAlert`, the task-modal kv list keeps HEAD's
+  merge-target/deferred rows plus the new `last update` row, and
+  `cmd_serve` combines the step-leased port fallback with `--wait-port` -
+  `args.port` is stamped with the resolved port before `serve_args` so a
+  respawn can never argparse-fail on `--port None`. QUEUE.md kept both
+  DONE bullets. 74 targeted tests green on the merge seam classes.
 - DONE 2026-10-17 (resolve-follow-up-plan, merge resolution): unioned
   `conductor/20261016-013719-workflow-ux-safety/follow-up-plan` onto
   master (merge 4d42238) - the workflow-ux-safety run's closing review
