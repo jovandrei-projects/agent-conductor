@@ -129,7 +129,10 @@ var S = {
   pollXid: null,
   pinBottom: true,
   lastFocus: null,
-  ctxEnv: null                 // last computed next-question envelope
+  ctxEnv: null,                // last computed next-question envelope
+  attach: [],                  // pending uploads for the CURRENT conv
+  pendAtt: {},                 // conv id -> stashed pending uploads
+  dict: null                   // live dictation {rec,base,final} or null
 };
 
 var TERMINAL = { done: 1, partial: 1, error: 1, cancelled: 1 };
@@ -294,11 +297,26 @@ function msgHtml(m) {
         ? ' <span class="aim-st err" title="this answer ran with ' +
           'mutations allowed">rw</span>' : '');
   }
+  var atts = thaw(m.attachments);
+  var attHtml = '';
+  if (m.role === 'user' && atts && atts.length) {
+    /* previews come back through the id-gated binary route - the raw
+       path stays server-side and the reopened conversation keeps its
+       image references + thumbnails */
+    attHtml = '<div class="aim-ats">' + atts.map(function (a) {
+      var url = API + '/attachments/' + encodeURIComponent(a.id || '');
+      return '<a class="aim-at" href="' + url + '" target="_blank" ' +
+        'rel="noopener" title="' + esc(a.name || 'image') + '">' +
+        '<img src="' + url + '" alt="' + esc(a.name || 'image') + '"' +
+        ' loading="lazy"></a>';
+    }).join('') + '</div>';
+  }
   h += '<div class="aim ' + role + '" data-mid="' + esc(m.id) + '">' +
     '<div class="aim-meta">' + meta + '</div>' +
     '<div class="aim-body">' +
     (m.role === 'user'
-      ? '<p>' + esc(m.text).replace(/\n/g, '<br>') + '</p>'
+      ? (m.text ? '<p>' + esc(m.text).replace(/\n/g, '<br>') + '</p>'
+                : '') + attHtml
       : renderReply(m, xa)) +
     '</div>';
   if (xa && xa.sources && xa.sources.length) {
@@ -441,6 +459,7 @@ function paint() {
       list.innerHTML = S.msgs.map(msgHtml).join('');
     if (wasBottom) list.scrollTop = list.scrollHeight;
   }
+  paintAtt();
   syncView();
 }
 
@@ -481,6 +500,24 @@ async function loadConv(id) {
   if (!out.conversation) throw new Error('conversation not found');
   S.conv = out.conversation;
   S.msgs = out.items || [];
+  /* slots pushed into S.attach during the load window belong to OTHER
+     conversations (their ensureConv created its own) - re-park them
+     before the restore's stash comes back, and keep the conv filter
+     so a foreign slot can never surface on the wrong thread */
+  S.attach.forEach(function (a) {
+    if (a.conv && a.conv !== id &&
+        (S.pendAtt[a.conv] = S.pendAtt[a.conv] || []).indexOf(a) < 0)
+      S.pendAtt[a.conv].push(a);
+  });
+  var foreign = S.attach.filter(function (a) {
+    return a.conv && a.conv !== id;
+  });
+  var keep = S.attach.filter(function (a) {
+    return foreign.indexOf(a) < 0;
+  });
+  S.attach = (S.pendAtt[id] || []).filter(function (a) {
+    return !a.conv || a.conv === id;
+  }).concat(keep);
   store('ac-ai-conv', convId());
   var ta = byId('ai-text');
   if (ta) ta.value = store(draftKey()) || '';
@@ -535,7 +572,25 @@ async function loadActions() {
 async function send() {
   var ta = byId('ai-text');
   var text = ta ? ta.value.trim() : '';
-  if (!text || S.sending) return;
+  /* only ids already uploaded under THIS conversation bind - a slot
+     that migrated to another conv's stash is never sent here */
+  var ready = S.attach.filter(function (a) {
+    return a.id && (!a.conv || !convId() || a.conv === convId());
+  });
+  if (S.sending) return;
+  if (S.attach.some(function (a) { return a.status === 'uploading'; })) {
+    note('Image uploads are still in flight - send in a moment.',
+         false);
+    return;
+  }
+  if (S.attach.some(function (a) { return a.status === 'error'; })) {
+    note('An image failed to upload - remove it (\u00d7) or re-attach ' +
+         'before sending.');
+    return;
+  }
+  if (!text && !ready.length) return;
+  teardownDict();              // the box clears; the recording must not
+                               // keep writing into the next draft
   S.sending = true;
   setSendState();
   note('');
@@ -545,7 +600,8 @@ async function send() {
     var cmid = uid('m');
     var out = await aapi('POST',
       '/conversations/' + encodeURIComponent(conv.id) + '/messages',
-      { text: text, client_msg_id: cmid, client_ctx: curCtx() });
+      { text: text, client_msg_id: cmid, client_ctx: curCtx(),
+        attachments: ready.map(function (a) { return a.id; }) });
     /* the returned pair joins the local list; dedupe by id/client_msg_id
        keeps a re-send from double-showing */
     var um = out.message || out.user_message;
@@ -560,6 +616,9 @@ async function send() {
     if (x && um) S.exch[um.id] = x;
     if (x && am) S.exchByAid[am.id] = x;
     if (ta) { ta.value = ''; }
+    S.attach = [];
+    if (convId()) S.pendAtt[convId()] = [];
+    paintAtt();
     store(draftKey(), '');
     S.pinBottom = true;
     paint();
@@ -616,7 +675,14 @@ async function pollX(xid) {
       statusLine(x.status === 'done' ? 'Reply received'
         : x.status === 'cancelled' ? 'Reply stopped'
         : 'Reply failed');
-      if (x.status === 'error') note('Reply failed: ' + (x.error || '?'));
+      if (x.status === 'error') {
+        var etxt = String(x.error || '?');
+        note('Reply failed: ' + etxt +
+          (/image attachment refused|no verified image support/i
+            .test(etxt)
+            ? ' - open settings (the model name in the header) to pick ' +
+              'a vision-capable model' : ''));
+      }
       loadConvs(); refreshUsage(); loadActions();
       setSendState();
       paint();
@@ -632,6 +698,267 @@ async function stopReply() {
   try { await aapi('POST', '/exchanges/' + encodeURIComponent(xid) +
     '/cancel'); }
   catch (e) { note('Stop failed: ' + (e.message || e)); }
+}
+
+/* ------------------------------------------------------ attachments */
+var ATT_MAX_BYTES = 20 * 1024 * 1024;    // mirrors the server cap
+var ATT_PER_MSG = 20;
+
+function stashAttach() {
+  /* park pending uploads under the conversation each one belongs to -
+     server-side rows are conv-scoped, so they can never ride along to
+     a different chat; they come back via loadConv when their own
+     conversation does. Unresolved slots (ensureConv still in flight)
+     park with the conv that was visible at stash time - once their
+     upload resolves, the migrate step re-parks them correctly */
+  var cur = convId();
+  S.attach.forEach(function (a) {
+    var cid = a.conv || cur;
+    if (cid)
+      (S.pendAtt[cid] = S.pendAtt[cid] || []).push(a);
+  });
+  S.attach = [];
+}
+
+function paintAtt() {
+  var el = byId('ai-ats');
+  if (!el) return;
+  el.hidden = !S.attach.length;
+  el.innerHTML = S.attach.map(function (a, i) {
+    var inner;
+    if (a.status === 'uploading')
+      inner = '<span class="ai-at-msg">uploading\u2026</span>';
+    else if (a.status === 'error')
+      inner = '<span class="ai-at-msg err">upload failed</span>';
+    else
+      inner = '<img src="' + API + '/attachments/' +
+        encodeURIComponent(a.id) + '" alt="' +
+        esc(a.name || 'image') + '">';
+    return '<span class="ai-at' + (a.status ? ' ' + a.status : '') +
+      '">' + inner + '<button type="button" data-ai-atrm="' + i + '" ' +
+      'aria-label="Remove ' + esc(a.name || 'image') + '" ' +
+      'title="Remove attachment">\u00d7</button></span>';
+  }).join('');
+}
+
+function removeAtt(i) {
+  /* removal only drops the pending reference: the server row stays
+     orphaned under its conversation (message_id never set) - same
+     tolerance as the request form, no delete endpoint needed */
+  S.attach.splice(i, 1);
+  paintAtt();
+}
+
+async function uploadAtt(file) {
+  var slot = { id: null, name: file.name ||
+    ('pasted-' + Date.now().toString(36) +
+      ((String(file.type || '').split('/')[1]) || 'png')
+      .replace(/[^a-z0-9]/gi, '') + '.png'),
+    ctype: file.type || '', bytes: file.size || 0,
+    status: 'uploading', conv: null };
+  S.attach.push(slot);
+  paintAtt();
+  statusLine('Uploading image');
+  try {
+    /* uploads are conversation-scoped - attaching before the first
+       send materializes the conversation now so the file can never
+       land on the wrong thread */
+    var conv = await ensureConv();
+    slot.conv = conv.id;
+    /* the slot is scoped to ITS conv - if the visible thread moved on
+       while this upload was in flight (a switch, or a still-running
+       restore whose loadConv already replaced S.attach), park it under
+       its own conv's stash instead of leaving it on the wrong thread */
+    if (convId() !== conv.id || S.attach.indexOf(slot) < 0) {
+      var i = S.attach.indexOf(slot);
+      if (i >= 0) S.attach.splice(i, 1);
+      var target = S.pendAtt[conv.id] = S.pendAtt[conv.id] || [];
+      if (target.indexOf(slot) < 0) target.push(slot);
+      paintAtt();
+    }
+    var out = await aapi('POST',
+      '/attachments?conversation=' + encodeURIComponent(conv.id) +
+      '&ref=' + encodeURIComponent(uid('att')), file, true);
+    slot.id = out.id;
+    slot.name = out.name || slot.name;
+    slot.ctype = out.ctype || slot.ctype;
+    slot.bytes = out.bytes;
+    slot.status = '';
+    statusLine('Image attached');
+  } catch (e) {
+    slot.status = 'error';
+    note('Image upload failed: ' + (e.message || e));
+    statusLine('Image upload failed');
+  }
+  paintAtt();
+}
+
+function attachFiles(files) {
+  files = Array.prototype.slice.call(files || []);
+  var picked = [], skipped = [];
+  files.forEach(function (f) {
+    var t = String((f && f.type) || '');
+    if (t.indexOf('image/') !== 0)
+      skipped.push((f && f.name) || 'a non-image file');
+    else if (f.size > ATT_MAX_BYTES)
+      skipped.push(((f && f.name) || 'an image') + ' (over 20 MB)');
+    else picked.push(f);
+  });
+  if (skipped.length)
+    note('Skipped: ' + skipped.join(', ') +
+         ' - only PNG/JPEG/GIF/WebP/BMP images up to 20 MB attach.');
+  var room = ATT_PER_MSG - S.attach.length;
+  if (picked.length > room) {
+    note('At most ' + ATT_PER_MSG + ' images per message - the extra ' +
+         'ones were skipped.');
+    picked = picked.slice(0, room);
+  }
+  if (!picked.length) return;
+  /* honest heads-up when the catalog is loaded AND says the current
+     family lacks verified vision; the server still makes the call at
+     dispatch (catalog absent = no warning, never a fake verdict) */
+  var fam = S.conv ? S.conv.model : (S.defaults || {}).model;
+  var ent = fam && famEntry(fam);
+  if (S.catalog && fam && ent && ent.vision !== true)
+    note('Heads-up: ' + fam + ' has no verified image support - the ' +
+         'reply may refuse these images; assistant settings lists ' +
+         'vision-capable models.', false);
+  picked.forEach(uploadAtt);
+}
+
+/* ------------------------------------------------------- dictation */
+function micCtor() {
+  var w = (typeof window !== 'undefined') ? window : {};
+  return w.SpeechRecognition || w.webkitSpeechRecognition || null;
+}
+
+function dictUI() {
+  var b = byId('ai-mic');
+  if (!b) return;
+  var on = !!S.dict, avail = !!micCtor();
+  b.className = 'ai-cbtn' + (on ? ' rec' : '') + (avail ? '' : ' na');
+  b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  if (on) {
+    b.title = 'Stop dictation - the transcript stays editable';
+    statusLine('Listening - click the mic again to stop');
+  } else {
+    b.title = avail
+      ? 'Dictate into the text box - audio is processed by your ' +
+        'browser\u2019s speech service; words land as editable text ' +
+        'and are never sent automatically'
+      : 'Dictation unavailable - this browser has no speech ' +
+        'recognition (Chrome, Edge and Safari support it; Firefox ' +
+        'does not)';
+  }
+}
+
+function startDict() {
+  if (S.dict) {                       // explicit stop: results still in
+    var d0 = S.dict;                  // flight may land, then onend
+    d0.stopping = true;               // clears state
+    try { d0.rec.stop(); } catch (e) { S.dict = null; }
+    dictUI();
+    return;
+  }
+  var Ctor = micCtor();
+  if (!Ctor) {
+    note('Voice input is not available in this browser - speech ' +
+         'recognition works in Chrome, Edge and Safari but not here. ' +
+         'The microphone stays off.', false);
+    return;
+  }
+  var rec;
+  try { rec = new Ctor(); }
+  catch (e) {
+    note('Could not start speech recognition: ' + (e.message || e));
+    return;
+  }
+  var ta = byId('ai-text');
+  var base = ta ? String(ta.value) : '';
+  if (base && !/\s$/.test(base)) base += ' ';
+  var d = { rec: rec, base: base, final: '', stopping: false };
+  S.dict = d;
+  rec.continuous = true;
+  rec.interimResults = true;
+  /* interim + final results rewrite only the dictated TAIL of the box
+     (base + final + interim) - text the user typed stays untouched and
+     everything remains editable until they send it themselves */
+  rec.onresult = function (ev) {
+    if (S.dict !== d) return;
+    var fin = '', inter = '';
+    var res = ev.results || [];
+    for (var i = ev.resultIndex || 0; i < res.length; i++) {
+      var r = res[i];
+      var t = (r[0] && r[0].transcript) || '';
+      if (r.isFinal) fin += t; else inter += t;
+    }
+    /* engines differ on whether transcripts arrive with their own
+       spacing - join segments on a boundary so words can never fuse */
+    if (fin) {
+      if (d.final && !/\s$/.test(d.final) && !/^\s/.test(fin))
+        d.final += ' ';
+      d.final += fin;
+    }
+    var tail = d.final;
+    if (inter) {
+      if (tail && !/\s$/.test(tail) && !/^\s/.test(inter)) tail += ' ';
+      tail += inter;
+    }
+    var t2 = byId('ai-text');
+    if (t2) {
+      t2.value = d.base + tail;
+      store(draftKey(), t2.value);
+    }
+  };
+  rec.onerror = function (ev) {
+    var e = ev && ev.error;
+    if (!e || e === 'aborted' || S.dict !== d) return;
+    var known = {
+      'not-allowed': 'Microphone permission denied - allow microphone ' +
+        'access for this page to dictate.',
+      'service-not-allowed': 'Microphone permission denied - allow ' +
+        'microphone access for this page to dictate.',
+      'audio-capture': 'No microphone was found on this device.',
+      'network': 'The browser\u2019s speech service is unreachable - ' +
+        'dictation audio is processed externally and needs that ' +
+        'connection.'
+    };
+    if (e === 'no-speech')
+      note('No speech was detected - dictation stopped.', false);
+    else note(known[e] || ('Dictation error: ' + e));
+    teardownDict();
+  };
+  rec.onend = function () {
+    if (S.dict === d) { S.dict = null; dictUI(); }
+  };
+  try { rec.start(); }
+  catch (e) {
+    S.dict = null;
+    dictUI();
+    note('Could not start dictation: ' + (e.message || e));
+    return;
+  }
+  dictUI();
+  /* external-processing disclosure, once per tab; Web Speech hands
+     audio to the browser vendor's service - we never see or store the
+     recording, only the transcript */
+  if (!sessStore('ac-ai-dict-note')) {
+    sessStore('ac-ai-dict-note', '1');
+    note('Dictation is on. Audio is processed by your browser\u2019s ' +
+         'speech service (for Chrome/Edge that is the vendor\u2019s ' +
+         'cloud service). Words land in the box as editable text - ' +
+         'nothing sends automatically and no audio is stored here.',
+         false);
+  }
+}
+
+function teardownDict() {
+  var d = S.dict;
+  S.dict = null;                    // late results die with the state
+  if (d && d.rec) {                 // reference, never the textarea
+    try { d.rec.abort(); } catch (e) {}
+  }
+  dictUI();
 }
 
 /* ---------------------------------------------------------- settings */
@@ -936,6 +1263,8 @@ function toggleChat() {
   else minimize();
 }
 function minimize() {
+  teardownDict();                // the mic never keeps recording into
+                                 // a closed composer
   S.mode = 'closed';
   store('ac-ai-open', '');
   applyMode();
@@ -948,9 +1277,13 @@ function setExpanded(on) {
 
 function openConv(id) {
   if (id === convId()) return;
-  /* the composer draft is per-conversation - stash before switching */
+  /* the composer draft AND pending uploads are per-conversation -
+     stash both before switching (uploads are conv-scoped server-side,
+     so they can only ever rejoin their own conversation) */
+  teardownDict();
   var ta = byId('ai-text');
   if (ta) store(draftKey(), ta.value);
+  stashAttach();
   S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
   S.usage = null; S.actions = {};
   S.pollXid = null;                    // orphan the old conv's poller
@@ -961,8 +1294,10 @@ function openConv(id) {
 }
 
 function newConv() {
+  teardownDict();
   var ta = byId('ai-text');
   if (ta) store(draftKey(), ta.value);   // stash before switching
+  stashAttach();
   S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
   S.usage = null; S.actions = {};
   S.pollXid = null;                    // the previous conv's poller dies
@@ -1011,14 +1346,39 @@ function injectDom() {
       '</div>' +
     '</div>' +
     '<div class="ai-compose">' +
-      '<textarea id="ai-text" rows="2" maxlength="90000" ' +
-        'aria-label="Message the assistant" ' +
-        'placeholder="Ask about this view\u2026"></textarea>' +
-      '<button type="button" id="ai-send" class="ai-send" ' +
-        'title="Send (Enter; Shift+Enter adds a newline)">Send</button>' +
-      '<button type="button" id="ai-stop" class="ai-stop" hidden ' +
-        'aria-label="Stop the reply" title="Stop the reply">' +
-        '\u25a0</button>' +
+      '<div class="ai-cwrap">' +
+        '<div id="ai-ats" class="ai-ats" hidden></div>' +
+        '<textarea id="ai-text" rows="2" maxlength="90000" ' +
+          'aria-label="Message the assistant" ' +
+          'placeholder="Ask about this view\u2026"></textarea>' +
+      '</div>' +
+      '<div class="ai-cbtns">' +
+        '<button type="button" id="ai-attach" class="ai-cbtn" ' +
+          'aria-label="Attach images" ' +
+          'title="Attach an image - or paste one straight into the ' +
+          'text box"><svg viewBox="0 0 24 24" width="15" height="15" ' +
+          'fill="none" stroke="currentColor" stroke-width="2" ' +
+          'stroke-linecap="round" stroke-linejoin="round" ' +
+          'aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 ' +
+          '01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 ' +
+          '01-2.83-2.83l8.49-8.48"/></svg></button>' +
+        '<button type="button" id="ai-mic" class="ai-cbtn" ' +
+          'aria-pressed="false" aria-label="Dictate into the text box" ' +
+          'title="Dictate into the text box"><svg viewBox="0 0 24 24" ' +
+          'width="15" height="15" fill="none" stroke="currentColor" ' +
+          'stroke-width="2" stroke-linecap="round" ' +
+          'stroke-linejoin="round" aria-hidden="true"><path d="M12 1a3 ' +
+          '3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 ' +
+          '7 0 01-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/>' +
+          '<line x1="8" y1="23" x2="16" y2="23"/></svg></button>' +
+        '<button type="button" id="ai-send" class="ai-send" ' +
+          'title="Send (Enter; Shift+Enter adds a newline)">Send</button>' +
+        '<button type="button" id="ai-stop" class="ai-stop" hidden ' +
+          'aria-label="Stop the reply" title="Stop the reply">' +
+          '\u25a0</button>' +
+      '</div>' +
+      '<input type="file" id="ai-file" accept="image/*" multiple ' +
+        'hidden aria-hidden="true" tabindex="-1">' +
     '</div>' +
     '<div id="ai-status" class="ai-sr" aria-live="polite"></div>' +
     '</div>' +
@@ -1068,6 +1428,14 @@ function bind() {
       var el;
       if ((el = t.closest('#ai-send'))) { send(); return; }
       if ((el = t.closest('#ai-stop'))) { stopReply(); return; }
+      if ((el = t.closest('#ai-attach'))) {
+        var fi = byId('ai-file');
+        if (fi && fi.click) fi.click();
+        return;
+      }
+      if ((el = t.closest('#ai-mic'))) { startDict(); return; }
+      if ((el = t.closest('[data-ai-atrm]'))) {
+        removeAtt(+el.getAttribute('data-ai-atrm')); return; }
       if ((el = t.closest('#ai-min'))) { minimize(); return; }
       if ((el = t.closest('#ai-size'))) {
         setExpanded(S.mode !== 'expanded'); return; }
@@ -1112,12 +1480,40 @@ function bind() {
         list.scrollHeight - 30;
     });
     var ta = byId('ai-text');
-    if (ta) ta.addEventListener('keydown', function (e) {
-      if (e.key === 'Enter' && !e.shiftKey) {
+    if (ta) {
+      ta.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          e.stopPropagation();
+          send();
+        }
+      });
+      /* paste carries two payloads: FILE items go through attachFiles
+         (images upload, everything else is skipped with a note - the
+         default paste is suppressed only once a file is present), and
+         a clipboard without files falls through to the browser's
+         normal text paste untouched */
+      ta.addEventListener('paste', function (e) {
+        var cd = e.clipboardData;
+        if (!cd || !cd.items) return;
+        var files = [];
+        for (var i = 0; i < cd.items.length; i++) {
+          var it = cd.items[i];
+          if (it && it.kind === 'file' && it.getAsFile) {
+            var f = it.getAsFile();
+            if (f) files.push(f);
+          }
+        }
+        if (!files.length) return;
         e.preventDefault();
-        e.stopPropagation();
-        send();
-      }
+        attachFiles(files);
+      });
+    }
+    var fi = byId('ai-file');
+    if (fi) fi.addEventListener('change', function (e) {
+      attachFiles(e.target && e.target.files);
+      try { e.target.value = ''; }   // re-picking the same file refires
+      catch (e2) {}
     });
   }
   var setw = byId('aisetwrap');
@@ -1162,6 +1558,7 @@ function init() {
   var mode = store('ac-ai-open');
   var dask = byId('dask');
   if (dask) dask.hidden = false;
+  dictUI();                       // paint the mic's real availability
   if (mode === 'compact' || mode === 'expanded') {
     openChat(mode);
     var ta = byId('ai-text');
@@ -1180,7 +1577,8 @@ var AskAI = {
   compact: function () { setExpanded(false); },
   openSettings: openSettings, nav: navSrc, send: send,
   ctx: curCtx, ctxLabel: ctxLabel, syncView: syncView,
-  _s: S, _paint: paint, _aapi: aapi,
+  _s: S, _paint: paint, _aapi: aapi, _paintAtt: paintAtt,
+  _attachFiles: attachFiles, _dictUI: dictUI,
   _msgHtml: msgHtml, _settingsForm: settingsForm
 };
 if (typeof window !== 'undefined') {

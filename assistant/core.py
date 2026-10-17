@@ -31,6 +31,8 @@ TITLE_MAX = 120
 HISTORY_PAGE_MAX = 200
 CONV_PAGE_MAX = 100
 MODEL_HISTORY_CHARS = 24_000  # default digest budget; storage keeps all
+ATTACH_PER_MESSAGE_MAX = 20   # same bound as the host request form
+ATTACH_PER_CONV_MAX = 200     # uploads are never deleted; bound the pile
 
 SETTINGS_KEYS = ("model", "effort", "fast", "readonly")
 SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -408,13 +410,18 @@ class AssistantCore:
     def _bind_attachments(self, conn, conv_id: str, ids: list) -> list[dict]:
         """Resolve client-supplied attachment ids to row refs for the
         message's attachments JSON."""
-        if not isinstance(ids, list) or len(ids) > 20:
-            raise AssistantError("attachments must be a list of ids")
+        if not isinstance(ids, list) or len(ids) > ATTACH_PER_MESSAGE_MAX:
+            raise AssistantError(
+                f"attachments must be a list of at most "
+                f"{ATTACH_PER_MESSAGE_MAX} ids")
         rows = []
         for aid in ids:
             att = self.store.get_attachment(str(aid))
             if att is None or att["conversation_id"] != conv_id:
                 raise AssistantError("Attachment not found", 404)
+            if att["message_id"]:
+                raise AssistantError(
+                    "Attachment is already bound to a message", 409)
             rows.append({"id": att["id"], "name": att["name"],
                          "path": att["path"], "ctype": att["ctype"],
                          "bytes": att["bytes"]})
@@ -730,7 +737,10 @@ class AssistantCore:
                     client_ref=None) -> dict:
         """Validate + persist image bytes through the host's saver, then
         record the reference. `client_ref` dedupes a retried upload; the
-        stored path must resolve under the host's attachments dir."""
+        stored path must resolve under the host's attachments dir. The
+        saver is authoritative on empties/size/magic bytes - its errors
+        keep their HTTP status through the AssistantError translation so
+        the host's RequestError never leaks across the seam."""
         self._conv(conv_id)
         if self._save_attach is None:
             raise AssistantError("Attachments not configured", 409)
@@ -739,8 +749,19 @@ class AssistantCore:
                                                      str(client_ref)[:128])
             if have:
                 return dict(have, deduped=True)
+        if len(self.store.list_attachments(conv_id)) \
+                >= ATTACH_PER_CONV_MAX:
+            raise AssistantError(
+                f"This conversation already has {ATTACH_PER_CONV_MAX} "
+                "attachments", 409)
         self._guarded(self.store.path.parent)
-        saved = self._save_attach(bytes(data))   # host raises on bad input
+        try:
+            saved = self._save_attach(bytes(data))  # host validates bytes
+        except AssistantError:
+            raise
+        except Exception as exc:                 # noqa: BLE001 - host's own
+            raise AssistantError(                # error type stays outside
+                str(exc), getattr(exc, "status", 400)) from exc
         path = Path(saved["path"]).resolve()
         if self._attach_dir and not path.is_relative_to(
                 self._attach_dir.resolve()):
@@ -754,6 +775,31 @@ class AssistantCore:
         with self.store.txn() as conn:
             self.store.insert_attachment(conn, rec)
         return self.store.get_attachment(rec["id"])
+
+    def read_upload(self, att_id: str) -> tuple[bytes, str]:
+        """Serve stored attachment bytes back for previews. Authorization
+        is the row itself: the id must exist (ID_RE is the lookup
+        boundary), its conversation must still exist, and the recorded
+        path must resolve under the host's attachments dir - the client
+        never hands us a filesystem path. Only image/* (or octet-stream
+        for rows that predate ctype recording) is ever returned, so a
+        tampered row can't turn this into an HTML-serving endpoint."""
+        att = self.store.get_attachment(att_id)
+        if att is None:
+            raise AssistantError("Attachment not found", 404)
+        self._conv(att["conversation_id"])
+        path = Path(att["path"]).resolve()
+        if self._attach_dir and not path.is_relative_to(
+                self._attach_dir.resolve()):
+            raise AssistantError("Attachment path outside attachments dir")
+        try:
+            data = path.read_bytes()
+        except OSError:
+            raise AssistantError("Attachment data is missing", 404)
+        ctype = str(att.get("ctype") or "")
+        if not ctype.startswith("image/"):
+            ctype = "application/octet-stream"
+        return data, ctype
 
     # ------------------------------------------------------------ actions
     def propose_action(self, conv_id: str, kind: str, payload: dict, *,
