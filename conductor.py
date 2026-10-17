@@ -13756,6 +13756,66 @@ a { color:#58a6ff; text-decoration:none; }
 #powerbox .actions #pw-cancel { margin-right:auto; }
 #powerbox .actions .btn.danger:hover:not(:disabled) { border-color:#f85149; }
 #pwstat { margin-top:10px; min-height:15px; }
+/* 'What's new' tour - a Driver.js-style spotlight with no library.
+   #tourring's oversized box-shadow IS the page dim: its transparent
+   center lets the anchor show through lit while everything else darkens
+   (a ring stacked under a plain dim layer could never cut the hole).
+   A card with no usable anchor gets the wrap's own dim + centering.
+   z 60 sits above the details modal (50/51) but below the themed
+   confirm/power dialogs (70); while a modal is open .suspended drops
+   the whole layer so the dialog owns the screen, and closing it resumes
+   the same card. */
+#tourwrap { position:fixed; inset:0; z-index:60; }
+#tourwrap.dim { background:rgba(0,0,0,.55); }
+#tourwrap.suspended { display:none; }
+#tourring { position:fixed; border:2px solid #58a6ff; border-radius:10px;
+  box-shadow:0 0 0 9999px rgba(0,0,0,.55); pointer-events:none;
+  box-sizing:border-box; }
+#tourring::after { content:''; position:absolute; inset:-4px;
+  border:2px solid #58a6ff; border-radius:12px;
+  animation:tourpulse 1.6s ease-out infinite; }
+@keyframes tourpulse { 0% { transform:scale(1); opacity:.8; }
+  100% { transform:scale(1.22); opacity:0; } }
+@media (prefers-reduced-motion: reduce) {
+  #tourring::after { animation:none; } }
+#tourcard { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%);
+  width:min(440px,92vw); max-height:82vh; overflow:auto;
+  background:#161b22; border:1px solid #30363d; border-radius:10px;
+  padding:16px 18px; font-size:13px; box-sizing:border-box;
+  box-shadow:0 12px 36px rgba(0,0,0,.5); }
+#tourcard.anchored { transform:none; }
+#tourcard .tpos { color:#8b949e; font-size:11px; text-transform:uppercase;
+  letter-spacing:.06em; }
+#tourcard h3 { margin:4px 40px 8px 0; font-size:14px; }
+#tourcard .ttag { display:inline-block; border:1px solid; border-radius:9px;
+  padding:0 8px; font-size:11px; }
+#tourcard .tblurb { color:#c9d1d9; margin:9px 0; white-space:pre-wrap;
+  overflow-wrap:anywhere; }
+#tourcard .tsec { color:#8b949e; font-size:11px; font-weight:600;
+  text-transform:uppercase; letter-spacing:.05em; margin:10px 0 3px; }
+#tourcard .tlist { margin:2px 0 0; padding-left:18px; color:#8b949e;
+  font-size:12px; max-height:120px; overflow:auto; }
+#tourcard .tlist code { background:#0d1117; border-radius:4px;
+  padding:0 4px; margin-right:2px; }
+#tourcard .trel .chip { margin:0 6px 4px 0; }
+#tourcard .trel .chip:hover { border-color:#58a6ff; }
+#tourcard .tactions { display:flex; gap:8px; align-items:center;
+  margin-top:14px; padding-top:12px; border-top:1px solid #21262d; }
+#tourcard .tactions .tgap { flex:1; }
+#tourcard .tourhist { margin-top:12px; }
+#tourcard .tourhist > summary { color:#8b949e; font-size:12px;
+  cursor:pointer; }
+#tourcard .thist { display:block; width:100%; text-align:left;
+  background:none; border:0; border-top:1px solid #161b22; color:#e6edf3;
+  font:inherit; font-size:12px; padding:5px 2px; cursor:pointer; }
+#tourcard .thist:hover { color:#58a6ff; }
+#tourcard .thist .sub { float:right; font-size:11px; }
+#tour-btn .tbadge { display:inline-block; margin-left:7px; padding:0 6px;
+  border-radius:9px; background:#1f6feb; color:#fff; font-size:11px;
+  line-height:15px; vertical-align:1px; }
+#tour-btn .tbadge::before { content:''; display:inline-block; width:6px;
+  height:6px; border-radius:50%; background:#7ee787; margin-right:4px;
+  vertical-align:1px; }
 #detail { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); width:min(780px,92vw); max-height:82vh; background:#161b22; border:1px solid #30363d; border-radius:10px; padding:18px 22px; overflow:auto; z-index:51; font-size:13px; box-sizing:border-box; }
 #detail h3 { margin:0 170px 10px 0; font-size:14px; }
 #detail .kv { display:grid; grid-template-columns:96px 1fr; gap:4px 12px; }
@@ -14002,10 +14062,10 @@ td :is(a,button):focus-visible { outline-offset:-2px; }
 #detail .mpop .mnone { color:#6e7681; font-size:11px; font-style:italic;
   padding:4px 10px; }
 #detail .actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:16px 0 0; }
-#detail .notice, #powerbox .notice { color:#8b949e; background:#0d1117; border-left:3px solid #30363d; padding:8px 10px; margin:10px 0; }
-#detail .notice.warn, #powerbox .notice.warn { border-color:#d29922; color:#e6edf3; }
-#detail .notice.error, #powerbox .notice.error { border-color:#f85149; color:#ffb2aa; }
-#powerbox .notice.ok { border-color:#3fb950; color:#c9d1d9; }
+#detail .notice, #powerbox .notice, #tourcard .notice { color:#8b949e; background:#0d1117; border-left:3px solid #30363d; padding:8px 10px; margin:10px 0; }
+#detail .notice.warn, #powerbox .notice.warn, #tourcard .notice.warn { border-color:#d29922; color:#e6edf3; }
+#detail .notice.error, #powerbox .notice.error, #tourcard .notice.error { border-color:#f85149; color:#ffb2aa; }
+#powerbox .notice.ok, #tourcard .notice.ok { border-color:#3fb950; color:#c9d1d9; }
 #powerbox .notice.info { border-color:#58a6ff; color:#c9d1d9; }
 #detail details.proposal { margin-top:14px; }
 #detail details.proposal summary { cursor:pointer; color:#58a6ff; }
@@ -14074,6 +14134,8 @@ tr.ctxanchor td { background:#1c3041; }
       title="machine-wide parallel-agent cap - live slots / cap. Every driver re-checks the cap within seconds; raising it frees queued steps, lowering it never kills a running agent">
       <button type="button" id="pool-dec" aria-label="one fewer parallel agent">&minus;</button><span id="pool-val">agents &hellip;</span><button type="button" id="pool-inc" aria-label="one more parallel agent">+</button>
     </span>
+    <button type="button" class="btn secondary" id="tour-btn"
+      title="what's new - a guided tour of changes, finished runs and proposals since your last look">What's new<span id="tour-badge" class="tbadge" hidden></span></button>
     <button type="button" class="btn secondary" id="power-btn"
       title="stop or restart this dashboard - warns about merges and live tasks first">&#x23FB;</button>
     <div class="seg" id="density" role="group" aria-label="Row density">
@@ -14092,6 +14154,7 @@ tr.ctxanchor td { background:#1c3041; }
 <div id="backdrop" hidden><div id="detail" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button type="button" class="x" id="dx">Close ×</button><button type="button" id="dask" data-ask-ai hidden aria-label="Ask AI about this view" title="Ask AI about this view"><span class="ai-spark" aria-hidden="true">&#x2726;</span>Ask AI</button><div id="dbody"></div></div></div>
 <div id="askwrap" hidden><div id="askbox" role="alertdialog" aria-modal="true"><div id="asktitle"></div><div id="askmsg"></div><div id="askbtns" class="actions"></div></div></div>
 <div id="powerwrap" hidden><div id="powerbox" role="dialog" aria-modal="true"><h3>Dashboard power</h3><div id="pwbody"></div><div class="actions"><button type="button" class="btn secondary" id="pw-cancel">Cancel</button><button type="button" class="btn danger" id="pw-stop">Stop</button><button type="button" class="btn" id="pw-restart">Restart</button></div><div class="sub" id="pwstat"></div></div></div>
+<div id="tourwrap" hidden><div id="tourring" hidden></div><div id="tourcard" role="dialog" aria-modal="true" aria-labelledby="tourcard-title" tabindex="-1"></div></div>
 <script>
 const COLORS = {done:'#3fb950',partial:'#d29922',blocked:'#d29922',
 stopped:'#d29922',
@@ -17430,6 +17493,10 @@ function render(d){
   else if (d.serve_boot !== BOOT){ location.reload(); return; }
   lastData = d; AGENTS = d.agents;
   AGENTS.forEach((a,i)=>a._i=i);   // stable cell ids before the sig check
+  // the What's-new badge rides the state poll - it updates even on a
+  // sig-identical repaint (the count isn't in the sig), and null keeps
+  // the pill hidden until the server's async build lands
+  tourBadge(d.tour_unseen);
   if (selectedRun && !d.runs.some(r=>runKey(r)===selectedRun)) selectedRun=null;
   const now = Date.now();
   const live = d.agents.filter(a=>a.status==='running');
@@ -18138,6 +18205,14 @@ document.addEventListener('click', async e=>{
   const askBtn = t.closest && t.closest('[data-ask]');
   if (askBtn){ _askDone(+askBtn.dataset.ask); return; }
   if (t.id==='askwrap'){ _askDone(-1); return; }
+  // What's new tour: the button opens it, a click landing on the dim
+  // (#tourwrap itself - the ring is pointer-events:none and the card is
+  // a child) is a backdrop dismissal = Skip, and card buttons route
+  // through their data-tour action
+  if (t.id==='tour-btn'){ openTour(); return; }
+  if (t.id==='tourwrap'){ tourClose(); return; }
+  const tourActEl = t.closest && t.closest('[data-tour]');
+  if (tourActEl){ tourAct(tourActEl.dataset.tour, tourActEl); return; }
   // dashboard power dialog
   if (t.id==='power-btn'){ openPower(); return; }
   if (t.id==='pw-cancel' || t.id==='powerwrap'){
@@ -19048,7 +19123,10 @@ document.addEventListener('keydown', e=>{
     if (!document.getElementById('askwrap').hidden){ _askDone(-1); return; }
     if (!document.getElementById('powerwrap').hidden){
       document.getElementById('powerwrap').hidden=true; return; }
-    if (!document.getElementById('backdrop').hidden) closeDetail();
+    if (!document.getElementById('backdrop').hidden){ closeDetail(); return; }
+    // an open tour dismisses like Skip - never a viewed/snooze POST; a
+    // suspended one stays put (the modal above it owns Escape)
+    if (tourSt) tourClose();
   }
 });
 // hovering a run row highlights its agent rows across all project tables,
@@ -19152,9 +19230,352 @@ function applySel(){
         want.has((agen?'a:':'r:') + k));
       x.classList.toggle('dlinked', !agen && link.has('r:'+k));
     });
+  // a What's-new tour suspends beneath an open details modal - the
+  // dialog is the stronger layer; closing it resumes the same card,
+  // re-placed against whatever the page did behind it
+  const tw = document.getElementById('tourwrap');
+  if (tourSt && tw && tw.classList){
+    const susp = !document.getElementById('backdrop').hidden;
+    const was = tw.classList.contains('suspended');
+    tw.classList.toggle('suspended', susp);
+    if (!susp && was) tourPlace(true);   // resume, not every poll
+  }
   // the assistant's "next question" view chip follows modal navigation;
   // applySel fires on every open/close/re-render so the chip never polls
   if (globalThis.aiSync){ try{ globalThis.aiSync(); }catch(e){} }
+}
+// --- What's new tour ---------------------------------------------------
+// A Driver.js-style spotlight walkthrough with no library: #tourring's
+// oversized box-shadow IS the page dim and its transparent center pops
+// the anchor through; an entry with no usable anchor falls back to a
+// dimmed centered card. The deck (feed.entries, oldest -> newest) is the
+// walkthrough; feed.history is the viewed section that reopens cards the
+// watermark already passed. All state is `tourSt` - null means closed.
+let tourSt = null;
+const TOUR_TAG_STYLE = {new:'#bc8cff',improved:'#58a6ff',fixed:'#3fb950'};
+// The badge is a pure function of /api/state's tour_unseen field: null
+// means the server hasn't computed a count yet - an honest unknown, not
+// a fake 0 - so the pill stays hidden rather than lying. Tour transition
+// POSTs carry the fresh count too, so marking a card repaints it
+// without waiting for the next poll.
+function tourBadge(n){
+  const b = document.getElementById('tour-badge');
+  if (!b) return;
+  const v = (typeof n==='number' && n>0) ? n : 0;
+  b.hidden = !v;
+  b.textContent = v>99 ? '99+' : String(v);
+  const btn = document.getElementById('tour-btn');
+  if (btn && btn.classList) btn.classList.toggle('unread', !!v);
+}
+const tourReduced = () => typeof matchMedia==='function' &&
+  matchMedia('(prefers-reduced-motion: reduce)').matches;
+const tourDeck = () => (tourSt && tourSt.feed && tourSt.feed.entries) || [];
+const tourHist = () => (tourSt && tourSt.feed && tourSt.feed.history) || [];
+const tourCur = () => tourSt && (tourSt.mode==='hist'
+  ? tourHist()[tourSt.hi] : tourDeck()[tourSt.idx]);
+// every repository/record string below flows through esc() - curated
+// blurbs, commit subjects and request labels are never trusted markup
+function tourRelatedHtml(e){
+  const runs = (e.runs||[]).map(k=>{
+    const r = ((lastData&&lastData.runs)||[]).find(x=>runKey(x)===k);
+    return `<button type="button" class="chip" ` +
+      `data-run-details="${esc(k)}" title="open this run's details">` +
+      `${esc(r && (r.run||k) || base(k))}</button>`;
+  }).join('');
+  const reqs = (e.requests||[]).map(rid=>{
+    const r = ((lastData&&lastData.runs)||[]).find(x=>x.request_id===rid);
+    return `<button type="button" class="chip" ` +
+      `data-open-request="${esc(rid)}" title="open this request">` +
+      `${esc(r && (r.run||rid) || rid)}</button>`;
+  }).join('');
+  return (runs || reqs)
+    ? `<div class="tsec">related</div><div class="trel">${runs}${reqs}</div>`
+    : '';
+}
+function tourCardHtml(e, posText){
+  const tag = TOUR_TAG_STYLE[e.tag] ? e.tag : 'new';
+  const commits = (e.commits||[]).map(c=>
+    `<li><code>${esc(String(c.sha||'').slice(0,10))}</code> ` +
+    `${esc(c.subject)}</li>`).join('');
+  return `<div class="tpos">${esc(posText)}` +
+    (e.stop_title ? ` · ${esc(e.stop_title)}` : '') + `</div>` +
+    `<h3 id="tourcard-title">${esc(e.title||'(untitled)')}</h3>` +
+    `<span class="ttag" style="color:${TOUR_TAG_STYLE[tag]};` +
+      `border-color:${TOUR_TAG_STYLE[tag]}">${tag}</span>` +
+    (e.state==='snoozed'
+      ? ` <span class="sub">deferred earlier</span>` : '') +
+    (e.state==='viewed'
+      ? ` <span class="sub">viewed</span>` : '') +
+    (e.unavailable
+      ? ` <span class="sub">source window lost</span>` : '') +
+    `<div class="tblurb">${esc(e.blurb||'')}</div>` +
+    (commits
+      ? `<div class="tsec">commits</div><ul class="tlist">${commits}</ul>`
+      : '') +
+    tourRelatedHtml(e);
+}
+function tourActionsHtml(){
+  if (tourSt.mode==='hist')
+    return `<button type="button" class="btn secondary" ` +
+      `data-tour="back">&larr; Back</button>` +
+      `<button type="button" class="btn secondary" data-tour="unview"` +
+      `${tourSt.pending?' disabled':''}>mark unread</button>` +
+      `<span class="tgap"></span>` +
+      `<button type="button" class="btn secondary" data-tour="skip">` +
+      `Close</button>`;
+  const e = tourCur(), deck = tourDeck();
+  return `<button type="button" class="btn secondary" data-tour="prev"` +
+    `${tourSt.idx<=0?' disabled':''}>&larr;</button>` +
+    `<button type="button" class="btn secondary" data-tour="next"` +
+    `${tourSt.idx>=deck.length-1?' disabled':''}>&rarr;</button>` +
+    `<span class="tgap"></span>` +
+    `<button type="button" class="btn secondary" data-tour="skip">` +
+    `Skip</button>` +
+    (e && e.state==='viewed'
+      ? `<span class="sub">marked viewed</span>`
+      : `<button type="button" class="btn" data-tour="mark"` +
+        `${tourSt.pending?' disabled':''}>` +
+        `${tourSt.pending?'marking&hellip;':'Mark viewed'}</button>`);
+}
+function tourHistHtml(){
+  const hs = tourHist();
+  if (!hs.length) return '';
+  return `<details class="tourhist"><summary>viewed earlier ` +
+    `(${hs.length})</summary>` + hs.map((h,i)=>
+      `<button type="button" class="thist" data-tour="hist" ` +
+      `data-hi="${i}" title="reopen this card">` +
+      `${esc(h.title||'(untitled)')}` +
+      `<span class="sub">${esc(h.viewed_at ? loc(h.viewed_at)
+        : (h.state||'viewed'))}</span></button>`).join('') +
+    `</details>`;
+}
+function tourShow(){
+  const wrap = document.getElementById('tourwrap');
+  const card = document.getElementById('tourcard');
+  if (!wrap || !card) return;
+  if (!tourSt){ wrap.hidden = true; return; }
+  wrap.hidden = false;
+  // sync the suspend marker too - applySel re-derives it on every modal
+  // open/close, but a tour opened while a dialog is already up must
+  // start covered (the z-60 layer sits over the modal otherwise)
+  if (wrap.classList)
+    wrap.classList.toggle('suspended',
+      !document.getElementById('backdrop').hidden);
+  let inner;
+  if (tourSt.err){
+    inner = `<h3 id="tourcard-title">What's new</h3>` +
+      `<div class="notice error">${esc(tourSt.err)}</div>` +
+      `<div class="tactions"><span class="tgap"></span>` +
+      `<button type="button" class="btn secondary" data-tour="skip">` +
+      `Close</button>` +
+      `<button type="button" class="btn" data-tour="retry">Retry</button>` +
+      `</div>`;
+  } else if (!tourSt.feed){
+    inner = `<h3 id="tourcard-title">What's new</h3>` +
+      `<div class="notice">loading the change feed&hellip;</div>`;
+  } else if (tourSt.mode==='hist'){
+    const h = tourHist()[tourSt.hi];
+    inner = h
+      ? tourCardHtml(h, `viewed ${tourSt.hi+1} of ${tourHist().length}`) +
+        `<div class="tactions">${tourActionsHtml()}</div>`
+      : `<h3 id="tourcard-title">What's new</h3>` +
+        `<div class="notice">That card is gone.</div>` +
+        `<div class="tactions">${tourActionsHtml()}</div>`;
+  } else {
+    const deck = tourDeck(), e = deck[tourSt.idx];
+    inner = e
+      ? tourCardHtml(e, `Update ${tourSt.idx+1} of ${deck.length}`) +
+        (tourSt.notice
+          ? `<div class="notice error">${esc(tourSt.notice)}</div>` : '') +
+        `<div class="tactions">${tourActionsHtml()}</div>` +
+        tourHistHtml()
+      : `<h3 id="tourcard-title">All caught up</h3>` +
+        `<div class="notice ok">nothing new since the last ` +
+        `walkthrough</div>` +
+        `<div class="tactions"><span class="tgap"></span>` +
+        `<button type="button" class="btn secondary" data-tour="skip">` +
+        `Close</button></div>` + tourHistHtml();
+  }
+  card.innerHTML = inner;
+  card.classList.toggle('busy', !!tourSt.pending);
+  tourPlace(true);
+}
+function tourAnchorEl(e){
+  const sel = e && e.anchor;
+  if (!sel || !document.querySelector) return null;
+  let el = null;
+  try { el = document.querySelector(sel); } catch(_){ el = null; }
+  if (!el || !el.getBoundingClientRect) return null;
+  const r = el.getBoundingClientRect();
+  // a usable anchor has real layout - a hidden/zero-sized element gets
+  // the centered fallback like a missing selector
+  if (!r || r.width<=0 || r.height<=0) return null;
+  return {el, rect:r};
+}
+function tourPlace(reveal){
+  const wrap = document.getElementById('tourwrap');
+  const ring = document.getElementById('tourring');
+  const card = document.getElementById('tourcard');
+  if (!tourSt || !wrap || !ring || !card || wrap.hidden) return;
+  // while suspended under a modal the layer is display:none - don't
+  // re-place (and especially don't scrollIntoView) behind the dialog
+  if (wrap.classList && wrap.classList.contains('suspended')) return;
+  const a = tourAnchorEl(tourCur());
+  const vw = (typeof window!=='undefined' && window.innerWidth) || 1024;
+  const vh = (typeof window!=='undefined' && window.innerHeight) || 768;
+  if (!a){
+    wrap.classList.add('dim'); ring.hidden = true;
+    card.classList.remove('anchored');
+    card.style.top = card.style.left = '';
+    return;
+  }
+  let r = a.rect;
+  // reveal - only when a card is (re)shown, never on a scroll/resize
+  // re-place: scrollIntoView there would fight the user's own scrolling
+  const off = r.top<0 || (r.bottom!=null?r.bottom:r.top+r.height)>vh ||
+    r.left<0 || (r.right!=null?r.right:r.left+r.width)>vw;
+  if (reveal && off && a.el.scrollIntoView){
+    a.el.scrollIntoView({block:'nearest',
+      behavior:tourReduced()?'auto':'smooth'});
+    r = a.el.getBoundingClientRect();
+  }
+  wrap.classList.remove('dim'); ring.hidden = false;
+  const pad = 8, gap = 12, margin = 12;
+  const rb = r.bottom!=null ? r.bottom : r.top+r.height;
+  ring.style.left = (r.left-pad)+'px'; ring.style.top = (r.top-pad)+'px';
+  ring.style.width = (r.width+pad*2)+'px';
+  ring.style.height = (r.height+pad*2)+'px';
+  const cw = Math.min(440, vw-margin*2);
+  card.style.width = cw+'px';
+  const ch = card.offsetHeight || 300;
+  // prefer below the ring, flip above when it wouldn't fit, then clamp -
+  // the card must stay reachable whatever the anchor's position
+  let top = rb + pad + gap;
+  if (top + ch > vh - margin) top = r.top - pad - gap - ch;
+  top = Math.max(margin, Math.min(top, Math.max(margin, vh-ch-margin)));
+  card.style.top = top+'px';
+  card.style.left = Math.max(margin,
+    Math.min(r.left, vw-cw-margin))+'px';
+  card.classList.add('anchored');
+}
+// scroll/resize listeners live only while the tour is open - closing
+// removes them so nothing keeps firing on a dead overlay
+function tourBind(on){
+  if (on){
+    const sc = () => { if (tourSt) tourPlace(false); };
+    tourSt._sc = sc;
+    document.addEventListener('scroll', sc, true);
+    if (typeof window!=='undefined' && window.addEventListener)
+      window.addEventListener('resize', sc);
+  } else if (tourSt && tourSt._sc){
+    document.removeEventListener('scroll', tourSt._sc, true);
+    if (typeof window!=='undefined' && window.removeEventListener)
+      window.removeEventListener('resize', tourSt._sc);
+    tourSt._sc = null;
+  }
+}
+async function tourLoad(){
+  if (!tourSt) return;
+  tourSt.feed = null; tourSt.err = null; tourShow();
+  try { const f = await api('GET', '/api/tour');
+    if (tourSt) tourSt.feed = f;
+  } catch(e){ if (tourSt) tourSt.err = e.message || String(e); }
+  if (tourSt) tourShow();
+}
+function openTour(){
+  if (tourSt) return;
+  tourSt = {feed:null, err:null, notice:null, idx:0, hi:0, mode:'deck',
+    pending:false, returnEl:document.activeElement||null, _sc:null};
+  tourBind(true);
+  tourShow();
+  const card = document.getElementById('tourcard');
+  if (card && card.focus) card.focus();
+  tourLoad();
+}
+function tourClose(){
+  // the ONLY close path: Skip, Escape, the dim and Close all land here -
+  // none of them POSTs viewed or snooze, so dismissing never
+  // acknowledges or implicitly defers an entry
+  if (!tourSt) return;
+  tourBind(false);
+  const back = tourSt.returnEl;
+  tourSt = null;
+  tourShow();
+  const el = (back && back.focus && back.isConnected!==false)
+    ? back : document.getElementById('tour-btn');
+  if (el && el.focus) el.focus();
+}
+async function tourMark(){
+  const e = tourCur();
+  if (!tourSt || !e || tourSt.pending || e.state==='viewed') return;
+  tourSt.pending = true; tourSt.notice = null; tourShow();
+  let r;
+  try {
+    r = await api('POST',
+      '/api/tour/'+encodeURIComponent(e.id)+'/viewed', {});
+  } catch(err){
+    // a failed mark must NOT advance: the card stays put with the error
+    // so the click is retryable instead of silently skipping the entry
+    if (!tourSt) return;
+    tourSt.pending = false;
+    tourSt.notice = 'Mark viewed failed: ' + (err.message || err);
+    tourShow(); return;
+  }
+  if (!tourSt) return;                          // closed mid-flight
+  tourSt.pending = false;
+  e.state = 'viewed'; e.viewed_at = new Date().toISOString();
+  const hs = tourSt.feed.history || (tourSt.feed.history = []);
+  if (!hs.some(h=>h.id===e.id)) hs.unshift(e);
+  tourBadge(r.unseen_count);                    // fresh count, no poll wait
+  const deck = tourDeck();
+  let ni = deck.findIndex((x,j)=>j>tourSt.idx && x.state!=='viewed');
+  if (ni<0) ni = deck.findIndex(x=>x.state!=='viewed');
+  tourSt.idx = ni<0 ? deck.length : ni;         // past end -> caught up
+  tourSt.mode = 'deck';
+  tourShow();
+}
+async function tourUnview(){
+  const h = tourSt && tourSt.mode==='hist' && tourHist()[tourSt.hi];
+  if (!h || tourSt.pending) return;
+  tourSt.pending = true; tourShow();
+  try {
+    const r = await api('POST',
+      '/api/tour/'+encodeURIComponent(h.id)+'/unview', {});
+    if (!tourSt) return;
+    tourSt.pending = false;
+    tourBadge(r.unseen_count);
+    tourSt.mode = 'deck';
+    // the card returns to the live deck - the server already rebuilt
+    // the feed, so re-pull it instead of guessing positions locally
+    await tourLoad();
+    if (!tourSt) return;
+    const j = tourDeck().findIndex(x=>x.id===h.id);
+    if (j>=0) tourSt.idx = j;
+    tourShow();
+  } catch(err){
+    if (!tourSt) return;
+    tourSt.pending = false;
+    tourSt.err = 'Unview failed: ' + (err.message || err);
+    tourShow();
+  }
+}
+function tourAct(act, el){
+  if (!tourSt) return;
+  if (act==='skip' || act==='close'){ tourClose(); return; }
+  if (act==='retry'){ tourLoad(); return; }
+  // a persist call is in flight - close stays live (it abandons the
+  // reply) but deck movement and other transitions wait for it
+  if (tourSt.pending) return;
+  if (act==='mark'){ tourMark(); return; }
+  if (act==='unview'){ tourUnview(); return; }
+  if (act==='prev' && tourSt.idx>0){ tourSt.idx--; tourShow(); return; }
+  if (act==='next' && tourSt.idx<tourDeck().length-1){
+    tourSt.idx++; tourShow(); return; }
+  if (act==='hist'){
+    const i = +(el && el.dataset && el.dataset.hi || 0);
+    if (tourHist()[i]){ tourSt.mode='hist'; tourSt.hi=i; tourShow(); }
+    return; }
+  if (act==='back'){ tourSt.mode='deck'; tourShow(); return; }
 }
 // --- assistant surface bridge ----------------------------------------
 // The chat client (assistant/static/chat.js) reads which view is on
