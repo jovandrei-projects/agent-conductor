@@ -487,13 +487,14 @@ setRoute((url,opt)=>{
   const body=JSON.parse(posted.opt.body);
   assert.deepEqual(body,{model:'gpt-6-luna',effort:'medium',
     fast:true,readonly:true});
-  // header now shows the new snapshot
-  assert.match(nodes.get('ai-name').textContent,/gpt-6-luna.*medium/);
-  // ...while the old reply badge still shows what it ran under
+assert.equal(nodes.get('ai-name').textContent,'gpt-6-luna');
+  assert.match(nodes.get('ai-name').title,/gpt-6-luna.*medium.*fast/);
+  // badges are model-only too; the full snapshot moves into the title
   const html=window.AskAI._msgHtml({id:'m2',role:'assistant',
     text:'old',status:'complete',ctx_ref:'',
     settings_json:'{"model":"gpt-6-luna","effort":"low","fast":true,"readonly":true}'});
-  assert.match(html,/gpt-6-luna \u00b7 low \u00b7 fast/);
+  assert.match(html,/>gpt-6-luna<\/button>/);
+  assert.match(html,/title="gpt-6-luna · low · fast/);
 })().then(()=>process.exitCode=0).catch(e=>{console.error(e);
   process.exitCode=1;});
 ''',
@@ -1263,8 +1264,9 @@ setRoute((url,opt)=>{
   // the in/out split preserved on the tooltip instead of the cramped
   // 'in/out' pair that truncated to '22.0/...' in the 400px card
   const sum=nodes.get('ai-usage-sum').textContent;
-  assert.match(sum,/tok 360 \u00b7 ~\$0\.0010/);
-  assert.match(nodes.get('ai-usage-sum').title,/300 in \/ 60 out/);
+  assert.match(sum,/tok 360 · cached 50 · ~\$0\.0010/);
+  assert.match(nodes.get('ai-usage-sum').title,
+    /300 in \(50 cached\) \/ 60 out/);
 })().then(()=>process.exitCode=0).catch(e=>{console.error(e);
   process.exitCode=1;});
 ''',
@@ -1404,6 +1406,11 @@ setRoute((url,opt)=>{
   assert(html.includes('data-ai-del="conv-2"'),'delete op rendered');
   assert.match(html,/2 KB/,'size estimate shown');
   assert.match(html,/KB/,'KB unit present');
+  // the ellipsized sub line is always fully readable on hover
+  assert(html.includes('title="chat one
+'),
+    'row tooltip carries title + full sub line');
+  assert.match(html,/title="[^"]*2 KB[^"]*"/,'tooltip keeps full KB');
   // rename: clicking the pen swaps the row to an input
   nodes.get('ai-rail')._h.click({target:{closest:s=>
     s==='[data-ai-ren]'?{getAttribute:()=>'conv-2'}:null}});
