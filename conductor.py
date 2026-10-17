@@ -13081,13 +13081,20 @@ th { position:sticky; top:var(--topbar-h,110px); z-index:7;
   font-size:11px; text-transform:uppercase; padding:4px 10px 4px 0;
   border-bottom:1px solid #21262d; }
 td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+/* a left gutter inside every first cell: the left-edge state markers
+   (unreviewed cyan, selected/dsel blue) paint an inset stripe there, so
+   the stripe sits in the gutter instead of overlapping the cell text */
+.wrapw td:first-child, .wrapw th:first-child { padding-left:8px; }
+/* the agents table's run name: extra right padding keeps a long,
+   ellipsized name from visually colliding with the model column */
+td.rcell { padding-right:18px; }
 td.wrap { white-space:normal; color:#8b949e; font-size:12px; }
 td.step { white-space:normal; }  /* wt/merged chips wrap under a long name */
 /* tr.agen is not clickable as a row anymore - its named controls (step
    name -> details, run name -> filter) carry pointer cursors themselves,
    so the row does not advertise a click that does nothing. */
 tr.runrow { cursor:pointer; }
-tr.runrow:hover td { background:#172532; }
+tr.runrow:hover td { background:#26405a; }
 tr.runrow.selected td { background:#1c3041; }
 tr.runrow.selected td:first-child { box-shadow:inset 3px 0 #58a6ff; }
 .dots span { animation:blink 1.2s infinite; color:#58a6ff; }
@@ -13096,8 +13103,11 @@ tr.runrow.selected td:first-child { box-shadow:inset 3px 0 #58a6ff; }
 @keyframes blink { 0%,100%{opacity:.15} 50%{opacity:1} }
 tr.agen td { transition:background .12s; }
 tr.agen:hover td { background:#26405a; }
+/* .hl is the hover's run group: the hovered row's siblings plus a linked
+   follow-up pair. It stays a notch under the directly hovered row -
+   hover beats .hl, and a row that is BOTH gets the strongest shade. */
 tr.hl td { background:#1c2833; }
-tr.agen.hl:hover td { background:#2a4a68; }
+tr.hl:hover td { background:#2a4a68; }
 /* .dsel marks the row whose details are on screen - the open task modal's
    agent row, an open run/request/questionnaire/summary modal's run row. It
    is independent of the pointer (hover no longer erases it) and distinct
@@ -13146,6 +13156,9 @@ body.compact td br { display:none; }
    let them clip inline after the name); its one rule is below. */
 .toksub { color:#8b949e; font-size:12px; }
 body.compact td .toksub { display:none; }
+/* .toks is .toksub's look without the compact hide - the agents table's
+   tokens column keeps its labeled numbers at both densities */
+.toks { color:#8b949e; font-size:12px; }
 /* Chips on the .rlabels line must never clip invisibly at the td edge:
    compact squeezes td.wrap to nowrap, which pins every chip to one line -
    a pill starting mid-line can shrink to max-width:100% yet still
@@ -13554,12 +13567,9 @@ const kfmt = n => n==null?'-':(n>=1000
 // turn = in + cached (the tooltip carries it).
 const billed = t => t && t.prompt!=null
   ? Math.max(t.prompt-(t.cached||0),0) : null;
-const fmtT = t => (!t||t.prompt==null) ? '-' :
-  `in ${kfmt(billed(t))} · out ${kfmt(t.completion)}` +
-  ` · cached ${kfmt(t.cached||0)}` +
-  (t.llm_steps ? ` · ${t.llm_steps} turns` : '');
-// compact density: bare in/out/cached + LLM turns - order is fixed and
-// spelled out in TOK_HELP + the cell title
+// token readout: billed-in/out/cached + LLM turns, order fixed and
+// spelled out in TOK_HELP + the cell title - the one labeled short
+// form both tables use at every density
 const fmtTc = t => (!t||t.prompt==null) ? '-' :
   `${kfmt(billed(t))}/${kfmt(t.completion)}/${kfmt(t.cached||0)}` +
   (t.llm_steps ? ` ${t.llm_steps}L` : '');
@@ -13681,12 +13691,12 @@ let AGENTS = [];          // last payload, for the detail modal
 // same widths line up across tables)
 const AGENT_COLS = '<colgroup>' +
   '<col style="width:8%"><col style="width:20%">' +
-  '<col style="width:8%"><col class="hide-s" style="width:6%">' +
+  '<col style="width:9%"><col class="hide-s" style="width:6%">' +
   '<col class="hide-s" style="width:5%"><col class="hide-s" style="width:5%">' +
   '<col style="width:6%"><col style="width:6%">' +
   '<col class="hide-s" style="width:10%"><col class="hide-s" style="width:5%">' +
   '<col style="width:6%"><col class="hide-s" style="width:5%">' +
-  '<col style="width:10%">' +
+  '<col style="width:9%">' +
   '</colgroup>';
 
 let detailIdx = null;
@@ -17125,16 +17135,16 @@ function render(d){
         'cumulative driver execution time'}">${runElapsed(r,now)}</td>` +
       `<td class="counts">` +
       `${counts||'<span class="toksub">not planned</span>'}` +
-      // .toksub, not .sub: these labeled lines are meant to render in
-      // compact too (fmtTc is the compact form) - the blanket td .sub
-      // hide made the compact branch unreachable
+      // the run table shows token lines at full density only (compact
+      // hides .toksub); they always render in fmtTc short form - the
+      // same labeled numbers the agents table's tokens column shows
       (r.plan_tokens ? `<br><span class="toksub" ` +
         `title="${esc(tokTitle(r.plan_tokens))}">planner: ` +
-        `${density==='compact' ? fmtTc(r.plan_tokens) : fmtT(r.plan_tokens)}` +
+        `${fmtTc(r.plan_tokens)}` +
         (r.plan_cost?` · ${fmtC(r.plan_cost)}`:'') + `</span>` : '') +
       (r.tokens ? `<br><span class="toksub" ` +
         `title="${esc(tokTitle(r.tokens))}">steps: ` +
-        `${density==='compact' ? fmtTc(r.tokens) : fmtT(r.tokens)}` +
+        `${fmtTc(r.tokens)}` +
         (r.cost?` · ${fmtC(r.cost)}`:'') + `</span>` : '') +
       (runUsd!=null ? `<br><span class="toksub" ` +
         `title="estimated self-serve ` +
@@ -17271,7 +17281,7 @@ function render(d){
         // identity - a request-backed run's key survives its dir changing;
         // a task with no run association keeps plain text: there is no
         // filter target to apply.
-        `<td>${aRk && a.run!=null && a.run!==''
+        `<td class="rcell">${aRk && a.run!=null && a.run!==''
           ? `<button type="button" class="linkbtn run-link" ` +
             `data-filter-run="${esc(aRk)}" ` +
             `title="show only run ${esc(a.run)} and its tasks">` +
@@ -17285,8 +17295,13 @@ function render(d){
         `<td class="hide-s">${esc(a.mode||'-')}${a.cloud?' cloud':''}</td>` +
         `<td>${loc(a.started_at)}</td>` +
         `<td data-el="${a._i}">${elapsed(a,now)}</td>` +
+        // same labeled fmtTc form as the run table's steps:/planner:
+        // lines, at BOTH densities - 'tokens:' is the label here since
+        // a task row has no planner/steps split
         `<td class="hide-s" title="${esc(tokTitle(a.tokens))}">` +
-        `${density==='compact' ? fmtTc(a.tokens) : fmtT(a.tokens)}</td>` +
+        `${a.tokens&&a.tokens.prompt!=null
+          ? `<span class="toks">tokens: ${fmtTc(a.tokens)}</span>`
+          : '-'}</td>` +
         `<td class="hide-s" title="${esc(costTitle(a.cost))}">` +
         `${fmtC(a.cost)}</td>` +
         `<td>${loc(a.ended_at)}</td>` + sessTd +

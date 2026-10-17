@@ -4560,13 +4560,13 @@ assert.match(elem('runs').innerHTML,/>1 running</);
 assert.match(elem('runs').innerHTML,/>1 done</);
 assert.match(elem('runs').innerHTML,/class="dot run"/);
 assert.match(elem('runs').innerHTML,/est \$1\.50/);
-// run row: step-token line names every field under the 'steps:' label
-assert.match(elem('runs').innerHTML,/steps: in 1k · out 200 · cached 0 · 2 turns · \$1\.50/);
-// agent row: cost cell; tokens render as labeled fields (in/out/cached/
-// turns) - the bare '1k/200 ·2st' compact form is gone.
+// run row: step-token line under the 'steps:' label, in the shared
+// billed-in/out/cached + turns short form
+assert.match(elem('runs').innerHTML,/steps: 1k\/200\/0 2L · \$1\.50/);
+// agent row: cost cell; the tokens cell carries the same labeled short
+// form the run table uses ('tokens:' is the row's label)
 assert.match(elem('agents').innerHTML,/\$0\.12/);
-assert.match(elem('agents').innerHTML,/in 1k · out 200 · cached 0 · 2 turns/);
-assert.doesNotMatch(elem('agents').innerHTML,/1k\/200/);
+assert.match(elem('agents').innerHTML,/tokens: 1k\/200\/0 2L/);
 // compact density: bare billed-in/out/cached + turns (in = prompt -
 // cached, the billed part - Desktop's "input" number)
 assert.strictEqual(vm.runInContext(
@@ -5176,14 +5176,27 @@ assert.match(elem('runs').innerHTML,
         (b) The planner:/steps:/est token lines carry .toksub and are
         HIDDEN at compact density - the leaner table drops them, and
         the numbers stay reachable at full density and in the run
-        modal. The markup itself is still emitted in fmtTc short form,
-        so toggling densities needs no refetch."""
+        modal. The markup is always emitted in the shared fmtTc short
+        form, so toggling densities needs no refetch."""
         html = conductor._DASH_HTML
         self.assertRegex(
             html, r'body\.compact td \.toksub \{[^}]*display:\s*none')
         self.assertRegex(html, r'\.toksub \{[^}]*color:#8b949e')
+        # the agents table's tokens label shares the muted look but is
+        # exempt from the compact hide (.toks, no compact rule)
+        self.assertRegex(html, r'\.toks \{[^}]*color:#8b949e')
         self.assertRegex(
             html, r'body\.compact td \.sub \{[^}]*display:\s*none')
+        # hover hierarchy: the row under the pointer is a notch stronger
+        # than the run group .hl, and both shades for a hovered .hl row
+        self.assertRegex(html, r'tr\.hl td \{[^}]*#1c2833')
+        self.assertRegex(html, r'tr\.hl:hover td \{[^}]*#2a4a68')
+        self.assertRegex(html, r'tr\.runrow:hover td \{[^}]*#26405a')
+        # the unreviewed/selected left-edge stripe gets its own gutter
+        self.assertRegex(
+            html, r'\.wrapw td:first-child[^}]*padding-left:8px')
+        # long run names keep air between run and model columns
+        self.assertRegex(html, r'td\.rcell \{[^}]*padding-right:18px')
         js = html.split("<script>\n", 1)[1].split("</script>", 1)[0]
         harness = r'''
 const vm=require('node:vm'), assert=require('node:assert/strict');
@@ -5231,16 +5244,16 @@ assert.ok(sp.indexOf('Needs review') < sp.indexOf('>sp<'),
 const rq=row('req');
 assert.match(rq,/class="rlabels">[^]*?class="stage generating"[^>]*>Preparing proposal/);
 assert.match(rq,/class="genline"[^>]*>reading the repo</);
-// (b) the token labels carry .toksub, exempt from the compact hide
+// (b) the token labels carry .toksub in the shared fmtTc short form
 const tok=row('tokrun');
-assert.match(tok,/class="toksub"[^>]*>planner: in 4k · out 1k · cached 6k · 2 turns · \$0\.02</);
-assert.match(tok,/class="toksub"[^>]*>steps: in 50k · out 9k · cached 150k · 11 turns · \$1\.50</);
+assert.match(tok,/class="toksub"[^>]*>planner: 4k\/1k\/6k 2L · \$0\.02</);
+assert.match(tok,/class="toksub"[^>]*>steps: 50k\/9k\/150k 11L · \$1\.50</);
 assert.match(tok,/class="toksub"[^>]*>est \$1\.52</);
 assert.doesNotMatch(tok,/class="sub"[^>]*>steps:/);
 // 'not planned' is a label too - same compact exemption
 assert.match(row('req'),/class="toksub">not planned</);
-// compact pass: same labels in fmtTc short form (fmtTc finally reaches
-// the runs table - it was dead code inside the hidden .sub spans)
+// compact pass: same labels, same fmtTc short form - the markup is
+// density-independent and only the .toksub hide differs
 vm.runInContext("setDensity('compact')",ctx);
 render();
 runs=elem('runs').innerHTML;
@@ -5251,10 +5264,10 @@ assert.match(tokc,/class="toksub"[^>]*>est \$1\.52</);
 const spc=row('stale-paused');
 assert.match(spc,/class="rlabels">[^]*?class="stage paused"[^>]*>paused - resume ready</);
 assert.match(spc,/class="stage error"[^>]*>Needs review</);
-// back to full: the long labeled form returns, markup unchanged
+// back to full: identical markup - only the CSS hide flips
 vm.runInContext("setDensity('full')",ctx);
 render();
-assert.match(row('tokrun'),/steps: in 50k · out 9k · cached 150k · 11 turns/);
+assert.match(row('tokrun'),/steps: 50k\/9k\/150k 11L/);
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
                            capture_output=True, text=True, encoding="utf-8",
