@@ -523,6 +523,107 @@ setRoute((url,opt)=>{
 ''')
         self.assertEqual(p.returncode, 0, p.stderr)
 
+    def test_readonly_checkbox_reflects_saved_state(self):
+        """sqlite stores readonly/fast as INTEGER - a saved readonly=0
+        must open the settings dialog UNCHECKED (`0 !== false` in JS made
+        it always-checked), the header pill reads 'actions on', and the
+        pill itself opens the dialog."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const S=window.AskAI._s;
+  // the wire shape: sqlite ints, exactly what GET /conversations returns
+  S.conv={id:'conv-1',model:'gpt-6-luna',effort:'low',fast:0,readonly:0};
+  window.AskAI._paint();
+  // the pill reports the saved state, not a default
+  assert.equal(nodes.get('ai-state').textContent,'actions on');
+  // the pill is a button - clicking it opens assistant settings
+  nodes.get('aichat')._h.click({target:{
+    closest:s=>s==='#ai-state'?nodes.get('ai-state'):null}});
+  await flush();
+  assert.equal(nodes.get('aisetwrap').hidden,false,
+    'state pill opens assistant settings');
+  assert.equal(nodes.get('ais-ro').checked,false,
+    'readonly=0 must render unchecked, not always-checked');
+  assert.equal(nodes.get('ais-fast').checked,false);
+  assert.equal(S.sel.readonly,false,
+    'S.sel carries the saved off-state - a no-change save stays off');
+  // and a raw-int conv still seeds correctly if ingest is bypassed
+  S.conv.readonly=0;
+  window.AskAI._settingsForm();
+  assert.equal(nodes.get('ais-ro').checked,false);
+  // the true branch too: readonly=1 stays checked
+  S.conv.readonly=1;
+  window.AskAI._settingsForm();
+  assert.equal(nodes.get('ais-ro').checked,true);
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js=r'''
+setRoute((url,opt)=>{
+  if(url.endsWith('/models'))return{models:[
+    {uid:'gpt-6-luna-low',family:'gpt-6-luna',label:'G6L',
+     in:0.2,out:1.0,vision:true,fast_variant:false}],
+   default_resolution:{ok:true,uid:'gpt-6-luna-low'}};
+  if(url.endsWith('/settings'))return{defaults:{model:'gpt-6-luna',
+    effort:'low',fast:false,readonly:true}};
+  return{items:[]};
+});
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_usage_dropdown_light_dismiss(self):
+        """The header usage <details> has no native light-dismiss: a
+        click on neutral page surface closes it, a click inside leaves
+        it open, and Escape drops the topmost layer before minimizing."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const ud=nodes.get('ai-usage');
+  const outside={closest:()=>null};
+  // outside click while closed: no-op
+  handlers.click({target:outside});
+  assert(!ud.open);
+  // open -> outside click closes it
+  ud.open=true;
+  handlers.click({target:outside});
+  assert.equal(ud.open,false,'outside click dismisses usage popup');
+  // open -> click INSIDE the details leaves it alone
+  ud.open=true;
+  handlers.click({target:{closest:s=>s==='#ai-usage'?ud:null}});
+  assert.equal(ud.open,true,'click inside stays open');
+  // Escape peels the popup first, the chat stays up
+  nodes.get('aichat')._h.keydown({key:'Escape',
+    target:{},stopPropagation(){},preventDefault(){}});
+  assert.equal(ud.open,false,'Escape closes the popup');
+  assert.equal(nodes.get('aichat').hidden,false,'chat still open');
+  // Escape again -> now the chat minimizes
+  nodes.get('aichat')._h.keydown({key:'Escape',
+    target:{},stopPropagation(){},preventDefault(){}});
+  assert.equal(nodes.get('aichat').hidden,true,'second Escape minimizes');
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_header_layout_keeps_controls(self):
+        """Header text cells (name/ctx/usage) must be the shrinkable
+        ones - flex:none on them pushed the right-side icon buttons out
+        of the fixed 400px card when the usage label grew."""
+        css = (STATIC_DIR / "chat.css").read_text(encoding="utf-8")
+        self.assertRegex(css, r'\.ai-ctx \{[^}]*flex: 0 1 auto')
+        self.assertRegex(css, r'\.ai-ctx \{[^}]*min-width: 0')
+        self.assertRegex(css, r'\.ai-usage \{[^}]*flex: 0 1 auto')
+        self.assertRegex(css, r'\.ai-usage summary \{[^}]*max-width: 100%')
+        self.assertRegex(css, r'\.ai-name \{[^}]*min-width: 0')
+        self.assertRegex(css, r'\.ai-hbtn \{[^}]*flex: none')
+        # the state pill is a clickable control now
+        self.assertRegex(css, r'\.ai-pill \{[^}]*cursor: pointer')
+
     def test_citation_navigation(self):
         """A citation chip routes through window.aiNav with its frozen
         nav descriptor and does not reset the open conversation."""
