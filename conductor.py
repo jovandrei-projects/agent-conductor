@@ -4808,7 +4808,9 @@ def _slots_view(slot_dir: Path | None = None) -> dict:
             "holders": [{"run": h.get("run"),
                          "run_dir": Path(h["run_dir"]).name
                          if h.get("run_dir") else None,
-                         "step": h.get("step")}
+                         "step": h.get("step"),
+                         "slot": h.get("slot"),
+                         "leased_at": h.get("leased_at")}
                         for h in holders]}
 
 
@@ -13596,18 +13598,34 @@ h3.proj .sub { margin-bottom:0; font-weight:400; }
 .seg button { background:transparent; border:0; color:#8b949e;
   font:inherit; font-size:12px; padding:5px 11px; cursor:pointer; }
 .seg button.on { background:#1f6feb; color:#fff; }
-/* live machine-pool control: -/+ the concurrent-agent cap, value shows
-   leased slots / cap and goes amber while the pool is full */
-.poolbox { display:inline-flex; align-items:center; border:1px solid #30363d;
-  border-radius:7px; overflow:hidden; font-size:12px; }
-.poolbox button { background:transparent; border:0; color:#8b949e;
-  font:inherit; padding:5px 8px; cursor:pointer; }
-.poolbox button:hover:not(:disabled) { color:#fff; background:#1f6feb; }
-.poolbox button:disabled { opacity:.35; cursor:default; }
-.poolbox #pool-val { padding:5px 9px; color:#e6edf3; min-width:64px;
+/* the topbar pool button opens the pool modal - its label is 'agents
+   in-use/cap' (plus a queued count while steps wait) and it goes amber
+   while the pool is full or over-committed */
+.poolbox { background:transparent; border:1px solid #30363d;
+  border-radius:7px; color:#e6edf3; font:inherit; font-size:12px;
+  padding:5px 10px; cursor:pointer; }
+.poolbox:hover { border-color:#1f6feb; color:#fff; }
+.poolbox.full { color:#d29922; }
+/* the modal's cap stepper drafts the new cap; Apply commits it - a
+   pending draft tints blue, nothing changes until then */
+.capctl { display:inline-flex; align-items:center;
+  border:1px solid #30363d; border-radius:7px; overflow:hidden;
+  font-size:13px; }
+.capctl button { background:transparent; border:0; color:#8b949e;
+  font:inherit; padding:6px 12px; cursor:pointer; }
+.capctl button:hover:not(:disabled) { color:#fff; background:#1f6feb; }
+.capctl button:disabled { opacity:.35; cursor:default; }
+.capctl #cap-draft { padding:6px 14px; color:#e6edf3; min-width:44px;
   text-align:center; border-left:1px solid #30363d;
   border-right:1px solid #30363d; }
-.poolbox.full #pool-val { color:#d29922; }
+.capctl.dirty #cap-draft { color:#58a6ff; font-weight:600; }
+#detail .poolstat { display:flex; gap:18px; flex-wrap:wrap; margin:10px 0;
+  padding:9px 12px; border:1px solid #21262d; border-radius:7px;
+  font-size:13px; }
+#detail .poolstat b { color:#e6edf3; font-weight:600; }
+#detail .poolstat .warn { color:#d29922; }
+#detail table.pooltab { table-layout:auto; }
+#detail table.pooltab td, #detail table.pooltab th { padding-right:18px; }
 /* task/run history feed (driver events.jsonl + dashboard action log) */
 .evlog { margin:6px 0 10px; max-height:220px; overflow:auto;
   border:1px solid #21262d; border-radius:7px; }
@@ -14070,10 +14088,10 @@ tr.ctxanchor td { background:#1c3041; }
     <span class="sub" id="meta">loading&hellip;</span>
     <span class="tb-gap"></span>
     <button type="button" class="btn" id="new-request">New request</button>
-    <span class="poolbox" id="poolbox" role="group" aria-label="Parallel agents"
-      title="machine-wide parallel-agent cap - live slots / cap. Every driver re-checks the cap within seconds; raising it frees queued steps, lowering it never kills a running agent">
-      <button type="button" id="pool-dec" aria-label="one fewer parallel agent">&minus;</button><span id="pool-val">agents &hellip;</span><button type="button" id="pool-inc" aria-label="one more parallel agent">+</button>
-    </span>
+    <button type="button" class="poolbox" id="poolbox"
+      title="machine-wide agent pool: slots in use / cap, shared by every run on this box. Click for the live breakdown - who holds each slot, who is queued - and the cap control">
+      <span id="pool-val">agents &hellip;</span>
+    </button>
     <button type="button" class="btn secondary" id="power-btn"
       title="stop or restart this dashboard - warns about merges and live tasks first">&#x23FB;</button>
     <div class="seg" id="density" role="group" aria-label="Row density">
@@ -14283,6 +14301,8 @@ let modalQA = null;         // {id, rec, sel:Set, free:''} while the planner
                             // questionnaire modal is open
 let runModalKey = null;     // runKey while the run-details modal shows
 let summaryView = null;     // {key: agentKey} while the summary modal shows
+let poolView = false;       // the agent-pool modal is open
+let poolCapDraft = null;    // unapplied cap value in that modal (null = none)
 let modalScroll = null;     // scrollTop a Back navigation restores on render
 const modalHist = [];       // Back stack: {kind, key|id, scroll} entries of
                             // the view each modal-to-modal jump left behind
@@ -14760,7 +14780,7 @@ function _closeDetailNow(keepStack){
     qDismissed.add(qSig(modalQA.id, modalQA.rec.pending_questions));
   detailIdx = null; detailKey = null; modalRequest = null; modalQA = null;
   runModalKey = null; summaryView = null; detailHTML = '';
-  modalRunKey = null;
+  modalRunKey = null; poolView = false; poolCapDraft = null;
   if (!keepStack){ modalHist.length = 0; modalScroll = null; }
   document.getElementById('backdrop').hidden = true;
   applySel();        // every row mark clears with the dialog it belongs to
@@ -14856,6 +14876,7 @@ function snapshotModal(){
     return {kind:'request',id:modalRequest.id,scroll};
   if (detailKey!=null) return {kind:'agent',key:detailKey,scroll};
   if (runModalKey) return {kind:'run',key:runModalKey,scroll};
+  if (poolView) return {kind:'pool',scroll};
   return null;
 }
 function pushHist(snap){
@@ -14880,6 +14901,7 @@ function histLabel(snap){
     const r=(lastData?.runs||[]).find(x=>runKey(x)===snap.key);
     return 'run '+(r?r.run:snap.key);
   }
+  if (snap.kind==='pool') return 'agent pool';
   return 'request';
 }
 function backBtnHTML(){
@@ -14909,7 +14931,7 @@ function modalBack(){
     // the open*() calls below run their own closeDetail(keepStack) -
     // clear this view's markers first so its dirty flag can't re-prompt
     detailIdx=null; detailKey=null; modalRequest=null; modalQA=null;
-    runModalKey=null; summaryView=null;
+    runModalKey=null; summaryView=null; poolView=false;
     modalScroll=top.scroll;
     if (top.kind==='agent'){
       const j=AGENTS.findIndex(x=>agentKey(x)===top.key);
@@ -14922,6 +14944,7 @@ function modalBack(){
     }
     if (top.kind==='request'){ openRequest(top.id,true); return; }
     if (top.kind==='summary'){ openSummary(top.key,false); return; }
+    if (top.kind==='pool'){ openPool(false); return; }
   }
   modalScroll=null;
   closeDetail(true);                   // history exhausted - nothing to show
@@ -15344,7 +15367,7 @@ function showDetail(i, keepStack){
   // routing it through closeDetail would hide+reshow the dialog and
   // churn every piece of view state for nothing.
   const sameView = detailKey===key && !modalRequest && !modalQA &&
-    !runModalKey && !summaryView &&
+    !runModalKey && !summaryView && !poolView &&
     !document.getElementById('backdrop').hidden;
   if (!sameView && !closeThen(closeDetail(false, !!keepStack),
       ()=>showDetail(i, keepStack))) return;
@@ -17347,27 +17370,188 @@ async function answerQuestion(body){
 }
 
 let lastSig = null, BOOT = null;
+// Steps queued FOR a pool slot right now. slot_wait stays stamped on the
+// record after the lease lands, so 'queued' status is the real signal -
+// counting the flag alone would list running steps that waited earlier.
+const slotWaiters = d =>
+  (d.agents||[]).filter(a=>a.slot_wait && a.status==='queued');
 function syncPoolBox(){
   const sp = lastData && lastData.slot_pool,
         pv = document.getElementById('pool-val');
   if (!pv || !sp) return;
-  pv.textContent = `agents ${sp.in_use}/${sp.cap}`;
+  const q = slotWaiters(lastData).length;
+  pv.textContent = `agents ${sp.in_use}/${sp.cap}` +
+    (q ? ` \u00B7 ${q} queued` : '');
   pv.parentElement.classList.toggle('full', sp.in_use>=sp.cap);
-  const dec=document.getElementById('pool-dec'),
-        inc=document.getElementById('pool-inc');
-  if (dec) dec.disabled = sp.cap<=1;
-  if (inc) inc.disabled = sp.cap>=32;
 }
-async function poolBump(dlt, btn){
+// --- agent-pool modal ----------------------------------------------------
+// The topbar button's whole story in one place: what the cap does (and
+// never does - it never kills a running agent), who holds each slot right
+// now, who is queued for one, and a stepper that drafts a new cap for the
+// Apply button to commit. Repaints ride the normal refresh tick; an
+// untouched draft survives them via poolCapDraft.
+function openPool(){
+  // another modal may be open - leave through the same guard the task
+  // view uses (a dirty request form still gets its confirm first).
+  // keepStack: a Back jump already popped+re-entered us, so the stack
+  // under it must survive this close.
+  if (!closeThen(closeDetail(false, true), openPool)) return;
+  poolView = true; poolCapDraft = null;
+  renderPool();
+  if (modalScroll==null){
+    const d = document.getElementById('detail');
+    if (d) d.scrollTop = 0;
+  }
+  applyModalScroll();
+  document.getElementById('backdrop').hidden = false;
+}
+function renderPool(){
+  if (!poolView) return;
+  const html = lastData ? poolHtml(lastData)
+    : `<h3 id="modal-title">Agent pool</h3>` +
+      `<div class="notice">Loading&hellip;</div>`;
+  if (html===detailHTML) return;      // identical repaint - keep the DOM
+  const fcap = captureModalFocus();
+  const scap = captureModalScroll();
+  document.getElementById('dbody').innerHTML = html;
+  detailHTML = html;
+  restoreModalFocus(fcap);
+  restoreModalScroll(scap);
+}
+function poolHtml(d){
+  const sp = d.slot_pool || {cap:0, in_use:0, holders:[]},
+        cap = sp.cap, inUse = sp.in_use||0,
+        draft = poolCapDraft==null ? cap : poolCapDraft,
+        dirty = draft!==cap,
+        waiters = slotWaiters(d),
+        now = Date.now();
+  const bar = modalHist.length
+    ? `<div class="dnav"><span class="dnav-l">${backBtnHTML()}</span>` +
+      `</div>` : '';
+  const findA = h => h.run_dir==null ? null
+    : AGENTS.find(x=>x.step===h.step && base(x.run_dir||'')===h.run_dir);
+  // a lease can outlive its dashboard row (dead driver, orphaned worker
+  // still running) - such holders show 'leased' instead of a live status
+  const holdRows = (sp.holders||[]).map(h=>{
+    const a = findA(h);
+    const runCell = a
+      ? `<button type="button" class="linkbtn" ` +
+        `data-run-details="${esc(a.run_key||a.run_dir)}" ` +
+        `title="open this run's details">${esc(a.run||h.run||h.run_dir)}` +
+        `</button>`
+      : esc(h.run||h.run_dir||'(claiming)');
+    const stepCell = a
+      ? `<button type="button" class="linkbtn" ` +
+        `data-agent-detail="${esc(agentKey(a))}" ` +
+        `title="open this task's details">${esc(h.step)}</button>`
+      : esc(h.step||'');
+    const stCell = a
+      ? `<span class="stc st-${STCLASS[a.status]||'other'}">` +
+        `${esc(a.status)}</span>`
+      : `<span class="stc st-other">leased</span>`;
+    return `<tr><td>${h.slot!=null?h.slot:'&hellip;'}</td>` +
+      `<td class="wrap">${runCell}</td><td class="wrap">${stepCell}</td>` +
+      `<td>${stCell}</td>` +
+      `<td>${a?elapsed(a,now):'-'}</td>` +
+      `<td title="${esc(h.leased_at||'')}">` +
+      `${h.leased_at?loc(h.leased_at):'-'}</td></tr>`;
+  }).join('');
+  const qRows = waiters.map(a=>
+    `<tr><td class="wrap"><button type="button" class="linkbtn" ` +
+      `data-run-details="${esc(a.run_key||a.run_dir)}" ` +
+      `title="open this run's details">${esc(a.run||a.run_dir)}</button>` +
+      `</td><td class="wrap"><button type="button" class="linkbtn" ` +
+      `data-agent-detail="${esc(agentKey(a))}" ` +
+      `title="open this task's details">${esc(a.step)}</button></td>` +
+      `<td>${fmtS(a.slot_waited_s)}</td></tr>`).join('');
+  // waits that never touch the pool (device lease, merge lock, wave cap)
+  const otherQ = AGENTS.filter(a=>a.status==='queued' && !a.slot_wait);
+  let notice = '';
+  if (dirty && draft<inUse)
+    notice = `<div class="notice warn">Cap below current use: ` +
+      `<b>${inUse-draft}</b> agent(s) would be over the limit. ` +
+      `<b>Nothing is killed</b> - running agents always finish their ` +
+      `step (or their own timeout). New dispatches just wait until use ` +
+      `drops below ${draft}.</div>`;
+  else if (dirty && draft>cap)
+    notice = `<div class="notice">Raises the ceiling - lands within ` +
+      `seconds; queued steps lease as slots free.</div>`;
+  else if (dirty)
+    notice = `<div class="notice">Lowers the ceiling - no running ` +
+      `agent is killed; queued steps keep waiting until a slot ` +
+      `frees.</div>`;
+  return bar +
+    `<h3 id="modal-title">Agent pool</h3>` +
+    `<div class="sub">One machine-wide ceiling on concurrent Devin ` +
+    `sessions, shared by every run on this box ` +
+    `(CONDUCTOR_MAX_AGENTS). Each dispatched step leases one slot for ` +
+    `its whole life - attempts, interrupt respawns and merge resolvers ` +
+    `included. Lowering the cap <b>never kills</b> a running agent; ` +
+    `raising it frees queued steps.</div>` +
+    `<div class="poolstat">` +
+      `<span>in use <b>${inUse}/${cap}</b></span>` +
+      `<span>queued for a slot ` +
+        `<b${waiters.length?' class="warn"':''}>${waiters.length}</b>` +
+      `</span>` +
+      `<span>cpu <b>${d.cpu_count||'?'}</b> cores</span>` +
+      `<span>free ram <b>${d.free_ram_gb||'?'}</b> GB</span>` +
+    `</div>` +
+    `<div class="actions" style="margin-top:0">` +
+      `<span class="sub">cap</span>` +
+      `<span class="capctl${dirty?' dirty':''}">` +
+        `<button type="button" id="cap-dec" ` +
+          `aria-label="one fewer parallel agent"` +
+          `${draft<=1?' disabled':''}>&minus;</button>` +
+        `<span id="cap-draft">${draft}</span>` +
+        `<button type="button" id="cap-inc" ` +
+          `aria-label="one more parallel agent"` +
+          `${draft>=32?' disabled':''}>+</button>` +
+      `</span>` +
+      `<button type="button" class="btn" id="cap-apply"` +
+        `${dirty?'':' disabled'} title="commit the drafted cap - ` +
+        `every driver picks it up within seconds">Apply</button>` +
+      (dirty ? `<span class="sub">current cap: ${cap}</span>` : '') +
+    `</div>` + notice +
+    `<h3 style="margin-top:16px">holding a slot</h3>` +
+    (holdRows
+      ? `<div class="wrapw"><table class="pooltab"><tr><th>slot</th>` +
+        `<th>run</th><th>step</th><th>status</th><th>elapsed</th>` +
+        `<th>leased</th></tr>${holdRows}</table></div>`
+      : `<div class="sub">idle - no agent holds a slot right now.</div>`) +
+    (waiters.length
+      ? `<h3 style="margin-top:16px">queued for a slot</h3>` +
+        `<div class="wrapw"><table class="pooltab"><tr><th>run</th>` +
+        `<th>step</th><th>waiting</th></tr>${qRows}</table></div>`
+      : '') +
+    (otherQ.length
+      ? `<div class="sub" style="margin-top:12px">${otherQ.length} ` +
+        `other queued step(s) wait on a device lease, a merge lock or ` +
+        `their wave - they don't hold pool slots.</div>`
+      : '');
+}
+function poolStep(dlt){
   const sp = lastData && lastData.slot_pool;
-  if (!sp || !btn || btn.disabled) return;
-  const box = document.getElementById('poolbox');
-  box.querySelectorAll('button').forEach(b=>b.disabled=true);
+  if (!sp) return;
+  const cur = poolCapDraft==null ? sp.cap : poolCapDraft,
+        n = Math.min(32, Math.max(1, cur+dlt));
+  if (n===cur) return;
+  poolCapDraft = n;
+  renderPool();
+}
+async function poolApply(btn){
+  const sp = lastData && lastData.slot_pool;
+  if (!sp || poolCapDraft==null || poolCapDraft===sp.cap) return;
+  if (btn) btn.disabled = true;
   try {
-    const sp2 = await api('POST','/api/pool',{cap:sp.cap+dlt});
+    const sp2 = await api('POST','/api/pool',{cap:poolCapDraft});
     if (lastData) lastData.slot_pool = sp2;
-  } catch (e) { await showAlert('Pool cap: '+(e.message||e)); }
-  syncPoolBox();
+    poolCapDraft = null;
+    renderPool();
+    syncPoolBox();
+  } catch (e) {
+    if (btn) btn.disabled = false;
+    await showAlert('Pool cap: '+(e.message||e));
+  }
 }
 function tickElapsed(now){
   for (const a of AGENTS){
@@ -17436,13 +17620,6 @@ function render(d){
   const planned = d.agents.filter(a=>a.status==='planned').length;
   document.getElementById('meta').innerHTML =
     `${d.agents.length-planned} agents | ${planned} planned | ${live.length} running | ` +
-    (d.slot_pool ? `<b title="machine-wide agent slots (CONDUCTOR_MAX_AGENTS` +
-      `, default ${d.slot_pool.cap}); queued = steps holding no slot yet"` +
-      `>slots ${d.slot_pool.in_use}/${d.slot_pool.cap}</b>` +
-      (d.slot_pool.in_use>=d.slot_pool.cap
-        ? ` <span style="color:#d29922">queued: ` +
-          `${d.agents.filter(a=>a.slot_wait).length}</span>` : '') +
-      ` | ` : '') +
     `cpu ${d.cpu_count||'?'} cores | free ram ${d.free_ram_gb||'?'} GB | ` +
     `refreshed ${loc(d.generated_at)}` +
     (d.pricing && d.pricing.models
@@ -18042,6 +18219,9 @@ function render(d){
       showRunDetails(modalRunKey);
     else closeDetail(true);
   }
+  // the pool modal is fully live: holder rows appear/leave as leases
+  // land and the queued table fills - repaint it on every payload
+  if (poolView && !document.getElementById('backdrop').hidden) renderPool();
   // the open summary view isn't repainted on refresh - its document is
   // static - but the review marks it surfaces are live; re-decorate in
   // place so a click flips pill/link/strikethrough without a reopen
@@ -18144,8 +18324,13 @@ document.addEventListener('click', async e=>{
     document.getElementById('powerwrap').hidden=true; return; }
   if (t.id==='pw-restart'){ powerAct('restart'); return; }
   if (t.id==='pw-stop'){ powerAct('stop'); return; }
-  if (t.id==='pool-dec'){ poolBump(-1, t); return; }
-  if (t.id==='pool-inc'){ poolBump(1, t); return; }
+  // the topbar pool button opens the modal; inside it the stepper only
+  // drafts, Apply commits
+  if (t.id==='poolbox' || (t.closest && t.closest('#poolbox'))){
+    openPool(); return; }
+  if (t.id==='cap-dec'){ poolStep(-1); return; }
+  if (t.id==='cap-inc'){ poolStep(1); return; }
+  if (t.id==='cap-apply'){ poolApply(t); return; }
   if (t.id==='new-request'){
     openNew(); return; }
   if (t.dataset && t.dataset.density){
