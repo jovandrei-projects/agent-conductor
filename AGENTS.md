@@ -62,6 +62,8 @@ python conductor.py serve [--port 8773]     live dashboard of all agents
 python conductor.py sweep                   re-mark orphaned records 'lost'
 python conductor.py merge <run_dir>         land pending (deferred/parked) branches
 python conductor.py summarize <run_dir>     write the run's LLM executive summary
+python conductor.py regen-followup <id>     re-review + rewrite a stale follow-up
+                                            proposal in place (dashboard spawn)
 python conductor.py sessions [--rm]         list/clean spawned devin sessions
 python conductor.py demo                    end-to-end vs tests/mock_devin.py
 python run_tests.py                         unittest suite (mock-only, no auth)
@@ -473,7 +475,24 @@ register a written file explicitly - the deliberate override that also
 imports files predating the feature or orphaned by a foreign checkout.
 Run rows carry the `followup` stamp (registered/empty/missing/invalid/
 deferred/absent) with a chip linking the request; busy destinations
-defer to the next pass instead of failing (`_assert_unwatched`). `On
+defer to the next pass instead of failing (`_assert_unwatched`).
+A stale imported follow-up re-reviews instead of replanning: the
+request modal's 'Regenerate follow-up' (on `imported == "followup"`
+records, replacing the answer-only planner's Regenerate tasks - a
+follow-up's `raw` is only a stub, so generic regeneration could never
+re-check its items) spawns a detached `conductor.py regen-followup
+<id>` -> one `devin -p` review session IN the source project that
+rewrites `<run>-followup.toml` in place (drop done/obsolete items,
+keep what remains, add substantiated gaps, or a no-`[[step]]` file when
+nothing remains). The path-keyed intake folds the rewrite into the SAME
+request record - never a second row - and an empty rewrite drops the
+owned copy so `empty` has no launchable manifest. While it runs the
+`<id>.regen` marker (live-pid contract like `.summarizing`) drives the
+`fu_regen` stage ('Re-reviewing follow-up'), refuses save/apply/
+generate/discard, and guards the intake's republish; the session's
+log/export/bookkeeping land as `<id>.regen.*` plus `rec.fu_regen`
+(same shape as `run_summary`), surfaced as an aux `follow-up-review`
+agent row and the modal's 'Review output (live)' tail. `On
 step failure` and `Attempts/step` map to
 `run.on_failure` and `[defaults].max_attempts`; generation fails closed
 when the planner ignores them (edit the TOML directly to override).

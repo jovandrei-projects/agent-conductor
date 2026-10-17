@@ -12546,6 +12546,295 @@ assert.match(row('fu-run'),/follow-up &rarr; <b class="fu-bad">invalid<\/b>/);
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class FollowupRegenTests(unittest.TestCase):
+    """'Regenerate follow-up' re-reviews a stale imported follow-up: a
+    detached devin session rewrites the SOURCE manifest in place, the
+    normal intake folds the result into the SAME request record
+    ('updated'/'empty'/'edited'), and the .regen marker drives a
+    fu_regen dashboard stage while the review is live. Nothing launches,
+    nothing duplicates."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.proj = make_project(self.base)
+        self.runs = self.base / "runs"
+        self.requests = self.base / "requests"
+        self.manifests = self.base / "manifests"
+        self.manifests.mkdir()
+        patch = mock.patch.object(conductor, "load_projects", return_value={
+            "proj": {"path": self.proj, "cloud_ok": False}})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def proposal(self, name="rest-followup",
+                 description="Finish the leftover work"):
+        return f'''[run]
+name = "{name}"
+description = "{description}"
+checkpoint = true
+
+[defaults]
+project = "proj"
+model = "swe-2"
+
+[[step]]
+name = "leftover"
+prompt = "Finish the leftovers."
+'''
+
+    def empty_proposal(self, name="rest-followup"):
+        return f'''# re-review found nothing left worth doing
+[run]
+name = "{name}"
+description = "nothing remains"
+checkpoint = true
+'''
+
+    def run_dir(self, name="rest"):
+        d = self.runs / f"20261017-000000-{name}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "state.json").write_text(json.dumps({
+            "run": name,
+            "manifest": str(self.manifests / f"{name}.toml"),
+            "ended_at": "2026-10-17T01:00:00",
+            "steps": {"follow-up-plan": {
+                "status": "done", "ended_at": "2026-10-17T01:00:00"}}}),
+            encoding="utf-8")
+        return d
+
+    def recs(self):
+        # *.json also matches <id>.regen.export.json transcripts - only a
+        # request record has an id-shaped stem
+        return [json.loads(p.read_text(encoding="utf-8"))
+                for p in self.requests.glob("*.json")
+                if conductor.REQUEST_ID_RE.fullmatch(p.stem)]
+
+    def registered(self, name="rest"):
+        """A run dir + its produced follow-up file, discovered into one
+        ready request record - returns (rec, source_path, run_dir)."""
+        rd = self.run_dir(name)
+        src = self.manifests / f"{name}-followup.toml"
+        src.write_text(self.proposal(f"{name}-followup"),
+                       encoding="utf-8")
+        conductor.discover_followups(self.runs, self.requests,
+                                     self.manifests)
+        return self.recs()[0], src, rd
+
+    def fake_session(self, rewrite=None, wait=(0, False, False, False, 0.0),
+                     seen=None):
+        """(popen_patch, wait_patch) pair: FakeProc captures the devin
+        spawn, the wait_worker stand-in optionally rewrites the follow-up
+        source mid-'session' and reports `wait`'s verdict."""
+        real_popen = subprocess.Popen
+        def fake_popen(cmd, **kwargs):
+            # only the worker's own --prompt-file spawn is faked - every
+            # other subprocess (git probes inside the intake guards) runs
+            if "--prompt-file" not in cmd:
+                return real_popen(cmd, **kwargs)
+            if seen is not None:
+                seen["cmd"] = cmd
+                seen["cwd"] = kwargs.get("cwd")
+                seen["prompt"] = Path(
+                    cmd[cmd.index("--prompt-file") + 1]).read_text(
+                        encoding="utf-8")
+            if "--export" in cmd:
+                Path(cmd[cmd.index("--export") + 1]).write_text(
+                    json.dumps({"mock": True, "session": "mock-regen"}),
+                    encoding="utf-8")
+            kwargs["stdout"].write(b"mock review session\nSTATUS: done\n")
+            kwargs["stdout"].flush()
+            return mock.Mock()
+        def fake_wait(proc, log, timeout_s, *a, **kw):
+            if rewrite is not None:
+                rewrite()
+            Path(log).parent.mkdir(parents=True, exist_ok=True)
+            return wait
+        return (mock.patch.object(conductor.subprocess, "Popen", fake_popen),
+                mock.patch.object(conductor, "wait_worker", fake_wait))
+
+    def test_start_refuses_non_followup(self):
+        rec, _src, _rd = self.registered()
+        # a plain (non-imported) request has no source file to re-review
+        p = self.requests / f"{rec['id']}.json"
+        rec.pop("imported")
+        p.write_text(json.dumps(rec), encoding="utf-8")
+        with self.assertRaises(conductor.RequestError):
+            conductor.regen_followup_start(
+                rec["id"], self.requests, self.manifests, self.runs,
+                ["devin"])
+
+    def test_start_refuses_second_review_and_blocks_edits(self):
+        rec, _src, _rd = self.registered()
+        marker = conductor._regen_marker(self.requests, rec["id"])
+        marker.write_text(str(os.getpid()), encoding="utf-8")  # live pid
+        with self.assertRaises(conductor.RequestError):
+            conductor.regen_followup_start(
+                rec["id"], self.requests, self.manifests, self.runs,
+                ["devin"])
+        # while the marker lives the record is mid-review: no save,
+        # apply, generate, or discard
+        self.assertTrue(conductor._regenerating(rec["id"], self.requests))
+        calls = (
+            lambda: conductor.save_request(
+                rec["id"], {}, self.requests, self.manifests, self.runs),
+            lambda: conductor.apply_request(
+                rec["id"], {}, self.requests, self.manifests, self.runs),
+            lambda: conductor.start_generation(
+                rec["id"], self.requests, self.manifests, self.runs,
+                ["devin"]),
+            lambda: conductor.discard_request(
+                rec["id"], self.requests, self.manifests, self.runs))
+        for call in calls:
+            with self.assertRaises(conductor.RequestError):
+                call()
+        # a dead-pid marker doesn't count - it's orphaned debris
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        marker.write_text(str(dead.pid), encoding="utf-8")
+        self.assertFalse(
+            conductor._regenerating(rec["id"], self.requests))
+
+    def test_start_spawns_detached_and_marks_stage(self):
+        rec, _src, _rd = self.registered()
+        with mock.patch.object(conductor, "_launch_process",
+                               return_value=os.getpid()) as lp:
+            out = conductor.regen_followup_start(
+                rec["id"], self.requests, self.manifests, self.runs,
+                ["devin"])
+        self.assertEqual(out["regenerating"], rec["id"])
+        cmd = lp.call_args[0][0]
+        self.assertIn("regen-followup", cmd)
+        self.assertIn(rec["id"], cmd)
+        stage = conductor._request_status(
+            json.loads((self.requests / f"{rec['id']}.json").read_text(
+                encoding="utf-8")), self.runs, requests_dir=self.requests)
+        self.assertEqual(stage, "fu_regen")
+        d = conductor.collect_dashboard(
+            self.runs, ["no-such-devin"], self.requests)
+        row = next(r for r in d["runs"]
+                   if r.get("request_id") == rec["id"])
+        self.assertEqual(row["stage"], "fu_regen")
+        aux = [a for a in d["agents"]
+               if a.get("step") == "follow-up-review"]
+        self.assertEqual(len(aux), 1)
+        self.assertEqual(aux[0]["status"], "running")
+        self.assertTrue(aux[0]["aux"])
+        conductor._regen_marker(self.requests, rec["id"]).unlink(
+            missing_ok=True)
+
+    def test_rewrite_republishes_same_record(self):
+        rec, src, rd = self.registered()
+        seen = {}
+        pop, wait = self.fake_session(
+            rewrite=lambda: src.write_text(
+                self.proposal("rest-followup", "still worth doing v2"),
+                encoding="utf-8"), seen=seen)
+        with pop, wait:
+            self.assertTrue(conductor.regen_followup(
+                rec["id"], self.requests, self.manifests, self.runs,
+                ["devin"]))
+        recs = self.recs()
+        self.assertEqual([r["id"] for r in recs], [rec["id"]])
+        rec2 = recs[0]
+        self.assertEqual(rec2["status"], "ready")
+        self.assertEqual(rec2["description"], "still worth doing v2")
+        rg = rec2["fu_regen"]
+        self.assertEqual(rg["status"], "ready")
+        self.assertEqual(rg["session"], "mock-regen")
+        self.assertIn("rewritten in place", rg["note"])
+        self.assertEqual(rg["work_dir"], str(self.proj))
+        self.assertFalse(conductor._regen_marker(
+            self.requests, rec["id"]).exists())
+        # the review ran IN the project with the source path in its brief
+        self.assertEqual(seen["cwd"], str(self.proj))
+        self.assertIn(str(src), seen["prompt"])
+        self.assertIn("REWRITE", seen["prompt"])
+        self.assertIn("--export", seen["cmd"])
+        ev = (rd / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"followup_regen"', ev)
+
+    def test_empty_rewrite_drops_owned_copy(self):
+        rec, src, _rd = self.registered()
+        owned = Path(rec["manifest"])
+        self.assertTrue(owned.is_file())
+        pop, wait = self.fake_session(
+            rewrite=lambda: src.write_text(self.empty_proposal(),
+                                           encoding="utf-8"))
+        with pop, wait:
+            self.assertTrue(conductor.regen_followup(
+                rec["id"], self.requests, self.manifests, self.runs,
+                ["devin"]))
+        rec2 = self.recs()[0]
+        self.assertEqual(rec2["status"], "empty")
+        self.assertIsNone(rec2["manifest"])
+        self.assertEqual(rec2["proposed_steps"], [])
+        self.assertFalse(owned.exists())     # the stale plan is gone
+        self.assertEqual(rec2["fu_regen"]["status"], "empty")
+        d = conductor.collect_dashboard(
+            self.runs, ["no-such-devin"], self.requests)
+        row = next(r for r in d["runs"]
+                   if r.get("request_id") == rec["id"])
+        self.assertEqual(row["stage"], "empty")
+        with self.assertRaises(conductor.RequestError):
+            conductor.launch_request(rec["id"], self.requests,
+                                     self.manifests, self.runs, ["devin"])
+
+    def test_failed_session_keeps_proposal(self):
+        rec, src, _rd = self.registered()
+        owned = Path(rec["manifest"])
+        pop, wait = self.fake_session(wait=(3, False, False, False, 0.0))
+        with pop, wait:
+            self.assertFalse(conductor.regen_followup(
+                rec["id"], self.requests, self.manifests, self.runs,
+                ["devin"]))
+        rec2 = self.recs()[0]
+        self.assertEqual(rec2["status"], "ready")
+        self.assertEqual(owned.read_text(encoding="utf-8"),
+                         src.read_text(encoding="utf-8"))
+        self.assertEqual(rec2["fu_regen"]["status"], "failed")
+        self.assertFalse(conductor._regen_marker(
+            self.requests, rec["id"]).exists())
+
+    def test_unchanged_review_leaves_record_alone(self):
+        rec, _src, _rd = self.registered()
+        pop, wait = self.fake_session()          # session runs, writes zip
+        with pop, wait:
+            self.assertTrue(conductor.regen_followup(
+                rec["id"], self.requests, self.manifests, self.runs,
+                ["devin"]))
+        rec2 = self.recs()[0]
+        self.assertEqual(rec2["status"], "ready")
+        self.assertEqual(rec2["fu_regen"]["status"], "unchanged")
+
+    def test_hand_edit_beats_the_rewrite(self):
+        rec, src, _rd = self.registered()
+        owned = Path(rec["manifest"])
+        owned.write_text("# human notes\n"
+                         + owned.read_text(encoding="utf-8"),
+                         encoding="utf-8")
+        pop, wait = self.fake_session(
+            rewrite=lambda: src.write_text(
+                self.proposal("rest-followup", "v3"), encoding="utf-8"))
+        with pop, wait:
+            self.assertFalse(conductor.regen_followup(
+                rec["id"], self.requests, self.manifests, self.runs,
+                ["devin"]))
+        self.assertIn("# human notes",
+                      owned.read_text(encoding="utf-8"))
+        self.assertEqual(
+            self.recs()[0]["fu_regen"]["note"],
+            "kept - the proposal was hand-edited meanwhile")
+
+    def test_regen_button_route_and_stage_wired(self):
+        html = conductor._DASH_HTML
+        self.assertIn('data-action="regen"', html)
+        self.assertIn('/regen-followup', html)
+        self.assertIn('Re-reviewing follow-up', html)
+        self.assertIn('Regenerate follow-up', html)
+        self.assertIn('fu_regen', html)
+
+
 @slow
 class DeviceOwnershipTests(unittest.TestCase):
     """The `device` step key leases ONE adb serial machine-wide for a
