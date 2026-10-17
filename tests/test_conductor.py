@@ -2484,6 +2484,29 @@ prompt = "Polish the catalog."
         self.assertEqual((self.requests / f"{rec['id']}.gen.log")
                          .read_text(), "planner died mid-thought\n")
 
+    def test_drain_leaves_a_spool_whose_owner_is_alive(self):
+        """_GENERATING is per-process: a second serve/status process
+        draining the shared spool must not mark a live foreign generation
+        'interrupted' - owner_pid/planner_pid in job.json are the
+        cross-process liveness check (a --print log stays empty the whole
+        turn, so log freshness alone is not proof of death)."""
+        rec = self.new()
+        spool = self._spool_fixture(rec, log="")     # 0-byte --print log
+        job = json.loads((spool / "job.json").read_text())
+        job["gen_id"] = rec.get("gen_id") or "live-gen"
+        job["owner_pid"] = os.getpid()              # this test process
+        job["owner_boot"] = conductor.SERVE_BOOT
+        job["planner_pid"] = os.getpid()
+        (spool / "job.json").write_text(json.dumps(job))
+
+        adopted = conductor.drain_planner_spool(self.spool)
+        time.sleep(0.3)                             # let any drain run
+        self.assertNotIn(rec["id"], adopted)
+        self.assertTrue(spool.exists())             # spool untouched
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertNotIn("interrupted", str(rec.get("error")))
+
     def test_drain_never_republishes_a_superseded_draft(self):
         """A regenerate crashed before its own draft: the previous
         generation's draft.toml stays on disk but must NOT publish -

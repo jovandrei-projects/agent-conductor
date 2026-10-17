@@ -8738,6 +8738,18 @@ STATUS: done
             if rid:
                 with REQUEST_LOCK:
                     _GEN_PROCS[rid] = proc
+            # The detached planner may outlive its owner - job.json gets
+            # its pid so a drain under a dead owner still waits it out
+            # (a --print session writes the log only at turn end, so an
+            # empty log is NOT proof of a dead planner).
+            try:
+                jf = log.parent / "job.json"
+                if jf.is_file():
+                    job = json.loads(jf.read_text(encoding="utf-8"))
+                    job["planner_pid"] = proc.pid
+                    jf.write_text(json.dumps(job), encoding="utf-8")
+            except (OSError, ValueError):
+                pass
             try:
                 rc, timed_out, hung, stopped, _ext = wait_worker(
                     proc, log, 600,
@@ -9024,6 +9036,12 @@ def _finish_generation(request_id: str, requests_dir: Path,
             "request_id": request_id, "requests_dir": str(requests_dir),
             "manifests_dir": str(manifests_dir), "runs_dir": str(runs_dir),
             "gen_id": gen_id,
+            # Ownership for cross-process drain liveness: _GENERATING only
+            # covers THIS process, so a foreign drain (a second serve, a
+            # status call - anything running collect_dashboard) must check
+            # pids. SERVE_BOOT is module-load time = this process's start.
+            "owner_pid": os.getpid(),
+            "owner_boot": SERVE_BOOT,
             "base_updated_at": base.get("updated_at"),
             "base_status": base.get("status"),
             "base_stopped_at": base.get("generation_stopped_at"),
@@ -9202,10 +9220,16 @@ def drain_planner_spool(root: Path | None = None) -> list[str]:
             continue
         # _GENERATING is keyed by attempt gen_id - a live generation's
         # spool carries it in job.json (and the overlay once written).
-        live = {_job_meta(d).get("gen_id"),
+        job = _job_meta(d)
+        live = {job.get("gen_id"),
                 (_spool_rec(d.name) or {}).get("gen_id")}
         if _GENERATING.intersection(live - {None}) \
                 or d.name in _DRAINING:
+            continue
+        # _GENERATING only covers THIS process: a live foreign owner (a
+        # second serve, a parallel generation) is not an orphan - a drain
+        # here would mark its still-running generation 'interrupted'.
+        if pid_alive(job.get("owner_pid"), job.get("owner_boot")):
             continue
         _DRAINING.add(d.name)
         threading.Thread(target=_drain_spool, args=(d,), daemon=True).start()
@@ -9242,6 +9266,13 @@ def _drain_generating(rid: str, overlay: dict, spool: Path,
     """A generation that never finished: publish a spooled draft, extract
     one from a finished-but-uncaptured planner log, wait out an orphan
     that is still writing, else land the interruption as an error."""
+    job = _job_meta(spool)
+    # A dead owner's detached planner may still be writing (a --print
+    # session writes the log only at turn end, so an empty/stale log is
+    # NOT proof of death) - leave the spool for the next pass.
+    if pid_alive(job.get("planner_pid"),
+                 overlay.get("generation_started_at")):
+        return
     draft = spool / "draft.toml"
     current = overlay.get("draft_started_at") == overlay.get(
         "generation_started_at") and overlay.get("draft_started_at")
