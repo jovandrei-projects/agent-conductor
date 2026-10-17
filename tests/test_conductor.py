@@ -5328,8 +5328,10 @@ const click=t=>handlers.click({target:{...t,closest:()=>null},
         """Slow view chips (archived/trash refetch the whole state) show a
         spinner + content dim while the fetch is in flight, ignore a
         repeat click on the same chip (no toggle-back), and clear up on
-        success AND failure. Regression for 'clicked, nothing happened,
-        clicked again and un-toggled'."""
+        success AND failure - including a wedged fetch, which must settle
+        via the AbortSignal timeout or the chip spins forever. Regression
+        for 'clicked, nothing happened, clicked again and un-toggled'
+        and 'spinner keeps spinning after the action completed'."""
         html = conductor._DASH_HTML
         # static hooks: chip spinner + content dim + a busy click gate
         self.assertRegex(html, r'button\.chip\.busy::after[^}]*animation:chipspin')
@@ -5351,13 +5353,14 @@ const document={getElementById:elem,querySelector:()=>null,
   addEventListener:(ev,h)=>{handlers[ev]=h;}};
 const data={serve_boot:'b',generated_at:'2026-10-17T00:00:00',agents:[],
   runs:[],archived_runs:3,trash_count:2};
-const fetches=[]; const pending=[]; let failNext=false;
-const fetch=(url,opt)=>{fetches.push(url);
+const fetches=[]; const sigs=[]; const pending=[]; let failNext=false;
+const fetch=(url,opt)=>{fetches.push(url); sigs.push(opt&&opt.signal);
   if(failNext) return Promise.reject(new Error('net down'));
   return new Promise(res=>pending.push(()=>res(
     {ok:true,json:async()=>data})));};
 const ctx=vm.createContext({document,location:{reload:()=>{}},
-  setTimeout:()=>{},fetch,confirm:()=>true});
+  setTimeout:()=>{},fetch,confirm:()=>true,
+  AbortSignal:{timeout:ms=>({_ms:ms})}});
 vm.runInContext(src,ctx);
 const chip=(ds)=>{const o={id:'',dataset:ds,disabled:false,
   isContentEditable:false,classList:mkCls(),_attrs:{},
@@ -5373,6 +5376,10 @@ const click=t=>handlers.click({target:t,preventDefault:()=>{}});
   assert.equal(arch._attrs['aria-busy'],'true');
   assert.equal(document.body.classList.contains('viewload'),true);
   assert.deepEqual(fetches,['/api/state?archived=1']);
+  // the state fetch carries an AbortSignal timeout - a wedged request
+  // must settle or chipBusy would hold 'arch' (spinner + dead chip)
+  // until a page reload
+  assert.equal(sigs[0] && sigs[0]._ms, 30000);
   // a repeat click while it spins must not toggle back off / refetch
   const p2=click(arch);
   await p2;

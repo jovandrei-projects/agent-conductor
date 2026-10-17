@@ -15547,9 +15547,13 @@ function ctxMoveFocus(key){
   ctxState.idx = i;
   if (bs[i].focus) bs[i].focus();
 }
-async function api(method,path,body){
+async function api(method,path,body,timeoutMs){
   const opt = method==='GET' ? {} : {method,
     headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})};
+  // a never-settling fetch would park callers forever - chipBusy never
+  // clears, its view chip spins and stays inert until a page reload
+  if (timeoutMs && typeof AbortSignal!=='undefined' && AbortSignal.timeout)
+    opt.signal = AbortSignal.timeout(timeoutMs);
   const res=await fetch(path,opt);
   const out=await res.json();
   if (!res.ok) throw new Error(out.error||`HTTP ${res.status}`);
@@ -15563,7 +15567,10 @@ async function api(method,path,body){
 let stateReqSeq = 0;
 async function refresh(){
   const my = ++stateReqSeq;
-  const d = await api('GET', stateUrl());
+  // 30s: far above the worst observed payload (~6s cold session cache,
+  // ~1s typical) - a fetch past this is wedged (dropped/half-open
+  // connection, stalled handler) and must settle so busy chips release
+  const d = await api('GET', stateUrl(), null, 30000);
   if (my===stateReqSeq) render(d);
 }
 // A user-clicked refetch (view chips, trash ops) can take seconds - the
