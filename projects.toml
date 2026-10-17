@@ -21,7 +21,7 @@ path = "."
 cloud_ok = true   # decided 2026-10-13. NOTE: repo has no git remote yet -
                   # cloud steps clone from origin, so they need a GitHub
                   # repo + push first.
-verify = "python run_tests.py"
+verify = "python run_tests.py --jobs 8"
 
 [project.apartment-3d]
 path = "../apartment-3d"
