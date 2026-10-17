@@ -1404,6 +1404,10 @@ setRoute((url,opt)=>{
   assert(html.includes('data-ai-del="conv-2"'),'delete op rendered');
   assert.match(html,/2 KB/,'size estimate shown');
   assert.match(html,/KB/,'KB unit present');
+  // the ellipsized sub line is always fully readable on hover
+  assert(html.includes('title="chat one\n'),
+    'row tooltip carries title + full sub line');
+  assert.match(html,/title="[^"]*2 KB[^"]*"/,'tooltip keeps full KB');
   // rename: clicking the pen swaps the row to an input
   nodes.get('ai-rail')._h.click({target:{closest:s=>
     s==='[data-ai-ren]'?{getAttribute:()=>'conv-2'}:null}});
