@@ -13915,10 +13915,12 @@ let runsShown = SHOW_N;   // visible run-table rows; active runs never hide
 const ORDER = ['running','queued','waiting','planned','done','partial',
                'blocked','stopped','timed_out','failed','skipped','lost',
                'superseded'];
-const FACETS = ['wt','merged','unmerged','deferred'];
+const FACETS = ['unreviewed','wt','merged','unmerged','deferred'];
+const FACET_TINT = {unreviewed:'#39c5cf'};
 const matchesFacet = (a,f) => f==='wt' ? a.wt :
   f==='merged' ? a.merged===true :
-  f==='unmerged' ? a.merged===false : a.deferred===true;
+  f==='unmerged' ? a.merged===false :
+  f==='deferred' ? a.deferred===true : !!a.needs_review;
 const runKey = r => r.key||r.dir;
 let lastData = null;
 let AGENTS = [];          // last payload, for the detail modal
@@ -17142,7 +17144,8 @@ function render(d){
     `<span class="filter-group"><span class="filter-label">tags:</span>` +
     FACETS.filter(f=>facetCounts[f]||facets.has(f)).map(f=>
       `<button type="button" class="chip${facets.has(f)?' active':''}" ` +
-      `data-facet="${f}" aria-pressed="${facets.has(f)}">` +
+      `data-facet="${f}" aria-pressed="${facets.has(f)}" ` +
+      `${FACET_TINT[f]?`style="color:${FACET_TINT[f]}" `:''}>` +
       `${facetCounts[f]} ${f}${facets.has(f)?' ×':''}</button>`).join('') +
     '</span>' +
     `<span class="filter-group"><span class="filter-label">view:</span>` +
