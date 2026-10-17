@@ -842,7 +842,25 @@ concrete fast adapter - this branch wires its discovery but does not
 merge it. Contract + schema v5 documented below; new `TransportTests`
 (16) cover selection, read-only routing, init-failure fallback,
 snapshot freezing, back-compat NULL rows, per-transport session namespacing
-and reconcile adoption. Full suite run recorded in this file's log.
+and reconcile adoption. Commit bf2000a.
+
+### Verified (runtime-and-settings)
+
+- `tests.test_assistant` 67 OK, `tests.test_assistant_runtime` 65 OK
+  (49 prior + 16 TransportTests), `tests.test_assistant_host` +
+  `tests.test_assistant_ui` 63 OK, `tests.test_assistant_actions` 38 OK -
+  all standalone green.
+- `python run_tests.py --jobs 8`: 868 tests, 5 shards failed - ALL
+  failures are conductor/worktrees run-control races under a saturated
+  shared box (this live wave's driver held 4 of the machine-global
+  `%TEMP%/agent-conductor-slots` cap=8 and ~5 parallel `run_tests.py`
+  gates from sibling worktree agents ran concurrently; steps sat
+  'queued' for slots and stop/drain flags landed mid-queue -> 'skipped'
+  not 'stopped', or wave-overlap timing assertions lost their overlap).
+  Every failing test re-run standalone on this branch PASSES:
+  StopControlTests(3), PauseRunTests(2), StepControl skip-resume,
+  CumulativeElapsed driver-span, WorkerContextE2E ports. Zero failures
+  in assistant code; no leaked provider processes (tests use fakes).
 
 ## Implemented contracts (fast-transport runtime + settings)
 

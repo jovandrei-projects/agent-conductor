@@ -14,6 +14,19 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 
+class ProviderUnavailable(Exception):
+    """The transport could not start or continue a provider dispatch
+    (spawn failure, handshake failure, unreachable endpoint, dead
+    session). Distinct from a turn-level error: the exchange never
+    reached the model, so the runtime may retry on another transport."""
+
+
+class AuthUnavailable(ProviderUnavailable):
+    """Credential-shaped unavailability - stored auth missing/expired.
+    The runtime's fast-transport fallback keys on this to route the
+    exchange through the CLI transport without failing the question."""
+
+
 @dataclass
 class ProviderHandle:
     """One in-flight provider dispatch."""

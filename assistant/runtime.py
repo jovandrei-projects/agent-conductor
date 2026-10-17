@@ -42,6 +42,7 @@ What this module owns, per the manifest's runtime requirements:
   restart) are re-owned - a still-live provider pid is adopted and
   polled to its finish, a dead one is re-dispatched on the same session.
 """
+import inspect
 import json
 import logging
 import re
@@ -438,9 +439,9 @@ class AssistantRuntime:
                                  encoding="utf-8")
                 started = self._now()
                 try:
-                    handle = provider.send(
-                        str(ppath), session_id=sid, model_uid=uid,
-                        export_path=str(epath), workspace=self.workspace)
+                    handle = self._send(
+                        provider, str(ppath), sid=sid, uid=uid,
+                        epath=str(epath), attachments=attachments)
                 except Exception as exc:            # noqa: BLE001
                     # A send failure on the fast transport is an init
                     # problem (credentials, endpoint, spawn) - the
@@ -999,6 +1000,29 @@ class AssistantRuntime:
                 "reason": "the fast transport cannot carry image "
                           "attachments"}
         return "fast", fast, None
+
+    def _send(self, provider, prompt_path: str, *, sid, uid, epath,
+              attachments):
+        """Dispatch one turn on `provider`. Adapters whose send()
+        accepts an `attachments` kwarg (e.g. the ACP lane's native image
+        blocks) get the message's attachment rows with `mime_type`
+        normalized from the row's `ctype`; adapters without it get the
+        same send() call as before."""
+        kw = {}
+        try:
+            params = inspect.signature(provider.send).parameters
+            if "attachments" in params or any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD
+                    for p in params.values()):
+                kw["attachments"] = [
+                    {**a, "mime_type": a.get("mime_type")
+                     or a.get("ctype")}
+                    for a in attachments]
+        except (TypeError, ValueError):
+            pass
+        return provider.send(prompt_path, session_id=sid,
+                             model_uid=uid, export_path=epath,
+                             workspace=self.workspace, **kw)
 
     def _fallback_ok(self, transport: str) -> bool:
         """True when the current hop may be re-routed to the CLI lane -
