@@ -1354,6 +1354,12 @@ const row={dataset:{runKey:'/first'}};
   // the 'unreviewed' tag chip counts needs_review tasks and filters
   // both tables the same way the merge-state tags do
   assert.match(elem('filters').innerHTML,/1 unreviewed/);
+  // the run row's counts cell carries the same count as a clickable
+  // filter pill - alpha (needs_review) belongs to run 'first'
+  assert.match(elem('runs').innerHTML,
+    /data-facet="unreviewed"[^>]*>1 unreviewed<\/button>/);
+  assert.doesNotMatch(elem('runs').innerHTML.split('A separate run')[1],
+    /unreviewed<\/button>/);
   await click({dataset:{facet:'unreviewed'}});
   assert.match(elem('filters').innerHTML,/unreviewed ×/);
   assert.doesNotMatch(elem('agents').innerHTML,/>beta</);
@@ -5208,6 +5214,13 @@ assert.match(elem('runs').innerHTML,
             html, r'\.wrapw td:first-child[^}]*padding-left:8px')
         # long run names keep air between run and model columns
         self.assertRegex(html, r'td\.rcell \{[^}]*padding-right:18px')
+        # the modal's top-right chrome (Close x; Ask AI lives in
+        # chat.css) is position:fixed inside #detail - the modal's
+        # translate() transform makes it the containing block, so the
+        # buttons stay pinned while the modal body scrolls
+        self.assertRegex(html, r'#detail \.x \{[^}]*position:\s*fixed')
+        chat_css = (conductor.ROOT / 'assistant/static/chat.css')            .read_text(encoding='utf-8')
+        self.assertRegex(chat_css, r'#dask \{[^}]*position:\s*fixed')
         js = html.split("<script>\n", 1)[1].split("</script>", 1)[0]
         harness = r'''
 const vm=require('node:vm'), assert=require('node:assert/strict');
