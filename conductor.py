@@ -12155,8 +12155,14 @@ a { color:#58a6ff; text-decoration:none; }
 #askbtns { display:flex; gap:8px; justify-content:flex-end; }
 #powerbox h3 { margin:0 0 10px; font-size:14px; }
 #powerbox ul { margin:6px 0; padding-left:18px; }
-#powerbox .actions { margin-top:14px; }
-#pwstat { margin-top:8px; min-height:15px; }
+/* footer bar: the separator lifts the controls off the report text,
+   dismissive Cancel sits alone at the left, the disruptive pair
+   (Stop before Restart, primary rightmost) groups at the right */
+#powerbox .actions { display:flex; gap:10px; align-items:center; margin-top:16px; padding-top:14px; border-top:1px solid #21262d; }
+#powerbox .actions .btn { min-width:88px; padding:7px 14px; }
+#powerbox .actions #pw-cancel { margin-right:auto; }
+#powerbox .actions .btn.danger:hover:not(:disabled) { border-color:#f85149; }
+#pwstat { margin-top:10px; min-height:15px; }
 #detail { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); width:min(780px,92vw); max-height:82vh; background:#161b22; border:1px solid #30363d; border-radius:10px; padding:18px 22px; overflow:auto; z-index:51; font-size:13px; box-sizing:border-box; }
 #detail h3 { margin:0 80px 10px 0; font-size:14px; }
 #detail .kv { display:grid; grid-template-columns:96px 1fr; gap:4px 12px; }
@@ -12417,7 +12423,7 @@ tr.ctxanchor td { background:#1c3041; }
 <div id="ctxmenu" role="menu" aria-label="row actions" hidden></div>
 <div id="backdrop" hidden><div id="detail" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button type="button" class="x" id="dx">Close ×</button><div id="dbody"></div></div></div>
 <div id="askwrap" hidden><div id="askbox" role="alertdialog" aria-modal="true"><div id="asktitle"></div><div id="askmsg"></div><div id="askbtns" class="actions"></div></div></div>
-<div id="powerwrap" hidden><div id="powerbox" role="dialog" aria-modal="true"><h3>Dashboard power</h3><div id="pwbody"></div><div class="actions"><button type="button" class="btn" id="pw-restart">Restart</button><button type="button" class="btn danger" id="pw-stop">Stop</button><button type="button" class="btn secondary" id="pw-cancel">Cancel</button></div><div class="sub" id="pwstat"></div></div></div>
+<div id="powerwrap" hidden><div id="powerbox" role="dialog" aria-modal="true"><h3>Dashboard power</h3><div id="pwbody"></div><div class="actions"><button type="button" class="btn secondary" id="pw-cancel">Cancel</button><button type="button" class="btn danger" id="pw-stop">Stop</button><button type="button" class="btn" id="pw-restart">Restart</button></div><div class="sub" id="pwstat"></div></div></div>
 <script>
 const COLORS = {done:'#3fb950',partial:'#d29922',blocked:'#d29922',
 stopped:'#d29922',
