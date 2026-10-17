@@ -541,7 +541,7 @@ class CoreIntegrationTests(unittest.TestCase):
     def test_exchange_sources_persist_and_thaw(self):
         with tempfile.TemporaryDirectory() as td:
             core, _ = self._core(td)
-            self.assertEqual(core.store.user_version(), 2)
+            self.assertEqual(core.store.user_version(), 3)
             cv = core.create_conversation({"view": "dashboard"})
             r = core.post_message(cv["id"], "q", client_msg_id="cm-src-0001")
             xid = r["exchange"]["id"]

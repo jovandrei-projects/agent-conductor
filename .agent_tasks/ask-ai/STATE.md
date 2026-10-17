@@ -75,10 +75,11 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
       schema v2 exchanges.sources, set_enriched, enricher/retrieval
       ctor args; 25 new tests; verified on real records - see
       'Implemented contracts' below)
-- [ ] assistant-runtime - provider adapter + gate + usage capture
-      (implement ProviderAdapter as `assistant/providers/devin_print.py`;
-      wire dispatcher.launch/cancel; `usage_delta` + price snapshot
-      helpers already exist; `/exchanges/<id>` poll returns partial text)
+- [x] assistant-runtime - provider adapter + gate + usage capture
+      (shipped `assistant/providers/devin_print.py` + `assistant/
+      runtime.py` + `assistant/calc.py` + `assistant_host/modelpick.py`;
+      schema v3 exchanges.requests; live-verified `devin -p -r` smoke
+      2026-10-17 incl. resume + cumulative delta; contracts below)
 - [ ] persistent-chat-interface - surface, launchers, settings, history
       (assistant/static/chat.js + md.js + route registration in
       make_dashboard_handler -> assistant.http_api.dispatch)
@@ -210,22 +211,114 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
   empty, window shown. No fabricated hits anywhere.
 
 
+## Implemented contracts (assistant-runtime)
+
+- `assistant/calc.py` - `evaluate(expr) -> {"value","expr"}`: AST
+  whitelist (numbers, +-*/**//%parens, unary, the math constants, a
+  fixed function table incl. min/max/sum on lists). No names, no
+  attribute/index/calls-of-names, no walrus/cond/comprehension; length
+  + node-count + complexity guards; CalcError on anything else -
+  arithmetic exceptions become CalcError, never propagate.
+- `assistant/providers/devin_print.py` - `DevinPrintProvider(argv, env=,
+  spawn=, spawn_kwargs=, kill=, alive=, run_list=)`: one dispatch = one
+  `devin --print --prompt-file <f> [-r sid] [--model uid]
+  --permission-mode auto --export <f> --respect-workspace-trust false`
+  child in the assistant workspace (`devin list` there is
+  assistant-only). `--model` is emitted ONLY on fresh spawns (ignored +
+  warned on `-r`). Poll: export first (sid/agent.model_name/
+  final_metrics/answer tail), else bounded stdout narration tail with
+  \r-frame collapse; done = process exit, nonzero = error, missing
+  reply = error, auth-shaped tail = 'provider is not authenticated'.
+  `cancel` = kill_tree via injected seam (taskkill /T /F); `sessions()`
+  parses `devin list --format json`; `attach(exchange row)` +
+  `alive_pid(pid)` back reconcile adoption. All process seams injected -
+  the package never imports conductor.
+- `assistant/runtime.py` - `AssistantRuntime(core, provider, workspace=,
+  spool_dir=, resolve=, price_for=, preamble=, retrieval=, calculate=,
+  max_hops=5, hop_timeout=900, poll_s=0.8, max_concurrent=4)`: the
+  dispatcher core calls (launch/cancel/reconcile). Per exchange: resolve
+  settings server-side (failure = error answer, never a dispatch); the
+  vision gate refuses image posts to unverified families with concrete
+  verified alternatives; a resolved-uid change forces a FRESH session
+  (`--model` is ignored on `-r`); prompts = [preamble + contract] on
+  fresh only + session settings + frozen context envelope +
+  bounded history digest (fresh only - a resumed session carries its
+  own) + user text + attachment paths. Tool contract: ONE fenced
+  ```tool_call {search|fetch|calc} per turn; results land as fenced
+  untrusted ```tool_result; search/fetch run through the host
+  RetrievalAdapter server-side (bounded, filter-whitelisted,
+  kind+key-only echo); calc never evals. ```proposed_action blocks in
+  the reply -> core.propose_action rows (inert while readonly; only a
+  human confirm can execute). Usage: export counters are CUMULATIVE -
+  per-exchange usage = delta vs the session's last recorded cumulative
+  (store.last_session_totals); absent counters record NULL (unknown,
+  never zero). Every dispatch lands an exchanges.requests[] boundary
+  {n,kind(fresh/resume/tool/adopted),pid,session_id,request_id sid#hN,
+  prompt/export paths,started/ended,exit_code,error,usage delta,cum}.
+  Reconcile(): inflight exchanges re-arm on startup - live provider pid
+  = ADOPTED via attach() (polls its recorded export to the finish, never
+  re-spawns), queued/dead-pid = re-dispatched; terminal finalize dedupes
+  through claim_request(sid#xid).
+- Schema v3: `exchanges.requests TEXT` (additive ALTER; migration test
+  pattern moved to v4). `core.record_request` appends under txn;
+  `note_dispatch` rewrites pid/paths per hop; `note_provider_session`
+  stamps exchange + conversation resume handle; `session_totals` reads
+  the newest earlier `cum` snapshot for deltas; `inflight_exchanges`
+  feeds reconcile; `settings_validator` seam validates EFFECTIVE
+  merged settings on conv create + settings updates.
+- `assistant_host/modelpick.py` - catalog-aware resolution against the
+  LIVE `model_options` map: family parse (uid = fam[-suffix]), effort
+  validation, fast = family's own marker suffix after the effort segment
+  (`-priority` gpt-6/5.6, `-fast` claude, `-lightning` swe - NEVER a
+  universal flag; fast-BRANDED families like swe-1.6-fast satisfy
+  fast=true bare), `VISION = {'gpt-6-luna': True}` only-verified map,
+  errors carry concrete verified alternative uids - never a silent
+  substitution. `make_validator(options_fn)` feeds core;
+  `resolve_settings(snap, attachments_present)` feeds the runtime;
+  `annotate_catalog(models, options, defaults)` adds
+  vision/fast_variant flags + `default_resolution` (honest ok/error).
+  Empty catalog (CLI down/unauthed): save-time validation defers,
+  dispatch fails with 'catalog unavailable'.
+- `conductor_adapters.open_runtime(data_dir=, runs_dir=, requests_dir=,
+  devin_argv=, provider=, reconcile=True) -> (core, runtime)`: real
+  provider (clean_devin_env + hidden flags + kill_tree + pid_alive),
+  runtime dispatcher, settings validator, catalog annotation, seeded
+  default `gpt-6-luna/low/fast` (preference only - dispatch re-verifies),
+  startup reconcile. `open_core()` unchanged for tests.
+- `conductor.py` serve: `/api/assistant/*` registered for GET+POST (raw
+  body through - attachment route carries image bytes; JSON routes
+  parse inside dispatch); lazy `assistant_open()` under STATE_LOCK -
+  init failure = 503 `assistant unavailable`, dashboard unaffected.
+
+### Verified live (devin 3000.x, 2026-10-17)
+
+- `devin auth status` -> logged in; `model_options` -> 54 families incl.
+  `gpt-6-luna` with low/medium/high/xhigh/max + `-priority` fast + `none`.
+- DevinPrintProvider spawn in %TEMP% scratch, uid
+  `gpt-6-luna-low-priority`: session `candied-scissor`, label
+  `GPT-6 Luna Low Thinking Fast`, exit 0, export metrics
+  14495p/7c/0cached/9steps, answer 'SMOKE OK'.
+- Resume `-r candied-scissor` (no --model emitted): same session, cum
+  29010p/14c/11steps -> delta math correct; `sessions()` listed it.
+- Suite: 37 new test_assistant_runtime tests (scripted provider +
+  tests/fake_devin_chat.py real-subprocess binary + e2e) + modelpick +
+  calc; full suite 632/632 green, 8 shards.
+
 ## Where it stopped
 
-`view-context-and-retrieval` is implemented and green: generic seams
-(set_enriched, schema v2 exchanges.sources, enricher/retrieval ctor args,
-exchanges route) + host adapters (ConductorContext 8 view providers +
-register hook, ConductorRetrieval search/fetch/fetch_many with
-interpreted windows + coverage meta, host_conductor_static.md wired
-through open_core). 37+25 focused tests, full suite 595 green (8
-shards), `conductor.py demo` green, both required real-record checks
-passed (verification-section fetch + apartment-3d camera windows;
-honest zero-match for September). Still NOT wired into `serve` -
-make_dashboard_handler doesn't register the assistant routes, no
-dispatcher/provider exists, exchanges stay `queued`. Next session =
-`assistant-runtime` per the manifest: `providers/devin_print.py` +
-dispatcher seam into open_core (retrieval/enricher already default
-there; static_preamble() is the system-prompt input).
+`assistant-runtime` is implemented, tested and live-smoke-verified:
+the `devin -p [-r]` provider, the dispatcher runtime (tool loop,
+proposals, usage deltas, reconcile/adopt), catalog-aware settings
+resolution with verified defaults, and `/api/assistant/*` route
+registration in `make_dashboard_handler` are all landed. Exchanges now
+drive real provider turns end to end. Remaining per the manifest:
+`persistent-chat-interface` (assistant/static/chat.js + md.js UI -
+launchers, composer, bubble/expand, settings modal, citations, exchange
+poll wiring), `images-and-dictation` (client composer + SpeechRecognition;
+server side is done), `guarded-dashboard-actions` (conductor
+ActionAdapter over conductor functions + confirm cards), then
+`usage-and-price-visibility` UI + `integration-and-design-review` +
+`follow-up-plan`.
 
 ## Deferred or blocked
 
@@ -234,4 +327,7 @@ there; static_preamble() is the system-prompt input).
   feature. Re-check after a `devin update`.
 - Whether the serve process should host a long-lived acp server child vs
   per-exchange `devin -p` spawns - DESIGN.md recommends per-exchange.
+- The default seeded `fast=true` is a preference: dispatch re-verifies
+  per family (swe-2 has no fast variant; resolution errors name verified
+  alternatives, e.g. `gpt-6-luna-<effort>-priority`).
 - Phone access is out of scope (loopback-only dashboard boundary).
