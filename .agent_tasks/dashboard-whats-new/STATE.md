@@ -153,8 +153,13 @@ tour-llm-polish landed on this branch: tour_polish.py (provider seam,
 range-keyed tour-cache.json, validation, coalescing), tour_feeds
 `polish=` hook, conductor `_tour_polisher`/`_tour_build` wiring +
 `enrichment` payload field, tests/test_tour_polish.py (24 tests;
-96/96 tour tests green). tour-dashboard is the sibling wave step (its
-merge state is the conductor's business). Next: tour-validation.
+96/96 tour tests green). Full --jobs 8 suite: 886 tests, 3 shards
+failed ONLY on shared-box contention flakes (agent slot pool
+starvation: StepControl/PauseRun 's1 never reached running', device/
+port lease timing, a Windows tempdir file-lock) - every failing test
+passes solo, none touch tour code. tour-dashboard is the sibling wave
+step (its merge state is the conductor's business). Next:
+tour-validation.
 
 ## Verification
 
