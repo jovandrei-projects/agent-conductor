@@ -2093,7 +2093,7 @@ def run_events(run_dir: Path, limit: int = 2000) -> list[dict]:
     return out[-limit:]
 
 
-def tail_status(stdout_log: Path) -> str | None:
+def tail_status(stdout_log: Path | None) -> str | None:
     """The worker's terminal STATUS: line. Reads the WHOLE log, not a
     tail: an agent that prints 'STATUS: done' then a long closing report
     (>8KB of prose) must not flip to 'failed - no STATUS line' - that
@@ -7056,6 +7056,33 @@ def _gen_log_path(request_id: str, requests_dir: Path) -> Path:
     return sp if sp.is_file() else requests_dir / f"{request_id}.gen.log"
 
 
+def _regen_log_path(request_id: str, requests_dir: Path) -> Path:
+    """A follow-up re-review session's stdout log (requests_dir - the
+    planner spool is generation-only)."""
+    return requests_dir / f"{request_id}.regen.stdout.log"
+
+
+def _regen_export_path(request_id: str, requests_dir: Path) -> Path:
+    return requests_dir / f"{request_id}.regen.export.json"
+
+
+def _regen_marker(requests_dir: Path, request_id: str) -> Path:
+    return requests_dir / f"{request_id}.regen"   # holds the reviewer pid
+
+
+def _regenerating(request_id: str, requests_dir: Path) -> bool:
+    """Is a follow-up re-review session currently live for this request?
+    The marker holds the detached subprocess pid; a stale marker whose
+    pid is gone (crash between launch and write, or an orphaned file)
+    doesn't count - same contract as .summarizing."""
+    try:
+        pid = int(_regen_marker(requests_dir, request_id)
+                  .read_text().strip())
+    except (OSError, ValueError):
+        return False
+    return pid_alive(pid)
+
+
 def _read_request_file(request_id: str, requests_dir: Path) -> dict:
     """The request record exactly as it sits in requests_dir - callers
     deciding whether the human moved on while a spool was parked need the
@@ -8044,7 +8071,7 @@ def save_request(request_id: str, payload: dict,
     with REQUEST_LOCK:
         _assert_unwatched(runs_dir, requests_dir, manifests_dir)
         rec = _read_request(request_id, requests_dir)
-        stage = _request_status(rec, runs_dir)
+        stage = _request_status(rec, runs_dir, requests_dir=requests_dir)
         if stage not in _REQUEST_EDITABLE_STAGES:
             raise RequestError("This request is being processed or already run", 409)
         rec["status"] = stage
@@ -8094,7 +8121,7 @@ def apply_request(request_id: str, payload: dict,
     with REQUEST_LOCK:
         _assert_unwatched(runs_dir, requests_dir, manifests_dir)
         rec = _read_request(request_id, requests_dir)
-        stage = _request_status(rec, runs_dir)
+        stage = _request_status(rec, runs_dir, requests_dir=requests_dir)
         if stage not in _REQUEST_EDITABLE_STAGES:
             raise RequestError("This request is being processed or already run",
                                409)
@@ -8327,7 +8354,14 @@ def _followup_apply(rec: dict, text: str, manifests_dir: Path,
     if status == "empty":
         # Nothing to launch or review in TOML terms: keep the source
         # pointer, no owned copy, no steps - the row reads 'No work
-        # remains' and can never drift stale or be started.
+        # remains' and can never drift stale or be started. A re-review
+        # REPLACING a prior proposal also drops its owned copy (same
+        # guard as the rename-drop below) so manifests/ never keeps the
+        # stale plan around as an orphan.
+        old = Path(rec["manifest"]) if rec.get("manifest") else None
+        if old is not None and old.name.startswith(f"{rec['id']}-") \
+                and old.parent.resolve() == manifests_dir.resolve():
+            old.unlink(missing_ok=True)
         rec.update(manifest=None, proposed_steps=[],
                    run=name or rec.get("run"),
                    description=str(run_doc.get("description") or "")[:300],
@@ -8436,8 +8470,9 @@ def _register_followup_source(source: Path, run_ctx: dict | None,
                     rec.get("status") not in ("missing", "empty"):
                 rec = None          # not ours to fold - register normally
     if rec is not None:
-        stage = _request_status(rec, runs_dir)
-        if stage in ("launched", "launching", "generating", "questions"):
+        stage = _request_status(rec, runs_dir, requests_dir=requests_dir)
+        if stage in ("launched", "launching", "generating", "questions",
+                     "fu_regen"):
             return f"kept:{stage}", rec
         if ent and ent.get("sha") == sha and \
                 rec.get("status") == ent.get("status"):
@@ -8547,8 +8582,9 @@ def _register_followup_outcome(run_ctx: dict, step_rec: dict,
         except RequestError:
             rec = None
     if rec is not None:
-        stage = _request_status(rec, runs_dir)
-        if stage in ("launched", "launching", "generating", "questions"):
+        stage = _request_status(rec, runs_dir, requests_dir=requests_dir)
+        if stage in ("launched", "launching", "generating", "questions",
+                     "fu_regen"):
             return f"kept:{stage}", rec
         if rec.get("status") == status and rec.get("error") == error \
                 and not rec.get("manifest"):
@@ -8825,9 +8861,16 @@ def request_details(request_id: str, requests_dir: Path = REQUESTS_DIR,
         rec["gen_tail"] = (stdout_tail(str(log), 40)
                            if log.is_file() else None)
         if runs_dir:
-            status = _request_status(rec, runs_dir)
+            status = _request_status(rec, runs_dir,
+                                     requests_dir=requests_dir)
             if status == "error" and rec["status"] == "generating":
                 rec["error"] = "Planning was interrupted. Regenerate to retry."
+            if status == "fu_regen":
+                # stream the live review log into the same modal slot the
+                # planner's tail uses
+                rlog = _regen_log_path(request_id, requests_dir)
+                rec["gen_tail"] = (stdout_tail(str(rlog), 40)
+                                   if rlog.is_file() else None)
             rec["status"] = status
         return rec
 
@@ -9742,7 +9785,8 @@ def start_generation(request_id: str,
         # watched cwd), so a live worker or an in-progress merge must not
         # block generation. Only the deferred publish waits on the repo.
         rec = _read_request(request_id, requests_dir)
-        if _request_status(rec, runs_dir) not in _REQUEST_EDITABLE_STAGES:
+        if _request_status(rec, runs_dir, requests_dir=requests_dir) \
+                not in _REQUEST_EDITABLE_STAGES:
             raise RequestError("Only drafts or unrun proposals can be generated", 409)
         # A leftover sentinel from a stopped attempt would kill this new
         # pass on the first wait_worker poll - clear before marking.
@@ -9861,7 +9905,8 @@ def stop_generation(request_id: str,
     with REQUEST_LOCK:
         _assert_unwatched(runs_dir, requests_dir)
         rec = _read_request(request_id, requests_dir)
-        if _request_status(rec, runs_dir) != "generating":
+        if _request_status(rec, runs_dir, requests_dir=requests_dir) \
+                != "generating":
             raise RequestError(
                 "This request is not preparing a proposal", 409)
         _flag_raise(gen_stop_flag(request_id).name)
@@ -9902,7 +9947,8 @@ def _request_run_dir(request_id: str, runs_dir: Path) -> Path | None:
 
 
 def _request_status(rec: dict, runs_dir: Path,
-                    launched: set[str] | None = None) -> str:
+                    launched: set[str] | None = None,
+                    requests_dir: Path | None = None) -> str:
     # `launched` - a request_id set the caller already derived while
     # scanning run dirs (collect_dashboard builds one anyway) - skips an
     # O(every state.json) glob per request, the dominant payload cost
@@ -9920,6 +9966,12 @@ def _request_status(rec: dict, runs_dir: Path,
         age = time.time() - (_iso_ts(eff.get("generation_started_at"))
                              or time.time())
         return "generating" if age <= 660 else "error"
+    # A live re-review marker outranks the stored status while the
+    # session may still rewrite the source file - the reviewer drops its
+    # own marker before publishing, so its re-import never reads this.
+    if requests_dir is not None and _regenerating(rec["id"],
+                                                  requests_dir):
+        return "fu_regen"
     status = eff.get("status") or "draft"
     if status != "launching":
         return status
@@ -9983,7 +10035,8 @@ def launch_request(request_id: str,
         _assert_unwatched(runs_dir, requests_dir)
         rec = _read_request(request_id, requests_dir)
         pend = _pending_actions(rec)
-        if _request_status(rec, runs_dir) not in ("ready", "launch_failed") \
+        if _request_status(rec, runs_dir, requests_dir=requests_dir) \
+                not in ("ready", "launch_failed") \
                 or pend["gen"] or pend["opts"]:
             which = []
             if pend["gen"]:
@@ -10033,7 +10086,8 @@ def launch_request(request_id: str,
                         _watcher_identity(sj.parent.name, sname, srec) +
                         "); wait or isolate work in a worktree", 409)
         if ROOT.resolve() in targets and any(
-                _request_status(r, runs_dir) == "generating" for f in
+                _request_status(r, runs_dir, requests_dir=requests_dir)
+                in ("generating", "fu_regen") for f in
                 requests_dir.glob("*.json")
                 # *.gen.export.json transcripts share the dir and match the
                 # glob - only a request record carries the 'id' field
@@ -10056,6 +10110,317 @@ def launch_request(request_id: str,
             _save_request(rec, requests_dir)
             raise RequestError("Could not start the conductor process", 500) from exc
         return dict(rec)
+
+
+FOLLOWUP_REGEN_TIMEOUT_S = 1800
+# A re-review is a real work session (read run records + .agent_tasks +
+# code, then write), not the summarizer's quick prose pass - same budget
+# follow-up-plan's timeout_min = 30 carries.
+
+
+def _regen_plan(rec: dict, manifests_dir: Path, runs_dir: Path,
+                projects: dict) -> tuple[Path, dict | None, Path, str]:
+    """(target file, run_ctx, review work_dir, slug) for a follow-up
+    re-review.
+
+    The target is the SAME source path the proposal registered from while
+    it exists - the intake keys on the resolved path, so rewriting it in
+    place folds into the same request row ('updated'), never a duplicate.
+    run_ctx mirrors import_followup_file's so a recovered/derived target
+    still lands on the originating run's record. work_dir is the project
+    checkout the review session runs in: the follow-up-plan step's slug
+    first, then the proposal's own step slugs, then the record's project.
+    """
+    target = None
+    src = rec.get("source_manifest")
+    if src:
+        p = Path(src)
+        if p.parent.is_dir():
+            target = p
+    run_ctx = None
+    st: dict = {}
+    rd = (runs_dir / rec["source_run"]) if rec.get("source_run") else None
+    if rd is not None and (rd / "state.json").is_file():
+        try:
+            st = json.loads((rd / "state.json").read_text(
+                encoding="utf-8"))
+        except (OSError, ValueError):
+            st = {}
+        run_ctx = {"run": st.get("run"), "dir": rd.name,
+                   "request": st.get("request_id"),
+                   "step": rec.get("source_step") or "follow-up-plan",
+                   "path": str(rd)}
+    if target is None:
+        slug = st.get("run") or ""
+        if not slug:
+            raise RequestError(
+                "No follow-up source file is recorded for this "
+                "proposal", 409)
+        target = manifests_dir / f"{slug}-followup.toml"
+    slug = ((st.get("steps") or {}).get("follow-up-plan") or {}).get(
+        "slug")
+    if not slug or slug not in projects:
+        slug = next((s["slug"] for s in rec.get("proposed_steps") or []
+                     if s.get("slug") in projects), None)
+    slug = slug if slug in projects else rec.get("project")
+    ent = projects.get(slug or "")
+    if ent is None or not Path(ent["path"]).is_dir():
+        raise RequestError(
+            "Cannot resolve the project this follow-up reviews - the "
+            "source run is gone and the record names no usable slug", 409)
+    return target, run_ctx, Path(ent["path"]), slug
+
+
+def _regen_prompt(rec: dict, target: Path, run_ctx: dict | None,
+                  work_dir: Path, projects: dict, runs_dir: Path) -> str:
+    """The re-review session's brief: re-check a stale follow-up proposal
+    against current project truth and rewrite it in place - including the
+    explicit 'nothing remains' empty-manifest exit the file-based intake
+    supports (and the answer-only planner cannot express)."""
+    run_name = (run_ctx or {}).get("run") or rec.get("run") or "?"
+    run_dir = (run_ctx or {}).get("dir") or rec.get("source_run") or ""
+    when = (rec.get("created_at") or "")[:10] or "earlier"
+    slugs = sorted({s.get("slug") for s in rec.get("proposed_steps") or []
+                    if s.get("slug")})
+    proj_lines = "".join(f"  - {s}: {projects[s]['path']}\n"
+                         for s in slugs if s in projects) \
+        or f"  - {work_dir}\n"
+    run_rec = (f"   The originating run's records (per-step stdout logs, "
+               f"STATUS/NEXT/OUTCOME reports) are at {run_ctx['path']} - "
+               f"read them for what was attempted; do not re-propose "
+               f"finished work.\n" if run_ctx else
+               f"   If run records exist they live under {runs_dir} - "
+               f"the newest dir ending in -{run_dir}.\n")
+    return f"""A follow-up proposal for conductor run {run_name} was written {when}
+at {target} - a TOML manifest proposing leftover or newly discovered
+work as [[step]] items. Time has passed: some items may already be done,
+superseded, or no longer worthwhile, and new gaps may have appeared.
+
+Re-review it against CURRENT state before proposing anything:
+1. Read {target} - every [[step]] is a proposed task.
+2. Check each item against ground truth, not the file's claims:
+   .agent_tasks/ progress notes, git history, and the code itself in the
+   project(s) below. An item already landed, made obsolete, or proven
+   wrong is DROPPED - never carried forward for completeness.
+{proj_lines}\
+{run_rec}3. Add newly discovered gaps only when you can substantiate them in
+   the current tree - never pad the list.
+
+Then REWRITE {target} IN PLACE, exactly once, proposing ONLY the work
+that is still worth doing. Keep the existing [run].name so the proposal
+keeps its identity. If nothing remains worth doing, write the file
+anyway but with no [[step]] entries (a [run] table + comments saying
+so) - that registers as "no work remains" rather than a runnable job.
+It must pass proposal validation: [run].name a short safe slug,
+[run].description one sentence of AT MOST 300 characters (overlong
+descriptions fail validation and the proposal lands broken),
+checkpoint = true, every [[step]].project a registered projects.toml
+slug (registered: {', '.join(sorted(projects))}). The file is imported
+into the proposals list automatically - do not implement or launch it,
+and do not schedule anything: only a human can start it.
+
+End your reply with:
+STATUS: done
+OUTCOME: <one or two sentences - what the re-review kept, dropped, added>
+"""
+
+
+def regen_followup_start(request_id: str,
+                        requests_dir: Path = REQUESTS_DIR,
+                        manifests_dir: Path = MANIFESTS_DIR,
+                        runs_dir: Path = RUNS_DIR,
+                        devin_argv: list[str] | None = None) -> dict:
+    """POST /api/requests/<id>/regen-followup - 'Regenerate follow-up':
+    spawn the re-review session detached (same discipline as
+    resume/merge/summarize launches). The subprocess owns the session and
+    the publish; this process only validates and plants the marker so the
+    dashboard can show the review immediately."""
+    with REQUEST_LOCK:
+        _assert_unwatched(runs_dir, requests_dir, manifests_dir)
+        rec = _read_request(request_id, requests_dir)
+        if rec.get("imported") != "followup":
+            raise RequestError(
+                "Regenerate follow-up only applies to imported "
+                "follow-up proposals", 409)
+        stage = _request_status(rec, runs_dir, requests_dir=requests_dir)
+        if stage in ("generating", "questions", "launching", "launched"):
+            raise RequestError(
+                f"Wait - this request is {stage} right now", 409)
+        if _regenerating(request_id, requests_dir):
+            raise RequestError(
+                "A re-review is already running for this follow-up", 409)
+        # resolve early so a missing file/project refuses before spawn -
+        # the subprocess resolves afresh at run time. The review reads
+        # the project's git history and code: a live worker mutating that
+        # checkout mid-review would race it, so refuse while one holds it.
+        _t, _rc, work_dir, _slug = _regen_plan(
+            rec, manifests_dir, runs_dir, load_projects())
+        _assert_unwatched(runs_dir, work_dir)
+    cmd = [sys.executable, str(ROOT / "conductor.py"), "regen-followup",
+           request_id, "--runs-dir", str(runs_dir)]
+    if devin_argv and devin_argv != ["devin"]:
+        cmd += ["--devin", shlex.join(devin_argv)]
+    try:
+        pid = _launch_process(
+            cmd, requests_dir / f"{request_id}.regen.launch.log")
+    except OSError as exc:
+        raise RequestError("Could not start the re-review process",
+                           500) from exc
+    try:
+        _regen_marker(requests_dir, request_id).write_text(
+            str(pid), encoding="utf-8")
+    except OSError:
+        pass
+    return {"regenerating": request_id, "pid": pid}
+
+
+def regen_followup(request_id: str,
+                   requests_dir: Path = REQUESTS_DIR,
+                   manifests_dir: Path = MANIFESTS_DIR,
+                   runs_dir: Path = RUNS_DIR,
+                   devin_argv: list[str] | None = None) -> bool:
+    """The detached re-review session behind 'Regenerate follow-up': one
+    fresh `devin -p` in the source project that rewrites the follow-up
+    file in place, then the normal intake folds the result into the same
+    request record ('updated'/'empty'/'edited'). rec['fu_regen'] keeps
+    the bookkeeping row - same shape run_summary carries. Never launches
+    anything."""
+    devin_argv = devin_argv or ["devin"]
+    marker = _regen_marker(requests_dir, request_id)
+    try:
+        marker.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+    log = _regen_log_path(request_id, requests_dir)
+    export_path = _regen_export_path(request_id, requests_dir)
+    t0 = time.time()
+    started_at = now_iso()
+
+    def finish(status: str, note: str | None = None,
+               session: str | None = None, rc: int | None = None,
+               extra: dict | None = None) -> None:
+        try:
+            cur = _read_request_file(request_id, requests_dir)
+            prev = cur.get("fu_regen") or {}
+            cur["fu_regen"] = {
+                "status": status,
+                "started_at": prev.get("started_at") or started_at,
+                "ended_at": now_iso(),
+                "elapsed_s": round(time.time() - t0, 1),
+                "work_dir": prev.get("work_dir"),
+                "slug": prev.get("slug"),
+                "session": session or tail_session_id(export_path),
+                "model_actual": tail_agent_model(export_path),
+                "tokens": tail_metrics(export_path),
+                "exit_code": rc, "note": note,
+                **(extra or {})}
+            _save_request(cur, requests_dir)
+        except (OSError, RequestError):
+            pass
+
+    try:
+        try:
+            rec = _read_request_file(request_id, requests_dir)
+            target, run_ctx, work_dir, rslug = _regen_plan(
+                rec, manifests_dir, runs_dir, load_projects())
+        except RequestError as exc:
+            print(f"regen-followup: {exc}")
+            finish("failed", str(exc)[:160])
+            return False
+        sha_before = (hashlib.sha1(target.read_bytes()).hexdigest()
+                      if target.is_file() else None)
+        try:
+            rec["fu_regen"] = {"status": "running",
+                               "started_at": started_at,
+                               "work_dir": str(work_dir), "slug": rslug}
+            _save_request(rec, requests_dir)
+        except OSError:
+            pass
+        with tempfile.TemporaryDirectory(
+                prefix="conductor-furegen-") as wd:
+            pf = Path(wd) / "regen.md"
+            pf.write_text(
+                _regen_prompt(rec, target, run_ctx, work_dir,
+                              load_projects(), runs_dir),
+                encoding="utf-8")
+            pm = rec.get("model") or ""
+            pe = rec.get("effort") or ""
+            cmd = devin_argv + [
+                "--print", "--prompt-file", str(pf),
+                "--permission-mode", "bypass",
+                "--respect-workspace-trust", "false",
+                "--export", str(export_path)]
+            if pm:
+                cmd += ["--model",
+                        f"{pm}-{pe}" if pe and pm != "adaptive" else pm]
+            print(f"[regen] spawning: {shlex.join(cmd)}")
+            with open(log, "wb") as out:
+                proc = subprocess.Popen(
+                    cmd, cwd=str(work_dir), stdout=out,
+                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                    env=clean_devin_env(), **_detached_kwargs())
+                rc, timed_out, _hung, _stopped, _ext = wait_worker(
+                    proc, log, FOLLOWUP_REGEN_TIMEOUT_S)
+        session = tail_session_id(export_path)
+        if timed_out or rc != 0:
+            print(f"[regen] session exited rc={rc}"
+                  + (" (timed out)" if timed_out else ""))
+            finish("failed", "timed out" if timed_out else
+                   f"session exited {rc}", session, rc)
+            return False
+        if not target.is_file():
+            finish("failed", "the review wrote no file", session, rc)
+            return False
+        if hashlib.sha1(target.read_bytes()).hexdigest() == sha_before:
+            finish("unchanged",
+                   "the review left the proposal unchanged", session, rc)
+            return True
+        # The file is stable now - drop the marker BEFORE publishing so
+        # the intake's own fu_regen keep-guard doesn't refuse it.
+        marker.unlink(missing_ok=True)
+        try:
+            index = _followup_index(requests_dir)
+            outcome, rec2 = _register_followup_source(
+                target, run_ctx, index, requests_dir, manifests_dir,
+                runs_dir)
+        except RequestError as exc:
+            # a live worker watching the workspace deferred the publish -
+            # the next discovery pass still folds the rewritten file in
+            finish("failed", f"publish deferred: {exc}", session, rc)
+            return False
+        ok = outcome in ("updated", "registered")
+        st2 = (rec2 or {}).get("status") or outcome
+        note = {
+            "updated": "proposal rewritten in place",
+            "registered": "proposal rewritten in place",
+            "edited": "kept - the proposal was hand-edited meanwhile",
+            "discarded": "kept - the proposal was discarded meanwhile",
+        }.get(outcome, outcome)
+        print(f"[regen] publish: {outcome}"
+              + (f" -> request {rec2['id']} ({st2})" if rec2 else ""))
+        if run_ctx:
+            try:
+                log_event(Path(run_ctx["path"]),
+                          event="followup_regen", request=request_id,
+                          outcome=outcome, session=session)
+            except (OSError, ValueError):
+                pass
+        finish(st2, note, session, rc)
+        return ok
+    finally:
+        marker.unlink(missing_ok=True)
+
+
+def cmd_regen_followup(args: argparse.Namespace) -> int:
+    runs_dir = Path(args.runs_dir).resolve() if args.runs_dir else RUNS_DIR
+    requests_dir = runs_dir.parent / "requests"
+    manifests_dir = _followup_owner_dir(runs_dir)
+    devin_argv = (shlex.split(args.devin) if args.devin else
+                  shlex.split(os.environ.get("CONDUCTOR_DEVIN")
+                              or "devin"))
+    ok = regen_followup(args.request_id, requests_dir, manifests_dir,
+                        runs_dir, devin_argv)
+    return 0 if ok else 1
 
 
 def resume_run(name: str, runs_dir: Path = RUNS_DIR,
@@ -11746,7 +12111,8 @@ def discard_request(request_id: str,
     trash_dir = trash_dir or _trash_root(runs_dir)
     with REQUEST_LOCK:
         rec = _read_request(request_id, requests_dir)   # overlay wins
-        if _request_status(rec, runs_dir) not in _REQUEST_EDITABLE_STAGES:
+        if _request_status(rec, runs_dir, requests_dir=requests_dir) \
+                not in _REQUEST_EDITABLE_STAGES:
             raise RequestError("A running or launched proposal cannot be discarded",
                                409)
         _assert_unwatched(runs_dir, requests_dir, manifests_dir, trash_dir)
@@ -12602,6 +12968,72 @@ def summary_agent(st: dict, key: str, run_dir: Path,
         "tokens": tokens, "wt": False,
         "cost": estimate_cost(tokens, model, None, prices,
                               rs.get("model_actual")),
+        "stdout_log": str(log) if log.is_file() else None,
+        "tail": stdout_tail(str(log)) if log.is_file() else None,
+        "log_mtime": file_mtime_iso(log) if log.is_file() else None,
+        "export": str(exp) if exp.is_file() else None,
+        "arc": cached_arc(str(exp)) if exp.is_file() else None,
+        "prompt": None, "prompt_editable": False,
+        "notes_enabled": False, "skipped_by_user": False}]
+
+
+def fu_regen_agent(rec: dict, requests_dir: Path,
+                   prices: dict) -> list[dict]:
+    """The bookkeeping row for a follow-up re-review session - `aux` like
+    the summarizer/planner rows: it rides the proposal's task list while
+    it runs (the .regen marker covers liveness) and stays after, carrying
+    rec['fu_regen']'s terminal bookkeeping (session, tokens, elapsed,
+    note). Not a pipeline step, never runnable."""
+    rg = rec.get("fu_regen") or {}
+    live = _regenerating(rec["id"], requests_dir)
+    if not rg and not live:
+        return []
+    rstatus = rg.get("status") or ""
+    if live:
+        status = "running"
+    elif rstatus in ("failed", "error"):
+        status = "failed"
+    elif rstatus.startswith(("kept", "edited", "discarded")):
+        status = "stopped"
+    else:
+        status = "done"
+    log = _regen_log_path(rec["id"], requests_dir)
+    exp = _regen_export_path(rec["id"], requests_dir)
+    tokens = rg.get("tokens")
+    task = "Re-review this follow-up proposal against current state"
+    return [{
+        "run": rec.get("run") or rec.get("label"),
+        "run_dir": None, "run_key": f"request:{rec['id']}",
+        "request_id": rec["id"],
+        "step": "follow-up-review",
+        "slug": rg.get("slug") or rec.get("project") or "conductor",
+        "aux": True, "seq": None,
+        "work_dir": rg.get("work_dir") or "-",
+        "status": status, "created_at": rg.get("started_at"),
+        "started_at": rg.get("started_at"),
+        "ended_at": rg.get("ended_at"),
+        "elapsed_s": rg.get("elapsed_s"),
+        "alive": live, "pid": None,
+        "session_id": rg.get("session"), "session_gone": False,
+        "model": rec.get("model"),
+        "model_actual": rg.get("model_actual"),
+        "effort": rec.get("effort"), "mode": "review", "cloud": False,
+        "verify_ok": None,
+        "task": task,
+        "task_full": (task + ": " + str(rec.get("source_manifest") or "")),
+        "purpose": "follow-up-regen",
+        "note": rg.get("note"), "next": None,
+        "exit_code": rg.get("exit_code"),
+        "outcome": ("no work remains"
+                    if rstatus == "empty" else None),
+        "outcomes": None,
+        "branch": None, "merged": None,
+        "deferred": False, "merge_kind": None, "target_branch": None,
+        "deferred_verified": None,
+        "tokens": tokens, "wt": False,
+        "cost": estimate_cost(tokens, rec.get("model"),
+                              rec.get("effort"), prices,
+                              rg.get("model_actual")),
         "stdout_log": str(log) if log.is_file() else None,
         "tail": stdout_tail(str(log)) if log.is_file() else None,
         "log_mtime": file_mtime_iso(log) if log.is_file() else None,
@@ -13485,14 +13917,17 @@ def collect_dashboard(runs_dir: Path,
     for rid, rec in requests.items():
         if rid in launched:
             continue
-        stage = _request_status(rec, runs_dir, launched)
+        stage = _request_status(rec, runs_dir, launched, requests_dir)
         if stage == "launched":
             continue
         steps = rec.get("proposed_steps") or []
         key = f"request:{rid}"
         log_p = _gen_log_path(rid, requests_dir)
-        gen_tail = (stdout_tail(str(log_p))
-                    if stage in ("generating", "error") and log_p.is_file()
+        tail_p = (_regen_log_path(rid, requests_dir)
+                  if stage == "fu_regen" else log_p)
+        gen_tail = (stdout_tail(str(tail_p))
+                    if stage in ("generating", "error", "fu_regen")
+                    and tail_p.is_file()
                     else None)
         gen_last = next((ln for ln in reversed((gen_tail or "").splitlines())
                          if ln.strip()), None)
@@ -13596,6 +14031,10 @@ def collect_dashboard(runs_dir: Path,
         agents.extend(plan_attempt_agents(
             rec, key, generating=stage == "generating",
             log_path=log_p, prices=prices))
+        # The detached re-review session rides the plan's task list as an
+        # aux row - bookkeeping like the summarizer's, never a pipeline
+        # step.
+        agents.extend(fu_regen_agent(rec, requests_dir, prices))
     # session_id is discovered post-spawn (diff of `devin list`); while a
     # step runs the cell is empty. Attribute it live instead: among the
     # unclaimed ids in the step's work_dir, the spawned one is the session
@@ -14000,6 +14439,7 @@ td .stage { max-width:100%; overflow:hidden; text-overflow:ellipsis;
 .stage.interrupted { color:#f0883e; border-color:#7a3d12; background:#2d1f14; }
 .stage.questions { color:#ffa657; border-color:#7a3d12; background:#2d1f14; }
 .stage.empty { color:#8b949e; border-color:#30363d; }
+.stage.fu_regen { color:#bc8cff; border-color:#614b84; background:#251d35; }
 .stage.missing { color:#f0883e; border-color:#7a3d12; background:#2d1f14; }
 .stage.followup { color:#8b949e; }
 .stage.wt { color:#58a6ff; }
@@ -14203,12 +14643,13 @@ failed:'#f85149',timed_out:'#f0883e',running:'#58a6ff',queued:'#8b949e',
 waiting:'#8b949e',skipped:'#6e7681',planned:'#bc8cff',ready:'#bc8cff',
 generating:'#bc8cff',draft:'#d29922',questions:'#ffa657',
 launching:'#58a6ff',launch_failed:'#f85149',lost:'#6e7681',
-superseded:'#8b949e',
+superseded:'#8b949e',fu_regen:'#bc8cff',
 empty:'#8b949e',missing:'#f0883e'};
 const STAGES = {draft:'Draft · unsent',generating:'Preparing proposal',
   questions:'Needs your answers',
   ready:'Ready to run',launching:'Starting run',launch_failed:'Start failed',
-  error:'Planning failed',empty:'No work remains',
+  error:'Planning failed',fu_regen:'Re-reviewing follow-up',
+  empty:'No work remains',
   missing:'Follow-up missing'};
 const esc = s => (s==null?'':String(s)).replace(/[&<>"]/g,
   c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -14327,12 +14768,14 @@ function runElapsed(r, now){
   if (r.elapsed_s != null) return fmtS(r.elapsed_s);
   return '-'; }
 // While a request generates, its planner row carries the live stdout tail -
-// stream it into the open request modal's <pre id="gtail">.
+// stream it into the open request modal's <pre id="gtail"> (same slot the
+// follow-up re-review row uses while it runs).
 function streamGenTail(){
   const gel = document.getElementById('gtail');
   if (!gel || !modalRequest) return;
   const pa = AGENTS.find(a=>a.request_id===modalRequest.id &&
-                          a.step==='plan-proposal');
+                          (a.step==='plan-proposal' ||
+                           a.step==='follow-up-review'));
   const t = (pa && pa.tail) || '';
   if (gel.textContent !== t){ gel.textContent = t; gel.scrollTop = gel.scrollHeight; }
 }
@@ -16621,7 +17064,7 @@ function openNew(){
   showRequestForm({status:'new',raw:'',label:'',project:'',...defaults});
 }
 function showRequestForm(rec){
-  const stage=rec.status, editable=!['generating','launching','launched'].includes(stage);
+  const stage=rec.status, editable=!['generating','launching','launched','fu_regen'].includes(stage);
   const disabled=editable?'':' disabled';
   rqAttachments=Array.isArray(rec.attachments)?rec.attachments.slice():[];
   const choices=lastData?.project_options||[];
@@ -16676,10 +17119,20 @@ function showRequestForm(rec){
       `your answers before writing the TOML ` +
       `(${(rec.pending_questions||[]).length} pending). Answer them via the ` +
       `button below, or edit the request and Regenerate.</div>`:'') +
+    (stage==='fu_regen'?`<div class="notice warn">A re-review session is ` +
+      `checking this follow-up against the project's current state - ` +
+      `the rewritten proposal lands here when it finishes (it may ` +
+      `conclude nothing remains).</div>`:'') +
     (rec.gen_tail && (stage==='generating'||stage==='error'||
-                      stage==='questions')
-      ? `<label>Planner output${stage==='generating'?' (live)':''}</label>` +
+                      stage==='questions'||stage==='fu_regen')
+      ? `<label>${stage==='fu_regen'?'Review output':'Planner output'}` +
+        `${stage==='generating'||stage==='fu_regen'?' (live)':''}</label>` +
         `<pre id="gtail">${esc(rec.gen_tail)}</pre>`:'') +
+    (rec.fu_regen && rec.fu_regen.ended_at && stage!=='fu_regen'
+      ? `<div class="sub">last re-review: ` +
+        `${esc(rec.fu_regen.status||'?')} ` +
+        `${loc(rec.fu_regen.ended_at)}` +
+        `${rec.fu_regen.note?' - '+esc(rec.fu_regen.note):''}</div>`:'') +
     (stage==='launching'||stage==='launched'?`<div class="notice">This ` +
       `request has already been started; editing and discard are disabled.</div>`:'') +
     `<label for="rq-label">Short label (optional until planned)</label>` +
@@ -16825,12 +17278,24 @@ function showRequestForm(rec){
       // Regenerate is a neutral secondary - the primary slot on a
       // reviewed proposal belongs to Start run, and an amber 'attn' flag
       // would be a colour-only staleness signal (the note above names
-      // the pending fields instead)
-      `<button type="button" id="rq-generate" ` +
-      `class="btn${rec.manifest?' secondary':''}" data-action="generate" ` +
-      `title="plan a fresh TOML runbook from the request fields - ` +
-      `replaces the current proposal only when generation succeeds">` +
-      `${rec.manifest?'Regenerate tasks':'Generate proposal'}</button>` +
+      // the pending fields instead). An imported follow-up gets the
+      // re-review session instead: the planner is answer-only and the
+      // record's 'request text' is a stub, so Regenerate tasks could
+      // never re-check what's still worth doing.
+      (rec.imported==='followup'
+        ? `<button type="button" id="rq-generate" ` +
+          `class="btn secondary" data-action="regen" ` +
+          `title="spawn a review session that re-checks every proposed ` +
+          `item against the project's current state and rewrites this ` +
+          `follow-up in place - it may conclude nothing remains">` +
+          `Regenerate follow-up</button>`
+        : `<button type="button" id="rq-generate" ` +
+          `class="btn${rec.manifest?' secondary':''}" ` +
+          `data-action="generate" ` +
+          `title="plan a fresh TOML runbook from the request fields - ` +
+          `replaces the current proposal only when generation succeeds">` +
+          `${rec.manifest?'Regenerate tasks':'Generate proposal'}` +
+          `</button>`) +
       (rec.manifest?`<button type="button" id="rq-apply" ` +
         `class="btn secondary" data-action="apply">` +
         `Apply options to TOML</button>`:''):'') +
@@ -17330,6 +17795,11 @@ async function requestAction(action){
   if (action==='stop' && !await askConfirm(
       'Stop preparing this proposal? The planner session is cancelled - ' +
       'your request and any previous proposal are kept.')) return;
+  if (action==='regen' && !await askConfirm(
+      'Spawn a review session to re-check this follow-up against ' +
+      'current project state? It rewrites the proposal in place - ' +
+      'the step list becomes whatever it finds still worth doing ' +
+      '(possibly nothing).')) return;
   if (action==='run'){
     if (modalRequest.dirty){ formError('Save and review edits before starting.'); return; }
     if (!await askConfirm(`Start ${rec.run} now? This will execute ${rec.proposed_steps?.length||0} ` +
@@ -17361,6 +17831,8 @@ async function requestAction(action){
         await api('POST',`/api/requests/${rid}/generate`,{});
     } else if (action==='run'){
       await api('POST',`/api/requests/${rid}/run`,{});
+    } else if (action==='regen'){
+      await api('POST',`/api/requests/${rid}/regen-followup`,{});
     } else if (action==='stop'){
       if (!rid) return;
       await api('POST',`/api/requests/${rid}/stop`,{});
@@ -19870,7 +20342,8 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                         runs_dir, run_dir=body.get("run")), 201)
                 elif (m := re.fullmatch(r"/api/requests/([^/]+)/"
                                          r"(save|generate|run|discard|apply"
-                                         r"|answer|stop)", path)):
+                                         r"|answer|stop|regen-followup)",
+                                        path)):
                     request_id, action = m.groups()
                     if action == "save":
                         self._json(save_request(request_id, body, requests_dir,
@@ -19879,6 +20352,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                         self._json(start_generation(request_id, requests_dir,
                                                     manifests_dir, runs_dir,
                                                     devin_argv), 202)
+                    elif action == "regen-followup":
+                        self._json(regen_followup_start(
+                            request_id, requests_dir, manifests_dir,
+                            runs_dir, devin_argv), 202)
                     elif action == "stop":
                         self._json(stop_generation(request_id, requests_dir,
                                                    runs_dir), 202)
@@ -20132,6 +20609,10 @@ def main(argv: list[str] | None = None) -> int:
             ("import", cmd_import,
              "register an already-written manifest as a proposal "
              "(follow-up recovery - never launches)"),
+            ("regen-followup", cmd_regen_followup,
+             "re-review a stale follow-up proposal against current "
+             "state and rewrite it in place (dashboard spawn - never "
+             "launches)"),
             ("sessions", cmd_sessions,
              "list / clean up conductor-spawned devin sessions"),
             ("demo", cmd_demo, "self-test against a mock devin")):
@@ -20151,13 +20632,13 @@ def main(argv: list[str] | None = None) -> int:
                            help="cap concurrent agents (overrides the "
                                 "manifest's run.max_parallel)")
         if name in ("plan", "run", "demo", "sessions", "sweep", "merge",
-                    "summarize"):
+                    "summarize", "regen-followup"):
             p.add_argument("--devin", default=None,
                            help="devin command override (e.g. mock shim). "
                                 "Split with shlex - quote or use forward "
                                 "slashes in Windows paths")
         if name in ("run", "demo", "serve", "sweep", "sessions", "merge",
-                    "summarize", "import"):
+                    "summarize", "import", "regen-followup"):
             p.add_argument("--runs-dir", default=None, help=argparse.SUPPRESS)
         if name in ("sessions", "sweep"):
             p.add_argument("--keep-hours", type=float, default=48,
@@ -20195,10 +20676,13 @@ def main(argv: list[str] | None = None) -> int:
                            help="model for the summary session "
                                 "(default: the run's recorded "
                                 "summarize_model, else the CLI default)")
+        if name == "regen-followup":
+            p.add_argument("request_id")
     args = ap.parse_args(argv)
     return {"plan": cmd_plan, "run": cmd_run, "status": cmd_status,
             "serve": cmd_serve, "sweep": cmd_sweep, "merge": cmd_merge,
             "summarize": cmd_summarize, "import": cmd_import,
+            "regen-followup": cmd_regen_followup,
             "sessions": cmd_sessions, "demo": cmd_demo}[args.cmd](args)
 
 

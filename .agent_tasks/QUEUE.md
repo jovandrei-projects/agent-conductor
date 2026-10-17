@@ -29,6 +29,29 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-17 (ac-followup-regen, user-requested): 'Regenerate
+  follow-up' - a stale imported follow-up proposal can be re-reviewed
+  in place instead of hand-edited or abandoned. New dashboard action
+  on `imported == "followup"` records (the generic Regenerate tasks
+  button swaps out: the planner is answer-only and the record's `raw`
+  is a stub, so it could never re-check the items) -> POST
+  /api/requests/<id>/regen-followup -> detached
+  `conductor.py regen-followup <id>` -> one `devin -p` review session
+  in the source project (work_dir = follow-up-plan's slug, else a
+  proposed step's, else the record's project) that rewrites
+  `<run>-followup.toml` in place - drops landed/obsolete items, keeps
+  what remains, adds substantiated gaps, or writes a no-`[[step]]`
+  manifest when nothing remains. The path-keyed intake republishes
+  into the SAME request record (updated/empty/edited - a hand-edited
+  owned copy still wins); an empty rewrite drops the owned TOML so
+  'No work remains' carries no launchable manifest. `<id>.regen`
+  live-pid marker -> `fu_regen` stage ('Re-reviewing follow-up'),
+  refuses save/apply/generate/discard mid-review and guards the
+  republish; `rec.fu_regen` bookkeeping + aux `follow-up-review`
+  agent row + live 'Review output' tail in the modal; session
+  artifacts `<id>.regen.{stdout.log,export.json,launch.log}` ride the
+  existing `<id>.*` trash glob. 9 new FollowupRegenTests; worktree
+  branch conductor/ac-followup-regen.
 - DONE 2026-10-17 (follow-up-plan, closing step of run
   20261017-051357-dashboard-ask-ai): reviewed the run against the
   request (ask-ai assistant). ALL NINE feature steps did real,
