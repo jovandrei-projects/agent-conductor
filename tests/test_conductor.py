@@ -14079,5 +14079,174 @@ assert.match(elem('agents').innerHTML,/>2m3[01]s</);  // 120 + ~30 live
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class LegacyRunElapsedEventTests(unittest.TestCase):
+    """A legacy run (no exec_intervals) resumed under a pre-schema
+    build only proves its LAST dispatch's driver_started_at->ended_at
+    window - the reported '4s' rows. The run's own events.jsonl still
+    records every dispatch's run_start/terminal pair, so
+    _run_elapsed_split rebuilds all driver windows from it instead of
+    trusting which stamp survived the resume."""
+
+    @staticmethod
+    def _run_dir(base: Path, events: str) -> Path:
+        rd = base / "runs" / "20260101-000000-x"
+        rd.mkdir(parents=True)
+        (rd / "events.jsonl").write_text(events, encoding="utf-8")
+        return rd
+
+    def test_resumed_legacy_run_sums_all_dispatches(self):
+        """Two recorded run_start/run_end pairs bank both windows; the
+        day's idle gap between them never counts."""
+        with tempfile.TemporaryDirectory() as td:
+            rd = self._run_dir(
+                Path(td),
+                '{"ts":"2026-10-16T01:36:39","event":"run_start"}\n'
+                '{"ts":"2026-10-16T03:43:01","event":"run_end"}\n'
+                '{"ts":"2026-10-16T10:06:43","event":"run_start"}\n'
+                '{"ts":"2026-10-16T10:06:46","event":"run_end"}\n')
+            st = {"started_at": "2026-10-16T01:36:39",
+                  "ended_at": "2026-10-16T10:06:46",
+                  "driver_started_at": "2026-10-16T10:06:42",
+                  "steps": {}}
+            els, start = conductor._run_elapsed_split(st, rd)
+            self.assertAlmostEqual(els, 7582.0 + 3.0, places=1)
+            self.assertIsNone(start)
+
+    def test_no_event_log_keeps_last_window_fallback(self):
+        """Without an events file the provable last dispatch is all the
+        record offers - small, but honest."""
+        with tempfile.TemporaryDirectory() as td:
+            rd = Path(td) / "runs" / "20260101-000000-x"
+            rd.mkdir(parents=True)          # no events.jsonl
+            st = {"started_at": "2026-10-16T01:36:39",
+                  "ended_at": "2026-10-16T10:06:46",
+                  "driver_started_at": "2026-10-16T10:06:42",
+                  "steps": {}}
+            els, start = conductor._run_elapsed_split(st, rd)
+            self.assertAlmostEqual(els, 4.0, places=1)
+            self.assertIsNone(start)
+
+    def test_dead_dispatch_ends_at_witness_not_now(self):
+        """A crashed legacy run's trailing run_start closes at the last
+        recorded sign of life, not at read time."""
+        with tempfile.TemporaryDirectory() as td:
+            rd = self._run_dir(
+                Path(td),
+                '{"ts":"2026-10-16T01:00:00","event":"run_start"}\n'
+                '{"ts":"2026-10-16T01:02:00","event":"step_running"}\n')
+            st = {"started_at": "2026-10-16T01:00:00", "steps": {}}
+            els, _ = conductor._run_elapsed_split(st, rd)
+            self.assertAlmostEqual(els, 120.0, places=1)
+
+    def test_live_legacy_run_ticks_from_last_run_start(self):
+        """A still-driving legacy run ticks base+now from its open
+        run_start, with earlier closed windows banked."""
+        with tempfile.TemporaryDirectory() as td:
+            rd = self._run_dir(
+                Path(td),
+                '{"ts":"2026-10-16T01:00:00","event":"run_start"}\n'
+                '{"ts":"2026-10-16T02:00:00","event":"run_end"}\n'
+                '{"ts":"2026-10-16T03:00:00","event":"run_start"}\n')
+            st = {"started_at": "2026-10-16T01:00:00", "steps": {}}
+            with mock.patch.object(conductor, "driver_alive",
+                                   return_value=True):
+                els, start = conductor._run_elapsed_split(st, rd)
+            self.assertAlmostEqual(els, 3600.0, places=1)
+            self.assertEqual(start, "2026-10-16T03:00:00")
+
+    def test_unpaired_terminal_event_is_ignored(self):
+        """A run_end without a preceding run_start bounds nothing."""
+        with tempfile.TemporaryDirectory() as td:
+            rd = self._run_dir(
+                Path(td),
+                '{"ts":"2026-10-16T02:00:00","event":"run_end"}\n')
+            st = {"started_at": "2026-10-16T01:00:00",
+                  "ended_at": "2026-10-16T02:00:00", "steps": {}}
+            els, _ = conductor._run_elapsed_split(st, rd)
+            self.assertAlmostEqual(els, 3600.0, places=1)
+
+
+class DeleteRunRequestReconcileTests(unittest.TestCase):
+    """Trashing a run re-hands its originating request: the request only
+    reads 'launched' while a run dir carries its request_id, so without
+    reconciliation its stored 'launching' reconciles to 'launch_failed' -
+    'Start failed' lying about a delete. The record returns to 'ready';
+    restoring the run re-anchors 'launched' via the request_id scan."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.runs = self.base / "runs"
+        self.requests = self.base / "requests"
+        self.requests.mkdir(parents=True)
+        self.trash = self.base / "trash"
+
+    def _request(self, rid, status="launching"):
+        rec = {"id": rid, "status": status,
+               "launched_at": "2026-10-15T21:04:57",
+               "raw": "make the icon blue"}
+        (self.requests / f"{rid}.json").write_text(
+            json.dumps(rec), encoding="utf-8")
+        return rec
+
+    def _run(self, rid=None, name="20260101-000000-x"):
+        rd = (self.runs / name).resolve()
+        rd.mkdir(parents=True, exist_ok=True)
+        st = {"run": name, "request_id": rid,
+              "started_at": "2026-10-15T21:04:58",
+              "ended_at": "2026-10-15T21:30:00",
+              "run_dir": str(rd), "steps": {}}
+        (rd / "state.json").write_text(json.dumps(st), encoding="utf-8")
+        (rd / "events.jsonl").write_text("{}\n", encoding="utf-8")
+        return rd
+
+    def test_trash_resets_launching_request_to_ready(self):
+        with tempfile.TemporaryDirectory() as td2:
+            _ = td2  # runs/requests dirs come from setUp, not _RunControlBase
+            rid = "20261015-210430-ae3572b8"
+            self._request(rid)
+            rd = self._run(rid)
+            out = conductor.delete_run(rd.name, {"confirm": True},
+                                       self.runs, self.trash,
+                                       self.requests)
+            self.assertTrue(out["trashed"])
+            rec = json.loads(
+                (self.requests / f"{rid}.json").read_text())
+            self.assertEqual(rec["status"], "ready")
+            self.assertIsNone(rec["error"])
+            self.assertEqual(
+                conductor._request_status(rec, self.runs), "ready")
+
+    def test_restore_reanchors_request_to_launched(self):
+        rid = "20261015-210430-ae3572b8"
+        self._request(rid)
+        rd = self._run(rid)
+        out = conductor.delete_run(rd.name, {"confirm": True},
+                                   self.runs, self.trash, self.requests)
+        conductor.restore_trash(out["trash_id"], self.trash,
+                                requests_dir=self.requests,
+                                runs_dir=self.runs)
+        rec = json.loads((self.requests / f"{rid}.json").read_text())
+        self.assertEqual(conductor._request_status(rec, self.runs),
+                         "launched")
+
+    def test_non_launching_request_untouched(self):
+        rid = "20261015-210430-ae3572b8"
+        self._request(rid, status="ready")
+        rd = self._run(rid)
+        conductor.delete_run(rd.name, {"confirm": True},
+                             self.runs, self.trash, self.requests)
+        rec = json.loads((self.requests / f"{rid}.json").read_text())
+        self.assertEqual(rec["status"], "ready")
+        self.assertNotIn("updated_at", rec)   # untouched - no rewrite
+
+    def test_missing_request_record_is_fine(self):
+        rd = self._run("20261015-210430-ae3572b8")
+        out = conductor.delete_run(rd.name, {"confirm": True},
+                                   self.runs, self.trash, self.requests)
+        self.assertTrue(out["trashed"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1814,6 +1814,41 @@ def _run_iv_close(state: dict, end_iso: str, *, run_dir: Path | None = None,
             if wit is not None and t0 <= wit < end_t else end_iso
 
 
+def _run_event_windows(run_dir: Path | None
+                       ) -> tuple[list[tuple[float, float]], float | None]:
+    """(closed windows, trailing open start) rebuilt from the run's own
+    events.jsonl: every dispatch logs `run_start`, and run_end /
+    run_abort / run_stop / run_deadline closes it. Legacy state rows (no
+    exec_intervals) lost every dispatch but the last to stamp bookkeeping
+    - the event log still has all of them."""
+    closed: list[tuple[float, float]] = []
+    open0: float | None = None
+    if run_dir is None:
+        return closed, open0
+    try:
+        lines = (run_dir / "events.jsonl").read_text(
+            encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return closed, open0
+    for ln in lines:
+        try:
+            ev = json.loads(ln)
+        except ValueError:
+            continue
+        ts = _iso_ts(ev.get("ts"))
+        if ts is None:
+            continue
+        kind = ev.get("event")
+        if kind == "run_start":
+            open0 = ts
+        elif kind in ("run_end", "run_abort", "run_stop",
+                      "run_deadline") and open0 is not None:
+            if ts > open0:
+                closed.append((open0, ts))
+            open0 = None
+    return closed, open0
+
+
 def _run_elapsed_split(state: dict,
                        run_dir: Path | None = None
                        ) -> tuple[float | None, str | None]:
@@ -1821,11 +1856,14 @@ def _run_elapsed_split(state: dict,
     part sums every finished driver interval plus a crashed interval
     capped at its last sign of life - stable across refreshes. The live
     interval never enters it: its start ships separately so the client
-    ticks base + now-start. Legacy rows (no exec_intervals) fall back to
-    the recorded span: a resumed legacy run only has its last driver's
-    driver_started_at->ended_at window provable, a single-execution one
-    the full pair; a dead unended one ends at last witness; nothing
-    recorded -> (None, None) so the column shows '-' not a guess."""
+    ticks base + now-start. Legacy rows (no exec_intervals) rebuild
+    driver windows from the event log's run_start/terminal pairs when a
+    run_dir is in hand - a resumed legacy run keeps EVERY recorded
+    dispatch instead of only the last driver's provable seconds; without
+    events they fall back to the recorded span (last driver_started_at->
+    ended_at window for a resumed run, the full pair for a single
+    execution, last witness for a dead unended one); nothing recorded
+    -> (None, None) so the column shows '-' not a guess."""
     ivs = state.get("exec_intervals")
     live = not state.get("ended_at") and driver_alive(state)
     if ivs:
@@ -1851,6 +1889,21 @@ def _run_elapsed_split(state: dict,
     t0 = _iso_ts(state.get("started_at"))
     t1 = _iso_ts(state.get("ended_at"))
     d0 = _iso_ts(state.get("driver_started_at"))
+    wins, open0 = _run_event_windows(run_dir)
+    if wins or open0 is not None:
+        # Event-derived windows beat the single-stamp heuristics: the
+        # resume that stamped driver_started_at also logged run_start, so
+        # resumed legacy runs report all dispatches, not a 4-second tail.
+        total = sum(max(0.0, b - a) for a, b in wins)
+        if live:
+            start = open0 if open0 is not None else (d0 or t0)
+            return (round(total, 1),
+                    _iso_from(start) if start is not None else None)
+        if open0 is not None:           # died mid-dispatch - end at evidence
+            wit = _run_witness_ts(state, run_dir)
+            if wit is not None and wit > open0:
+                total += wit - open0
+        return round(total, 1), None
     if live:
         base = d0 if d0 is not None else t0
         return (0.0, _iso_from(base)) if base is not None else (None, None)
@@ -10904,7 +10957,8 @@ def _rewrite_run_paths(run_dir: Path, old_abs: str) -> None:
 
 
 def delete_run(run_name: str, body: dict, runs_dir: Path = RUNS_DIR,
-               trash_dir: Path | None = None) -> dict:
+               trash_dir: Path | None = None,
+               requests_dir: Path = REQUESTS_DIR) -> dict:
     """Dashboard 'Delete run': move the run's whole on-disk record - state,
     events, prompts, stdout logs, ATIF exports - to recoverable trash
     (data/trash/<entry>/), NOT rmtree. The row leaves every normal list at
@@ -10977,6 +11031,22 @@ def delete_run(run_name: str, body: dict, runs_dir: Path = RUNS_DIR,
             (_flag_dir() / f"{prefix}-{_safe_name(d.name)}").unlink(
                 missing_ok=True)
         except OSError:
+            pass
+    # The request that spawned this run only reads 'launched' while a run
+    # dir carrying its request_id exists; with the dir trashed its stored
+    # 'launching' would reconcile to 'launch_failed' - a lie (the launch
+    # succeeded; the run was deleted later). Hand it back to 'ready' so
+    # the row offers Start run (or Discard); restoring the run re-anchors
+    # it to 'launched' via the request_id scan either way.
+    rid = st.get("request_id")
+    if rid and REQUEST_ID_RE.fullmatch(str(rid)):
+        try:
+            rrec = _read_request(str(rid), requests_dir)
+            if rrec.get("status") == "launching":
+                rrec.update(status="ready", error=None,
+                            updated_at=now_iso())
+                _save_request(rrec, requests_dir)
+        except (OSError, ValueError):
             pass
     return {"deleted": run_name, "trashed": True,
             "trash_id": meta["id"], "expires_at": meta["expires_at"]}
@@ -18452,7 +18522,7 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                                                 runs_dir))
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/delete", path)):
                     self._json(delete_run(m.group(1), body, runs_dir,
-                                          trash_dir))
+                                          trash_dir, requests_dir))
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/review", path)):
                     self._json(set_run_review(m.group(1), body, runs_dir))
                 elif (m := re.fullmatch(
