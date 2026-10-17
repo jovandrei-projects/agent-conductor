@@ -981,6 +981,24 @@ Append as they are hit.
     Verify with `grep -n '\\\\' conductor.py` and mentally
     halve what you see; the Node harness tests catch breakage only if a
     test exercises that code path.
+17. **A capped `shell=True` gate must die by TREE, and a suite that
+    leases real slots can deadlock its own run.** Burned
+    2026-10-17 assistant-fast-transport: `subprocess.run(verify,
+    shell=True, timeout=)` killed only the cmd shell at the cap, the
+    orphaned `run_tests.py` + unittest shards kept the captured pipes
+    open, and the post-kill `communicate()` retry waited on an EOF that
+    never came - two `STATUS: done` steps froze at 'running' mid-
+    teardown, their agent slots never releasing. Meanwhile the suite
+    itself was hung on the REAL slot pool: test shards leased machine
+    slots 1/6/8 while the run held 2-5 and the other run 7 - an
+    uncapped acquire against your own leases. Both halves fixed
+    together: the gate is Popen + `communicate(timeout)` + `kill_tree`
+    + a `VERIFY_KILL_GRACE_S`-bounded second read, and `step_env` now
+    points `CONDUCTOR_SLOT_DIR` at a per-step temp sandbox so a
+    worker's (or gate's) conductor-test subprocesses never share the
+    machine pool. While a step sits in this window the record now
+    carries `reported` - the worker's printed STATUS - so the
+    dashboard can say 'reported done' instead of a bare 'running'.
 
 ## The task workspace - read before starting work
 

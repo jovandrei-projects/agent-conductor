@@ -80,6 +80,10 @@ MODE_FLAG = {"normal": "auto", "auto": "auto", "accept-edits": "accept-edits",
 # a completed turn (verify still runs) instead of a timeout.
 STATUS_GRACE_S = 120.0
 WAIT_POLL_S = 15.0        # wait() slice between STATUS checks on the log
+# After the verify gate's cap kills its process tree, the pipes should
+# EOF at once; a stray grandchild holding a handle gets this grace
+# before the gate abandons the capture and records the timeout anyway.
+VERIFY_KILL_GRACE_S = 10.0
 # A recorded session_id can briefly vanish from `devin list` right after
 # spawn (registration lags seconds-to-a-minute, and the dashboard's own
 # listing cache is 120s stale) - don't read that as 'deleted' for the
@@ -5172,6 +5176,16 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         step_env["CONDUCTOR_SERVICE_PORT"] = str(service_port)
         step_env["CONDUCTOR_SERVICE_URL"] = \
             f"http://127.0.0.1:{service_port}"
+    # The machine-wide agent-slot registry gets a per-step sandbox: a
+    # worker on the conductor repo itself (or its verify gate running the
+    # suite) would otherwise lease REAL slots, and a test shard parked on
+    # a full pool waits uncapped while holding the pipes that keep its
+    # gate alive - the run deadlocks against its own leases (hit
+    # 2026-10-17: two verify-stuck steps pinned slots 4/5, three test
+    # shards held 1/6/8, and every queued acquire waited forever).
+    step_env["CONDUCTOR_SLOT_DIR"] = str(
+        Path(tempfile.gettempdir()) / "agent-conductor-slots-"
+        f"{_safe_name(run_dir.name)}-{_safe_name(step.name)}")
 
     t0 = _now()
     timed_out = False
@@ -5189,6 +5203,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     intr_respawn = False
     intr_late = False
     intr_banked = False
+    watched = True            # spawn block recomputes; True = no mid-step save
     while True:
         if intr_respawn:
             # 'Interrupt + instruct': the worker was killed by our own
@@ -5266,6 +5281,9 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                 with STATE_LOCK:
                     rec["pid"] = proc.pid
                     rec["attempts"] = attempt
+                    # a fresh session hasn't reported anything yet -
+                    # drop the previous dispatch's stamp
+                    rec["reported"] = None
                     try:
                         watched = run_dir.resolve().is_relative_to(
                             Path(work_dir).resolve())
@@ -5356,6 +5374,15 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         new_sessions = (session_ids(devin_argv, work_dir) or set()) - before
         all_sessions |= new_sessions
         status_line = tail_status(stdout_log)
+        # The worker's own verdict, readable while teardown still runs:
+        # post-commit, the verify gate and the pool merge can stretch for
+        # minutes (or wedge), and bare 'running' can't tell a mid-turn
+        # step from one whose session already ended 'done'.
+        if status_line is not None and rec.get("reported") != status_line:
+            with STATE_LOCK:
+                rec["reported"] = status_line
+                if not watched:
+                    save_state(run_dir, state)
         attempt_outcome = tail_outcome(stdout_log)
         if attempt_outcome:
             attempt_outcomes.append((attempt, attempt_outcome))
@@ -5375,25 +5402,60 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
 
     verify_ok = None
     if step.verify and not timed_out and not stopped:
+        # Popen + communicate, not subprocess.run: a shell=True gate that
+        # hits its cap must die by TREE. subprocess.run's timeout kills
+        # only the cmd shell, and children it spawned keep the captured
+        # pipes open - the post-kill communicate() retry then blocks on
+        # an EOF that never comes and the step records 'running' forever
+        # (hit 2026-10-17: a slot-starved verify suite outlived its dead
+        # shell; two 'STATUS: done' steps froze mid-teardown and their
+        # agent slots never released). kill_tree gets the whole tree so
+        # the pipes EOF and the second communicate returns.
+        vproc = subprocess.Popen(step.verify, cwd=str(work_dir),
+                                 shell=True, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE,
+                                 stdin=subprocess.DEVNULL, text=True,
+                                 encoding="utf-8", errors="replace",
+                                 env=step_env,
+                                 **hidden_subprocess_kwargs())
+        vout = verr = ""
+        verify_timed_out = False
         try:
-            v = subprocess.run(step.verify, cwd=str(work_dir), shell=True,
-                               capture_output=True, text=True,
-                               encoding="utf-8", errors="replace",
-                               timeout=(step.verify_timeout_min * 60),
-                               env=step_env,
-                               **hidden_subprocess_kwargs())
-            verify_ok = v.returncode == 0
-            (run_dir / f"{step.name}.verify.log").write_text(
-                (v.stdout or "") + (v.stderr or ""), encoding="utf-8",
-                errors="replace")
-        except subprocess.TimeoutExpired:
-            # A hung gate must not crash the conductor - it is a failed
-            # verify like any other red run.
+            vout, verr = vproc.communicate(
+                timeout=step.verify_timeout_min * 60)
+            verify_ok = vproc.returncode == 0
+        except subprocess.TimeoutExpired as te:
+            kill_tree(vproc)
+            verify_timed_out = True
+            # keep whatever the gate already printed - it is the only
+            # trace of a hung suite
+            vout = te.output or ""
+            verr = te.stderr or ""
+            try:
+                vout, verr = vproc.communicate(
+                    timeout=VERIFY_KILL_GRACE_S)
+            except subprocess.TimeoutExpired as te2:
+                # Orphaned grandchildren still pin a pipe - abandon the
+                # capture rather than deadlock the step record. The
+                # reader threads die with the driver.
+                vout = te2.output or vout
+                verr = te2.stderr or verr
+                for stream in (vproc.stdout, vproc.stderr):
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
             verify_ok = False
-            (run_dir / f"{step.name}.verify.log").write_text(
-                "verify timed out after "
-                f"{int(step.verify_timeout_min * 60)}s\n",
-                encoding="utf-8")
+        if isinstance(vout, bytes):
+            vout = vout.decode("utf-8", "replace")
+        if isinstance(verr, bytes):
+            verr = verr.decode("utf-8", "replace")
+        (run_dir / f"{step.name}.verify.log").write_text(
+            (vout or "") + (verr or "")
+            + (f"\nverify timed out after "
+               f"{int(step.verify_timeout_min * 60)}s - gate tree "
+               f"killed\n" if verify_timed_out else ""),
+            encoding="utf-8", errors="replace")
 
     # An interrupt request that landed during verify/teardown can never be
     # consumed for THIS dispatch - bank it into the notes channel like a
@@ -12228,6 +12290,27 @@ def stdout_tail(path: str | None, lines: int = 15) -> str | None:
                               data.decode("utf-8", "replace"))[-lines:])
 
 
+def live_step_log(rec: dict) -> Path | None:
+    """The log the CURRENT dispatch is writing. rec['stdout_log'] only
+    repoints at step end, so a retry's attemptN or an interrupt respawn's
+    interruptN log would otherwise be invisible until then - and a stale
+    attempt's 'STATUS: done' would masquerade as the live session's."""
+    base = rec.get("stdout_log")
+    if not base:
+        return None
+    p = Path(base)
+    stem = rec.get("name") or p.name.split(".")[0]
+    if rec.get("interrupts"):
+        cand = p.with_name(
+            f"{stem}.interrupt{rec['interrupts']}.stdout.log")
+    elif (rec.get("attempts") or 1) > 1:
+        cand = p.with_name(
+            f"{stem}.attempt{rec['attempts']}.stdout.log")
+    else:
+        cand = p
+    return cand if cand.is_file() else p
+
+
 def file_mtime_iso(path: str | Path | None) -> str | None:
     """A file's last-write stamp - the modal's 'last update' row for
     stdout logs (a live step's log keeps ticking between polls)."""
@@ -13148,6 +13231,14 @@ def collect_dashboard(runs_dir: Path,
                 "session_gone": session_gone,
                 "exit_code": rec.get("exit_code"),
                 "status_line": rec.get("status_line"),
+                # The worker's STATUS line can be in the log while the
+                # record still reads 'running' (post-commit, the verify
+                # gate, a pool-merge wait). rec['reported'] is the
+                # driver's stamp; the log read is the same truth for
+                # drivers that predate the field and for orphaned runs.
+                "reported": rec.get("reported") or (
+                    tail_status(live_step_log(rec))
+                    if status == "running" else None),
                 "service_port": rec.get("service_port"),
                 "service_url": rec.get("service_url"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
@@ -15290,7 +15381,9 @@ function showDetail(i, keepStack){
           ` - no proposal linked</span>`)]] : []),
     ['project',a.slug],
     ['status',a.status+(a.status==='failed'&&a.exit_code===0&&
-      a.status_line==null?' - ended without the STATUS: line':'')],
+      a.status_line==null?' - ended without the STATUS: line':'')+
+      (a.status==='running'&&a.reported
+        ?' - worker reported '+a.reported:'')],
     ...(a.depends_on && a.depends_on.length
       ? [['depends on', a.depends_on.map(dn =>
           a.dep_wait && a.dep_wait.includes(dn) ? dn+' (waiting)' : dn
@@ -17838,6 +17931,12 @@ function render(d){
           `and resumed this step with added instructions ` +
           `${a.interrupts}x - same step, not a retry"> ` +
           `·intr×${a.interrupts}</span>` : '') +
+        (a.status==='running' && a.reported
+          ? `<span class="sub" title="the session already printed ` +
+            `STATUS: ${esc(a.reported)} - the driver is finishing up ` +
+            `(post-commit, verify gate, or waiting for the pool before ` +
+            `merge); the recorded status catches up when teardown ` +
+            `completes"> ·reported ${esc(a.reported)}</span>` : '') +
         (a.needs_review ? ` ${unreviewedPill('this task')}` : '') + `</td>` +
         // the step name is the task-modal affordance - a real button, so
         // keyboard activation is free; a bare row click no longer opens it.

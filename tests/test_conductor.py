@@ -758,6 +758,95 @@ verify_timeout_min = 0.008
             log = (next(runs.iterdir()) / "one.verify.log").read_text()
             self.assertIn("verify timed out after", log)
 
+    def test_verify_gate_isolated_slot_dir(self):
+        """The verify gate sees a per-step CONDUCTOR_SLOT_DIR sandbox,
+        never the machine pool - a suite that leases agent slots cannot
+        deadlock against the run's own leases."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "x"
+verify = "set CONDUCTOR_SLOT_DIR> slotdir.txt"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            val = (proj / "slotdir.txt").read_text().strip()
+            sd = val.split("=", 1)[1].strip()
+            self.assertIn("agent-conductor-slots-", sd)
+            self.assertNotEqual(
+                Path(sd), Path(tempfile.gettempdir())
+                / "agent-conductor-slots")
+
+    def test_verify_gate_pipe_pinning_grandchild(self):
+        """A verify gate whose grandchildren outlive the shell and pin the
+        captured pipes must still record the timeout - communicate() must
+        never block the step record on a leaked handle."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "x"
+verify = 'start /b python -c "import time; time.sleep(20)"'
+verify_timeout_min = 0.008
+''')
+            t0 = time.time()
+            self.assertEqual(run_manifest(m, runs), 1)
+            # gate cap (~0.5s) + kill grace (10s) - never the old
+            # wait-for-EOF-forever behavior
+            self.assertLess(time.time() - t0, 120)
+            state = json.loads(
+                (next(runs.iterdir()) / "state.json").read_text())
+            rec = state["steps"]["one"]
+            self.assertEqual(rec["status"], "failed")
+            self.assertEqual(rec["verify_ok"], False)
+
+    def test_reported_status_visible_during_verify(self):
+        """A worker's STATUS line lands in rec['reported'] while the
+        verify gate still runs - the dashboard can show 'reported done'
+        instead of a bare 'running'."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "x"
+verify = 'python -c "import time; time.sleep(6)"'
+''')
+            t = threading.Thread(target=run_manifest, args=(m, runs))
+            t.start()
+            seen = None
+            try:
+                deadline = time.time() + 60
+                while time.time() < deadline:
+                    sds = list(runs.glob("*/state.json"))
+                    rec = None
+                    if sds:
+                        try:
+                            rec = (json.loads(sds[0].read_text())
+                                   .get("steps", {}).get("one"))
+                        except (OSError, ValueError):
+                            rec = None     # writer mid-replace
+                    if rec and rec.get("status") == "running" \
+                            and rec.get("reported") == "done":
+                        seen = dict(rec)
+                        break
+                    time.sleep(0.2)
+            finally:
+                t.join(timeout=120)
+            self.assertIsNotNone(
+                seen, "never saw reported=done while status was running")
+
     def test_two_projects_same_wave_parallel_no_worktree(self):
         """Different project dirs in one wave run in the dirs themselves -
         no worktree needed, nothing to merge."""
