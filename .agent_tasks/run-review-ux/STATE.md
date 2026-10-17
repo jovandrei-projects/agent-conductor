@@ -51,7 +51,7 @@ See `DESIGN.md` for full reasoning + sources. Headlines:
 
 ### Phase 2 - implementation (manifest steps, other sessions)
 
-- [ ] review-workflow - the model above
+- [x] review-workflow - the model above (done 2026-10-16, see below)
 - [x] task-outcome-summary - SUMMARY: line -> rec["outcome"] -> modal/table
       (landed on master, merge d57e9c2)
 - [x] task-table-navigation - name-targeted clicks + selection highlight
@@ -66,12 +66,43 @@ See `DESIGN.md` for full reasoning + sources. Headlines:
 
 ## Where it stopped
 
-Design step merged to master (284fb2a, 2026-10-16) after a bookkeeping
-both-append resolution on QUEUE.md + efficiency_stats.md. Next session
-= `review-workflow` step: implement per DESIGN.md - `completion_seq` bumps
-at the enumerated write sites, `review-*` sentinels + endpoints +
-`collect_dashboard` fields, modal buttons + ctx-menu items, `.stage`
-pill + row accent. Do NOT implement the other steps' scopes.
+`review-workflow` merged to master 2026-10-16 via merge-resolver
+session after the wave merge conflicted on bookkeeping + test/class
+tails (kept both sides). It was implemented + verified on the branch
+(290/290 `python run_tests.py`, demo + `plan` green). What landed:
+
+- `completion_seq` bumps at every terminal-outcome write: run_step
+  terminal update, pre-spawn non-repo fail, resume merge-finalize flips,
+  halt_remaining run close, auth aborts, end-of-run ended_at, sweep
+  lost-mark + run close, _merge_run + _merge_deferred_group flips.
+- `review-<flagkey>[-<step>]` sentinels (JSON `{reviewed, seq, at}`) in
+  %TEMP% - trap-5 safe - folded into state.json by save_state's new
+  `_fold_review_flags`, exempt from clear_run_flags, overlaid live in
+  collect_dashboard (newer `at` wins).
+- Endpoints: POST /api/runs/<d>/review and .../steps/<s>/review
+  (`set_run_review`/`set_step_review`/`_set_review`). Body `{reviewed}`
+  + optional `seq` guard: an ack against a stale view 409s; 'mark
+  reviewed' with nothing to review (seq-less, no tombstone) also 409s.
+  Run and task marks are fully independent.
+- Dashboard: `completion_seq`/`review`/`needs_review` on run + task
+  dicts; `.stage.unreviewed` cyan pill (#39c5cf - the free hue), left
+  row inset + bolded task name + `· unreviewed` aria suffix; 'review'
+  kv row + Mark-as-reviewed/needing-review button in BOTH modals and
+  both ctx menus (same data-review-run/review-step hooks). Run-level
+  seq mismatch is gated on `ended_at` so a resumed in-flight run does
+  not resurrect the old flag; a LIVE step suppresses its flag rather
+  than dropping seq (pop would let an old ack collide with the recycled
+  seq - documented in collect_dashboard).
+- Failure stays failure: the pill is a sibling of status, never a
+  recolor; `ReviewWorkflowTests` pins failed+unreviewed coexisting.
+- 14 new tests: seq stamping, ack/re-flag persistence, repeat saves,
+  run/task independence, legacy no-autoflag + manual marks, stale-seq
+  409, flag overlay + fold, clear_run_flags exemption, sweep lost bump,
+  resume re-completion re-flag, HTTP endpoint statuses, Node JS badge/
+  modal/ctx/dispatch regression.
+
+Next session = any other Phase-2 step (none started). Do NOT implement
+their scopes here.
 
 ## Deferred or blocked
 

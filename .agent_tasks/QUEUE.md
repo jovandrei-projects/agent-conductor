@@ -232,6 +232,30 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   checkbox -> `run.summarize` via `_apply_fields_to_toml` +
   `_guarantee_isolation`. 10 new RunSummaryTests + manifest-parse +
   renderer coverage.
+- DONE 2026-10-16 (review-workflow, step of run
+  20261016-100852-run-review-ux): durable human review marks for
+  finalized runs + tasks. Every terminal-outcome write bumps
+  `completion_seq` (step end, pre-spawn fail, resume merge flips,
+  halt/auth run close, sweep lost-mark, dashboard/deferred merge
+  flips); `review-<flagkey>[-<step>]` JSON sentinels `{reviewed, seq,
+  at}` live in %TEMP% (trap-5 safe), fold into state.json on every
+  save_state (`_fold_review_flags`), survive clear_run_flags, and
+  overlay live in collect_dashboard (newer `at` wins). An ack binds the
+  seq it saw: a re-completion after resume/retry re-flags, repeated
+  saves of the same outcome never reset it, an ack against a stale view
+  is refused (409), and seq-less legacy records never auto-flag though
+  manual marks + tombstones still work. Run and task marks are fully
+  independent; a LIVE step suppresses its flag (no seq pop - a
+  recycled seq would let an old ack cover new work). Endpoints: POST
+  /api/runs/<d>/review and .../steps/<s>/review. Dashboard: cyan
+  `.stage.unreviewed` pill + left row inset + bolded task name +
+  `· unreviewed` aria suffix (text is the carrier, not color), 'review'
+  kv row + Mark-as-reviewed/needing-review buttons in both modals and
+  both context menus. A failed outcome keeps its red status + the flag
+  - unreviewed never reads as success. Run-level mismatch is gated on
+  ended_at so an in-flight resume hides the stale flag. 290/290 mock
+  tests + demo + plan green; 14 new ReviewWorkflowTests incl. HTTP
+  statuses and a Node JS badge/modal/ctx/dispatch regression.
 - DONE 2026-10-16 (row-context-menus, wave step of run
   20261016-013719-workflow-ux-safety): right-click (or Shift+F10 / the
   Menu key on a focused row) opens a `#ctxmenu` action list on run and
