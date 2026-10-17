@@ -27,6 +27,17 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-17 (resolve-follow-up-plan, merge resolution): unioned
+  `conductor/20261016-013719-workflow-ux-safety/follow-up-plan` onto
+  master (merge 4d42238) - the workflow-ux-safety run's closing review
+  step, which documented 14/17 request items landed, 3 parked-but-
+  complete branches, and drafted workflow-ux-safety-followup.toml
+  (registered as ready request 20261016-194008-703a9675, not launched).
+  Both conflicts were doc both-appends: QUEUE.md kept HEAD's
+  manual-merge-guard + integration-verification + modal/summary-UX
+  DONE bullets AND the branch's closing-review bullet;
+  efficiency_stats.md kept HEAD's 12 appended rows AND the branch's
+  follow-up-plan row. No code touched.
 - DONE 2026-10-17 (resolve-deferred-merge-controls, merge resolution):
   unioned `deferred-merge-controls` onto master (merge d7a1cc9) - the
   `merge` request field coexists with `merge_target`/`summarize`, and the
