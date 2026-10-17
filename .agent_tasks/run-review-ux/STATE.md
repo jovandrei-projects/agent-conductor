@@ -66,9 +66,10 @@ See `DESIGN.md` for full reasoning + sources. Headlines:
 
 ## Where it stopped
 
-`review-workflow` merged to master 2026-10-16 via merge-resolver
-session after the wave merge conflicted on bookkeeping + test/class
-tails (kept both sides). It was implemented + verified on the branch
+`review-workflow` merged to master 2026-10-16 (merge bcade8f) via
+merge-resolver session after the wave merge conflicted on bookkeeping
+appends + shared-harness class tails (kept both sides; 437/437 suite
+green on the merge). It was implemented + verified on the branch
 (290/290 `python run_tests.py`, demo + `plan` green). What landed:
 
 - `completion_seq` bumps at every terminal-outcome write: run_step
