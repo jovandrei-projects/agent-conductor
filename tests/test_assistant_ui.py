@@ -298,6 +298,23 @@ class MdRenderTests(unittest.TestCase):
         self.assertNotIn('href="javascript', out)
         self.assertIn('href="http://x.io"', out)
 
+    def test_nav_links_become_in_app_affordances(self):
+        """`nav:<view>/<key>` (the model's citation grammar) renders as a
+        data-ai-nav affordance the delegated handler routes to aiNav -
+        never an external href. %XX stays inside the escaped key."""
+        out = self._render(
+            "[Open summary](nav:summary/request%3Aabc%7Cstep-1) "
+            "[x](nav:run/request%3Aabc) "
+            "[evil](nav:summary/k%22%20onclick%3Dalert(1))")
+        self.assertIn('data-ai-nav="summary"', out)
+        self.assertIn('data-ai-key="request:abc|step-1"', out)
+        self.assertIn('data-ai-nav="run"', out)
+        self.assertNotIn('href="nav:', out)
+        # %22 decodes to a literal quote - it must stay ESCAPED inside
+        # the key attribute, never break out into a real attribute
+        self.assertIn('data-ai-key="k&quot; onclick=alert(1"', out)
+        self.assertNotIn('" onclick=', out)
+
     def test_lists_and_headings(self):
         out = self._render("## h\n- one\n- two\n1. first\n---\n> note\n")
         self.assertIn('<h2>h</h2>', out)
@@ -758,9 +775,10 @@ setRoute((url,opt)=>{
   assert.deepEqual(body.attachments,['att-3']);
   assert.equal(S.attach.length,0);
   assert.equal(nodes.get('ai-ats').hidden,true);
-  // attachments-only send is legal (text optional)
+  // attachments-only send is legal (text optional); a real uploaded
+  // slot carries the conversation scope it was uploaded under
   S.attach=[{id:'att-7',name:'c.png',ctype:'image/png',bytes:9,
-    status:''}];
+    status:'',conv:'conv-9'}];
   nodes.get('ai-text').value='';
   nodes.get('aichat')._h.click({target:{closest:s=>
     s==='#ai-send'?nodes.get('ai-send'):null}});
@@ -1079,7 +1097,7 @@ setRoute((url,opt)=>{
   window.AskAI._paint();
   const html=nodes.get('ai-list').innerHTML;
   // priced exchange: compact summary + the expandable hop breakdown
-  assert.match(html,/<details class="aim-use">/);
+  assert.match(html,/<details class="aim-use" data-xu="x1">/);
   assert.match(html,/in 1\.2k \(500 cached\)/);
   assert.match(html,/out 56/);
   assert.match(html,/2 turns/);

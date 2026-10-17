@@ -22,10 +22,22 @@ function esc(s) {
 function inline(s) {
   s = esc(s);
   // [label](http...) and bare http(s) URLs in ONE pass so a linked url
-  // is never linkified twice; only http/https schemes render as anchors.
-  s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<"()]+)/g,
+  // is never linkified twice; only http/https render as anchors.
+  // `nav:<view>/<key>` links (the model's citation grammar) render as
+  // in-app navigation affordances - the chat's delegated handler opens
+  // the record inside the dashboard instead of leaving the page.
+  s = s.replace(
+    /\[([^\]\n]+)\]\((nav:[a-z-]+\/[^\s)]+|https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<"()]+)/g,
     function (m, t, u, u2) {
       var url = u || u2, label = t || u2;
+      if (url.indexOf('nav:') === 0) {
+        var rest = url.slice(4), sl = rest.indexOf('/');
+        if (sl < 0) return label;
+        return '<a href="#" data-ai-nav="' + rest.slice(0, sl) +
+          '" data-ai-key="' +
+          esc(decodeURIComponent(rest.slice(sl + 1))) +
+          '">' + label + '</a>';
+      }
       return '<a href="' + url + '" target="_blank" ' +
         'rel="noopener noreferrer">' + label + '</a>';
     });

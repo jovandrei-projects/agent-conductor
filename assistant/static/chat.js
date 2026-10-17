@@ -262,7 +262,15 @@ function settingsLabel(snap) {
 }
 
 function srcLabel(src, i) {
-  var label = src.label || src.key || src.kind || ('source ' + (i + 1));
+  var label = src.label;
+  if (!label && src.key) {
+    /* legacy rows stored before labels were synthesized fall back to
+       the key - its last segment (the step name) is the readable part */
+    var k = String(src.key).replace(/#(run-)?summary$/, '');
+    var cut = k.lastIndexOf('|');
+    label = cut >= 0 ? k.slice(cut + 1) : k;
+  }
+  label = label || src.kind || ('source ' + (i + 1));
   return '[' + (i + 1) + '] ' + label;
 }
 
@@ -327,7 +335,7 @@ function msgHtml(m) {
   if (xa && xa.sources && xa.sources.length) {
     h += '<div class="aim-srcs">' +
       xa.sources.map(function (s, i) {
-        var nav = s.nav || {};
+        var nav = srcNav(s);
         return '<button type="button" class="aim-src" data-ai-nav="' +
           esc(nav.view || '') + '" data-ai-key="' + esc(nav.key || '') +
           '" title="' + esc(s.kind || '') + ' - opens in the dashboard">' +
@@ -411,7 +419,8 @@ function usageHtml(xa, snap) {
   if (xa.usd != null) bits.push('~' + fmtUsd(xa.usd) + ' est.');
   else if (hasU || xa.status !== 'cancelled')
     bits.push('cost unknown');
-  var h = '<details class="aim-use"><summary>' +
+  var h = '<details class="aim-use" data-xu="' +
+    esc(xa.id || '') + '"><summary>' +
     esc(bits.join(' \u00b7 ')) + '</summary><div class="aim-udet">';
   /* the settings snapshot this exchange actually ran under (frozen on
      the message - later settings edits never rewrite it) */
@@ -486,7 +495,8 @@ function usageViewHtml() {
       esc(g.exchanges + ' exch \u00b7 in ' + fmtTok(g.prompt_t) +
         ' \u00b7 out ' + fmtTok(g.completion_t) +
         (g.cached_t ? ' (' + fmtTok(g.cached_t) + ' cached)' : '') +
-        (g.usd ? ' \u00b7 ~' + fmtUsd(g.usd) : ' \u00b7 unpriced')) +
+        (g.usd != null ? ' \u00b7 ~' + fmtUsd(g.usd)
+                      : ' \u00b7 unpriced')) +
       (g.unpriced ? ' <span class="um-warn">' + esc(g.unpriced +
         ' unpriced') + '</span>' : '') + '</div>';
   });
@@ -494,7 +504,7 @@ function usageViewHtml() {
     ' exchange' + (t.exchanges === 1 ? '' : 's') + ' \u00b7 in ' +
     fmtTok(t.prompt_t) + ' \u00b7 out ' + fmtTok(t.completion_t) +
     (t.cached_t ? ' (' + fmtTok(t.cached_t) + ' cached)' : '') +
-    (t.usd ? ' \u00b7 ~' + fmtUsd(t.usd) : '')) + '</div>';
+    (t.usd != null ? ' \u00b7 ~' + fmtUsd(t.usd) : '')) + '</div>';
   if (t.unpriced)
     h += '<div class="um-l um-warn">' + esc(t.unpriced + ' exchange' +
       (t.unpriced === 1 ? ' has' : 's have') +
@@ -697,6 +707,13 @@ function paint() {
   var list = byId('ai-list');
   if (list) {
     var wasBottom = S.pinBottom;
+    /* usage <details> survive the repaint: innerHTML rebuilds collapse
+       them, so collect which ones are open (keyed by exchange id) and
+       re-open after the new markup lands */
+    var openDet = {};
+    if (list.querySelectorAll)
+      list.querySelectorAll('details.aim-use[open]').forEach(
+        function (d) { if (d.dataset.xu) openDet[d.dataset.xu] = 1; });
     if (!S.msgs.length)
       list.innerHTML = '<div class="ai-empty">Ask about what ' +
         'you\u2019re looking at - the current view is attached to each ' +
@@ -704,6 +721,9 @@ function paint() {
         '</div>';
     else
       list.innerHTML = S.msgs.map(msgHtml).join('');
+    if (Object.keys(openDet).length && list.querySelectorAll)
+      list.querySelectorAll('details.aim-use').forEach(
+        function (d) { if (openDet[d.dataset.xu]) d.open = true; });
     if (wasBottom) list.scrollTop = list.scrollHeight;
   }
   paintAtt();
@@ -868,9 +888,10 @@ async function send() {
   var ta = byId('ai-text');
   var text = ta ? ta.value.trim() : '';
   /* only ids already uploaded under THIS conversation bind - a slot
-     that migrated to another conv's stash is never sent here */
+     that migrated to another conv's stash is never sent here, and a
+     slot can never send without a live conversation to scope it */
   var ready = S.attach.filter(function (a) {
-    return a.id && (!a.conv || !convId() || a.conv === convId());
+    return a.id && a.conv && a.conv === convId();
   });
   if (S.sending) return;
   if (S.attach.some(function (a) { return a.status === 'uploading'; })) {
@@ -901,15 +922,21 @@ async function send() {
        keeps a re-send from double-showing */
     var um = out.message || out.user_message;
     var am = out.assistant_message;
-    [um, am].forEach(function (m) {
-      if (m && !S.msgs.some(function (o) {
-        return o.id === m.id ||
-          (o.client_msg_id && o.client_msg_id === m.client_msg_id);
-      })) S.msgs.push(m);
-    });
     var x = out.exchange;
-    if (x && um) S.exch[um.id] = x;
-    if (x && am) S.exchByAid[am.id] = x;
+    /* the exchange is persisted server-side either way; only reflect it
+       here when the visible thread is still the one it belongs to - a
+       conv switch during the POST must not inject foreign messages */
+    var sameConv = S.conv && S.conv.id === conv.id;
+    if (sameConv) {
+      [um, am].forEach(function (m) {
+        if (m && !S.msgs.some(function (o) {
+          return o.id === m.id ||
+            (o.client_msg_id && o.client_msg_id === m.client_msg_id);
+        })) S.msgs.push(m);
+      });
+      if (x && um) S.exch[um.id] = x;
+      if (x && am) S.exchByAid[am.id] = x;
+    }
     if (ta) { ta.value = ''; }
     S.attach = [];
     if (convId()) S.pendAtt[convId()] = [];
@@ -1039,7 +1066,11 @@ function paintAtt() {
 function removeAtt(i) {
   /* removal only drops the pending reference: the server row stays
      orphaned under its conversation (message_id never set) - same
-     tolerance as the request form, no delete endpoint needed */
+     tolerance as the request form, no delete endpoint needed. `dead`
+     marks a slot removed while its upload was still in flight - the
+     post-upload park below must never resurrect it onto the stash. */
+  var slot = S.attach[i];
+  if (slot) slot.dead = true;
   S.attach.splice(i, 1);
   paintAtt();
 }
@@ -1064,7 +1095,8 @@ async function uploadAtt(file) {
        while this upload was in flight (a switch, or a still-running
        restore whose loadConv already replaced S.attach), park it under
        its own conv's stash instead of leaving it on the wrong thread */
-    if (convId() !== conv.id || S.attach.indexOf(slot) < 0) {
+    if (!slot.dead &&
+        (convId() !== conv.id || S.attach.indexOf(slot) < 0)) {
       var i = S.attach.indexOf(slot);
       if (i >= 0) S.attach.splice(i, 1);
       var target = S.pendAtt[conv.id] = S.pendAtt[conv.id] || [];
@@ -1278,7 +1310,9 @@ function effortsFor(fam) {
   var out = [], seen = {};
   suffixesFor(fam).forEach(function (s) {
     var head = s.split('-', 2)[0];
-    if (s && !seen[head] && (EFFORT_HEADS[head] || true)) {
+    /* effort heads are a fixed vocabulary - a bare marker suffix like
+       '-priority' must not surface as an effort choice */
+    if (s && !seen[head] && EFFORT_HEADS[head]) {
       seen[head] = 1; out.push(head);
     }
   });
@@ -1341,6 +1375,8 @@ function settingsForm() {
         'reached; settings cannot be changed right now'
       : 'only models in the live devin catalog are listed';
   }
+  var saveBtn = byId('ais-save');
+  if (saveBtn) saveBtn.disabled = catDown;   // never save a model-less form
   refillEffort();
   var fast = byId('ais-fast'), ro = byId('ais-ro');
   if (fast) fast.checked = !!cur.fast;
@@ -1503,6 +1539,21 @@ async function saveSettings() {
 }
 
 /* -------------------------------------------------------- navigation */
+var KIND_VIEW = { agent: 'agent', log: 'agent', run: 'run',
+  summary: 'summary', 'run-summary': 'run-summary', request: 'request' };
+function srcNav(s) {
+  /* the stored nav descriptor wins; sources persisted before the
+     server filled one in still navigate - kind+key are enough to
+     rebuild the same descriptor (mirrors _resolve_src server-side) */
+  var nav = (s && s.nav) || {};
+  if (nav.view && nav.key) return nav;
+  var v = KIND_VIEW[s && s.kind];
+  var k = String((s && s.key) || '')
+    .replace(/#(run-)?summary$/, '');
+  if (!v || !k) return {};
+  return { view: v, key: k };
+}
+
 function navSrc(view, key) {
   /* citation click: open the record in the dashboard's own modal chain;
      the chat surface is outside it and survives untouched */
@@ -1768,6 +1819,7 @@ function bind() {
       if ((el = t.closest('[data-ai-set]'))) { openSettings(); return; }
       if ((el = t.closest('[data-ai-note-x]'))) { note(''); return; }
       if ((el = t.closest('[data-ai-nav]'))) {
+        if (e.preventDefault) e.preventDefault();  // in-text nav links carry '#'
         navSrc(el.getAttribute('data-ai-nav'),
                el.getAttribute('data-ai-key')); return; }
       if ((el = t.closest('[data-ai-conv]'))) {
@@ -1833,6 +1885,16 @@ function bind() {
         if (!files.length) return;
         e.preventDefault();
         attachFiles(files);
+        /* a clipboard can carry files AND text together (copied from a
+           document the caption rides alongside) - keep the text too */
+        var txt = '';
+        try { txt = cd.getData ? cd.getData('text/plain') : ''; }
+        catch (e2) {}
+        if (txt) {
+          var st = ta.selectionStart, en = ta.selectionEnd;
+          ta.value = ta.value.slice(0, st) + txt + ta.value.slice(en);
+          ta.selectionStart = ta.selectionEnd = st + txt.length;
+        }
       });
     }
     var fi = byId('ai-file');
@@ -1868,6 +1930,22 @@ function bind() {
       if (e.key === 'Escape') {
         e.stopPropagation();
         closeSettings();
+        return;
+      }
+      /* aria-modal means focus stays inside - cycle Tab between the
+         dialog's focusables instead of leaking to the page behind */
+      if (e.key === 'Tab') {
+        var f = setw.querySelectorAll(
+          'select, input, button, [tabindex]:not([tabindex="-1"])');
+        f = Array.prototype.filter.call(f, function (el) {
+          return !el.disabled && el.offsetParent !== null; });
+        if (!f.length) return;
+        var first = f[0], last = f[f.length - 1];
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault(); last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault(); first.focus();
+        }
       }
     });
   }
