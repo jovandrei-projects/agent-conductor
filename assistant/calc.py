@@ -13,25 +13,42 @@ import math
 MAX_EXPR_CHARS = 500
 MAX_NODES = 120
 MAX_ABS = 1e308          # reject overflow-sized literals early
+MAX_POW_BITS = 65536     # ~8KB of digits - a model must never spin the
+                        # server into a multi-GB bigint compute
+
+
+class CalcError(ValueError):
+    """A rejected expression - reported to the caller as a tool error."""
+
+
+def _safe_pow(a, b):
+    """a ** b with a bigint-magnitude guard: ``9**9**9`` is AST-valid and
+    tiny in node count but produces an astronomically large int. Estimate
+    the result's bit length before evaluating; floats can't explode in
+    memory (they overflow to inf and _check rejects them)."""
+    if isinstance(a, int) and isinstance(b, int) and b > 0 \
+            and abs(a) > 1:
+        est = b * max(1, a.bit_length())
+        if est > MAX_POW_BITS:
+            raise CalcError("power result would be too large")
+    return a ** b
+
 
 _FUNCS = {
     "abs": abs, "round": round, "min": min, "max": max, "sum": sum,
     "floor": math.floor, "ceil": math.ceil, "trunc": math.trunc,
     "sqrt": math.sqrt, "log": math.log, "log2": math.log2,
-    "log10": math.log10, "exp": math.exp, "pow": pow,
+    "log10": math.log10, "exp": math.exp, "pow": _safe_pow,
     "isnan": math.isnan, "isinf": math.isinf,
 }
 _CONSTS = {"pi": math.pi, "e": math.e, "tau": math.tau}
 
+
 _BINOPS = {ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b,
            ast.Mult: lambda a, b: a * b, ast.Div: lambda a, b: a / b,
            ast.FloorDiv: lambda a, b: a // b, ast.Mod: lambda a, b: a % b,
-           ast.Pow: lambda a, b: a ** b}
+           ast.Pow: _safe_pow}
 _UNOPS = {ast.UAdd: lambda a: +a, ast.USub: lambda a: -a}
-
-
-class CalcError(ValueError):
-    """A rejected expression - reported to the caller as a tool error."""
 
 
 def _check(val):

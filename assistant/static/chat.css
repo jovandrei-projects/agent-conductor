@@ -2,11 +2,12 @@
  *
  * Palette + typography deliberately match the dashboard shell
  * (#0d1117/#161b22/#21262d/#30363d, #58a6ff accent, ui-monospace body).
- * Layering contract: launchers + panel sit at z-index 62 - above the
+ * Layering contract: launchers + panel sit at z-index 58 - above the
  * modal backdrop (#backdrop 50) and detail modal (51) so the chat stays
  * interactive over any open modal, but below the row menu (#ctxmenu 60
- * is transient pointer chrome) and the themed alert/confirm + power
- * dialogs (#askwrap/#powerwrap 70), which must never be covered.
+ * is transient pointer chrome that must draw over it) and the themed
+ * alert/confirm + power dialogs (#askwrap/#powerwrap 70), which must
+ * never be covered.
  *
  * All rules are scoped to the feature's own ids/classes - nothing here
  * restyles existing dashboard chrome.
@@ -16,7 +17,7 @@
 /* #aifab: the page-level floating launcher, lower-right. Subtle but
    solid (contrast over transparency) - it must not fade into content. */
 #aifab {
-  position: fixed; right: 18px; bottom: 18px; z-index: 62;
+  position: fixed; right: 18px; bottom: 18px; z-index: 58;
   display: inline-flex; align-items: center; gap: 7px;
   background: #21262d; color: #e6edf3; border: 1px solid #58a6ff;
   border-radius: 20px; padding: 9px 14px; font: inherit; font-size: 13px;
@@ -45,7 +46,7 @@
    repaints and reloads never touch it. compact = floating card,
    expanded = taller right-docked workspace with the history rail. */
 #aichat {
-  position: fixed; right: 18px; bottom: 18px; z-index: 62;
+  position: fixed; right: 18px; bottom: 18px; z-index: 58;
   width: min(400px, calc(100vw - 24px));
   height: min(560px, calc(100vh - 80px));
   display: flex; flex-direction: column;

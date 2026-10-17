@@ -226,6 +226,20 @@ class CalcTests(unittest.TestCase):
         with self.assertRaises(calc.CalcError):
             calc.evaluate("sqrt(-1)")                # math domain error
 
+    def test_pow_is_magnitude_bounded(self):
+        """``9**9**9`` is few-node AST but a multi-GB bigint compute -
+        exponent magnitude is bounded BEFORE evaluation on both the
+        operator and the pow() function path."""
+        for bad in ("9**9**9", "2**1000000", "pow(9, 9**9)",
+                    "pow(2, 10**100)"):
+            with self.assertRaises(calc.CalcError, msg=bad):
+                calc.evaluate(bad)
+        # honest exponents still work - ints, negatives, floats
+        self.assertEqual(calc.evaluate("2**20")["value"], 1048576)
+        self.assertAlmostEqual(calc.evaluate("2**-10")["value"], 1 / 1024)
+        self.assertEqual(calc.evaluate("pow(3, 4)")["value"], 81)
+        self.assertAlmostEqual(calc.evaluate("0.5**10")["value"], 1 / 1024)
+
 
 # ---------------------------------------------------------- modelpick
 
@@ -250,6 +264,18 @@ class ModelPickTests(unittest.TestCase):
         r = modelpick.resolve("swe-1-6-fast", "low", True, OPTIONS)
         self.assertEqual(r["uid"], "swe-1-6-fast-low")
         self.assertTrue(r["fast"])
+
+    def test_fast_without_effort_picks_a_fast_pair(self):
+        """effort='' + fast=True: fast variants only exist as
+        '<effort>-<marker>' pairs - the cheapest fast lane offered
+        resolves instead of a dead-end 'no fast variant'."""
+        r = modelpick.resolve("gpt-6-luna", "", True, OPTIONS)
+        self.assertEqual(r["uid"], "gpt-6-luna-low-priority")
+        self.assertEqual(r["effort"], "low")      # derived, reported
+        self.assertTrue(r["fast"])
+        r = modelpick.resolve("claude-opus-4-8", "", True, OPTIONS)
+        self.assertEqual(r["uid"], "claude-opus-4-8-low-fast")
+        self.assertEqual(r["effort"], "low")
 
     def test_unknown_model_and_bad_effort(self):
         with self.assertRaises(AssistantError) as e:

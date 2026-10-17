@@ -96,7 +96,7 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
       fail/cancel, extra-counter passthrough, by-model rollup, expandable
       per-exchange + conversation UI, settings price provenance; see
       'Implemented contracts (usage-and-price-visibility)' below)
-- [ ] integration-and-design-review
+- [x] integration-and-design-review
 - [ ] follow-up-plan
 
 ## Implemented contracts (persistent-chat-core)
@@ -669,6 +669,151 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
 - `python -m unittest tests.test_assistant tests.test_assistant_runtime
   tests.test_assistant_ui` -> 130 tests OK; `node --check` chat.js
   clean; `python run_tests.py` full suite re-run pending.
+
+## Where it stopped
+
+`integration-and-design-review` is done: the assembled branch was
+audited end-to-end, a dozen real defects fixed, verified against a
+live provider on isolated fixture data, browser-exercised
+(46 deterministic checks), and security-reviewed. Findings below;
+commits land in this worktree's branch.
+
+## Implemented (integration-and-design-review)
+
+Defects found in review and fixed:
+
+- `assistant_host/retrieval.py` `_resolve_src` + `_run_dir_for_key`:
+  the fetch tool contract hands back only `{kind,key}` echoes (search
+  stubs never expose `run_dir`), so fetched excerpts failed with
+  "run dir ? not found" and stored chips could not navigate. The key
+  is now re-resolved server-side (`request:<id>` -> run dir map,
+  `RUN_DIR_RE` names, display-name fallback) and a missing `nav`
+  descriptor + human-readable `label` are synthesized so stored
+  citations navigate and read `run / step - summary`. Confirmed
+  end-to-end: live re-fetch now lands real excerpts with working
+  nav descriptors.
+- `retrieval.search` `kinds` filter accepted a string and iterated it
+  character-wise; normalized to a list. Step `status` filters now use
+  `conductor.effective_statuses` (the modal's own semantics) with a
+  recorded-status fallback.
+- `assistant_host/actions.py` batch step-review entries accept
+  `{name, seq}` objects (not just names) - per-step completion
+  `seq` now propagates to `conductor.set_step_review`.
+- `assistant_host/modelpick.resolve`: `effort=''` + `fast=True` now
+  searches the family's actual fast-marked suffixes (`-priority`,
+  `-fast`, `-lightning`) instead of failing, and derives the effort
+  from the suffix picked.
+- `assistant/calc.py`: `_safe_pow` bounds integer-power evaluation by
+  estimated result bit-length (`MAX_POW_BITS = 65536`) - `9**9**9`
+  no longer hangs the evaluator.
+- `assistant/core.py`: `record_text_progress`/`cancel_exchange`
+  re-check exchange status inside the write txn so a raced terminal
+  (poll finished while cancelling) is never clobbered; attachment
+  upload dedupes on `client_ref` inside the txn and unlinks orphan
+  bytes on insert failure; `read_upload` refuses oversized reads;
+  `decide_action`/`execute_action` accept `conv_id` scoping; the
+  launch-tier ack gate fails closed when `expected_ack` errors or
+  returns empty instead of comparing against None.
+- `assistant/http_api.py`: decide/execute routes forward the
+  conversation id so cross-conversation action ids 404 instead of
+  resolving; request `cursor` shape validated.
+- `conductor.py` `assistant_open`: permanent init errors no longer
+  503 forever - a stale failure retires after 60s; the `power` seam
+  is omitted entirely when no server exists (a bare lambda used to
+  list `serve_power` as a no-op action kind).
+- `assistant/static/chat.js`: attachment slots are conversation-scoped
+  (`conv`), marked `dead` on removal, parked per-conversation
+  (`S.pendAtt`) when the visible thread moves during upload, and
+  `send()` filters by current conversation; paint preserves open
+  per-exchange usage `<details>` via `data-xu`; settings dialog has
+  a real focus trap + Escape + `aria-modal`, focuses the model
+  select on open, disables Save + says so when the model catalog is
+  unreachable; `effortsFor` accepts only known effort heads; pasted
+  text survives alongside an image; Escape closes settings first,
+  otherwise minimizes; citation chips derive a nav descriptor
+  client-side from `kind+key` when a legacy stored row lacks `nav`
+  (`srcNav`) and fall back to the step name as their label; in-text
+  `nav:<view>/<key>` citation links render as delegated
+  `[data-ai-nav]` anchors (in md.js) instead of literal markdown.
+- `assistant/static/chat.css`: launcher/panel z-index 58 - above the
+  modal backdrop (50/51) but below row context menus (60) and
+  alert/confirm/power dialogs (70).
+
+New regression tests (all green):
+
+- core: price snapshot first-write-wins; explicit `None` does not
+  clobber price fields; partial terminal sticky; cancel-race keeps
+  terminal; cursor shape validation; attachment ref dedupe + row-id
+  reads; decide/execute conv scoping 404.
+- actions: launch ack fails closed (empty expected ack), read-only
+  re-check at execute, batch `{name, seq}` propagation, rejected
+  proposals audited as failed.
+- host: fetch-by-key resolution, nav+label synthesis, effective-
+  status filter, kinds string normalization.
+- ui: usage-details repaint preservation, conv-scoped attachment
+  send filtering, paste keeps text, settings focus trap / outage
+  state, nav-link affordances incl. `%22` escape safety.
+
+### Verified (integration-and-design-review)
+
+Deterministic, on isolated fixture data (`--runs-dir
+%TEMP%\askai-data\runs`, real `devin` provider, served :8806
+loopback):
+
+- `python run_tests.py`: 734 tests, 1 transient
+  `PermissionError` on a temp `state.json` (Windows file-lock race in
+  `CumulativeElapsedTests.test_stop_then_restart_banks_first_dispatch`;
+  passes standalone in 47.9s). Earlier port-bound run's 3
+  `ServicePortLeaseTests` failures were my probe server holding
+  :8806 - the module is green standalone.
+- `node --check assistant/static/chat.js`, `md.js`: clean;
+  `python -m compileall assistant assistant_host tests`: clean.
+- Playwright headless Chromium (46 checks, screenshots in
+  `%TEMP%\askai-probe\shots`): FAB open/minimize/reopen; expand/
+  compact; `#dask` toggle inside a run modal; ctx chip follows
+  dashboard->run modal->close; draft survives nav + minimize +
+  reload; settings dialog real round-trip (effort medium -> server
+  persisted -> back to low), catalog 54 families from the live
+  `devin` list, Escape close, price provenance line; attach PNG ->
+  thumbnail -> remove; mic toggles dictation on (real browser speech
+  transcription itself stays unverified); history rail; usage chip
+  expands; Escape minimizes; reload restores open chat + last
+  conversation; citation chips + in-text `nav:` links open the right
+  dashboard modal while the chat survives; chip labels readable.
+- Live provider, 2 exchanges on one conversation (~$0.034 total,
+  recorded): the `tsc --noEmit` question answered correctly
+  (TypeScript flag = type-check without emit; the report's "clean"
+  is a worker report, not independent verification) with a cited,
+  navigable step-summary source; the apartment-3d camera question
+  returned four dated steps (`bird-eye-and-plan-views`,
+  `first-person-heading`, `third-person-camera-stability`,
+  `mobile-play-and-cameras`, all Oct 15) with evidence + working
+  `nav:summary` links and an honest coverage note (archived runs
+  excluded).
+- Security review: loopback bind verified (`127.0.0.1` listener);
+  `_check_origin` gates every `/api/assistant/*` call (host-local +
+  Origin match); read-only is enforced server-side at execute and
+  per-message settings cannot bypass it; action whitelist + schema
+  validation at propose + target revalidation + exact-target ack at
+  execute; retrieved content is quoted evidence - action proposals
+  come only from model-owned final text; md.js escapes all markup
+  (`javascript:` rejected, `%22` can't break attributes); attachment
+  route is id-gated, image-only, 20MB-capped, traversal 404'd;
+  calculator + retrieval + requests all bounded; durable SQLite
+  history verified by reload restore.
+- Split audit: `assistant/` keeps zero conductor imports;
+  `assistant_host/` holds all conductor-specific adapters.
+
+### Still unverified / honest gaps
+
+- Real speech transcription (browser SpeechRecognition audio path) -
+  UI states verified, actual recognition needs a mic-enabled real
+  browser profile.
+- A real image attached to a sent message (vision turn): prior phase
+  verified vision capability on the provider itself; an end-to-end
+  attachment-on-send exchange was not re-spent this step.
+- ACP `session/new` remains blocked (devin 3000.6.2 session-db
+  migration) - `-p -r` is the shipped transport.
 
 ## Where it stopped
 

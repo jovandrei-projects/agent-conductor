@@ -301,13 +301,30 @@ class ConductorActions(ActionAdapter):
     def _v_batch_step_review(self, p: dict) -> dict:
         _extra(p, "run", "steps", "reviewed")
         run, st = self._run(p)
-        steps = _str_list(p, "steps")
         names = set(st.get("steps") or {}) | conductor._manifest_step_names(st)
-        for s in steps:
-            if s not in names:
-                raise RequestError(f"Step {s!r} is not in this run", 404)
-        return {"run": run, "steps": sorted(set(steps)),
-                "reviewed": _b(p, "reviewed")}
+        items = p.get("steps")
+        if not isinstance(items, list) or not items or len(items) > 60:
+            raise RequestError("steps must be a list of 1-60 names")
+        out, seen = [], set()
+        for s in items:
+            # entries are step names, or {name, seq} when the model is
+            # acking a specific completion (same stale-ack guard the
+            # single-step kind keeps)
+            nm = s.get("name") if isinstance(s, dict) else s
+            seq = s.get("seq") if isinstance(s, dict) else None
+            if seq is not None and (not isinstance(seq, int)
+                                    or isinstance(seq, bool)):
+                raise RequestError("step seq must be an integer")
+            if not isinstance(nm, str) or not nm.strip():
+                raise RequestError(
+                    "steps entries must be names or {name,seq} objects")
+            nm = nm.strip()
+            if nm not in names:
+                raise RequestError(f"Step {nm!r} is not in this run", 404)
+            if nm not in seen:
+                seen.add(nm)
+                out.append({"name": nm, "seq": seq})
+        return {"run": run, "steps": out, "reviewed": _b(p, "reviewed")}
 
     def _v_archive_run(self, p: dict) -> dict:
         _extra(p, "run", "archived")
@@ -529,9 +546,15 @@ class ConductorActions(ActionAdapter):
                 r, dict(body), self.runs_dir))
 
     def _x_batch_step_review(self, p: dict) -> dict:
-        return self._batch(
-            p["steps"], lambda s: conductor.set_step_review(
-                p["run"], s, {"reviewed": p["reviewed"]}, self.runs_dir))
+        seqs = {s["name"]: s.get("seq") for s in p["steps"]}
+
+        def call(nm):
+            body = {"reviewed": p["reviewed"]}
+            if seqs.get(nm) is not None:
+                body["seq"] = seqs[nm]
+            return conductor.set_step_review(
+                p["run"], nm, body, self.runs_dir)
+        return self._batch([s["name"] for s in p["steps"]], call)
 
     def _x_archive_run(self, p: dict) -> dict:
         return conductor.set_run_archived(
@@ -715,7 +738,8 @@ _KINDS = {
     "batch_step_review": {
         "text": "Mark these tasks reviewed / needing review",
         "help": "batch_step_review {run, steps[], reviewed} - same review "
-                "mark on several tasks",
+                "mark on several tasks; a step may be {name, seq} to ack "
+                "a specific completion",
         "validate": ConductorActions._v_batch_step_review,
         "call": ConductorActions._x_batch_step_review},
     "set_run_archived": {

@@ -242,6 +242,39 @@ class AckAndGateTests(unittest.TestCase):
             self.assertEqual(args[1], {"pause": False, "drain": False})
             self.assertEqual(args[2], self.runs)
 
+    def test_launch_ack_failure_fails_closed(self):
+        """When the adapter cannot compute the launch kind's exact-target
+        ack at all, execute refuses - the ack gate fails CLOSED, a
+        missing/errored expected string never becomes an open gate."""
+        write_run(self.runs, "r1", ended_at=None)
+        cv = self._conv_off()
+        a = self.c.propose_action(cv["id"], "stop_run", {"run": "r1"})
+        self.c.decide_action(a["id"], True)
+        with mock.patch.object(self.a, "expected_ack",
+                               side_effect=RuntimeError("adapter down")):
+            with self.assertRaises(AssistantError) as e:
+                self.c.execute_action(a["id"], ack="stop_run:r1")
+            self.assertEqual(e.exception.status, 409)
+        self.assertEqual(self.c.store.get_action(a["id"])["state"],
+                         "confirmed")          # refused, not executed
+
+    def test_decisions_are_scoped_to_the_route_conversation(self):
+        """An action id confirmed through a DIFFERENT conversation's
+        confirm route 404s - the path's conv id is part of the authz."""
+        write_run(self.runs, "r1")
+        cv = self._conv_off()
+        other = conv(self.c)
+        self.c.update_settings(other["id"], {"readonly": False})
+        a = self.c.propose_action(cv["id"], "set_run_archived",
+                                  {"run": "r1", "archived": True})
+        with self.assertRaises(AssistantError) as e:
+            self.c.decide_action(a["id"], True, conv_id=other["id"])
+        self.assertEqual(e.exception.status, 404)
+        with self.assertRaises(AssistantError):
+            self.c.execute_action(a["id"], conv_id=other["id"])
+        self.assertEqual(self.c.store.get_action(a["id"])["state"],
+                         "proposed")           # never decided
+
     def test_forged_row_cannot_execute(self):
         """A client can't persist rows - but even a row that shouldn't
         exist (unknown kind, pre-confirmed) dies at the adapter boundary
@@ -531,6 +564,56 @@ class ExecuteTests(unittest.TestCase):
             body=json.dumps({"approve": False}).encode())
         self.assertEqual(code, 200)
         self.assertEqual(row["state"], "denied")
+
+    def test_confirm_requires_strict_booleans(self):
+        """A truthy STRING is not a decision - 'approve':'yes' or
+        'execute':1 must never confirm/run anything."""
+        write_run(self.runs, "r1")
+        a = self.c.propose_action(self.cv["id"], "set_run_archived",
+                                  {"run": "r1"})
+        url = (f"/api/assistant/conversations/{self.cv['id']}"
+               f"/actions/{a['id']}/confirm")
+        for body in ({"approve": "yes"}, {"approve": 1},
+                     {"approve": True, "execute": "yes"}):
+            code, row = http_api.dispatch(
+                self.c, "POST", url, body=json.dumps(body).encode())
+            self.assertEqual(code, 400, body)
+        self.assertEqual(self.c.store.get_action(a["id"])["state"],
+                         "proposed")           # untouched
+
+    def test_batch_step_review_carries_per_step_seq(self):
+        """{name,seq} step entries keep the stale-completion ack guard
+        the single-step kind has."""
+        write_run(self.runs, "r1",
+                  steps={"s1": {"status": "done", "completion_seq": 7},
+                         "s2": {"status": "done", "completion_seq": 2}})
+        with mock.patch.object(
+                conductor, "set_step_review",
+                return_value={"review": {"reviewed": True}}) as m:
+            out = self._run_through(
+                "batch_step_review",
+                {"run": "r1",
+                 "steps": [{"name": "s1", "seq": 7}, "s2"],
+                 "reviewed": True})
+        res = json.loads(out["result"])
+        self.assertEqual(set(res["done"]), {"s1", "s2"})
+        bodies = {c.args[1]: c.args[2] for c in m.call_args_list}
+        self.assertEqual(bodies["s1"], {"reviewed": True, "seq": 7})
+        self.assertEqual(bodies["s2"], {"reviewed": True})
+
+    def test_batch_step_review_rejects_bad_shapes(self):
+        write_run(self.runs, "r1",
+                  steps={"s1": {"status": "done"}})
+        a = self.a
+        for bad in ({"run": "r1", "steps": [{"name": "s1", "seq": "x"}],
+                     "reviewed": True},
+                    {"run": "r1", "steps": [{"name": "nope"}],
+                     "reviewed": True},
+                    {"run": "r1", "steps": [3],
+                     "reviewed": True},
+                    {"run": "r1", "steps": [], "reviewed": True}):
+            with self.assertRaises(conductor.RequestError, msg=bad):
+                a.validate("batch_step_review", bad)
 
 
 if __name__ == "__main__":

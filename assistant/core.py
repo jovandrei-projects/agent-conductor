@@ -33,6 +33,7 @@ CONV_PAGE_MAX = 100
 MODEL_HISTORY_CHARS = 24_000  # default digest budget; storage keeps all
 ATTACH_PER_MESSAGE_MAX = 20   # same bound as the host request form
 ATTACH_PER_CONV_MAX = 200     # uploads are never deleted; bound the pile
+ATTACH_READ_MAX = 25 * 1024 * 1024   # serve cap > the host's 20MB write cap
 
 SETTINGS_KEYS = ("model", "effort", "fast", "readonly")
 SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -618,6 +619,11 @@ class AssistantCore:
         if usd == "auto":
             usd = price_usage(usage, eff_price)
         with self.store.txn() as conn:
+            cur = conn.execute(
+                "SELECT status FROM exchanges WHERE id=?",
+                (xid,)).fetchone()
+            if cur and cur["status"] in EXCHANGE_TERMINAL:
+                return self.exchange_view(xid)   # raced terminal - keep it
             self.store.update_message(
                 conn, x["assistant_msg_id"],
                 text=str(text or "")[:TEXT_MAX],
@@ -632,12 +638,15 @@ class AssistantCore:
                 model_uid=(model or {}).get("uid") or x.get("model_uid"),
                 model_label=(model or {}).get("label")
                 or x.get("model_label"),
-                price_in=price.get("in", x.get("price_in")),
-                price_cached=price.get("cached", x.get("price_cached")),
-                price_out=price.get("out", x.get("price_out")),
-                price_fetched_at=price.get("fetched_at",
-                                           x.get("price_fetched_at")),
-                price_source=price.get("source", x.get("price_source")),
+                price_in=eff_price["in"],
+                price_cached=eff_price["cached"],
+                price_out=eff_price["out"],
+                price_fetched_at=(price["fetched_at"]
+                                  if price.get("fetched_at") is not None
+                                  else x.get("price_fetched_at")),
+                price_source=(price["source"]
+                              if price.get("source") is not None
+                              else x.get("price_source")),
                 sources=(json.dumps(sources, ensure_ascii=False)
                          if sources is not None else x.get("sources")),
                 error=(str(error)[:800] if error else x.get("error")),
@@ -654,7 +663,7 @@ class AssistantCore:
         snapshot is available, its calculated usd too - 'failed' never
         means 'free' or 'invisible'."""
         x = self._xid(xid)
-        if x["status"] in ("done", "error", "cancelled"):
+        if x["status"] in EXCHANGE_TERMINAL:
             return self.exchange_view(xid)
         self._guarded(self.store.path.parent)
         now = self._iso()
@@ -673,6 +682,11 @@ class AssistantCore:
         if usd is not None:
             fields["usd"] = usd
         with self.store.txn() as conn:
+            cur = conn.execute(
+                "SELECT status FROM exchanges WHERE id=?",
+                (xid,)).fetchone()
+            if cur and cur["status"] in EXCHANGE_TERMINAL:
+                return self.exchange_view(xid)   # raced terminal - keep it
             self.store.update_message(
                 conn, x["assistant_msg_id"], status="error",
                 text=(str(partial_text)[:TEXT_MAX]
@@ -708,6 +722,11 @@ class AssistantCore:
         if usd is not None:
             fields["usd"] = usd
         with self.store.txn() as conn:
+            cur = conn.execute(
+                "SELECT status FROM exchanges WHERE id=?",
+                (xid,)).fetchone()
+            if cur and cur["status"] not in EXCHANGE_LIVE:
+                return self.exchange_view(xid)   # finished while we killed
             self.store.update_message(conn, x["assistant_msg_id"],
                                       status="cancelled")
             self.store.update_exchange(conn, xid, **fields)
@@ -867,8 +886,24 @@ class AssistantCore:
                "name": saved["name"], "path": str(path),
                "bytes": len(data), "ctype": saved.get("ctype"),
                "created_at": self._iso()}
-        with self.store.txn() as conn:
-            self.store.insert_attachment(conn, rec)
+        try:
+            with self.store.txn() as conn:
+                if client_ref:
+                    have = self.store.find_attachment_by_ref(
+                        conv_id, rec["client_ref"])
+                    if have:
+                        try:
+                            path.unlink(missing_ok=True)   # orphan bytes
+                        except OSError:
+                            pass
+                        return dict(have, deduped=True)
+                self.store.insert_attachment(conn, rec)
+        except Exception:
+            try:
+                path.unlink(missing_ok=True)   # don't leave unrecorded
+            except OSError:                    # bytes behind a failed row
+                pass
+            raise
         return self.store.get_attachment(rec["id"])
 
     def read_upload(self, att_id: str) -> tuple[bytes, str]:
@@ -888,6 +923,9 @@ class AssistantCore:
                 self._attach_dir.resolve()):
             raise AssistantError("Attachment path outside attachments dir")
         try:
+            if path.stat().st_size > ATTACH_READ_MAX:
+                raise AssistantError("Attachment is too large to serve",
+                                     413)
             data = path.read_bytes()
         except OSError:
             raise AssistantError("Attachment data is missing", 404)
@@ -968,7 +1006,8 @@ class AssistantCore:
                                  or kind in LAUNCH_TIER_KINDS),
             confirm_text=spec.confirm_text or None)
 
-    def decide_action(self, aid: str, approve: bool) -> dict:
+    def decide_action(self, aid: str, approve: bool, *,
+                      conv_id: str | None = None) -> dict:
         """Human decision on the confirm card: proposed -> confirmed or
         denied. A 'confirmed' row can still be retracted (nothing has
         executed yet) but never goes back to proposed; terminal rows are
@@ -976,6 +1015,8 @@ class AssistantCore:
         at execute time - 'turn read-only back on' must invalidate
         pending writes."""
         a = self._action(aid)
+        if conv_id is not None and a["conversation_id"] != conv_id:
+            raise AssistantError("Action not found", 404)
         if a["state"] == "confirmed" and approve:
             return a
         if a["state"] not in ("proposed", "confirmed"):
@@ -987,7 +1028,8 @@ class AssistantCore:
                 decided_at=self._iso())
         return self.store.get_action(aid)
 
-    def execute_action(self, aid: str, *, ack: str | None = None) -> dict:
+    def execute_action(self, aid: str, *, ack: str | None = None,
+                       conv_id: str | None = None) -> dict:
         """Run a proposed/confirmed action through the host adapter.
         Read-only is re-read HERE - never earlier - and model output,
         retrieved text, and prompt text are not in its authority.
@@ -995,8 +1037,12 @@ class AssistantCore:
         Launch-tier kinds additionally demand `ack`: the adapter's
         expected exact-target string, echoed by the client from the
         separate confirmation step that showed target + effect. A bare
-        execute on a launch class always refuses."""
+        execute on a launch class always refuses - and a launch kind
+        whose exact target can't be computed refuses too (the ack gate
+        fails closed, never open)."""
         a = self._action(aid)
+        if conv_id is not None and a["conversation_id"] != conv_id:
+            raise AssistantError("Action not found", 404)
         if a["state"] in ("denied", "executed", "failed"):
             return a
         self._guarded(self.store.path.parent)
@@ -1014,8 +1060,13 @@ class AssistantCore:
         if a["requires_confirm"] and a["state"] != "confirmed":
             raise AssistantError("Action needs confirmation first", 409)
         if a["kind"] in LAUNCH_TIER_KINDS:
-            expected = self.expected_ack(aid)
-            if expected is not None and ack != expected:
+            try:
+                expected = self._actions.expected_ack(dict(a))
+            except Exception as exc:                # noqa: BLE001
+                raise AssistantError(
+                    "Cannot verify this action's target - refusing to "
+                    "run it", 409) from exc
+            if not expected or ack != expected:
                 raise AssistantError(
                     "Confirm the exact target first - this action needs "
                     "a separate explicit confirmation", 409)
