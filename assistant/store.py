@@ -22,7 +22,7 @@ import threading
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Chat entity ids look like the project's request ids with a short type
 # prefix: ``msg-20261017-051359-1ab2c3d4``. The regex is the authorization
@@ -149,9 +149,17 @@ _SCHEMA_V1 = [
     "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 ]
 
+# Schema v2: exchanges.sources - JSON list of the citation Source dicts the
+# retrieval adapter attached to an exchange ({kind,key,label,nav,excerpt,
+# bytes}); the UI renders them as modal-opening citation chips. Persisted,
+# never recomputed - a citation must keep pointing at what it meant at the
+# time it was recorded.
+_SCHEMA_V2 = ["ALTER TABLE exchanges ADD COLUMN sources TEXT"]
+
 # Ordered additive migrations: (new user_version, statements). v1 is the
-# baseline above; append (2, [...]) for the next change - never edit v1.
-MIGRATIONS: tuple[tuple[int, list[str]], ...] = ((1, _SCHEMA_V1),)
+# baseline above; append (3, [...]) for the next change - never edit v1/v2.
+MIGRATIONS: tuple[tuple[int, list[str]], ...] = ((1, _SCHEMA_V1),
+                                               (2, _SCHEMA_V2))
 
 
 def _row(r: sqlite3.Row | None) -> dict | None:
@@ -331,13 +339,13 @@ class Store:
             " pid, prompt_path, export_path, started_at, ended_at,"
             " prompt_t, completion_t, cached_t, llm_steps, model_uid,"
             " model_label, price_in, price_cached, price_out,"
-            " price_fetched_at, price_source, usd, error)"
+            " price_fetched_at, price_source, usd, error, sources)"
             " VALUES(:id,:conversation_id,:user_msg_id,:assistant_msg_id,"
             " :provider_session_id,:request_id,:status,:pid,:prompt_path,"
             " :export_path,:started_at,:ended_at,:prompt_t,:completion_t,"
             " :cached_t,:llm_steps,:model_uid,:model_label,:price_in,"
             " :price_cached,:price_out,:price_fetched_at,:price_source,"
-            " :usd,:error)", rec)
+            " :usd,:error,:sources)", rec)
         return rec
 
     def get_exchange(self, xid: str) -> dict | None:

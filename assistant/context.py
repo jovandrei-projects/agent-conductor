@@ -30,6 +30,8 @@ SENSITIVE_KEY_RE = re.compile(
 SELECTION_MAX = 2048          # user text-selection excerpt cap
 ENVELOPE_MAX_BYTES = 16384    # whole frozen envelope cap
 REF_VALUE_MAX = 512           # any single ref/state leaf value
+ENRICHED_MAX_BYTES = 12288    # `enriched` budget inside the envelope
+ENRICHED_LEAF_MAX = 6144      # a single enriched text leaf (excerpt slot)
 MAX_REFS = 32                 # distinct id keys per envelope
 MAX_DEPTH = 6
 
@@ -92,6 +94,90 @@ def envelope(view: str, *, refs=None, filters=None, selection="",
         "at": str(at or "")[:40],
     }
     return env
+
+
+def _sanitize_enriched(value, depth=0):
+    """Like _sanitize but with the excerpt-sized leaf cap - `enriched`
+    carries bounded record excerpts (task text, summary windows, log
+    tails) that the 512-char ref cap would destroy. Depth/key/sensitive
+    rules are identical."""
+    if depth > MAX_DEPTH:
+        return None
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            key = str(k)
+            if SENSITIVE_KEY_RE.search(key):
+                continue
+            if not REF_KEY_RE.fullmatch(key):
+                continue
+            sv = _sanitize_enriched(v, depth + 1)
+            if sv is not None:
+                out[key] = sv
+            if len(out) >= MAX_REFS:
+                break
+        return out
+    if isinstance(value, (list, tuple)):
+        out = [_sanitize_enriched(v, depth + 1) for v in value[:64]]
+        return [v for v in out if v is not None]
+    if isinstance(value, str):
+        if len(value) > ENRICHED_LEAF_MAX:
+            return (value[:ENRICHED_LEAF_MAX]
+                    + f"\n[...{len(value) - ENRICHED_LEAF_MAX} chars "
+                      "truncated...]")
+        return value
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    return str(value)[:ENRICHED_LEAF_MAX]
+
+
+def set_enriched(env: dict, enriched) -> dict:
+    """Attach the host's server-side `enriched` payload to a client-built
+    envelope, REPLACING whatever the client claimed - client text is never
+    authoritative (DESIGN 6.5). Sensitive keys drop out, leaves are capped,
+    and the whole block is fitted under ENRICHED_MAX_BYTES by shrinking its
+    longest strings so freeze() never has to shed the envelope."""
+    env["enriched"] = _sanitize_enriched(enriched) or {}
+    for _ in range(4):
+        size = len(json.dumps(env["enriched"], ensure_ascii=False)
+                   .encode("utf-8"))
+        if size <= ENRICHED_MAX_BYTES:
+            break
+        longest = _longest_leaf(env["enriched"])
+        if longest is None or not longest[0]:
+            # no addressable leaf (e.g. the whole block is one string):
+            # shrink the block itself
+            env["enriched"] = _sanitize_enriched(
+                str(env["enriched"])[:1024]) or {}
+            continue
+        path, text = longest
+        keep = max(256, len(text) - (size - ENRICHED_MAX_BYTES))
+        _set_leaf(env["enriched"], path,
+                  text[:keep] + f"\n[...{len(text) - keep} chars "
+                                "truncated...]")
+    return env
+
+
+def _longest_leaf(node, path=()):
+    """(path, text) of the longest string leaf, or None."""
+    best = None
+    if isinstance(node, str):
+        return (path, node)
+    items = (node.items() if isinstance(node, dict)
+             else enumerate(node) if isinstance(node, list) else ())
+    for k, v in items:
+        cand = _longest_leaf(v, path + (k,))
+        if cand and (best is None or len(cand[1]) > len(best[1])):
+            best = cand
+    return best
+
+
+def _set_leaf(node, path, text):
+    for k in path[:-1]:
+        node = node[k] if isinstance(node, dict) else node[k]
+    node[path[-1]] = text
 
 
 def freeze(env: dict) -> str:

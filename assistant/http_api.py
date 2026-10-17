@@ -13,6 +13,8 @@ Route summary (all under /api/assistant/):
   POST conversations/<id>/messages          - queue exchange {text,
        client_msg_id, client_ctx, attachments, settings} -> 202
   GET  conversations/<id>/usage             - per-exchange rows + rollup
+  GET  conversations/<id>/exchanges         - exchange rows incl. thawed
+       citation sources (chips survive reload)
   GET  conversations/<id>/actions           - audit rows for the conv
   POST conversations/<id>/settings          - per-conv settings update
   POST conversations/<cid>/actions/<aid>/confirm {approve}
@@ -97,6 +99,10 @@ def _h_usage(core, g, body, raw, q):
     return 200, core.usage(g[0])
 
 
+def _h_exchanges(core, g, body, raw, q):
+    return 200, {"items": core.list_exchanges(g[0])}
+
+
 def _h_actions(core, g, body, raw, q):
     return 200, {"items": core.list_actions(g[0])}
 
@@ -160,6 +166,8 @@ ROUTES = [
      _h_post_msg),
     ("GET",    re.compile(rf"/api/assistant/conversations/{_ID}/usage\Z"),
      _h_usage),
+    ("GET",    re.compile(rf"/api/assistant/conversations/{_ID}/exchanges\Z"),
+     _h_exchanges),
     ("GET",    re.compile(rf"/api/assistant/conversations/{_ID}/actions\Z"),
      _h_actions),
     ("POST",   re.compile(rf"/api/assistant/conversations/{_ID}/settings\Z"),
