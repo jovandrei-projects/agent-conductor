@@ -449,13 +449,18 @@ def _resolve_curated(records: list[dict], commits: list[dict],
                      win_runs: dict[str, tuple[str, dict]],
                      run_key_of, repo_dir: Path,
                      warnings) -> tuple[list[dict], set[str],
-                                        dict[str, dict]]:
+                                        dict[str, dict],
+                                        dict[str, set[str]]]:
     """Bind curated records to the window.
 
-    Returns (claim_cards, claimed_shas, augments): claim_cards are
-    dedicated curated cards; claimed_shas are commits removed from area
-    grouping; augments maps area -> record (fold-in upgrades)."""
+    Returns (claim_cards, claimed_shas, augments, aug_shas): claim_cards
+    are dedicated curated cards; claimed_shas are commits removed from
+    area grouping; augments maps area -> record (fold-in upgrades) and
+    aug_shas maps that area -> the record's matched commit shas, so a
+    polished card that claims them under a different stop still folds the
+    human text in (generated text never overrides curated)."""
     cards, augments = [], {}
+    aug_shas: dict[str, set[str]] = {}
     claimed: set[str] = set()
     for rec in records:
         where = f"{CURATED_NAME}:{rec['line']}"
@@ -493,14 +498,16 @@ def _resolve_curated(records: list[dict], commits: list[dict],
         areas = {_commit_area(c["subject"], c["files"]) for c in matched}
         if not hit_reqs and not hit_runs and len(areas) == 1 \
                 and next(iter(areas)) == rec["stop"]:
-            augments.setdefault(rec["stop"], rec)   # first fold wins
+            if rec["stop"] not in augments:     # first fold wins
+                augments[rec["stop"]] = rec
+                aug_shas[rec["stop"]] = {c["sha"] for c in matched}
             claimed.difference_update(c["sha"] for c in matched)
             continue
         tip = matched[0]["sha"]
         cards.append({"id": f"curated:{rec['stop']}:{tip[:_CARD_KM]}",
                       "stop": rec["stop"], "rec": rec, "commits": matched,
                       "requests": hit_reqs, "runs": hit_runs})
-    return cards, claimed, augments
+    return cards, claimed, augments, aug_shas
 
 
 def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
@@ -548,7 +555,7 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
     # never appears both curated and raw)
     curated, warns = load_curated(manifests_dir)
     warnings.extend(warns)
-    cards, claimed, augments = _resolve_curated(
+    cards, claimed, augments, aug_shas = _resolve_curated(
         curated, commits, win_reqs, win_runs, run_key_of, repo_dir,
         warnings)
     fold_req = {}                       # request id -> rec
@@ -678,10 +685,19 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
             if not cs:
                 continue
             grouped.update(c["sha"] for c in cs)
-            aug = augments.get(stop) if stop != "records" \
-                and stop not in aug_used else None
-            if aug:
-                aug_used.add(stop)
+            # a curated fold-in still wins over generated text: first the
+            # augment naming this stop, else an augment whose claimed
+            # commits this card grouped under a different stop
+            aug_key = (stop if stop in augments and stop != "records"
+                       and stop not in aug_used else None)
+            if aug_key is None:
+                cshas = {c["sha"] for c in cs}
+                aug_key = next((k for k, shas in aug_shas.items()
+                                if k not in aug_used and shas & cshas),
+                               None)
+            aug = augments.get(aug_key) if aug_key is not None else None
+            if aug is not None:
+                aug_used.add(aug_key)
             tag = card.get("tag")
             entries.append({
                 "id": f"area:{stop}:{cs[0]['sha'][:_CARD_KM]}",
@@ -709,6 +725,8 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
     for area, cs in groups.items():
         aug = augments.get(area) if area != "records" \
             and area not in aug_used else None
+        if aug is not None:
+            aug_used.add(area)
         subjects = [c["subject"] for c in cs]
         title = (aug["title"] if aug and aug["title"]
                  else (_short(subjects[0], _TITLE_MAX) if len(cs) == 1

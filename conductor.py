@@ -12870,6 +12870,9 @@ def tour_ctx(runs_dir: Path, requests_dir: Path | None = None,
             "feed": None,     # {"at": epoch, "payload": GET /api/tour body}
             "count": None,    # {"at": epoch, "value": int}
             "busy": False,    # a background build owns the refresh
+            "gen": 0,         # mutation epoch - a build that started
+                              # before a transition can't overwrite the
+                              # post-mutation cache it races
             "lock": threading.Lock()}
 
 
@@ -12910,6 +12913,8 @@ def _tour_build(ctx: dict, *, now: float | None = None) -> dict:
     ts = time.time() if now is None else now
     polisher = _tour_polisher(ctx)
     polish_on = polisher is not None and polisher.enabled()
+    with ctx["lock"]:
+        gen0 = ctx["gen"]
     state = tour_state.load(ctx["state_path"])
     boundary = tour_state.capture_boundary(ctx["repo_dir"], now=now)
     feed = tour_feeds.build_feed(
@@ -12933,8 +12938,9 @@ def _tour_build(ctx: dict, *, now: float | None = None) -> dict:
             polisher.kick(feed["range"],
                           on_done=lambda _r: _tour_invalidate(ctx))
     with ctx["lock"]:
-        ctx["feed"] = {"at": ts, "payload": payload}
-        ctx["count"] = {"at": ts, "value": feed["unseen_count"]}
+        if ctx["gen"] == gen0:
+            ctx["feed"] = {"at": ts, "payload": payload}
+            ctx["count"] = {"at": ts, "value": feed["unseen_count"]}
     return payload
 
 
@@ -13038,6 +13044,8 @@ def tour_transition(ctx: dict, entry_id: str, action: str,
                                    now=now)
     with ctx["lock"]:
         ctx["feed"] = ctx["count"] = None    # drop pre-mutation copies
+        ctx["gen"] += 1            # any build started before this
+                                   # transition now fails its store
     refreshed = _tour_build(ctx, now=now)
     result["unseen_count"] = refreshed["unseen_count"]
     return result
