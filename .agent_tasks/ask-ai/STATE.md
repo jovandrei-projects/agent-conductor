@@ -91,9 +91,11 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
       conductor.py functions, launch-tier armed confirms, readonly
       recheck, failed-proposal audit, action cards; see 'Implemented
       contracts (guarded-dashboard-actions)' below)
-- [ ] usage-and-price-visibility - per-exchange + session rollups
-      (usage/price snapshot columns + rollup endpoint exist; needs
-      provider-side capture + UI)
+- [x] usage-and-price-visibility - per-exchange + session rollups
+      (provider capture, dispatch-time price stamping, priced
+      fail/cancel, extra-counter passthrough, by-model rollup, expandable
+      per-exchange + conversation UI, settings price provenance; see
+      'Implemented contracts (usage-and-price-visibility)' below)
 - [ ] integration-and-design-review
 - [ ] follow-up-plan
 
@@ -576,19 +578,114 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
   the conductor call (ack gate) or the `conductor.*` function is
   mocked at the boundary.
 
+## Implemented contracts (usage-and-price-visibility)
+
+- `assistant/core.py` - `USAGE_COUNTERS` is the one counter list
+  (prompt/completion/cached/llm_steps). `_merged_usage(x, usage)` =
+  terminal usage merged over already-persisted partial counters
+  (explicit None never erases a landed partial); `_row_price(x)`
+  rebuilds the rate map from the row's own snapshot; `complete_exchange`
+  uses `eff_price` = passed rates else the row's stamped snapshot, so
+  cost is always computed against the rates the exchange was stamped
+  under - never re-looked-up. `fail_exchange`/`cancel_exchange` take
+  `price=` and compute `usd = price_usage(_merged_usage, _row_price)`
+  when unset - billable failures/cancels are priced, never free.
+  `set_price_snapshot(xid, price)` is first-write-wins (a mid-flight
+  table refresh can't rewrite dispatch-time inputs). `_usage_extra`
+  sums numeric `usage.extra` fields across the requests JSON;
+  `exchange_view`/`list_exchanges` thaw requests+sources and carry
+  `usage_extra`. `usage()` returns `{exchanges[], totals}` with
+  `by_model` groups (per-uid exchanges/tokens/usd/unpriced - a
+  mixed-model conversation never blends rates), `currency:'USD'`,
+  `cost_kind:'calculated'`, latest `price_fetched_at`/`price_source`;
+  `unpriced` counts only terminal rows that actually REPORTED usage
+  (a no-usage cancel is nothing-to-price, not unpriced).
+- `assistant/runtime.py` - `_delta_dict` diffs the canonical counters
+  AND every other numeric `total_*` key into `usage.extra` (cache
+  writes, image/summarization billing land verbatim when a provider
+  reports them - no invented price semantics). `_run_exchange` stamps
+  `set_price_snapshot` at dispatch (before the hop loop) so a
+  fail/cancel can price; `_finish` passes `price` into `fail_exchange`
+  for the died-without-text path. `exchanges.requests[]` keeps
+  `{kind: adopted}` and per-hop `usage.extra` for the expandable
+  breakdown.
+- `assistant_host/conductor_adapters.py` - `_pricing_meta()` =
+  `{currency,unit,tier,fetched_at,source}` from `_PRICE_CACHE`, merged
+  into the `/models` catalog payload - the settings modal's
+  rate-provenance line comes from the same snapshot the exchanges
+  store.
+- `assistant/static/chat.js` - per-terminal-exchange
+  `<details class="aim-use">` (native details = keyboard/screen-reader
+  accessible): compact summary (in/cached/out/turns/est.$/'usage not
+  reported'/'cost unknown' - never $0.00) expands to model+settings
+  snapshot+status+session, the per-hop `internal requests` rows
+  (`#n kind · request_id · Ns · exit · in/out/cached/turns · extras`,
+  `error:` line on failed hops), `usage_extra` under 'also reported
+  (no price semantics attached)', the rate snapshot (rates / source /
+  fetched date) and the 'calculated USD estimate - not an invoice'
+  line; an attachment-bearing turn notes 'no separate image charge;
+  image processing lands inside the token counters'. `fmtUsd` shows
+  `<$0.0001` for real-but-sub-precision costs (a nonzero cost never
+  reads as free). Header `#ai-usage` is now a `<details>`: summary
+  keeps the compact `in/out tok · ~$` chip; `#ai-useview` panel lists
+  `by model` groups (multi-model only), `N unpriced` badges, the
+  grand-total line, the unpriced 'unknown, not zero' note and the
+  calculated-USD + rate-provenance line.
+- `assistant/static/chat.js` settings modal - `#ais-price` shows the
+  resolved uid + its own rates (family fallback when unpriced), a
+  `vs standard <effort>: ~$X/$Y` comparison when the fast variant
+  reprices (skipped for fast-branded families), image support, and
+  `estimates in USD · rates fetched <date> (<source>) · not an
+  invoice` from `catalog.pricing`. The dialog never changes the
+  selection by itself.
+- `assistant/static/chat.css` - `.aim-use` details/summary/`.aim-udet`/
+  `.um-l`/`.um-r`(+`.err`)/`.um-h`/`.um-warn`; `.ai-usage` details +
+  absolute `.ai-useview` dropdown panel.
+
+### Verified (usage-and-price-visibility)
+
+- `tests/test_assistant.py` +10 (`UsageAccountingTests`): by-model
+  mixed-model rollup; stored snapshot survives a later rate-table
+  change (old row's usd/price_in/fetched_at untouched, new exchange
+  reprices); dispatch first-write-wins vs terminal refinement;
+  failed-exchange priced (`usd` from usage+snapshot, not free);
+  cancelled-with-usage priced from stored snapshot; no-usage cancel is
+  not 'unpriced'; unpriced-model cancel counted; all-None usage =
+  `usd=None` + unpriced (never $0); extra `total_*` counters roll up
+  through `usage_extra`; store reopen keeps usage/price/requests
+  verbatim.
+- `tests/test_assistant_runtime.py` +5: provider `total_*` extras land
+  in `usage.extra` + `usage_extra`; failed dispatch priced end-to-end;
+  cancelled-mid-run priced from the dispatch stamp; failed+retry are
+  two separately-priced exchanges sharing the session's cumulative
+  baseline; two exchanges on different uids price against their own
+  rate sets and roll up per-model.
+- `tests/test_assistant_ui.py` +3: the expandable per-exchange block
+  (summary, internal requests, extras, rate line, estimate label,
+  image-charge note, unknown-not-zero honesty, cancelled row);
+  `#ai-useview` (by-model split, total, unpriced honesty, USD/provenance);
+  settings price line (resolved uid, rates, standard-vs-fast compare
+  gone when fast unchecked, fetched/source/estimate wording).
+- `python -m unittest tests.test_assistant tests.test_assistant_runtime
+  tests.test_assistant_ui` -> 130 tests OK; `node --check` chat.js
+  clean; `python run_tests.py` full suite re-run pending.
+
 ## Where it stopped
 
-`guarded-dashboard-actions` is implemented and tested: model-authored
-```proposed_action blocks become audited action rows via the runtime's
-reply-tail scan; `ConductorActions` whitelists 28 kinds, each delegating
-to the same conductor.py function the dashboard endpoint calls;
-proposals render as confirm cards (Run/Deny for normal kinds,
-armed exact-target Confirm&run for launch tier posting the verbatim
-`expected_ack`); read-only is re-checked server-side at execute time;
-rejected/malformed proposals land as terminal `failed` rows; 170
-assistant + 702-test suite green, node --check clean.
-Remaining per the manifest: `usage-and-price-visibility` UI, then
-`integration-and-design-review` + `follow-up-plan`.
+`usage-and-price-visibility` is implemented and tested (18 new tests):
+every terminal exchange carries provider-reported token deltas,
+extra `total_*` counters verbatim (never priced), and a first-write-wins
+rate snapshot that survives later table refreshes; failed/cancelled/
+partial exchanges are priced from the stored snapshot (billable, never
+free, never $0-guessed); `GET .../usage` rolls up per-model groups +
+unpriced + USD/estimate provenance; the chat renders a compact chip per
+exchange that expands to internal-request hops, rate provenance and
+'calculated estimate - not an invoice'; the header chip expands to the
+conversation grand total + by-model split; settings shows resolved rates,
+standard-vs-fast comparison and fetched-date provenance pre-selection.
+130 assistant tests + node --check green; full `run_tests.py` rerun in
+flight. Remaining per the manifest: `integration-and-design-review`,
+then `follow-up-plan`.
 
 ## Deferred or blocked
 

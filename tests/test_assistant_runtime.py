@@ -578,6 +578,179 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(v["prompt_t"], 70)      # usage-so-far kept
             core.close()
 
+    def test_extra_metrics_land_in_hop_records(self):
+        """Counters outside the canonical four (cache writes, image or
+        summarization billing whenever the provider reports them under
+        extra total_* keys) pass through per-request usage.extra
+        verbatim and roll up on the exchange - stored, never priced."""
+        with tempfile.TemporaryDirectory() as td:
+            p = ScriptedProvider(lambda rec: [PollResult(
+                done=True, text="ok",
+                session_id=rec["handle"].session_id,
+                raw_metrics={"total_prompt_tokens": 100,
+                             "total_completion_tokens": 40,
+                             "total_cache_write_tokens": 25,
+                             "total_image_units": 2})])
+            core, rt = self._open(td, p)
+            cv = core.create_conversation({"view": "dashboard"})
+            x = wait_x(core, ask(core, cv, "hi")["exchange"]["id"])
+            v = core.exchange_view(x["id"])
+            req = v["requests"][0]
+            self.assertEqual(req["usage"]["extra"],
+                             {"total_cache_write_tokens": 25,
+                              "total_image_units": 2})
+            self.assertEqual(v["usage_extra"],
+                             {"total_cache_write_tokens": 25,
+                              "total_image_units": 2})
+            core.close()
+
+    def test_failed_dispatch_is_priced(self):
+        """A dispatch that consumed tokens and failed keeps both its
+        usage AND a calculated usd - 'error' never means free."""
+        with tempfile.TemporaryDirectory() as td:
+            p = ScriptedProvider(lambda rec: [PollResult(
+                done=True, error="provider exited 3",
+                session_id=rec["handle"].session_id,
+                raw_metrics={"total_prompt_tokens": 10,
+                             "total_cached_tokens": 4})])
+            price = (lambda uid, label:
+                     {"in": 0.2, "cached": 0.02, "out": 1.0,
+                      "fetched_at": 1.0, "source": "t-price"})
+            core, rt = self._open(td, p, price_for=price)
+            cv = core.create_conversation({"view": "dashboard"})
+            x = wait_x(core, ask(core, cv, "hi")["exchange"]["id"])
+            self.assertEqual(x["status"], "error")
+            self.assertEqual(x["prompt_t"], 10)
+            self.assertAlmostEqual(
+                x["usd"], ((10 - 4) * 0.2 + 4 * 0.02) / 1e6)
+            self.assertEqual(x["price_source"], "t-price")
+            u = core.usage(cv["id"])
+            self.assertEqual(u["totals"]["unpriced"], 0)
+            core.close()
+
+    def test_cancelled_dispatch_is_priced_from_snapshot(self):
+        """Cancel mid-run: usage-so-far plus the price snapshot stamped
+        at dispatch produce a calculated usd - a cancelled request can
+        still be billed."""
+        with tempfile.TemporaryDirectory() as td:
+            p = ScriptedProvider(lambda rec: [
+                PollResult(text="half-written",
+                           session_id=rec["handle"].session_id,
+                           raw_metrics={"total_prompt_tokens": 70,
+                                        "total_cached_tokens": 30,
+                                        "total_steps": 1}),
+                PollResult(done=True, text="never reached",
+                           session_id=rec["handle"].session_id)])
+            price = (lambda uid, label:
+                     {"in": 0.2, "cached": 0.02, "out": 1.0,
+                      "fetched_at": 2.0, "source": "t-price"})
+            core, rt = self._open(td, p, price_for=price)
+            cv = core.create_conversation({"view": "dashboard"})
+            xid = ask(core, cv, "slow")["exchange"]["id"]
+            t = time.time()
+            while time.time() - t < 10:             # land a partial
+                if core.exchange_view(xid).get("text"):
+                    break
+                time.sleep(0.05)
+            x = core.cancel_exchange(xid)
+            self.assertEqual(x["status"], "cancelled")
+            self.assertEqual(x["prompt_t"], 70)
+            self.assertEqual(x["price_source"], "t-price")
+            self.assertAlmostEqual(
+                x["usd"], ((70 - 30) * 0.2 + 30 * 0.02) / 1e6)
+            self.assertEqual(
+                core.usage(cv["id"])["totals"]["unpriced"], 0)
+            core.close()
+
+    def test_failed_and_retry_both_accounted(self):
+        """The failed exchange keeps its billable usage+price and the
+        retry is a NEW exchange on the resumed session: cumulative
+        deltas attribute each turn to its own exchange and the
+        conversation total covers both."""
+        with tempfile.TemporaryDirectory() as td:
+            state = {"fail": True}
+
+            def on_send(rec):
+                if state["fail"]:
+                    return [PollResult(
+                        done=True, error="spawn died",
+                        session_id=rec["handle"].session_id,
+                        raw_metrics={"total_prompt_tokens": 10})]
+                return [PollResult(
+                    done=True, text="recovered",
+                    session_id=rec["handle"].session_id,
+                    raw_metrics={"total_prompt_tokens": 20,
+                                 "total_completion_tokens": 5})]
+            p = ScriptedProvider(on_send)
+            price = (lambda uid, label:
+                     {"in": 0.2, "cached": 0.02, "out": 1.0,
+                      "fetched_at": 1.0, "source": "t"})
+            core, rt = self._open(td, p, price_for=price)
+            cv = core.create_conversation({"view": "dashboard"})
+            r1 = ask(core, cv, "hi", cmid="cm-retry-2")
+            x1 = wait_x(core, r1["exchange"]["id"])
+            self.assertEqual(x1["status"], "error")
+            self.assertEqual(x1["prompt_t"], 10)
+            self.assertIsNotNone(x1["usd"])        # failure is priced
+            p.sessions_v = {x1["provider_session_id"]}
+            state["fail"] = False
+            r2 = ask(core, cv, "hi", cmid="cm-retry-2")
+            self.assertFalse(r2["deduped"])
+            x2 = wait_x(core, r2["exchange"]["id"])
+            self.assertEqual(x2["status"], "done")
+            # resumed on the same session: turn-2's share of the
+            # cumulative 20 is 10 - the failed turn's consumption is
+            # not attributed to the retry
+            self.assertEqual(x2["prompt_t"], 10)
+            u = core.usage(cv["id"])
+            self.assertEqual(u["totals"]["exchanges"], 2)
+            self.assertEqual(u["totals"]["prompt_t"], 20)
+            self.assertEqual(u["totals"]["unpriced"], 0)
+            core.close()
+
+    def test_mixed_models_aggregate_per_model(self):
+        """Two exchanges on different resolved uids price against their
+        OWN rate sets; the conversation rollup splits them by model
+        rather than blending."""
+        with tempfile.TemporaryDirectory() as td:
+            cum = {}
+
+            def on_send(rec):
+                sid = rec["handle"].session_id
+                st = cum.setdefault(sid, {"p": 0, "c": 0})
+                st["p"] += 100
+                st["c"] += 10
+                return [PollResult(
+                    done=True, text="a",
+                    session_id=sid,
+                    raw_metrics={"total_prompt_tokens": st["p"],
+                                 "total_completion_tokens": st["c"]})]
+            prices = {"m-a": {"in": 0.1, "cached": 0.01, "out": 0.5,
+                              "fetched_at": 1.0, "source": "t"},
+                      "m-b": {"in": 2.0, "cached": 0.2, "out": 10.0,
+                              "fetched_at": 1.0, "source": "t"}}
+            p = ScriptedProvider(on_send)
+            core, rt = self._open(
+                td, p, price_for=lambda uid, label: prices.get(uid))
+            cv = core.create_conversation({"view": "dashboard"},
+                                          settings={"model": "m-a"})
+            x1 = wait_x(core, ask(core, cv, "one")["exchange"]["id"])
+            self.assertAlmostEqual(x1["usd"],
+                                   (100 * 0.1 + 10 * 0.5) / 1e6)
+            p.sessions_v = {x1["provider_session_id"]}
+            core.update_settings(cv["id"], {"model": "m-b"})
+            x2 = wait_x(core, ask(core, cv, "two")["exchange"]["id"])
+            # a fresh session under the new uid - cumulative baseline
+            # resets so the second exchange is NOT charged turn-1's cum
+            self.assertIsNone(p.sends[1]["session_id"])
+            self.assertEqual(x2["model_uid"], "m-b")
+            self.assertAlmostEqual(x2["usd"],
+                                   (100 * 2.0 + 10 * 10.0) / 1e6)
+            tot = core.usage(cv["id"])["totals"]
+            self.assertEqual(set(tot["by_model"]), {"m-a", "m-b"})
+            self.assertAlmostEqual(tot["usd"], x1["usd"] + x2["usd"])
+            core.close()
+
     def test_resend_after_error_dedupes_message_new_exchange(self):
         with tempfile.TemporaryDirectory() as td:
             state = {"fail": True}

@@ -331,6 +331,236 @@ class ExchangeTests(unittest.TestCase):
             c.close()
 
 
+class UsageAccountingTests(unittest.TestCase):
+    """Per-exchange usage/price accounting (DESIGN.md 6.9): rate
+    snapshots that a table refresh can never rewrite, priced
+    failures/cancels (billable), unpriced counted honestly - never
+    zero - and the by-model rollup for mixed-model conversations."""
+
+    PRICE = {"in": 0.2, "cached": 0.02, "out": 1.0,
+             "fetched_at": 1_760_000_000.0, "source": "docs-test"}
+
+    def test_by_model_rollup_splits_mixed_models(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            finish(c, ask(c, cv["id"], "a")["exchange"]["id"])
+            c.complete_exchange(
+                ask(c, cv["id"], "b")["exchange"]["id"], "b2",
+                usage={"prompt_t": 200, "completion_t": 50,
+                       "cached_t": 100, "llm_steps": 3},
+                model={"uid": "claude-opus-4-8-low-fast",
+                       "label": "Opus"},
+                price={"in": 2.0, "cached": 0.1, "out": 10.0,
+                       "fetched_at": 1_760_000_001.0,
+                       "source": "docs-test"})
+            u = c.usage(cv["id"])
+            bm = u["totals"]["by_model"]
+            self.assertEqual(set(bm), {"gpt-6-luna-low-priority",
+                                       "claude-opus-4-8-low-fast"})
+            self.assertEqual(bm["gpt-6-luna-low-priority"]["exchanges"],
+                             1)
+            self.assertEqual(
+                bm["claude-opus-4-8-low-fast"]["prompt_t"], 200)
+            self.assertEqual(u["totals"]["prompt_t"], 300)
+            self.assertEqual(u["totals"]["cached_t"], 130)
+            self.assertEqual(u["totals"]["exchanges"], 2)
+            self.assertEqual(u["totals"]["unpriced"], 0)
+            self.assertEqual(u["totals"]["currency"], "USD")
+            self.assertEqual(u["totals"]["cost_kind"], "calculated")
+            self.assertEqual(u["totals"]["price_source"], "docs-test")
+            c.close()
+
+    def test_snapshot_survives_later_rate_change(self):
+        """Price inputs land per row: a refreshed rate table reprices NEW
+        exchanges - it must never reach back and rewrite the old row's
+        cost."""
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            xid = ask(c, cv["id"], "a")["exchange"]["id"]
+            finish(c, xid)                       # 0.2/0.02/1.0 rates
+            old = c.exchange_view(xid)
+            self.assertAlmostEqual(old["price_in"], 0.2)
+            old_usd = old["usd"]
+            xid2 = ask(c, cv["id"], "b")["exchange"]["id"]
+            c.complete_exchange(
+                xid2, "b", usage={"prompt_t": 100, "completion_t": 40},
+                model={"uid": "gpt-6-luna-low-priority", "label": "L"},
+                price={"in": 9.9, "cached": 9.0, "out": 99.0,
+                       "fetched_at": 1_760_000_100.0,
+                       "source": "docs-new"})
+            after = c.exchange_view(xid)
+            self.assertEqual(after["usd"], old_usd)       # untouched
+            self.assertEqual(after["price_in"], 0.2)
+            self.assertEqual(after["price_fetched_at"],
+                             1_760_000_000.0)
+            self.assertAlmostEqual(
+                c.usage(cv["id"])["totals"]["usd"],
+                old_usd + ((100 * 9.9 + 40 * 99.0) / 1e6), places=6)
+            c.close()
+
+    def test_dispatch_snapshot_first_write_wins(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            xid = ask(c, cv["id"], "a")["exchange"]["id"]
+            c.set_price_snapshot(xid, self.PRICE)
+            c.set_price_snapshot(              # a refresh mid-flight
+                xid, {"in": 9.9, "cached": 9.0, "out": 99.0,
+                      "fetched_at": 9.0, "source": "new"})
+            row = c.store.get_exchange(xid)
+            self.assertEqual(row["price_in"], 0.2)        # first wins
+            self.assertEqual(row["price_source"], "docs-test")
+            # the terminal write may still refine rates (label match) -
+            # that is the final accounting, not history drift
+            c.complete_exchange(
+                xid, "a", usage={"prompt_t": 10, "completion_t": 5},
+                price={"in": 0.3, "cached": 0.03, "out": 1.5,
+                       "fetched_at": 2.0, "source": "docs-v2"})
+            row = c.store.get_exchange(xid)
+            self.assertEqual(row["price_in"], 0.3)
+            self.assertAlmostEqual(row["usd"],
+                                   (10 * 0.3 + 5 * 1.5) / 1e6)
+            c.close()
+
+    def test_failed_exchange_is_priced_not_free(self):
+        """A dispatch that consumed tokens and died is billed - 'error'
+        never implies zero cost."""
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            xid = ask(c, cv["id"], "a")["exchange"]["id"]
+            c.begin_exchange(xid)
+            c.update_partial(xid, "half", usage={"prompt_t": 70})
+            x = c.fail_exchange(
+                xid, "provider died",
+                usage={"prompt_t": 80, "completion_t": 10},
+                price=self.PRICE)
+            self.assertEqual(x["status"], "error")
+            self.assertEqual(x["prompt_t"], 80)   # final delta wins
+            self.assertAlmostEqual(x["usd"],
+                                   (80 * 0.2 + 10 * 1.0) / 1e6)
+            u = c.usage(cv["id"])
+            self.assertEqual(u["totals"]["unpriced"], 0)
+            self.assertGreater(u["totals"]["usd"], 0)
+            c.close()
+
+    def test_cancelled_with_usage_is_priced(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            xid = ask(c, cv["id"], "a")["exchange"]["id"]
+            c.begin_exchange(xid)
+            c.set_price_snapshot(xid, self.PRICE)
+            c.update_partial(xid, "half",
+                             usage={"prompt_t": 60, "completion_t": 20,
+                                    "cached_t": 10})
+            x = c.cancel_exchange(xid)
+            self.assertEqual(x["status"], "cancelled")
+            self.assertEqual(x["prompt_t"], 60)
+            self.assertAlmostEqual(
+                x["usd"],
+                ((60 - 10) * 0.2 + 10 * 0.02 + 20 * 1.0) / 1e6)
+            self.assertEqual(c.usage(cv["id"])["totals"]["unpriced"], 0)
+            c.close()
+
+    def test_cancelled_without_usage_is_not_unpriced(self):
+        """A never-dispatched cancel consumed nothing - it isn't
+        'unpriced', it is nothing-to-price."""
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            xid = ask(c, cv["id"], "a")["exchange"]["id"]
+            c.begin_exchange(xid)
+            x = c.cancel_exchange(xid)
+            self.assertIsNone(x["usd"])
+            self.assertEqual(c.usage(cv["id"])["totals"]["unpriced"], 0)
+            c.close()
+
+    def test_cancelled_unpriced_model_still_counted(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            xid = ask(c, cv["id"], "a")["exchange"]["id"]
+            c.begin_exchange(xid)
+            c.update_partial(xid, "half", usage={"prompt_t": 60})
+            x = c.cancel_exchange(xid)            # usage, no rate data
+            self.assertIsNone(x["usd"])
+            self.assertEqual(c.usage(cv["id"])["totals"]["unpriced"], 1)
+            c.close()
+
+    def test_missing_usage_never_prices_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            xid = ask(c, cv["id"], "a")["exchange"]["id"]
+            x = c.complete_exchange(
+                xid, "a",
+                usage={"prompt_t": None, "completion_t": None,
+                       "cached_t": None, "llm_steps": None},
+                price=self.PRICE)
+            self.assertIsNone(x["usd"])           # unknown, not $0.00
+            self.assertEqual(c.usage(cv["id"])["totals"]["unpriced"], 1)
+            c.close()
+
+    def test_extra_provider_counters_aggregate(self):
+        """Non-canonical counters (cache writes, image/summarization
+        billing once a provider reports them under extra total_* keys)
+        flow raw into the request records and roll up per exchange -
+        stored verbatim, never priced."""
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            xid = ask(c, cv["id"], "a")["exchange"]["id"]
+            c.begin_exchange(xid)
+            c.record_request(xid, {
+                "n": 1, "kind": "fresh", "request_id": "s#h1",
+                "usage": {"prompt_t": 50,
+                          "extra": {"total_cache_write_tokens": 40,
+                                    "total_image_units": 2}},
+                "cum": {}})
+            c.record_request(xid, {
+                "n": 2, "kind": "tool", "request_id": "s#h2",
+                "usage": {"prompt_t": 30,
+                          "extra": {"total_cache_write_tokens": 10}},
+                "cum": {}})
+            v = c.exchange_view(xid)
+            self.assertEqual(v["usage_extra"],
+                             {"total_cache_write_tokens": 50,
+                              "total_image_units": 2})
+            rows = c.usage(cv["id"])["exchanges"]
+            self.assertEqual(rows[0]["usage_extra"]
+                             ["total_cache_write_tokens"], 50)
+            c.close()
+
+    def test_accounting_survives_reopen(self):
+        """A fresh Store over the same db (the 'session reopening' /
+        serve-restart case) sees stored usage, the price snapshot and
+        request boundaries verbatim."""
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            xid = ask(c, cv["id"], "a")["exchange"]["id"]
+            c.begin_exchange(xid, provider_session_id="sess-9")
+            c.record_request(xid, {"n": 1, "kind": "fresh",
+                                   "request_id": "sess-9#h1",
+                                   "usage": {"prompt_t": 100},
+                                   "cum": {}})
+            finish(c, xid)
+            c.close()
+            c2 = make_core(td)
+            v = c2.exchange_view(xid)
+            self.assertEqual(v["prompt_t"], 100)
+            self.assertEqual(v["price_in"], 0.2)
+            self.assertEqual(v["requests"][0]["request_id"],
+                             "sess-9#h1")
+            u = c2.usage(cv["id"])
+            self.assertEqual(u["totals"]["exchanges"], 1)
+            self.assertEqual(u["totals"]["unpriced"], 0)
+            c2.close()
+
+
 class ContextTests(unittest.TestCase):
     def test_ctx_frozen_per_turn(self):
         """Each question keeps the view it was asked from; the next one

@@ -1031,6 +1031,176 @@ setRoute((url,opt)=>{
 ''')
         self.assertEqual(p.returncode, 0, p.stderr)
 
+    def test_usage_details_expandable_and_honest(self):
+        """Every terminal exchange renders a compact usage chip that
+        expands into the internal-request breakdown: provider-reported
+        counters, the frozen settings snapshot, rate provenance, extra
+        counters and an explicit 'calculated estimate - not an invoice'
+        label. Missing usage reads 'unknown', never $0; cancelled rows
+        keep their usage visible."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const S=window.AskAI._s;
+  S.conv={id:'conv-1',model:'m',effort:'',fast:0,readonly:1};
+  S.msgs=[
+    {id:'u1',role:'user',text:'q',ctx_ref:'',
+     settings_json:'{"model":"gpt-6-luna","effort":"low","fast":true,"readonly":true}',
+     attachments:'[{"id":"att-1","name":"a.png"}]'},
+    {id:'a1',role:'assistant',text:'ok',status:'complete',ctx_ref:'',
+     settings_json:'{"model":"gpt-6-luna","effort":"low","fast":true,"readonly":true}'},
+    {id:'u2',role:'user',text:'q2',ctx_ref:'',settings_json:'{}'},
+    {id:'a2',role:'assistant',text:'err',status:'error',ctx_ref:'',
+     settings_json:'{}'},
+    {id:'u3',role:'user',text:'q3',ctx_ref:'',settings_json:'{}'},
+    {id:'a3',role:'assistant',text:'stopped',status:'cancelled',
+     ctx_ref:'',settings_json:'{}'}];
+  S.exchByAid['a1']={id:'x1',status:'done',user_msg_id:'u1',
+    prompt_t:1234,completion_t:56,cached_t:500,llm_steps:2,
+    model_uid:'gpt-6-luna-low-priority',
+    model_label:'GPT-6 Luna Low Thinking Fast',
+    provider_session_id:'sess-1',usd:0.000289,
+    price_in:0.2,price_cached:0.02,price_out:1.0,
+    price_fetched_at:1760000000.0,price_source:'docs-test',
+    requests:[{n:1,kind:'fresh',request_id:'sess-1#h1',pid:1,
+      session_id:'sess-1',started_at:1,ended_at:4,exit_code:0,
+      usage:{prompt_t:1000,completion_t:50,cached_t:400,llm_steps:1}},
+      {n:2,kind:'tool',request_id:'sess-1#h2',pid:1,
+      session_id:'sess-1',started_at:4,ended_at:6,exit_code:0,
+      usage:{prompt_t:234,completion_t:6,cached_t:100,llm_steps:1,
+             extra:{total_cache_write_tokens:12}}}],
+    usage_extra:{total_cache_write_tokens:12}};
+  S.exchByAid['a2']={id:'x2',status:'error',user_msg_id:'u2',
+    error:'provider died'};
+  S.exchByAid['a3']={id:'x3',status:'cancelled',user_msg_id:'u3',
+    prompt_t:70,usd:0.000014};
+  window.AskAI._paint();
+  const html=nodes.get('ai-list').innerHTML;
+  // priced exchange: compact summary + the expandable hop breakdown
+  assert.match(html,/<details class="aim-use">/);
+  assert.match(html,/in 1\.2k \(500 cached\)/);
+  assert.match(html,/out 56/);
+  assert.match(html,/2 turns/);
+  assert.match(html,/~\$0\.0003 est\./);
+  assert.match(html,/internal requests/);
+  assert.match(html,/sess-1#h1/);
+  assert.match(html,/#2 tool/);
+  assert.match(html,/cache write tokens 12/);
+  assert.match(html,/gpt-6-luna-low-priority \(GPT-6 Luna/);
+  assert.match(html,/read-only \u00b7 status done \u00b7 session sess-1/);
+  assert.match(html,/rates \$0\.2 in \/ \$0\.02 cached \/ \$1 out/);
+  assert.match(html,/source docs-test/);
+  assert.match(html,/a calculated estimate, not an invoice/);
+  // attachments turn notes there is no separate image charge
+  assert.match(html,/no separate image charge/);
+  // the failed row with no usage: honest 'unknown', never $0
+  assert.match(html,/usage not reported/);
+  assert.match(html,/cost unknown/);
+  assert.doesNotMatch(html,/~\$0\.00([^0-9]|$)/);
+  // a cancelled row keeps its billable usage + estimate visible,
+  // and a real-but-tiny cost never rounds to a fake $0.00
+  assert.match(html,/stopped/);
+  assert.match(html,/in 70/);
+  assert.match(html,/~&lt;\$0\.0001 est\./);
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js="setRoute(()=>({items:[]}));")
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_usage_view_conversation_breakdown(self):
+        """The header chip is an expandable breakdown: grand totals, a
+        per-model split for mixed-model conversations, the unpriced
+        count and pricing provenance - never presented as an invoice."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const S=window.AskAI._s;
+  S.conv={id:'conv-1',model:'m',effort:'',fast:0,readonly:1};
+  S.usage={exchanges:[],totals:{exchanges:3,prompt_t:300,
+    completion_t:60,cached_t:50,llm_steps:4,usd:0.001,unpriced:1,
+    currency:'USD',cost_kind:'calculated',price_source:'docs-test',
+    price_fetched_at:1760000000.0,
+    by_model:{'m-a':{model_uid:'m-a',exchanges:2,prompt_t:200,
+      completion_t:40,cached_t:50,llm_steps:2,usd:0.0008,unpriced:0},
+     'm-b':{model_uid:'m-b',exchanges:1,prompt_t:100,completion_t:20,
+      cached_t:0,llm_steps:2,usd:0,unpriced:1}}}};
+  window.AskAI._paint();
+  const uv=nodes.get('ai-useview').innerHTML;
+  assert.match(uv,/by model/);
+  assert.match(uv,/m-a/);
+  assert.match(uv,/2 exch \u00b7 in 200 \u00b7 out 40 \(50 cached\)/);
+  assert.match(uv,/1 unpriced/);
+  assert.match(uv,/total 3 exchanges \u00b7 in 300 \u00b7 out 60 \(50 cached\)/);
+  assert.match(uv,/1 exchange has no price data - their cost is unknown, not zero/);
+  assert.match(uv,/calculated USD estimates/);
+  assert.match(uv,/docs-test/);
+  assert.match(uv,/not an invoice/);
+  // the collapsed chip keeps the compact grand total
+  const sum=nodes.get('ai-usage-sum').textContent;
+  assert.match(sum,/300\/60 tok \u00b7 ~\$0\.0010/);
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js="setRoute(()=>({items:[]}));")
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_settings_price_provenance_and_fast_compare(self):
+        """The pre-selection line shows the resolved variant's rates,
+        the standard-vs-fast comparison when fast reprices, image
+        capability and rate provenance (USD + fetched + estimate, not
+        an invoice) - informed choice, never an automatic switch."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const S=window.AskAI._s;
+  S.conv={id:'conv-1',model:'gpt-6-luna',effort:'low',fast:1,readonly:1};
+  window.AskAI.openSettings();
+  await flush();
+  const txt=nodes.get('ais-price').textContent;
+  assert.match(txt,/resolves to gpt-6-luna-low-priority/);
+  assert.match(txt,/~\$0\.2 in \/ \$1 out per 1M tok \(\$0\.02 cached\)/);
+  assert.match(txt,/vs standard low: ~\$0\.1 \/ \$0\.5/);
+  assert.match(txt,/image input verified/);
+  assert.match(txt,/estimates in USD/);
+  assert.match(txt,/rates fetched/);
+  assert.match(txt,/docs\.devin\.ai modelCostData/);
+  assert.match(txt,/not an invoice/);
+  // uncheck fast -> comparison disappears, plain rates shown
+  const setw=nodes.get('aisetwrap');
+  setw._h.change({target:{id:'ais-fast',checked:false}});
+  const t2=nodes.get('ais-price').textContent;
+  assert.doesNotMatch(t2,/vs standard/);
+  assert.match(t2,/resolves to gpt-6-luna-low \u00b7/);
+  assert.match(t2,/~\$0\.1 in \/ \$0\.5 out/);
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js=r'''
+setRoute((url,opt)=>{
+  if(url.endsWith('/models'))return{models:[
+    {uid:'gpt-6-luna-low',family:'gpt-6-luna',label:'Luna Low',
+     in:0.1,cached:0.01,out:0.5,vision:true,fast_variant:false},
+    {uid:'gpt-6-luna-low-priority',family:'gpt-6-luna',
+     label:'Luna Low Fast',in:0.2,cached:0.02,out:1.0,vision:true,
+     fast_variant:true}],
+   default_resolution:{ok:true,uid:'gpt-6-luna-low-priority'},
+   pricing:{currency:'USD',unit:'per 1M tokens',
+     tier:'TEAMS_TIER_PRO',fetched_at:1760000000.0,
+     source:'docs.devin.ai modelCostData (TEAMS_TIER_PRO)'}};
+  if(url.endsWith('/settings'))return{defaults:{model:'gpt-6-luna',
+    effort:'low',fast:true,readonly:true}};
+  return{items:[]};
+});
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

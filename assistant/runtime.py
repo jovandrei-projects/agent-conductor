@@ -142,6 +142,17 @@ def _delta_dict(prev: dict | None, cur: dict | None) -> dict | None:
         v = cur.get(src)
         out[dst] = (max(0, int(v) - int(prev.get(src) or 0))
                     if isinstance(v, (int, float)) else None)
+    extra = {}
+    for k, v in cur.items():
+        if k in _METRIC_KEYS or not isinstance(v, (int, float)):
+            continue
+        if not str(k).startswith("total_"):
+            continue
+        d = int(v) - int(prev.get(k) or 0)
+        if d:
+            extra[str(k)] = d
+    if extra:
+        out["extra"] = extra
     return out
 
 
@@ -339,6 +350,17 @@ class AssistantRuntime:
         job.last_cum = self._requests_last_cum(xid) or prev_cum
         job.base_cum = prev_cum
 
+        # ---------- pricing inputs stamped NOW (first-write-wins), so a
+        # failed or cancelled exchange can still be priced against the
+        # rate set it was dispatched under - the terminal write may
+        # refine it with the session's reported model label
+        if self._price_for:
+            try:
+                core.set_price_snapshot(
+                    xid, self._price_for(uid, resolved.get("label")))
+            except Exception:                   # noqa: BLE001
+                self._log.exception("price snapshot failed")
+
         # ---------- hop loop (each dispatch = one internal request
         # boundary, appended to exchanges.requests with its usage delta)
         reqs = self._requests_so_far(xid)
@@ -524,7 +546,7 @@ class AssistantRuntime:
             if claim.get("dup"):
                 return                              # retry-safe finalize
         if error and not text:
-            core.fail_exchange(xid, error, usage=usage)
+            core.fail_exchange(xid, error, usage=usage, price=price)
             return
         status = "partial" if (error or truncated) else "done"
         core.complete_exchange(
