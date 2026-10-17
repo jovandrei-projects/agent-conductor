@@ -72,24 +72,32 @@
 #aichat .ai-name {
   background: transparent; border: 0; color: #e6edf3; font: inherit;
   font-weight: 600; font-size: 13px; padding: 2px 4px; border-radius: 5px;
-  cursor: pointer; max-width: 45%;
+  cursor: pointer; max-width: 45%; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 #aichat .ai-name:hover { color: #79c0ff; text-decoration: underline; }
 #aichat .ai-name:focus-visible { outline: 2px solid #58a6ff; }
+/* the state pill is a BUTTON - it opens the settings dialog */
 #aichat .ai-pill {
-  flex: none; font-size: 10px; border-radius: 8px; padding: 1px 7px;
-  border: 1px solid #30363d; color: #8b949e;
+  flex: none; font: inherit; font-size: 10px; border-radius: 8px;
+  padding: 1px 7px; border: 1px solid #30363d; color: #8b949e;
+  background: transparent; cursor: pointer;
 }
+#aichat .ai-pill:hover { color: #e6edf3; border-color: #79c0ff; }
 #aichat .ai-pill.ro { color: #d29922; border-color: #d29922; }
 #aichat .ai-pill.rw { color: #f85149; border-color: #f85149; }
+/* the text cells (name/ctx/usage) shrink+ellipsis first, the icon
+   buttons are flex:none - a wide usage label can never push the
+   header controls out of the 400px card */
 #aichat .ai-ctx {
-  flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap; font-size: 11px; color: #8b949e;
+  flex: 0 1 auto; min-width: 0; max-width: 40%; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; font-size: 11px;
+  color: #8b949e;
   border: 1px solid #30363d; border-radius: 9px; padding: 1px 8px;
 }
 #aichat .ai-flex { flex: 1; min-width: 0; }
-#aichat .ai-usage { flex: none; font-size: 11px; color: #8b949e; }
+#aichat .ai-usage { flex: 0 1 auto; min-width: 0; font-size: 11px;
+  color: #8b949e; }
 #aichat .ai-hbtn {
   flex: none; background: #21262d; border: 1px solid #30363d;
   color: #8b949e; border-radius: 6px; font: inherit; font-size: 12px;
@@ -211,10 +219,11 @@
 
 /* header usage chip: a <details> dropdown with the conversation-level
    breakdown (grand total, per-model split, unpriced honesty) */
-#aichat .ai-usage { flex: none; position: relative; font-size: 11px;
-  color: #8b949e; max-width: 40%; }
+#aichat .ai-usage { flex: 0 1 auto; min-width: 0; position: relative;
+  font-size: 11px; color: #8b949e; max-width: 40%; }
 #aichat .ai-usage summary { cursor: pointer; list-style: none;
   padding: 2px 4px; border-radius: 5px; white-space: nowrap;
+  max-width: 100%;
   overflow: hidden; text-overflow: ellipsis; }
 #aichat .ai-usage summary::-webkit-details-marker { display: none; }
 #aichat .ai-usage summary:hover { color: #e6edf3; }

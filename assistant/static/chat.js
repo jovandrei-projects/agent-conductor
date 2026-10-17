@@ -667,9 +667,10 @@ function paint() {
       : S.defaults ? S.defaults.readonly !== false : true;
     pill.textContent = ro ? 'read-only' : 'actions on';
     pill.className = 'ai-pill ' + (ro ? 'ro' : 'rw');
-    pill.title = ro
+    pill.title = (ro
       ? 'the assistant can read the dashboard but cannot change anything'
-      : 'the assistant may propose actions for your confirmation';
+      : 'the assistant may propose actions for your confirmation') +
+      ' - open assistant settings';
   }
   var use = byId('ai-usage');
   if (use) {
@@ -746,6 +747,19 @@ function statusLine(msg) {
 }
 
 /* ------------------------------------------------------------- convs */
+function normConv(c) {
+  /* sqlite keeps fast/readonly as INTEGER 0/1 - the wire record carries
+     ints, and `0 !== false` is TRUE in JS, so any `!== false` check
+     (the settings form's checkbox seeding) misreads a saved 'off' as
+     'on'. Coerce once at ingest; an absent key keeps the safe
+     read-only default */
+  if (c) {
+    c.fast = !!c.fast;
+    c.readonly = c.readonly !== false && c.readonly !== 0;
+  }
+  return c;
+}
+
 async function ensureConv() {
   if (S.conv) return S.conv;
   var env = curCtx();
@@ -755,7 +769,7 @@ async function ensureConv() {
   var out = await aapi('POST', '/conversations', {
     client_ref: S.convRef, title: '', origin: env
   });
-  S.conv = out.conversation || out;
+  S.conv = normConv(out.conversation || out);
   S.convRef = uid('conv');            // next attempt gets a fresh ref
   store('ac-ai-conv', convId());
   return S.conv;
@@ -765,7 +779,7 @@ async function loadConv(id) {
   var out = await aapi('GET',
     '/conversations/' + encodeURIComponent(id));
   if (!out.conversation) throw new Error('conversation not found');
-  S.conv = out.conversation;
+  S.conv = normConv(out.conversation);
   S.msgs = out.items || [];
   /* slots pushed into S.attach during the load window belong to OTHER
      conversations (their ensureConv created its own) - re-park them
@@ -1346,6 +1360,12 @@ function famIsFastBrand(fam) {
     String(fam || '').replace(/[._]/g, '-'));
 }
 
+function roBool(v) {
+  /* wire `readonly` is a sqlite int 0/1 - only an explicit off (false or
+     0) means off; a missing key keeps the safe default (read-only) */
+  return v !== false && v !== 0;
+}
+
 function settingsForm() {
   var cur = S.conv
     ? { model: S.conv.model, effort: S.conv.effort, fast: S.conv.fast,
@@ -1357,7 +1377,7 @@ function settingsForm() {
   /* draft selection lives in S.sel - the dialog never re-reads control
      values, so partial DOMs cannot desync it */
   S.sel = { model: fam, effort: cur.effort || '', fast: !!cur.fast,
-    readonly: cur.readonly !== false };
+    readonly: roBool(cur.readonly) };
   var catDown = !fams.length;
   var sel = byId('ais-model');
   if (sel) {
@@ -1380,7 +1400,7 @@ function settingsForm() {
   refillEffort();
   var fast = byId('ais-fast'), ro = byId('ais-ro');
   if (fast) fast.checked = !!cur.fast;
-  if (ro) ro.checked = cur.readonly !== false;
+  if (ro) ro.checked = S.sel.readonly;
   settingsNotes();
 }
 
@@ -1524,7 +1544,7 @@ async function saveSettings() {
       var out = await aapi('POST',
         '/conversations/' + encodeURIComponent(convId()) + '/settings',
         body);
-      S.conv = out.conversation || out;
+      S.conv = normConv(out.conversation || out);
     } else {
       var dres = await aapi('POST', '/settings', body);
       S.defaults = (dres && dres.defaults) || S.defaults;
@@ -1687,7 +1707,8 @@ function injectDom() {
       'aria-label="Ask AI assistant" hidden>' +
     '<div class="ai-head">' +
       '<button type="button" id="ai-name" class="ai-name"></button>' +
-      '<span id="ai-state" class="ai-pill ro">read-only</span>' +
+      '<button type="button" id="ai-state" class="ai-pill ro">' +
+        'read-only</button>' +
       '<span id="ai-ctx" class="ai-ctx">about: dashboard</span>' +
       '<span class="ai-flex"></span>' +
       '<details id="ai-usage" class="ai-usage">' +
@@ -1792,6 +1813,12 @@ function bind() {
     var t = e.target && e.target.closest ? e.target : null;
     var lb = t && t.closest && t.closest('[data-ask-ai]');
     if (lb) { e.preventDefault(); toggleChat(); return; }
+    /* light-dismiss the header usage dropdown - a native <details>
+       stays open until its summary is clicked again, so a click on any
+       neutral surface closes it here (a click inside it is left alone) */
+    var ud = byId('ai-usage');
+    if (ud && ud.open && !(t && t.closest && t.closest('#ai-usage')))
+      ud.open = false;
   });
   var chat = byId('aichat');
   if (chat) {
@@ -1815,6 +1842,7 @@ function bind() {
       if ((el = t.closest('#ai-hist'))) {
         S.rail = !S.rail; if (S.rail) loadConvs(); paint(); return; }
       if ((el = t.closest('#ai-name'))) { openSettings(); return; }
+      if ((el = t.closest('#ai-state'))) { openSettings(); return; }
       if ((el = t.closest('#ai-new'))) { newConv(); return; }
       if ((el = t.closest('[data-ai-set]'))) { openSettings(); return; }
       if ((el = t.closest('[data-ai-note-x]'))) { note(''); return; }
@@ -1835,9 +1863,12 @@ function bind() {
     chat.addEventListener('keydown', function (e) {
       if (e.key === 'Escape') {
         e.stopPropagation();
-        if (byId('aisetwrap') && !byId('aisetwrap').hidden)
+        var ud = byId('ai-usage');
+        if (ud && ud.open) {            // topmost layer dismisses first
+          ud.open = false;
+        } else if (byId('aisetwrap') && !byId('aisetwrap').hidden) {
           closeSettings();
-        else minimize();
+        } else minimize();
         e.preventDefault();
         return;
       }
