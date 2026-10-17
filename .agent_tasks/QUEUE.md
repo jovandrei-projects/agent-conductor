@@ -24,6 +24,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 11 | Interrupt + instruct: stop+resume a running step with added instructions/screenshots, exactly-once across races/restarts | done | interrupt-with-instructions/ | intrq sentinel -> rnote fold -> same-step respawn (not a retry); late/stop-wins banking, restart exactly-once; composer+ctx UI, attach reuse; 303/303 + demo green |
 | 12 | Run/task review UX: ack state + outcome summaries + nav/timing/merge-guard pass | in progress | run-review-ux/ | manifest run 20261016-100852-run-review-ux; design in run-review-ux/DESIGN.md; all impl steps merged incl. integration-verification (merge e6655ad), 1 step left (follow-up-plan) |
 | 13 | Project-aware merge targets: merge_target key + conductor merge worktree + persisted target + dashboard branch selector | done | project-merge-targets/ | 247/247 mock tests + demo green; wave step of run 20261016-013719-workflow-ux-safety; landed on master via merge 6a40935 |
+| 14 | Dashboard What's new tour: persistent state + feeds + API + walkthrough UI + optional LLM polish | in progress | dashboard-whats-new/ | manifest run 20261017-145726-dashboard-whats-new; tour-state done (tour_state.py + 26 tests), tour-feeds next |
 
 ## Not yet filed as tasks
 
@@ -1187,3 +1188,31 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   driver_started_at ('still has a live conductor') - driver_alive is
   patched out for that assertion, its subject is prep-history never
   being runnable.
+- DONE 2026-10-17 (tour-state, wave step of run
+  20261017-145726-dashboard-whats-new): persistent state + watermark for
+  the dashboard 'What's new' tour, new stdlib-only module tour_state.py
+  (conductor.py untouched - routes/UI are later steps). State lives in
+  data/tour-state.json as exactly {watermark, viewed[], snoozed[]};
+  every mutation is a module-lock-serialized read-modify-write persisted
+  by tmp+os.replace (Windows PermissionError retry like save_state).
+  Watermark = {commit, at, origin}: commit is a RESOLVED sha bounding
+  `git log <commit>..<boundary.commit>`, at an ISO instant bounding the
+  record feeds (created_at/ended_at/registered). It is never symbolic
+  HEAD and never serve_boot; nothing touches it at serve start - a
+  restart neither acknowledges nor erases unviewed changes. First init
+  writes {commit:null, at:null, origin:'init'} - nothing acknowledged -
+  rather than silently pinning HEAD, so a lost/corrupt file re-presents
+  changes instead of hiding them (corrupt files are quarantined
+  .corrupt-<ts>, bytes kept). An unavailable recorded revision stays
+  recorded and reports watermark_status available=False; advancement is
+  refused while it is unresolvable. Transitions: mark_viewed is the only
+  watermark mover and only when the caller's remaining_new is empty -
+  it lands at the feed's captured boundary, never fresh HEAD, so commits
+  arriving mid-acknowledgment stay new; snooze defers (mutually
+  exclusive membership, doesn't pin the watermark); unview flags
+  unviewed_at and keeps the descriptor's {base,tip} range so entries
+  behind the watermark stay retrievable and resurface as new.
+  26 new TourState tests in tests/test_tour_state.py (init, serve_boot,
+  dead revision, boundary math incl. stale/descendant/time-clamp guards,
+  transitions, history-after-advance, mid-ack arrivals, 20-thread no-
+  lost-update).
