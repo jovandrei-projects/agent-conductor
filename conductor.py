@@ -410,6 +410,10 @@ class Step:
     device_boot: bool | None = None    # None: boot an AVD only for device=
                                        # "emulator"; True: "any" may boot too;
                                        # False: never boot, attached only.
+    depends_on: tuple[str, ...] = ()   # step names that must reach a terminal
+                                       # state first - 'failed'/'skipped' count
+                                       # (merge glitches never strand later
+                                       # work); running/queued/waiting hold it
 
 
 @dataclasses.dataclass
@@ -568,6 +572,15 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
         if vt <= 0:
             raise ManifestError(
                 f"step {merged['name']!r}: verify_timeout_min must be > 0")
+        deps = merged.get("depends_on", ())
+        if isinstance(deps, str):
+            deps = (deps,)
+        elif isinstance(deps, list):
+            deps = tuple(deps)
+        if not all(isinstance(d, str) and d for d in deps):
+            raise ManifestError(
+                f"step {merged['name']!r}: depends_on must name steps "
+                "(a string or list of strings)")
         # Device ownership: step > [defaults] > the project's registry entry
         # (a mobile slug may declare `device = "emulator"` once, like
         # `verify`). A cloud step can't see local adb devices - inheriting
@@ -623,7 +636,7 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
             merge_resolver=bool(mr), merge_target=mt, max_attempts=ma,
             stall_min=float(merged.get("stall_min", 20)),
             device=device, device_wait_s=device_wait_s,
-            device_boot=device_boot))
+            device_boot=device_boot, depends_on=deps))
     if not steps:
         raise ManifestError("manifest has no [[step]] entries")
     max_parallel = run.get("max_parallel")
@@ -652,6 +665,43 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
         if not isinstance(run_mt, str):
             raise ManifestError("run.merge_target must be a branch name string")
         run_mt = run_mt.strip() or None
+    if "depends_on" in defaults:
+        raise ManifestError(
+            "depends_on belongs on [[step]] - a [defaults] value would "
+            "give every step the same dependency")
+    # Dependency graph: names must resolve, no self-deps, no cycles, and
+    # every dep must be dispatchable no later than its dependent - an
+    # earlier-listed step, a same-wave sibling, or anything under
+    # parallel = true (the shared pool is eligibility-scheduled). A dep
+    # on a later group could never satisfy: groups dispatch in order.
+    byname = {s.name: s for s in steps}
+    order = {s.name: i for i, s in enumerate(steps)}
+    for s in steps:
+        for dep in s.depends_on:
+            if dep == s.name:
+                raise ManifestError(
+                    f"step {s.name!r}: cannot depend on itself")
+            d = byname.get(dep)
+            if d is None:
+                raise ManifestError(
+                    f"step {s.name!r}: unknown depends_on {dep!r}")
+            if order[dep] > order[s.name] and not (
+                    parallel or (s.wave is not None and d.wave == s.wave)):
+                raise ManifestError(
+                    f"step {s.name!r}: depends_on {dep!r} dispatches later "
+                    "- reorder the manifest or give both steps the same wave")
+    color: dict[str, int] = {s.name: 0 for s in steps}   # 0/1/2 dfs marks
+    def _dep_dfs(n: str) -> None:
+        color[n] = 1
+        for dep in byname[n].depends_on:
+            if color[dep] == 1:
+                raise ManifestError(f"depends_on cycle through {dep!r}")
+            if color[dep] == 0:
+                _dep_dfs(dep)
+        color[n] = 2
+    for s in steps:
+        if color[s.name] == 0:
+            _dep_dfs(s.name)
     return Manifest(path=path, name=name, on_failure=on_failure,
                     checkpoint=bool(run.get("checkpoint", True)),
                     preamble=preamble, max_hours=run.get("max_hours"),
@@ -762,6 +812,22 @@ def validate_groups(groups: list[list]) -> None:
                 raise ManifestError(
                     f"wave collision: {len(ss)} parallel steps ({names}) share "
                     f"{d} - set worktree=true on all of them")
+
+
+DEP_WAIT_STATUSES = frozenset(
+    {"running", "queued", "waiting", "planned", "pending"})
+
+
+def deps_unmet(step: "Step", state: dict) -> list[str]:
+    """depends_on names still non-terminal: dispatched/queued/waiting or
+    never attempted (no record). A dep satisfies on ANY terminal record -
+    'failed', 'stopped' and 'skipped' count: merge-park glitches and red
+    outcomes must not strand later work - the dependent agent can recover
+    or fetch the parked branch's files itself."""
+    recs = state.get("steps") or {}
+    return [dep for dep in step.depends_on
+            if (recs.get(dep) or {}).get("status") in
+            (None, *DEP_WAIT_STATUSES)]
 
 
 # ---------------------------------------------------------------- spawn
@@ -1975,6 +2041,54 @@ def log_event(run_dir: Path, **kv) -> None:
             f.write(line + "\n")
 
 
+def _run_hist_file(run_dir: Path) -> Path:
+    """Per-run USER-action history - kept in the flag dir, not run_dir,
+    so dashboard writes never trip a live worker's user-edit-awareness
+    (trap 5). events.jsonl itself stays driver-owned; the modals merge
+    both feeds."""
+    return _flag_dir() / f"hist-{_flag_key(run_dir)}.jsonl"
+
+
+def log_user_event(run_dir: Path, **kv) -> None:
+    """Best-effort audit line for dashboard-side actions (prompt edits,
+    notes, review marks, timeout changes, control clicks). A failed
+    history write must never fail the action it annotates."""
+    try:
+        _flag_dir().mkdir(exist_ok=True)
+        with open(_run_hist_file(run_dir), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": now_iso(), "by": "dashboard",
+                                **kv}, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def run_events(run_dir: Path, limit: int = 2000) -> list[dict]:
+    """Merged run history for the modals: the driver's events.jsonl plus
+    the dashboard's flag-dir action log, sorted oldest-first and capped
+    at the newest `limit` entries."""
+    out: list[dict] = []
+    for src, tag in ((run_dir / "events.jsonl", "run"),
+                     (_run_hist_file(run_dir), "ui")):
+        try:
+            lines = src.read_text(encoding="utf-8",
+                                  errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict):
+                ev["src"] = tag
+                out.append(ev)
+    out.sort(key=lambda e: str(e.get("ts") or ""))
+    return out[-limit:]
+
+
 def tail_status(stdout_log: Path) -> str | None:
     """The worker's terminal STATUS: line. Reads the WHOLE log, not a
     tail: an agent that prints 'STATUS: done' then a long closing report
@@ -2935,6 +3049,8 @@ def summarize_run_start(name: str, runs_dir: Path = RUNS_DIR,
         _summary_marker(d).write_text(str(pid), encoding="utf-8")
     except OSError:
         pass
+    log_user_event(d, event="run_summary_requested", pid=pid,
+                   model=model or None)
     return {"summarizing": name, "pid": pid}
 
 
@@ -4476,8 +4592,18 @@ def _slot_dir() -> Path:
                 or Path(tempfile.gettempdir()) / "agent-conductor-slots")
 
 
+MAX_AGENT_CAP = 32        # sanity ceiling on the live cap control -
+                          # the box physically cannot use more
+
+
+def _slot_cap_file() -> Path:
+    return _slot_dir() / "cap.json"
+
+
 def agent_slot_cap() -> int:
     """Machine-wide concurrent-agent ceiling. CONDUCTOR_MAX_AGENTS wins;
+    then the dashboard's live cap file (POST /api/pool writes it - every
+    driver re-reads it each slot poll, so a change lands mid-wait);
     otherwise 4..8 scaled to the box (never below 4 - four parallel
     sessions are proven fine on this machine)."""
     raw = os.environ.get("CONDUCTOR_MAX_AGENTS")
@@ -4488,7 +4614,29 @@ def agent_slot_cap() -> int:
                 return n
         except ValueError:
             pass
+    try:
+        n = int(json.loads(
+            _slot_cap_file().read_text(encoding="utf-8"))["cap"])
+        if n >= 1:
+            return min(n, MAX_AGENT_CAP)
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
     return max(4, min(DEFAULT_AGENT_CAP, os.cpu_count() or 8))
+
+
+def set_agent_cap(n: int) -> dict:
+    """POST /api/pool: persist the machine-wide cap; drivers pick it up
+    within SLOT_POLL_S. Lowering never kills running agents - it only
+    stops queued steps from leasing."""
+    if not isinstance(n, int) or isinstance(n, bool)             or not 1 <= n <= MAX_AGENT_CAP:
+        raise RequestError(f"cap must be an integer 1..{MAX_AGENT_CAP}")
+    f = _slot_cap_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"cap": n, "set_at": now_iso()}),
+                   encoding="utf-8")
+    os.replace(tmp, f)
+    return _slots_view()
 
 
 def _slot_info(path: Path) -> dict:
@@ -4671,12 +4819,15 @@ def _agent_slot_acquire(step: Step, run_dir: Path, state: dict,
     its own timeout. Halt/skip sentinels work while queued. The step
     record carries slot_wait=True + a note naming the holders so the
     dashboard queue shows who's ahead."""
-    cap = agent_slot_cap()
     t_wait = time.time()
     last_save = 0.0
     last_note = None
     wait_logged = False
     while True:
+        # re-read every poll: POST /api/pool changes the cap mid-wait -
+        # a raise frees this step on the next tick, a drop just keeps it
+        # queued (running agents are never preempted)
+        cap = agent_slot_cap()
         halt = _flag_set(stop_flag(run_dir), stop_flag(run_dir, step.name),
                          pause_flag(run_dir), drain_flag(run_dir))
         skipped = halt is None and skip_flag(run_dir, step.name).is_file()
@@ -5982,13 +6133,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         # target, so none of them can silently fall back to main.
         with STATE_LOCK:
             for step, _s, _w, _r, _b, _n, _g in prepared:
-                state["steps"].setdefault(step.name, {}).update(
-                    status="queued", name=step.name, wt=step.worktree,
-                    cloud=step.cloud,
-                    merge_target=targets.get(step.name))
+                rec = state["steps"].setdefault(step.name, {})
+                rec.update(status="queued", name=step.name, wt=step.worktree,
+                           cloud=step.cloud,
+                           merge_target=targets.get(step.name),
+                           deps=list(step.depends_on) or None)
+                unmet = deps_unmet(step, state)
+                if unmet:
+                    rec.update(dep_wait=unmet,
+                               note="waiting on step(s): "
+                                    + ", ".join(unmet))
             save_state(run_dir, state)
 
-        if len(prepared) == 1:
+        has_deps = any(s.depends_on for s, *_ in prepared)
+        if len(prepared) == 1 and not has_deps:
             step, slug, work_dir, repo_dir, branch, rnote, _dg = prepared[0]
             statuses = {step.name: run_step(step, slug, work_dir, cfg,
                                             run_dir, devin_argv, state,
@@ -5999,19 +6157,59 @@ def cmd_run(args: argparse.Namespace) -> int:
             hub_update(tid, state)
         else:
             statuses = {}
+            pending = list(prepared)
+            futs: dict = {}
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(len(prepared), cap)) as ex:
-                futs = {ex.submit(run_step, step, slug, work_dir, cfg,
-                                  run_dir, devin_argv, state,
-                                  do_checkpoint=(branch is None),
-                                  branch=branch,
-                                  resume_note=rnote,
-                                  repo_dir=repo_dir): step.name
-                        for step, slug, work_dir, repo_dir, branch, rnote, _g
-                        in prepared}
-                for f in concurrent.futures.as_completed(futs):
-                    statuses[futs[f]] = f.result()
-                    hub_update(tid, state)
+                while pending or futs:
+                    for pm in list(pending):
+                        unmet = deps_unmet(pm[0], state)
+                        rec = state["steps"].get(pm[0].name)
+                        if rec is not None and                                 unmet != (rec.get("dep_wait") or []):
+                            with STATE_LOCK:
+                                rec["dep_wait"] = unmet or None
+                                if unmet:
+                                    rec["note"] = ("waiting on step(s): "
+                                                   + ", ".join(unmet))
+                                elif (rec.get("note") or "").startswith(
+                                        "waiting on step"):
+                                    rec["note"] = None
+                                save_state(run_dir, state)
+                        if unmet:
+                            continue
+                        pending.remove(pm)
+                        step, slug, work_dir, repo_dir, branch, rnote, _dg = pm
+                        futs[ex.submit(
+                            run_step, step, slug, work_dir, cfg,
+                            run_dir, devin_argv, state,
+                            do_checkpoint=(branch is None),
+                            branch=branch,
+                            resume_note=rnote,
+                            repo_dir=repo_dir)] = step.name
+                    if not futs:
+                        # No live dispatcher can resolve the rest (a dep
+                        # was filtered out or never got a record) - skip
+                        # them rather than hang the wave forever.
+                        for pm in pending:
+                            unmet = deps_unmet(pm[0], state)
+                            with STATE_LOCK:
+                                state["steps"].setdefault(
+                                    pm[0].name, {}).update(
+                                    status="skipped", dep_wait=None,
+                                    ended_at=now_iso(),
+                                    note="dependency never resolved: "
+                                         + ", ".join(unmet))
+                                save_state(run_dir, state)
+                            log_event(run_dir, event="step_dep_blocked",
+                                      step=pm[0].name, deps=unmet)
+                            statuses[pm[0].name] = "skipped"
+                        break
+                    done, _ = concurrent.futures.wait(
+                        futs,
+                        return_when=concurrent.futures.FIRST_COMPLETED)
+                    for f in done:
+                        statuses[futs.pop(f)] = f.result()
+                        hub_update(tid, state)
 
         # Merge worktree branches back into their recorded targets,
         # in manifest order. The merge runs in the main checkout when the
@@ -7677,7 +7875,8 @@ def _publish_proposal(rec: dict, text: str, requests_dir: Path,
                    "effort": s.effort, "mode": s.mode,
                    "task": task_summary(s.prompt), "wt": s.worktree,
                    "mt": s.merge_target, "merge": s.merge,
-                   "cloud": s.cloud} for s in cfg.steps])
+                   "cloud": s.cloud,
+                   "deps": list(s.depends_on) or None} for s in cfg.steps])
     # The gen baseline moved to what this publish was built from, but the
     # option fields can still diverge from a hand-edited TOML - compute
     # rather than assume clean.
@@ -8016,7 +8215,8 @@ def _followup_apply(rec: dict, text: str, manifests_dir: Path,
                 "step": s.name, "slug": s.project, "model": s.model,
                 "effort": s.effort, "mode": s.mode,
                 "task": task_summary(s.prompt), "wt": s.worktree,
-                "cloud": s.cloud} for s in cfg.steps])
+                "cloud": s.cloud,
+                "deps": list(s.depends_on) or None} for s in cfg.steps])
         pend = _pending_actions(rec)
         rec["stale"] = bool(pend["gen"] or pend["opts"])
     else:
@@ -8694,6 +8894,16 @@ local branch the step's worktree branch is created from and merged back into
 instead of the checkout's current branch; it requires worktree = true.
 {branches_hint}Omit merge_target unless the human named one - a guessed
 branch name fails validation.
+depends_on = ["step-name", ...] (optional, per [[step]], never [defaults])
+holds a step until every named step reaches a terminal state - 'failed'
+counts, so a merge glitch never strands later work; a dep must name an
+earlier step or a same-wave sibling (under [run] parallel = true anything
+goes). Use it when later work needs earlier output (filenames, APIs,
+research notes the predecessor should leave behind for it) - a trailing
+'follow-up-plan' style step should depend on the rest. When the request
+asks for parallelism, make a best effort: pack independent steps into
+shared waves (or run.parallel) and keep only real prerequisites in
+depends_on.
 {verify_hint}Do not reproduce credentials or private data in the tracked manifest; refer
 agents to the project files containing those details instead.
 The proposal must NOT start work; the human will edit it and launch later.
@@ -9747,6 +9957,8 @@ def resume_run(name: str, runs_dir: Path = RUNS_DIR,
         _RESUME_PIDS[name] = _launch_process(cmd, d / "resume.launch.log")
     except OSError as exc:
         raise RequestError("Could not start the conductor process", 500) from exc
+    log_user_event(d, event="run_resume_requested",
+                   pid=_RESUME_PIDS[name])
     return {"resumed": name, "pid": _RESUME_PIDS[name]}
 
 
@@ -10300,6 +10512,9 @@ def merge_run_start(name: str, runs_dir: Path = RUNS_DIR,
         _MERGE_PIDS[name] = _launch_process(cmd, d / "merge.launch.log")
     except OSError as exc:
         raise RequestError("Could not start the merge process", 500) from exc
+    log_user_event(d, event="run_merge_requested",
+                   pid=_MERGE_PIDS[name],
+                   steps=only if only else None)
     return {"merging": name, "pid": _MERGE_PIDS[name]}
 
 
@@ -10604,7 +10819,9 @@ def stop_step(run_name: str, step_name: str,
     # NB no log_event here: while a step is live, run_dir can sit inside
     # the worker's watched cwd (self-hosted run) - writing events.jsonl
     # would itself trip user-edit-awareness (trap 5). The conductor logs
-    # step_stopped/run_stop itself.
+    # step_stopped/run_stop itself; the flag-dir history file is outside
+    # every watched cwd and safe to append.
+    log_user_event(d, event="step_stop_requested", step=step_name)
     return {"stopping": step_name}
 
 
@@ -10677,7 +10894,10 @@ def interrupt_step(run_name: str, step_name: str, body: dict,
     # run, sibling steps, or the dashboard's process).
     if rec.get("pid"):
         _kill_pid(rec["pid"], rec.get("started_at"))
-    # NB no log_event here for the same trap-5 reason as stop_step.
+    # Same trap-5 rule as stop_step - the flag-dir history is safe.
+    log_user_event(d, event="step_interrupt_requested", step=step_name,
+                   chars=len(instructions), preview=instructions[:300],
+                   attachments=len(attachments))
     return {"interrupting": step_name}
 
 
@@ -10708,8 +10928,10 @@ def skip_step(run_name: str, step_name: str, body: dict,
                 "works on steps that have not run", 409)
         _flag_raise(skip_flag(d, step_name).name)
         # Same trap-5 rule as stop_step: flag files only, never state.json.
+        log_user_event(d, event="step_skip_requested", step=step_name)
         return {"skipped": step_name}
     skip_flag(d, step_name).unlink(missing_ok=True)
+    log_user_event(d, event="step_unskip_requested", step=step_name)
     return {"unskipped": step_name,
             "turn_passed": (rec or {}).get("status") == "skipped"}
 
@@ -10770,10 +10992,12 @@ def stop_run(run_name: str, body: dict,
                 _flag_raise(f.name)
         live = [n for n, r in (st.get("steps") or {}).items()
                 if r.get("status") == "running" and step_live(r, driver_alive(st))]
+        log_user_event(d, event="run_pause_requested", live=len(live))
         return {"pausing": live}
     if body.get("drain"):
         for f in drain_flags_for(d, st):
             _flag_raise(f.name)
+        log_user_event(d, event="run_drain_requested")
         return {"draining": run_name}
     for f in stop_flags_for(d, st):
         _flag_raise(f.name)
@@ -10784,6 +11008,7 @@ def stop_run(run_name: str, body: dict,
                   st["steps"][n].get("started_at"))
         for f in stop_flags_for(d, st, n):
             _flag_raise(f.name)
+    log_user_event(d, event="run_stop_requested", live=len(live))
     return {"stopping": live}
 
 
@@ -10806,6 +11031,7 @@ def set_run_archived(run_name: str, body: dict,
     else:
         st.pop("archived", None)
     save_state(d, st)
+    log_user_event(d, event="run_archive_mark", archived=archived)
     return {"run": run_name, "archived": archived}
 
 
@@ -11096,10 +11322,13 @@ def delete_run(run_name: str, body: dict, runs_dir: Path = RUNS_DIR,
     # lands under its old name, but deliberately starts flag-clean: an
     # interrupted skip/stop decision is not something a restore replays.
     for f in _flag_dir().glob(f"*{_flag_key(d)}*"):
+        if f.name.startswith("hist-"):
+            continue          # audit, not a control sentinel
         try:
             f.unlink()
         except OSError:
             pass
+    log_user_event(d, event="run_trashed", trash_id=meta["id"])
     for prefix in ("stop", "drain", "pause"):
         try:
             (_flag_dir() / f"{prefix}-{_safe_name(d.name)}").unlink(
@@ -11155,6 +11384,8 @@ def set_step_timeout(run_name: str, step_name: str, body: dict,
     except OSError as exc:
         raise RequestError(f"Could not write the timeout flag: {exc}",
                            500) from exc
+    log_user_event(d, event="step_timeout_changed", step=step_name,
+                   minutes=minutes)
     return {"timeout_min": minutes}
 
 
@@ -11183,6 +11414,8 @@ def set_step_prompt(run_name: str, step_name: str, body: dict,
         _flag_dir().mkdir(exist_ok=True)
         if body.get("prompt") is None:
             flag.unlink(missing_ok=True)
+            log_user_event(d, event="step_prompt_reverted",
+                           step=step_name)
             return {"prompt_override": None}
         if not isinstance(body["prompt"], str):
             raise RequestError("prompt must be text")
@@ -11192,6 +11425,8 @@ def set_step_prompt(run_name: str, step_name: str, body: dict,
     except OSError as exc:
         raise RequestError(f"Could not write the prompt flag: {exc}",
                            500) from exc
+    log_user_event(d, event="step_prompt_edited", step=step_name,
+                   chars=len(body["prompt"]))
     return {"prompt_override": body["prompt"]}
 
 
@@ -11224,6 +11459,7 @@ def set_step_notes(run_name: str, step_name: str, body: dict,
         _flag_dir().mkdir(exist_ok=True)
         if body.get("notes") in (None, ""):
             flag.unlink(missing_ok=True)
+            log_user_event(d, event="step_notes_cleared", step=step_name)
             return {"resume_notes": None}
         if not isinstance(body["notes"], str):
             raise RequestError("notes must be text")
@@ -11234,6 +11470,8 @@ def set_step_notes(run_name: str, step_name: str, body: dict,
     except OSError as exc:
         raise RequestError(f"Could not write the notes flag: {exc}",
                            500) from exc
+    log_user_event(d, event="step_notes_updated", step=step_name,
+                   chars=len(body["notes"]))
     return {"resume_notes": body["notes"]}
 
 
@@ -11336,6 +11574,8 @@ def _set_review(run_name: str, step_name: str | None, body: dict,
             pass
         else:
             save_state(d, st)
+    log_user_event(d, event="review_marked",
+                   step=step_name, reviewed=reviewed)
     return {"run": run_name, "step": step_name, "review": out,
             "needs_review": _needs_review(seq, out)}
 
@@ -12043,6 +12283,7 @@ def proposal_agent(step: dict, rec: dict, projects: dict, key: str,
             "session_id": None, "model": step.get("model"),
             "effort": step.get("effort"), "mode": step.get("mode"),
             "task": step.get("task"), "task_full": None, "purpose": None,
+            "depends_on": step.get("deps"), "dep_wait": None,
             "model_actual": None, "wt": step.get("wt"),
             "merge_target": step.get("mt"),
             "timeout_min": step.get("timeout_min"),
@@ -12381,14 +12622,21 @@ def _pending_merge_view(st: dict, eff: dict[str, str]) -> tuple[
 
 
 def serve_safety(runs_dir: Path, requests_dir: Path | None = None) -> dict:
-    """What the dashboard's Stop/Restart dialog warns about: live merge
-    activity (repo merge locks, MERGE_HEADs, run merge-claim flags -
-    a restart mid-merge can orphan the op), still-live steps (a
-    restart does not kill workers, but queued launches and post-wave
-    merges stop until a new driver/serve takes over), and this process's
-    own in-flight request work - planner generations and launches die
-    with the server, leaving the request 'generating'/'launching' until
-    the next sweep marks it interrupted."""
+    """What the dashboard's Stop/Restart dialog reports, in two restart-
+    risk tiers. HIGH - work coordinated by THIS serve process: a proposal
+    generation's planner child is detached but the drain thread that
+    publishes the proposal lives here, so a restart orphans it and the
+    spool sweep stamps the request 'interrupted'; a request launcher's
+    child also survives, but _LAUNCH_PIDS dies with this process, so a
+    'launching' record past its grace window can mislabel 'launch_failed'
+    until the run's state.json links it. LOW - detached work that
+    outlives the dashboard: step workers and their drivers, in-flight
+    merges (repo merge locks, MERGE_HEADs, merge-* claims are held by
+    detached children that finish on their own and clear them), and
+    serve-spawned resume/merge/summarize children tracked by pid. A
+    restart loses only the live progress view - the new serve re-adopts
+    state.json records and on-disk claims, so LOW items inform but never
+    arm the confirm gate."""
     tasks, merges = [], []
     for sj in sorted(runs_dir.glob("*/state.json")):
         try:
@@ -12449,8 +12697,18 @@ def serve_safety(runs_dir: Path, requests_dir: Path | None = None) -> dict:
             return _read_request(rid, requests_dir)
         except Exception:
             return {}
+    seen_gen: set[str] = set()
     for rid, proc in list(_GEN_PROCS.items()):
         if proc is not None and proc.poll() is None:
+            rec = _req_rec(rid)
+            seen_gen.add(rid)
+            generating.append({
+                "id": rid,
+                "label": str(rec.get("label") or rec.get("run") or rid)})
+    # a drain in progress has no live planner proc but is exactly as
+    # restart-fragile - the spool it is publishing from dies unread
+    for rid in list(_DRAINING):
+        if rid not in seen_gen:
             rec = _req_rec(rid)
             generating.append({
                 "id": rid,
@@ -12463,8 +12721,18 @@ def serve_safety(runs_dir: Path, requests_dir: Path | None = None) -> dict:
             launching.append({
                 "id": rid,
                 "label": str(rec.get("label") or rec.get("run") or rid)})
+    # Detached serve-spawned children (resume/merge/summarize) - every
+    # one survives a restart and cleans its own on-disk bookkeeping, so
+    # they are reported but stay low-risk.
+    jobs: list[dict] = []
+    for kind, table in (("resume", _RESUME_PIDS), ("merge", _MERGE_PIDS),
+                        ("summarize", _SUM_PIDS)):
+        for name, pid in list(table.items()):
+            if pid and pid_alive(pid):
+                jobs.append({"kind": kind, "target": name, "pid": pid})
     return {"tasks": tasks, "merges": merges,
-            "generating": generating, "launching": launching}
+            "generating": generating, "launching": launching,
+            "jobs": jobs}
 
 
 def _respawn_serve(args: argparse.Namespace) -> None:
@@ -12838,6 +13106,8 @@ def collect_dashboard(runs_dir: Path,
                 # dispatched (queued/skipped records are pre-spawn);
                 # anything that ran takes resume notes instead - the
                 # original prompt is left untouched on purpose.
+                "depends_on": rec.get("deps"),
+                "dep_wait": rec.get("dep_wait"),
                 "prompt_editable": rec.get("status") in
                 ("queued", "skipped"),
                 # re-runnable outcomes take 'resume notes'; still-waiting
@@ -13235,6 +13505,34 @@ h3.proj .sub { margin-bottom:0; font-weight:400; }
 .seg button { background:transparent; border:0; color:#8b949e;
   font:inherit; font-size:12px; padding:5px 11px; cursor:pointer; }
 .seg button.on { background:#1f6feb; color:#fff; }
+/* live machine-pool control: -/+ the concurrent-agent cap, value shows
+   leased slots / cap and goes amber while the pool is full */
+.poolbox { display:inline-flex; align-items:center; border:1px solid #30363d;
+  border-radius:7px; overflow:hidden; font-size:12px; }
+.poolbox button { background:transparent; border:0; color:#8b949e;
+  font:inherit; padding:5px 8px; cursor:pointer; }
+.poolbox button:hover:not(:disabled) { color:#fff; background:#1f6feb; }
+.poolbox button:disabled { opacity:.35; cursor:default; }
+.poolbox #pool-val { padding:5px 9px; color:#e6edf3; min-width:64px;
+  text-align:center; border-left:1px solid #30363d;
+  border-right:1px solid #30363d; }
+.poolbox.full #pool-val { color:#d29922; }
+/* task/run history feed (driver events.jsonl + dashboard action log) */
+.evlog { margin:6px 0 10px; max-height:220px; overflow:auto;
+  border:1px solid #21262d; border-radius:7px; }
+.evrow { display:grid; grid-template-columns:70px 30px 1fr; gap:8px;
+  padding:4px 10px; border-bottom:1px solid #161b22; font-size:12px;
+  align-items:baseline; }
+.evrow:last-child { border-bottom:0; }
+.evtime { color:#8b949e; white-space:nowrap; font-size:11px; }
+.evtag { font-size:9px; padding:1px 5px; border-radius:8px;
+  background:#21262d; color:#8b949e; text-transform:uppercase;
+  text-align:center; }
+.evtag.ui { background:#1c3041; color:#79b8ff; }
+.evtxt { color:#c9d1d9; overflow:hidden; text-overflow:ellipsis; }
+.evtxt .evd { color:#8b949e; }
+.evempty { padding:12px; color:#6e7681; font-size:12px;
+  text-align:center; }
 table { border-collapse:collapse; width:100%; table-layout:fixed; }
 th { position:sticky; top:var(--topbar-h,110px); z-index:7;
   background:#0d1117; text-align:left; font-weight:600; color:#8b949e;
@@ -13617,6 +13915,7 @@ td :is(a,button):focus-visible { outline-offset:-2px; }
 #detail .notice.warn, #powerbox .notice.warn { border-color:#d29922; color:#e6edf3; }
 #detail .notice.error, #powerbox .notice.error { border-color:#f85149; color:#ffb2aa; }
 #powerbox .notice.ok { border-color:#3fb950; color:#c9d1d9; }
+#powerbox .notice.info { border-color:#58a6ff; color:#c9d1d9; }
 #detail details.proposal { margin-top:14px; }
 #detail details.proposal summary { cursor:pointer; color:#58a6ff; }
 #detail .proposal-list { margin-top:12px; padding-left:20px; }
@@ -13680,6 +13979,10 @@ tr.ctxanchor td { background:#1c3041; }
     <span class="sub" id="meta">loading&hellip;</span>
     <span class="tb-gap"></span>
     <button type="button" class="btn" id="new-request">New request</button>
+    <span class="poolbox" id="poolbox" role="group" aria-label="Parallel agents"
+      title="machine-wide parallel-agent cap - live slots / cap. Every driver re-checks the cap within seconds; raising it frees queued steps, lowering it never kills a running agent">
+      <button type="button" id="pool-dec" aria-label="one fewer parallel agent">&minus;</button><span id="pool-val">agents &hellip;</span><button type="button" id="pool-inc" aria-label="one more parallel agent">+</button>
+    </span>
     <button type="button" class="btn secondary" id="power-btn"
       title="stop or restart this dashboard - warns about merges and live tasks first">&#x23FB;</button>
     <div class="seg" id="density" role="group" aria-label="Row density">
@@ -14251,36 +14554,45 @@ let pwArmed = null;   // action the operator saw the fresh unsafe report
                       // for and still clicked again
 function powerBodyHtml(s){
   const m = s.merges || [], t = s.tasks || [],
-        g = s.generating || [], l = s.launching || [];
-  return (m.length
-      ? `<div class="notice error"><b>merge activity in progress</b>` +
-        `<ul>${m.map(x => `<li>${esc(x.where)} - ${esc(x.why)}</li>`)
-          .join('')}</ul>` +
-        `restarting now can orphan a merge mid-flight and leave the ` +
-        `repo's merge state or lock needing manual cleanup - waiting ` +
-        `for it to finish is the safe choice</div>` : '') +
-    (g.length
-      ? `<div class="notice error"><b>proposal generation in ` +
-        `progress</b><ul>` +
-        `${g.map(x => `<li>${esc(x.label)}</li>`).join('')}</ul>` +
-        `the planner runs inside this dashboard process - restarting ` +
-        `now kills it mid-flight and the request lands in error ` +
-        `('Planning was interrupted'); the previous proposal is kept, ` +
-        `but the planning session's work is lost</div>` : '') +
-    (l.length
-      ? `<div class="notice error"><b>run launch in progress</b><ul>` +
-        `${l.map(x => `<li>${esc(x.label)}</li>`).join('')}</ul>` +
-        `restarting now orphans the launcher - the run may still start ` +
-        `but the request record can wedge in 'Starting run' until a ` +
-        `sweep</div>` : '') +
+        g = s.generating || [], l = s.launching || [],
+        j = s.jobs || [];
+  const high = g.length + l.length;
+  const low = m.length + t.length + j.length;
+  return (high
+      ? `<div class="notice error"><b>interrupted or wedged by a ` +
+        `restart</b>` +
+        (g.length ? `<ul><li><b>proposal generation</b><ul>` +
+          `${g.map(x => `<li>${esc(x.label)}</li>`).join('')}</ul></li>` +
+          `</ul>the planner's drain lives in this dashboard process - ` +
+          `restarting orphans the generation and the request lands in ` +
+          `error ('Planning was interrupted'); the previous proposal is ` +
+          `kept, but the planning session's work is lost` : '') +
+        (l.length ? `<ul><li><b>run launch</b><ul>` +
+          `${l.map(x => `<li>${esc(x.label)}</li>`).join('')}</ul></li>` +
+          `</ul>the launcher itself is detached and keeps going, but ` +
+          `the dashboard's tracking of it dies - the request can ` +
+          `wedge in 'Starting run' (or briefly mislabel 'Start ` +
+          `failed') until the run's state links it` : '') +
+        `</div>` : '') +
     (t.length
-      ? `<div class="notice warn"><b>${t.length} task(s) live</b><ul>` +
+      ? `<div class="notice info"><b>keeps running through a ` +
+        `restart: ${t.length} task(s) live</b><ul>` +
         `${t.map(x => `<li>${esc(x.run)} / ${esc(x.step)} ` +
           `(${esc(x.status)})</li>`).join('')}</ul>` +
-        `workers keep running through a restart, but no new steps ` +
-        `launch and a merge firing mid-restart can miss its ` +
-        `window</div>` : '') +
-    (!m.length && !t.length && !g.length && !l.length
+        `workers and their drivers are detached processes - the ` +
+        `restart does not touch them and the new dashboard re-adopts ` +
+        `them from state.json</div>` : '') +
+    (m.length || j.length
+      ? `<div class="notice info"><b>detached jobs that finish on ` +
+        `their own</b><ul>` +
+        `${m.map(x => `<li>${esc(x.where)} - ${esc(x.why)}</li>`)
+          .join('')}` +
+        `${j.map(x => `<li>${esc(x.kind)} ${esc(x.target)} ` +
+          `(pid ${x.pid})</li>`).join('')}</ul>` +
+        `merges, resumes and summaries run in detached processes - a ` +
+        `restart only hides their live progress; they still complete ` +
+        `and clean up their own claims</div>` : '') +
+    (!high && !low
       ? `<div class="notice ok">nothing merging, planning or running ` +
         `- safe to restart</div>` : '');
 }
@@ -14315,11 +14627,10 @@ async function powerAct(action){
     return;
   }
   document.getElementById('pwbody').innerHTML = powerBodyHtml(s);
-  // merges + in-flight generations/launches die with this process;
-  // live steps survive but lose their driver windows - all four are
-  // 'see the warning, press again to confirm' conditions
-  if (((s.merges||[]).length || (s.tasks||[]).length ||
-       (s.generating||[]).length || (s.launching||[]).length) &&
+  // only serve-coordinated work (generation drain, launch bookkeeping)
+  // is genuinely broken by a restart - detached tasks/merges/jobs get a
+  // report, not a confirm gate
+  if (((s.generating||[]).length || (s.launching||[]).length) &&
       pwArmed!==action){
     pwArmed = action;   // the warning is now on screen - a repeat click
                         // is an informed choice, not a stale-read accident
@@ -14868,6 +15179,72 @@ function intrComposerHTML(a){
     `killed on the driver's next flag poll and the same step resumes ` +
     `with these instructions.</span></div>`;
 }
+// --- task/run history feed ----------------------------------------------
+// GET /api/runs/<dir>/events merges the driver's events.jsonl with the
+// dashboard's own action log; fetched lazily per open modal and re-read
+// at most every ~4s while the modal stays open.
+const histCache = {};   // run-dir name -> {at:ms, events:[..]|null}
+async function loadHist(dir){
+  try {
+    const d = await api('GET',
+      '/api/runs/'+encodeURIComponent(dir)+'/events');
+    histCache[dir] = {at:Date.now(), events:d.events||[]};
+  } catch (e) {
+    histCache[dir] = {at:Date.now(), events:[]};
+  }
+  // repaint whichever modal is open so fresh rows land without a
+  // re-open (loadHist is also fired by the 2s refresh via histFor)
+  if (detailIdx!=null && AGENTS[detailIdx] &&
+      base(AGENTS[detailIdx].run_dir||'')===dir)
+    showDetail(detailIdx, true);
+  else if (modalRunKey!=null){
+    const r = lastData && lastData.runs.find(x=>runKey(x)===modalRunKey);
+    if (r && base(r.dir)===dir) showRunDetails(modalRunKey);
+  }
+}
+function histFor(dir){
+  const c = histCache[dir];
+  if (!c){ histCache[dir] = {at:0, events:null}; loadHist(dir); return null; }
+  if (c.events && Date.now()-c.at > 4000) loadHist(dir);
+  return c.events;
+}
+const EV_HIDE = new Set(['ts','event','src','by','step','run']);
+function evDetail(e){
+  const bits = [];
+  for (const k of ['status','minutes','chars','preview','reviewed',
+      'attachments','live','pid','how','why','reason','model','branch',
+      'session','exit_code','elapsed_s','slot','waited_s','drain'])
+    if (e[k]!=null && e[k]!=='' && e[k]!==false)
+      bits.push(k+' '+(k==='elapsed_s'||k==='waited_s'?fmtS(e[k]):e[k]));
+  if (e.steps) bits.push('steps '+e.steps.join(', '));
+  if (e.attempts) bits.push(e.attempts+' attempt(s)');
+  return bits.join(' · ');
+}
+function evRow(e){
+  return `<div class="evrow"><span class="evtime">` +
+    `${e.ts?loc(e.ts):''}</span>` +
+    `<span class="evtag${e.src==='ui'?' ui':''}">` +
+    `${e.src==='ui'?'you':'run'}</span>` +
+    `<span class="evtxt"><b>${esc(String(e.event||'event')
+      .replace(/_/g,' '))}</b>` +
+    (e.step?` <span class="sub">${esc(e.step)}</span>`:'') +
+    (evDetail(e)?` <span class="evd">${esc(evDetail(e))}</span>`:'') +
+    `</span></div>`;
+}
+function histBlock(dir, step){
+  const evs = dir ? histFor(dir) : [];
+  const head = `<h3 style="margin-top:14px">history</h3>`;
+  if (evs===null)
+    return head + `<div class="evlog"><div class="evempty">` +
+      `loading history&hellip;</div></div>`;
+  const rows = step ? evs.filter(e=>e.step===step || !e.step) : evs;
+  return head +
+    (rows.length
+      ? `<div class="evlog">` +
+        rows.slice().reverse().map(evRow).join('') + `</div>`
+      : `<div class="evlog"><div class="evempty">` +
+        `no events recorded</div></div>`);
+}
 function showDetail(i, keepStack){
   const a = AGENTS[i]; if(!a) return;
   const key = agentKey(a);
@@ -14914,6 +15291,11 @@ function showDetail(i, keepStack){
     ['project',a.slug],
     ['status',a.status+(a.status==='failed'&&a.exit_code===0&&
       a.status_line==null?' - ended without the STATUS: line':'')],
+    ...(a.depends_on && a.depends_on.length
+      ? [['depends on', a.depends_on.map(dn =>
+          a.dep_wait && a.dep_wait.includes(dn) ? dn+' (waiting)' : dn
+        ).join(', ')]]
+      : []),
     ['review',reviewLine(a)],
     ['task prompt',a.task_full||a.task],
     // The worker-reported OUTCOME: line - the human-facing "what it did".
@@ -15135,6 +15517,7 @@ function showDetail(i, keepStack){
           `OUTCOME: line or ended before printing it</span>`
         : esc(v??'-')) + '</div>').join('') +
     `</div>` +
+    (a.run_dir ? histBlock(base(a.run_dir), a.step) : '') +
     (a.tail ? `<h3 style="margin-top:14px">stdout tail</h3><pre id="dtail">${esc(a.tail)}</pre>` : '') +
     (a.arc && a.arc.groups && a.arc.groups.length
       ? `<h3 style="margin-top:14px">trajectory` +
@@ -15569,6 +15952,7 @@ function showRunDetails(key, keepStack){
     pmHtml +
     ctlHtml +
     taskTbl +
+    (r.stage ? '' : histBlock(base(r.dir), null)) +
     // admin/destructive actions sit at the very bottom, after the task
     // list - away from the controls a user reaches for first
     (r.stage ? '' : `<div class="actions">` +
@@ -16870,6 +17254,28 @@ async function answerQuestion(body){
 }
 
 let lastSig = null, BOOT = null;
+function syncPoolBox(){
+  const sp = lastData && lastData.slot_pool,
+        pv = document.getElementById('pool-val');
+  if (!pv || !sp) return;
+  pv.textContent = `agents ${sp.in_use}/${sp.cap}`;
+  pv.parentElement.classList.toggle('full', sp.in_use>=sp.cap);
+  const dec=document.getElementById('pool-dec'),
+        inc=document.getElementById('pool-inc');
+  if (dec) dec.disabled = sp.cap<=1;
+  if (inc) inc.disabled = sp.cap>=32;
+}
+async function poolBump(dlt, btn){
+  const sp = lastData && lastData.slot_pool;
+  if (!sp || !btn || btn.disabled) return;
+  const box = document.getElementById('poolbox');
+  box.querySelectorAll('button').forEach(b=>b.disabled=true);
+  try {
+    const sp2 = await api('POST','/api/pool',{cap:sp.cap+dlt});
+    if (lastData) lastData.slot_pool = sp2;
+  } catch (e) { await showAlert('Pool cap: '+(e.message||e)); }
+  syncPoolBox();
+}
 function tickElapsed(now){
   for (const a of AGENTS){
     const td = document.querySelector(`td[data-el="${a._i}"]`);
@@ -17559,6 +17965,7 @@ function render(d){
     hideCtxMenu();
     openQuestions(qr.request_id); }
   syncTopbar();      // filter rows can wrap and change the bar height
+  syncPoolBox();
 }
 // right-click on a run/task row opens the action menu INSTEAD of the
 // browser menu - but the native one stays where it matters: editable
@@ -17638,6 +18045,8 @@ document.addEventListener('click', async e=>{
     document.getElementById('powerwrap').hidden=true; return; }
   if (t.id==='pw-restart'){ powerAct('restart'); return; }
   if (t.id==='pw-stop'){ powerAct('stop'); return; }
+  if (t.id==='pool-dec'){ poolBump(-1, t); return; }
+  if (t.id==='pool-inc'){ poolBump(1, t); return; }
   if (t.id==='new-request'){
     openNew(); return; }
   if (t.dataset && t.dataset.density){
@@ -18921,6 +19330,17 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                             f"{slug}: not a git repository root")
                     self._json({"slug": slug, "current": current_branch(pdir),
                                 "branches": list_local_branches(pdir)})
+                elif (m := re.fullmatch(
+                        r"/api/runs/([^/]+)/events", path)):
+                    # the modal history feed: driver events.jsonl + the
+                    # dashboard's own action log (flag dir) merged
+                    name = m.group(1)
+                    if not RUN_DIR_RE.fullmatch(name):
+                        raise RequestError("Invalid run dir", 404)
+                    d = (runs_dir / name).resolve()
+                    if d.parent != runs_dir.resolve()                             or not (d / "state.json").is_file():
+                        raise RequestError("Run not found", 404)
+                    self._json({"run": name, "events": run_events(d)})
                 elif (m := re.fullmatch(r"/api/requests/([^/]+)", path)):
                     rec = request_details(m[1], requests_dir,
                                           manifests_dir, runs_dir)
@@ -19030,6 +19450,9 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 if path == "/api/serve/power":
                     self._json(_serve_power(self.server,
                                             body.get("action")))
+                    return
+                if path == "/api/pool":
+                    self._json(set_agent_cap(body.get("cap")))
                     return
                 if path == "/api/requests":
                     self._json(create_request(body, requests_dir, runs_dir), 201)

@@ -77,6 +77,27 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   cross-run contention verified with CONDUCTOR_MAX_AGENTS=3 (second
   manifest queued ~5s on a busy box, then completed). ~10 new
   ParallelPoolTests/AgentSlotPoolTests/apply+harness tests.
+- DONE 2026-10-17 (granite-gauss batch, user-requested): live parallel
+  agent cap (top-bar poolbox `agents N/cap` + POST /api/pool persists
+  %TEMP%/../agent-cap so running drivers re-read it every slot poll -
+  raising frees queued steps, lowering stops new dispatches, never
+  kills running), `[[step]] depends_on` (gates dispatch on named steps
+  reaching ANY terminal state - 'failed' counts so a merge glitch never
+  strands later work; unknown/self/cycle/later-sequential deps rejected;
+  works in waves and the parallel pool; `deps`/`dep_wait` in state +
+  'depends on ... (waiting)' row in the task modal; planner prompt
+  taught to pack independent work into waves/parallel and keep only real
+  prerequisites as deps), task/run EVENT HISTORY (user actions
+  journaled to flag-dir feeds + driver events.jsonl merged by
+  run_events() -> GET /api/runs/<dir>/events -> 'history' block in both
+  modals, empty state explicit), and serve_safety restart-risk TIERS
+  (generation/launch bookkeeping = high-risk serve-side drains; detached
+  workers/merges/jobs = survives-restart warnings; power dialog arms the
+  second-confirm gate only on the high tier). All on branch
+  granite-gauss (commit 4efd4c4), worktree-side - NOT yet merged to
+  master; master is busy with run 20261017-051357-dashboard-ask-ai.
+  569/569 mock tests green (--jobs 8). verify_timeout_min on the step
+  already deployed as 01d9ad7.
 - DONE 2026-10-17 (resolve-obs-merge-telemetry, merge resolution): unioned
   `obs-merge-telemetry` onto master (merge 89c7b3a) - the dashboard
   power/themed-dialogs batch meets deferred-merge-controls. conductor.py

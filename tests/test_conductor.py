@@ -7865,6 +7865,9 @@ class TrajectoryDetailTests(unittest.TestCase):
 const vm=require('node:vm'), assert=require('node:assert/strict');
 const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
 const nodes=new Map(), handlers={}, fetches=[];
+// histBlock fires a /events fetch per modal open - filter to the
+// trajectory calls this test actually drives.
+const traj=()=>fetches.filter(f=>/\/trajectory/.test(f));
 const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
   textContent:'',scrollTop:9}); return nodes.get(id); };
 const document={getElementById:elem,querySelector:()=>null,
@@ -7912,8 +7915,8 @@ const open=k=>vm.runInContext(
     querySelector:()=>null};
   handlers.toggle({target:det4});
   await new Promise(r=>setImmediate(r));
-  assert.equal(fetches.length,1);
-  assert.match(fetches[0],/\/api\/runs\/r1\/steps\/s1\/trajectory/);
+  assert.equal(traj().length,1);
+  assert.match(traj()[0],/\/api\/runs\/r1\/steps\/s1\/trajectory/);
   vm.runInContext('render('+JSON.stringify(data)+')',ctx);
   await open('rk1|s1');
   body=elem('dbody').innerHTML;
@@ -7925,7 +7928,7 @@ const open=k=>vm.runInContext(
   assert.match(body,/data-arc-copy="4"/);
   assert.match(body,/tool call 1 · edit/);
   // second fetch? no - cached by export@mtime
-  assert.equal(fetches.length,1);
+  assert.equal(traj().length,1);
   // collapse-all returns to the compact closed state
   handlers.click({preventDefault:()=>{},target:{dataset:{},
     closest:s=>s==='[data-arc-none]'?{dataset:{}}:null}});
@@ -7940,14 +7943,14 @@ const open=k=>vm.runInContext(
   await open('rk2|s1');                    // same step name, other run
   body=elem('dbody').innerHTML;
   assert.doesNotMatch(body,/data-asid="4" open/);   // no state leak
-  assert.equal(fetches.length,1);                   // nothing fetched yet
+  assert.equal(traj().length,1);                    // nothing fetched yet
   // expanding here hits the OTHER export - a different cache entry
   handlers.toggle({target:{classList:{contains:c=>c==='arcent'},
     dataset:{asid:'4'},open:true,
     closest:s=>({dataset:{akey:'rk2|s1'}}),querySelector:()=>null}});
   await new Promise(r=>setImmediate(r));
-  assert.equal(fetches.length,2);
-  assert.match(fetches[1],/\/api\/runs\/r2\/steps\/s1\/trajectory/);
+  assert.equal(traj().length,2);
+  assert.match(traj()[1],/\/api\/runs\/r2\/steps\/s1\/trajectory/);
   // closing the modal + reopening keeps the expansion per agent key
   await open('rk1|s1');
   body=elem('dbody').innerHTML;
@@ -10720,7 +10723,8 @@ class PowerDialogTests(unittest.TestCase):
                                          "/api/serve/power")
             self.assertEqual(status, 200)
             self.assertEqual(out, {"tasks": [], "merges": [],
-                                   "generating": [], "launching": []})
+                                   "generating": [], "launching": [],
+                                   "jobs": []})
 
     def test_safety_flags_inflight_generation_and_launch(self):
         """A restart kills the planner/launcher processes this server
@@ -10803,6 +10807,88 @@ class PowerDialogTests(unittest.TestCase):
             self.assertEqual(len(out["merges"]), 1)
             self.assertIn("MERGE_HEAD", out["merges"][0]["why"])
 
+    def test_run_events_merges_ui_and_driver_feeds(self):
+        """run_events folds the driver's events.jsonl and the flag-dir
+        action log into one oldest-first feed tagged by source."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            rd = base / "runs" / "20261017-000000-t"
+            rd.mkdir(parents=True)
+            (rd / "events.jsonl").write_text(
+                '{"event": "step_end", "step": "s1", "status": "done", '
+                '"ts": "2026-10-17T00:00:02"}\n'
+                '{"event": "step_start", "step": "s1", '
+                '"ts": "2026-10-17T00:00:01"}\n'
+                'not json\n', encoding="utf-8")
+            with mock.patch.object(conductor, "_flag_dir",
+                                   lambda: base / "flags"):
+                conductor.log_user_event(rd, event="step_prompt_edited",
+                                         step="s1", chars=42)
+                evs = conductor.run_events(rd)
+                names = [e["event"] for e in evs]
+                self.assertEqual(
+                    names,
+                    ["step_start", "step_end", "step_prompt_edited"])
+                self.assertEqual(
+                    [e["src"] for e in evs], ["run", "run", "ui"])
+                self.assertEqual(evs[-1]["chars"], 42)
+                # a missing flag dir must never raise
+                self.assertEqual(conductor.run_events(rd), evs)
+
+    def test_events_endpoint_and_instrumented_actions(self):
+        """GET /api/runs/<dir>/events serves the merged feed; a real
+        dashboard action (archive) lands in it tagged by='dashboard'."""
+        with tempfile.TemporaryDirectory() as td:
+            runs, server = self._serve(td)
+            base = Path(td)
+            proj = make_project(base)
+            m = write_manifest(base, f"""
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+""")
+            self.assertEqual(run_manifest(m, runs), 0)
+            rd = next(runs.iterdir())
+            with mock.patch.object(conductor, "_flag_dir",
+                                   lambda: base / "flags"):
+                status, out = self._call(
+                    server.server_port, "POST",
+                    f"/api/runs/{rd.name}/archive", {"archived": True})
+                self.assertEqual(status, 200)
+                status, out = self._call(
+                    server.server_port, "GET",
+                    f"/api/runs/{rd.name}/events")
+            self.assertEqual(status, 200)
+            kinds = {(e["event"], e["src"]) for e in out["events"]}
+            self.assertIn(("run_start", "run"), kinds)
+            self.assertIn(("step_end", "run"), kinds)
+            self.assertIn(("run_archive_mark", "ui"), kinds)
+            status, out = self._call(server.server_port, "GET",
+                                     "/api/runs/not-a-run/events")
+            self.assertEqual(status, 404)
+
+    def test_pool_endpoint_sets_and_validates(self):
+        """POST /api/pool writes the live machine cap; /api/state then
+        reports it. Bad values are 4xx and don't disturb the file."""
+        with tempfile.TemporaryDirectory() as td:
+            runs, server = self._serve(td)
+            env = {"CONDUCTOR_SLOT_DIR": str(Path(td) / "slots"),
+                   "CONDUCTOR_MAX_AGENTS": ""}
+            with mock.patch.dict(os.environ, env):
+                status, out = self._call(server.server_port, "POST",
+                                         "/api/pool", {"cap": 6})
+                self.assertEqual(status, 200)
+                self.assertEqual(out["cap"], 6)
+                status, out = self._call(server.server_port, "GET",
+                                         "/api/state")
+                self.assertEqual(out["slot_pool"]["cap"], 6)
+                for bad in (0, 99, "x", None):
+                    status, out = self._call(server.server_port, "POST",
+                                             "/api/pool", {"cap": bad})
+                    self.assertEqual(status, 400, bad)
+                self.assertEqual(conductor.agent_slot_cap(), 6)
+
     def test_power_post_stop_and_restart_guard(self):
         with tempfile.TemporaryDirectory() as td:
             runs, server = self._serve(td)
@@ -10847,8 +10933,10 @@ class PowerDialogTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_power_rechecks_safety_at_press_time(self):
         """Stop/Restart re-fetch /api/serve/power when clicked - the
-        open-time report may be stale. An unsafe press shows the fresh
-        warnings and only ARMS the button; the second press proceeds."""
+        open-time report may be stale. A HIGH-risk press (in-flight
+        generation/launch) shows the fresh warnings and only ARMS the
+        button; the second press proceeds. LOW-risk work (live tasks,
+        detached merges/jobs) is reported but never gates."""
         js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
             "</script>", 1)[0]
         harness = r'''
@@ -10859,7 +10947,8 @@ const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,textC
 const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
   addEventListener:(event,handler)=>{handlers[event]=handler;}};
 // live state flips safe->unsafe mid-dialog; POSTs are recorded
-const calls=[]; let live={merges:[],tasks:[]};
+const calls=[]; let live={merges:[],tasks:[],generating:[],launching:[],
+  jobs:[]};
 const fetch=async(path,opt)=>{
   calls.push(((opt&&opt.method)||'GET')+' '+path);
   if (path==='/api/serve/power' && opt && opt.method==='POST')
@@ -10878,25 +10967,29 @@ const flush=async()=>{for(let i=0;i<30;i++) await Promise.resolve();};
   await click({id:'power-btn',dataset:{}});        // openPower: safe report
   await flush();
   assert.match(elem('pwbody').innerHTML,/safe to restart/);
-  live={merges:[{where:'repo',why:'MERGE_HEAD'}],tasks:[]};  // got unsafe
+  live={merges:[],tasks:[],generating:[{id:'r1',label:'plan x'}],
+        launching:[],jobs:[]};            // became HIGH-risk
   await click({id:'pw-restart',dataset:{}});
   await flush();
   // press-time recheck caught it: warning re-rendered, nothing posted,
   // buttons back enabled
-  assert.match(elem('pwbody').innerHTML,/merge activity in progress/);
+  assert.match(elem('pwbody').innerHTML,/proposal generation/);
   assert.match(elem('pwstat').textContent,/press Restart again/);
   assert.deepEqual(calls.filter(c=>c.startsWith('POST')),[]);
   await click({id:'pw-restart',dataset:{}});        // informed override
   await flush();
   assert.deepEqual(calls.filter(c=>c.startsWith('POST')),
                    ['POST /api/serve/power']);
-  // a different action is not armed by restart's warning
+  // LOW-risk activity (live merge + task + detached job) is reported
+  // but does NOT arm: the first press proceeds
+  live={merges:[{where:'repo',why:'MERGE_HEAD'}],
+        tasks:[{run:'t',step:'s1',status:'running'}],
+        generating:[],launching:[],
+        jobs:[{kind:'merge',target:'t',pid:1}]};
   await click({id:'power-btn',dataset:{}});
   await flush();
-  await click({id:'pw-stop',dataset:{}});
-  await flush();
-  assert.match(elem('pwstat').textContent,/press Stop again/);
-  assert.equal(calls.filter(c=>c.startsWith('POST')).length,1);
+  assert.match(elem('pwbody').innerHTML,/keeps running through/);
+  assert.match(elem('pwbody').innerHTML,/finish on their own/);
   await click({id:'pw-stop',dataset:{}});
   await flush();
   assert.equal(calls.filter(c=>c.startsWith('POST')).length,2);

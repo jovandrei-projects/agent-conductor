@@ -2688,6 +2688,76 @@ class AgentSlotPoolTests(unittest.TestCase):
             self.assertIsInstance(got[0], conductor._AgentSlot)
             conductor._slot_release(got[0], run_dir)
 
+    def test_cap_file_and_env_priority(self):
+        """agent_slot_cap: env wins, then the dashboard's cap.json,
+        then the computed floor - bad/edge file values are ignored."""
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td) / "slots"
+            env = {"CONDUCTOR_SLOT_DIR": str(sd),
+                   "CONDUCTOR_MAX_AGENTS": ""}
+            with mock.patch.dict(os.environ, env):
+                n = conductor.agent_slot_cap()
+                self.assertGreaterEqual(n, 4)           # computed floor
+                sd.mkdir()
+                (sd / "cap.json").write_text('{"cap": 3}')
+                self.assertEqual(conductor.agent_slot_cap(), 3)
+                (sd / "cap.json").write_text('{"cap": 99}')
+                self.assertEqual(conductor.agent_slot_cap(),
+                                 conductor.MAX_AGENT_CAP)   # clamped
+                (sd / "cap.json").write_text('{"cap": 0}')
+                self.assertGreaterEqual(conductor.agent_slot_cap(), 4)
+                (sd / "cap.json").write_text('not json')
+                self.assertGreaterEqual(conductor.agent_slot_cap(), 4)
+            with mock.patch.dict(
+                    os.environ,
+                    {"CONDUCTOR_SLOT_DIR": str(sd),
+                     "CONDUCTOR_MAX_AGENTS": "5"}):
+                self.assertEqual(conductor.agent_slot_cap(), 5)
+
+    def test_set_agent_cap_validates_and_persists(self):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td) / "slots"
+            with mock.patch.dict(
+                    os.environ, {"CONDUCTOR_SLOT_DIR": str(sd),
+                                 "CONDUCTOR_MAX_AGENTS": ""}):
+                for bad in (0, -1, 33, True, "4", None, 4.5):
+                    with self.assertRaises(conductor.RequestError):
+                        conductor.set_agent_cap(bad)
+                view = conductor.set_agent_cap(6)
+                self.assertEqual(view["cap"], 6)
+                self.assertEqual(conductor.agent_slot_cap(), 6)
+
+    def test_live_cap_raise_frees_queued_step(self):
+        """The acquire loop re-reads the cap each poll: a queued step
+        takes a newly-free index within a poll tick, no restart."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            sd = base / "slots"
+            run_dir, state = self._mk(base)
+            step = conductor.Step(name="s1", project="x", prompt="p")
+            held = conductor._slot_try_lease(1, run_dir, state, step, sd)
+            got = []
+            env = {"CONDUCTOR_SLOT_DIR": str(sd),
+                   "CONDUCTOR_MAX_AGENTS": ""}
+            with mock.patch.dict(os.environ, env),                  mock.patch.object(conductor, "SLOT_POLL_S", 0.05),                  mock.patch.object(conductor, "SLOT_WAIT_SAVE_S", 0.0):
+                conductor.set_agent_cap(1)
+                t = threading.Thread(target=lambda: got.append(
+                    conductor._agent_slot_acquire(
+                        step, run_dir, state, "proj", sd)))
+                t.start()
+                deadline = time.time() + 10
+                while time.time() < deadline and                         not state["steps"].get("s1", {}).get("slot_wait"):
+                    time.sleep(0.05)
+                self.assertTrue(state["steps"]["s1"]["slot_wait"])
+                self.assertEqual(got, [])
+                conductor.set_agent_cap(2)      # the dashboard's -/+
+                t.join(10)
+            self.assertEqual(len(got), 1)
+            self.assertIsInstance(got[0], conductor._AgentSlot)
+            self.assertEqual(got[0].index, 2)
+            for s in (held, got[0]):
+                conductor._slot_release(s, run_dir)
+
     def test_acquire_bails_when_stopped_while_queued(self):
         """A stop sentinel landing mid-queue ends the step 'skipped'
         without ever holding a slot."""
@@ -2711,6 +2781,231 @@ class AgentSlotPoolTests(unittest.TestCase):
             self.assertEqual(got, ["skipped"])
             self.assertEqual(state["steps"]["s1"]["status"], "skipped")
             conductor._slot_release(held, run_dir)
+
+
+class DependsOnTests(unittest.TestCase):
+    """[[step]] depends_on: schema + validation (names, self, cycles,
+    ordering), intra-wave gating, and terminal-not-success semantics -
+    a failed dep never strands its dependents."""
+
+    def test_parse_and_validate(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            # str + list forms normalize to tuples
+            m = write_manifest(base, f"""
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "x"
+
+[[step]]
+name = "b"
+project = "{proj.as_posix()}"
+prompt = "x"
+depends_on = "a"
+
+[[step]]
+name = "c"
+project = "{proj.as_posix()}"
+prompt = "x"
+depends_on = ["a", "b"]
+""")
+            cfg = conductor.load_manifest(m)
+            self.assertEqual(cfg.steps[1].depends_on, ("a",))
+            self.assertEqual(cfg.steps[2].depends_on, ("a", "b"))
+
+            def bad(body):
+                mm = base / "bad.toml"
+                mm.write_text(
+                    f'[run]\nname = "t"\n{body}', encoding="utf-8")
+                return mm
+
+            # unknown dep
+            with self.assertRaises(conductor.ManifestError):
+                conductor.load_manifest(bad(f"""
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "x"
+depends_on = ["ghost"]
+"""))
+            # self dep
+            with self.assertRaises(conductor.ManifestError):
+                conductor.load_manifest(bad(f"""
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "x"
+depends_on = ["a"]
+"""))
+            # dep on a LATER sequential step can never satisfy
+            with self.assertRaises(conductor.ManifestError):
+                conductor.load_manifest(bad(f"""
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "x"
+depends_on = ["b"]
+
+[[step]]
+name = "b"
+project = "{proj.as_posix()}"
+prompt = "x"
+"""))
+            # same-wave sibling deps are legal
+            cfg = conductor.load_manifest(bad(f"""
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "x"
+wave = 1
+worktree = true
+depends_on = ["b"]
+
+[[step]]
+name = "b"
+project = "{proj.as_posix()}"
+prompt = "x"
+wave = 1
+worktree = true
+"""))
+            # a same-wave cycle is not
+            with self.assertRaises(conductor.ManifestError):
+                conductor.load_manifest(bad(f"""
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "x"
+wave = 1
+worktree = true
+depends_on = ["b"]
+
+[[step]]
+name = "b"
+project = "{proj.as_posix()}"
+prompt = "x"
+wave = 1
+worktree = true
+depends_on = ["a"]
+"""))
+            # [defaults].depends_on is rejected outright
+            with self.assertRaises(conductor.ManifestError):
+                conductor.load_manifest(bad(f"""
+[defaults]
+depends_on = ["a"]
+
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "x"
+"""))
+
+    def test_dep_blocks_until_sibling_ends(self):
+        """Same wave, b depends_on a: b must not dispatch while a is
+        running - its start stamp follows a's end stamp."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            m = write_manifest(base, f"""
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "sleep=2 write a.txt"
+wave = 1
+worktree = true
+
+[[step]]
+name = "b"
+project = "{proj.as_posix()}"
+prompt = "write b.txt"
+wave = 1
+worktree = true
+depends_on = ["a"]
+""")
+            self.assertEqual(run_manifest(m, base / "runs"), 0)
+            st, rd = state_of(base / "runs")
+            a, b = st["steps"]["a"], st["steps"]["b"]
+            self.assertEqual(a["status"], "done")
+            self.assertEqual(b["status"], "done")
+            self.assertGreaterEqual(b["started_at"], a["ended_at"])
+            self.assertEqual(b.get("deps"), ["a"])
+
+    def test_failed_dep_does_not_block(self):
+        """A dep that fails is still 'attempted': b runs anyway - the
+        next agent can recover the parked branch itself."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            m = write_manifest(base, f"""
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "mockfail"
+wave = 1
+worktree = true
+
+[[step]]
+name = "b"
+project = "{proj.as_posix()}"
+prompt = "write b.txt"
+wave = 1
+worktree = true
+depends_on = ["a"]
+""", extra='on_failure = "continue"\n')
+            rc = run_manifest(m, base / "runs")
+            self.assertIn(rc, (0, 1))
+            st, rd = state_of(base / "runs")
+            self.assertEqual(st["steps"]["a"]["status"], "failed")
+            self.assertEqual(st["steps"]["b"]["status"], "done")
+
+    def test_sequential_dep_and_parallel_pool(self):
+        """depends_on under [run] parallel: a dep listed LATER is legal
+        (the pool is eligibility-scheduled) and still gates."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            m = write_manifest(base, f"""
+[[step]]
+name = "b"
+project = "{proj.as_posix()}"
+prompt = "write b.txt"
+worktree = true
+depends_on = ["a"]
+
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "sleep=2 write a.txt"
+worktree = true
+""", extra='parallel = true\n')
+            self.assertEqual(run_manifest(m, base / "runs"), 0)
+            st, rd = state_of(base / "runs")
+            a, b = st["steps"]["a"], st["steps"]["b"]
+            self.assertEqual(a["status"], "done")
+            self.assertEqual(b["status"], "done")
+            self.assertGreaterEqual(b["started_at"], a["ended_at"])
+
+    def test_dep_blocked_step_skips_instead_of_hanging(self):
+        """A dep with no terminal record and no live dispatcher skips
+        the dependent (with a note) instead of deadlocking the wave."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            run_dir = base / "run"
+            run_dir.mkdir()
+            state = {"run": "t", "steps": {
+                "gone": {"status": None},   # never attempted
+            }}
+            step = conductor.Step(name="s1", project="x", prompt="p",
+                                  depends_on=("gone",))
+            unmet = conductor.deps_unmet(step, state)
+            self.assertEqual(unmet, ["gone"])
+            state["steps"]["gone"]["status"] = "failed"   # terminal
+            self.assertEqual(conductor.deps_unmet(step, state), [])
+            state["steps"]["gone"]["status"] = "queued"
+            self.assertEqual(conductor.deps_unmet(step, state), ["gone"])
+            state["steps"]["gone"]["status"] = "skipped"
+            self.assertEqual(conductor.deps_unmet(step, state), [])
 
 
 class MergeQueueTests(unittest.TestCase):
