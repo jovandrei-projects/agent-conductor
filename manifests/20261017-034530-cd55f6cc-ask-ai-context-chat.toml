@@ -12,7 +12,8 @@ effort = "max"
 mode = "bypass"
 timeout_min = 75
 max_attempts = 3
-verify = "python run_tests.py"
+verify = "python run_tests.py --jobs 8"
+verify_timeout_min = 30
 
 [[step]]
 name = "research-and-design"

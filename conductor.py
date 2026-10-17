@@ -373,6 +373,9 @@ class Step:
     timeout_min: float = 60
     verify: str | None = None          # cmd.exe command run in the work dir
     verify_must_pass: bool = True
+    verify_timeout_min: float = 10     # the verify gate's wall-clock cap -
+                                       # TimeoutExpired counts as a failed
+                                       # verify like any other red run
     cloud: bool = False
     wave: int | None = None            # adjacent steps sharing a wave run in parallel
     worktree: bool = False             # run in a temp git worktree + branch, merged after
@@ -558,6 +561,13 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
         if not 1 <= ma <= 10:
             raise ManifestError(
                 f"step {merged['name']!r}: max_attempts must be 1-10")
+        try:
+            vt = float(merged.get("verify_timeout_min", 10))
+        except (TypeError, ValueError):
+            vt = 0
+        if vt <= 0:
+            raise ManifestError(
+                f"step {merged['name']!r}: verify_timeout_min must be > 0")
         # Device ownership: step > [defaults] > the project's registry entry
         # (a mobile slug may declare `device = "emulator"` once, like
         # `verify`). A cloud step can't see local adb devices - inheriting
@@ -604,6 +614,7 @@ def load_manifest(path: Path, text: str | None = None) -> Manifest:
             timeout_min=float(merged.get("timeout_min", 60)),
             verify=verify,
             verify_must_pass=bool(merged.get("verify_must_pass", True)),
+            verify_timeout_min=vt,
             cloud=bool(merged.get("cloud", False)),
             wave=merged.get("wave"),
             worktree=bool(merged.get("worktree", False)),
@@ -5217,7 +5228,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             v = subprocess.run(step.verify, cwd=str(work_dir), shell=True,
                                capture_output=True, text=True,
                                encoding="utf-8", errors="replace",
-                               timeout=600, env=step_env,
+                               timeout=(step.verify_timeout_min * 60),
+                               env=step_env,
                                **hidden_subprocess_kwargs())
             verify_ok = v.returncode == 0
             (run_dir / f"{step.name}.verify.log").write_text(
@@ -5228,7 +5240,9 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
             # verify like any other red run.
             verify_ok = False
             (run_dir / f"{step.name}.verify.log").write_text(
-                "verify timed out after 600s\n", encoding="utf-8")
+                "verify timed out after "
+                f"{int(step.verify_timeout_min * 60)}s\n",
+                encoding="utf-8")
 
     # An interrupt request that landed during verify/teardown can never be
     # consumed for THIS dispatch - bank it into the notes channel like a
@@ -10067,17 +10081,18 @@ def _merge_deferred_group(d: Path, st: dict, grp: dict, names: list[str],
             if not v or v in seen_v:
                 continue
             seen_v.add(v)
+            vt_s = (sobj.verify_timeout_min if sobj else 10) * 60
             try:
                 vp = subprocess.run(v, cwd=str(stage_wt), shell=True,
                                     capture_output=True, text=True,
                                     encoding="utf-8", errors="replace",
-                                    timeout=600,
+                                    timeout=vt_s,
                                     **hidden_subprocess_kwargs())
                 ok_v = vp.returncode == 0
                 out = (vp.stdout or "") + (vp.stderr or "")
             except subprocess.TimeoutExpired:
                 ok_v = False
-                out = "staged verify timed out after 600s\n"
+                out = f"staged verify timed out after {int(vt_s)}s\n"
             (d / f"{n}.mergeverify.log").write_text(
                 out, encoding="utf-8", errors="replace")
             if not ok_v:

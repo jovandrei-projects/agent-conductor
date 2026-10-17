@@ -698,6 +698,66 @@ verify_must_pass = false
             self.assertEqual(state["steps"]["one"]["status"], "done")
             self.assertEqual(state["steps"]["one"]["verify_ok"], False)
 
+    def test_verify_timeout_min_parse(self):
+        """[defaults]/step verify_timeout_min parses, defaults to 10, and
+        must be positive."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            m = write_manifest(base, f"""
+[defaults]
+verify_timeout_min = 25
+
+[[step]]
+name = "a"
+project = "{proj.as_posix()}"
+prompt = "x"
+
+[[step]]
+name = "b"
+project = "{proj.as_posix()}"
+prompt = "x"
+verify_timeout_min = 2
+""")
+            cfg = conductor.load_manifest(m)
+            self.assertEqual(cfg.steps[0].verify_timeout_min, 25)
+            self.assertEqual(cfg.steps[1].verify_timeout_min, 2)
+            bad = base / "bad.toml"
+            bad.write_text(f"""[run]
+name = "t"
+[[step]]
+name = "c"
+project = "{proj.as_posix()}"
+prompt = "x"
+verify_timeout_min = 0
+""", encoding="utf-8")
+            with self.assertRaises(conductor.ManifestError):
+                conductor.load_manifest(bad)
+
+    def test_verify_timeout_kills_slow_gate(self):
+        """A verify gate exceeding verify_timeout_min is killed and scored
+        like any failing verify (verify_ok=False -> step failed)."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f"""
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+verify = 'python -c "import time; time.sleep(30)"'
+verify_timeout_min = 0.008
+""")
+            self.assertEqual(run_manifest(m, runs), 1)
+            state = json.loads(
+                (next(runs.iterdir()) / "state.json").read_text())
+            rec = state["steps"]["one"]
+            self.assertEqual(rec["status"], "failed")
+            self.assertEqual(rec["verify_ok"], False)
+            log = (next(runs.iterdir()) / "one.verify.log").read_text()
+            self.assertIn("verify timed out after", log)
+
     def test_two_projects_same_wave_parallel_no_worktree(self):
         """Different project dirs in one wave run in the dirs themselves -
         no worktree needed, nothing to merge."""
