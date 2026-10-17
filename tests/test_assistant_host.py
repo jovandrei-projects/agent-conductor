@@ -368,6 +368,55 @@ class RetrievalFetchTests(unittest.TestCase):
                              "nav": {"view": "agent", "key": "k"}})
             self.assertIn("not found", ghost["excerpt"])
 
+    def test_fetch_by_key_only_resolves_the_record(self):
+        """The tool contract hands fetch only {kind,key[,nav]} echoes -
+        the server must re-resolve run_dir/step/request_id from the
+        stable key itself (search stubs never expose run_dir)."""
+        with tempfile.TemporaryDirectory() as td:
+            r = make_retrieval(Path(td))
+            srcs = r.search("verification",
+                            filters={"run": "model-compare-mobile"})
+            su = next(s for s in srcs if s["kind"] == "summary")
+            echo = {"kind": su["kind"], "key": su["key"]}   # tool echo
+            full = r.fetch(echo)
+            self.assertIn("tsc --noEmit", full["excerpt"])
+            self.assertEqual(full["step"],
+                             "mobile-visualizations-and-filters")
+            self.assertTrue(full["nav"]["key"])   # chip can navigate
+            # an agent source the same way
+            ag = next(s for s in srcs if s["kind"] == "agent")
+            full = r.fetch({"kind": ag["kind"], "key": ag["key"]})
+            self.assertIn("mobile-visualizations-and-filters",
+                          full["excerpt"])
+            # a run-kind source keyed by 'request:<id>'
+            rn = next(s for s in srcs if s["kind"] == "run")
+            full = r.fetch({"kind": rn["kind"], "key": rn["key"]})
+            self.assertIn("model-compare-mobile", full["excerpt"])
+            # a request-kind source resolves request:<id> -> the record
+            req_srcs = r.search("", filters={"project": "apartment-3d"})
+            rq = next(s for s in req_srcs if s["kind"] == "request")
+            full = r.fetch({"kind": rq["kind"], "key": rq["key"]})
+            self.assertNotIn("not found", full["excerpt"])
+
+    def test_fetch_synthesizes_label_and_nav_for_echoes(self):
+        """An echoed {kind,key} leaves the exchange's stored chips
+        readable AND navigable - _resolve_src derives the label/nav
+        the search stub originally carried."""
+        with tempfile.TemporaryDirectory() as td:
+            r = make_retrieval(Path(td))
+            srcs = r.search("verification",
+                            filters={"run": "model-compare-mobile"})
+            su = next(s for s in srcs if s["kind"] == "summary")
+            full = r.fetch({"kind": su["kind"], "key": su["key"]})
+            self.assertIn("mobile-visualizations-and-filters",
+                          full["label"])
+            self.assertIn("session summary", full["label"])
+            self.assertEqual(full["nav"], su["nav"])
+            rn = next(s for s in srcs if s["kind"] == "run")
+            full = r.fetch({"kind": rn["kind"], "key": rn["key"]})
+            self.assertIn("model-compare-mobile", full["label"])
+            self.assertEqual(full["nav"]["view"], "run")
+
     def test_fetch_many_shares_budget(self):
         with tempfile.TemporaryDirectory() as td:
             r = make_retrieval(Path(td))

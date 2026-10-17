@@ -344,7 +344,7 @@ class ConductorRetrieval(RetrievalAdapter):
         """Attach a bounded `excerpt` re-read from the live record."""
         budget = max(256, min(int(budget or MAX_EXCERPT_BYTES),
                               MAX_EXCERPT_BYTES))
-        src = dict(source)
+        src = self._resolve_src(source)
         try:
             text = self._excerpt_for(src, budget)
         except Exception as exc:            # noqa: BLE001 - honest empty
@@ -427,6 +427,8 @@ class ConductorRetrieval(RetrievalAdapter):
                             else list(st) if st else None)
         interp["include_archived"] = bool(filters.get("include_archived"))
         kinds = filters.get("kinds")
+        if isinstance(kinds, str):          # 'summary' means ['summary'],
+            kinds = [kinds]                 # not 's','u','m' iterated
         interp["kinds"] = ([k for k in kinds if k in _VALID_KINDS]
                            if kinds else None)
         # ---- subject keywords: explicit subject beats query tokens
@@ -500,6 +502,14 @@ class ConductorRetrieval(RetrievalAdapter):
             run_ok = self._in_window(
                 interp, [st.get("started_at"), st.get("ended_at")])
             steps = st.get("steps") or {}
+            # the status filter follows the dashboard's effective status
+            # (live-derived), never a stale recorded one
+            eff_status = {}
+            if interp["status"]:
+                try:
+                    eff_status = conductor.effective_statuses(st)
+                except Exception:              # noqa: BLE001
+                    eff_status = {}
             run_hits = self._count_hits(interp, " ".join(
                 str(st.get(k) or "") for k in
                 ("run", "description", "request_id")))
@@ -518,7 +528,8 @@ class ConductorRetrieval(RetrievalAdapter):
                                  rec.get("ended_at")]):
                     continue
                 if interp["status"] and \
-                        rec.get("status") not in interp["status"]:
+                        eff_status.get(name, rec.get("status")) \
+                        not in interp["status"]:
                     continue
                 hay = self._step_haystack(name, rec)
                 hits = self._count_hits(interp, hay)
@@ -725,6 +736,113 @@ class ConductorRetrieval(RetrievalAdapter):
         return src
 
     # ----------------------------------------------------------- fetch
+    def _request_run_map(self) -> dict:
+        """request:<id> -> run dir name, rebuilt per call so a freshly
+        launched run resolves immediately."""
+        out = {}
+        try:
+            dirs = [d for d in self._runs.iterdir() if d.is_dir()]
+        except OSError:
+            return out
+        for d in dirs:
+            try:
+                st = json.loads(
+                    (d / "state.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            rid = st.get("request_id")
+            if rid:
+                out.setdefault(str(rid), d.name)
+        return out
+
+    def _run_dir_for_key(self, run_key: str):
+        """run_key ('request:<id>' | abs dir path | dir name) -> a run dir
+        name confined under runs_dir, or None."""
+        rk = str(run_key or "").strip()
+        if not rk:
+            return None
+        if rk.startswith("request:"):
+            return self._request_run_map().get(rk[len("request:"):])
+        name = Path(rk).name
+        if conductor.RUN_DIR_RE.fullmatch(name):
+            return name
+        try:
+            for d in self._runs.iterdir():       # display-name fallback:
+                if d.is_dir() and (d.name == rk  # '<ts>-<run>' dirs end
+                                   or d.name.endswith("-" + rk)):
+                    return d.name                # with the run name
+        except OSError:
+            pass
+        return None
+
+    def _resolve_src(self, source: dict) -> dict:
+        """Fill run_dir/step/request_id from the stable key when the
+        caller only echoes {kind,key[,nav]} - which is exactly what the
+        runtime's fetch tool contract hands back (search stubs never
+        expose run_dir). The key is re-resolved server-side; a model can
+        never supply record locations of its own."""
+        s = dict(source)
+        kind = s.get("kind")
+        key = str(s.get("key") or "")
+        nav = s.get("nav") if isinstance(s.get("nav"), dict) else {}
+        base = str(nav.get("key") or key)
+        for suffix in ("#summary", "#run-summary"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+        run_key, step = base, None
+        if kind in ("agent", "log", "summary") and "|" in base:
+            run_key, _, step = base.rpartition("|")
+        if kind == "request":
+            if not s.get("request_id"):
+                s["request_id"] = key or base
+        elif kind in ("agent", "log", "summary", "run", "run-summary"):
+            if not s.get("run_dir"):
+                rd = self._run_dir_for_key(run_key)
+                if rd:
+                    s["run_dir"] = rd
+            if step and not s.get("step"):
+                s["step"] = step
+        # a fetch echo may carry no nav at all (the contract only asks
+        # for kind+key) - rebuild the dashboard descriptor so the stored
+        # citation chip still opens the record
+        nav = s.get("nav") if isinstance(s.get("nav"), dict) else {}
+        if not nav.get("view") or not isinstance(nav.get("key"), str):
+            view = _KIND_NAV.get(kind)
+            if view:
+                if kind == "request":
+                    nk = s.get("request_id")
+                else:
+                    rk = run_key if run_key.startswith("request:") \
+                        else (str(self._runs / s["run_dir"])
+                              if s.get("run_dir") else run_key)
+                    nk = (f"{rk}|{s['step']}"
+                          if kind in ("agent", "log", "summary")
+                          and s.get("step") else rk)
+                if nk:
+                    s["nav"] = {"view": view, "key": nk}
+        # an echoed stub has no display label either - derive the same
+        # 'run / step - summary' style the search stubs carry so stored
+        # citation chips never fall back to the raw key
+        if not s.get("label"):
+            disp = str(s.get("run") or "")
+            if not disp and s.get("run_dir"):
+                disp = s["run_dir"].split("-", 2)[-1]
+            if kind in ("agent", "log", "summary") and s.get("step"):
+                disp = f"{disp} / {s['step']}" if disp else s["step"]
+                if kind == "summary":
+                    disp += " - session summary"
+                elif kind == "log":
+                    disp += " - log"
+            elif kind == "run":
+                disp = f"run {disp}" if disp else "run"
+            elif kind == "run-summary":
+                disp = f"{disp} - run summary" if disp else "run summary"
+            elif kind == "request":
+                disp = f"request {s.get('request_id') or key or ''}".strip()
+            if disp:
+                s["label"] = disp
+        return s
+
     def _load_run(self, run_dir_name: str):
         name = Path(str(run_dir_name or "")).name
         if not name or not conductor.RUN_DIR_RE.fullmatch(name):

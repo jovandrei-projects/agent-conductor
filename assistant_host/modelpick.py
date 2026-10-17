@@ -156,7 +156,14 @@ def resolve(model: str, effort: str, fast, options: dict,
             f"{', '.join(repr(s) for s in suffixes) or '(bare uid only)'}")
     if fast and not family_is_fast(fam):
         markers = _fast_markers(suffixes)
-        want = (f"{effort}-{m}" if effort else m for m in markers)
+        if effort:
+            want = [f"{effort}-{m}" for m in markers]
+        else:
+            # no effort pinned: fast variants only exist as
+            # '<effort>-<marker>' pairs, so any of them satisfies 'fast'
+            # - catalog order picks the cheapest lane offered
+            want = [s for s in suffixes
+                    if s.rsplit("-", 1)[-1] in markers]
         suffix = next((s for s in want if s in suffixes), None)
         if suffix is None:
             alts = ([] if _alt else _alternatives(options, effort, True))
@@ -166,7 +173,8 @@ def resolve(model: str, effort: str, fast, options: dict,
                 + " - verified alternatives: "
                 + (", ".join(alts) if alts else "none on this catalog")
                 + (f"; or drop 'fast' and use `{fam}-{effort or 'default'}`"))
-        return {"uid": f"{fam}-{suffix}", "family": fam, "effort": effort,
+        return {"uid": f"{fam}-{suffix}", "family": fam,
+                "effort": effort or suffix.rsplit("-", 1)[0],
                 "fast": True, "suffix": suffix, "vision": VISION.get(fam)}
     uid = f"{fam}-{effort}" if effort else fam
     if effort and uid not in {fam, *[f"{fam}-{s}" for s in suffixes]}:

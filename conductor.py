@@ -17729,10 +17729,16 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
     # The assistant surface: one lazily-opened host runtime per serve
     # process. Errors are cached - a broken provider init degrades to a
     # 503 payload on /api/assistant/*, never a dead dashboard.
-    _assist = {"core": None, "runtime": None, "err": None}
+    _assist = {"core": None, "runtime": None, "err": None, "err_at": 0.0}
+    _ASSIST_RETRY_AFTER = 60.0    # a transient init failure (sqlite hiccup,
+                                # brief disk issue) retires after a minute -
+                                # never a permanent 503 until restart
 
     def assistant_open(server=None):
         with STATE_LOCK:
+            if _assist["err"] is not None and \
+                    _now() - _assist["err_at"] >= _ASSIST_RETRY_AFTER:
+                _assist["err"] = None          # stale failure - retry
             if _assist["core"] is None and _assist["err"] is None:
                 try:
                     from assistant_host.conductor_adapters import (
@@ -17742,12 +17748,15 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                         runs_dir=runs_dir, requests_dir=requests_dir,
                         manifests_dir=manifests_dir, trash_dir=trash_dir,
                         devin_argv=devin_argv,
-                        power=(lambda act, s=server: _serve_power(s, act)
-                               if server is not None else None))
+                        power=((lambda act, s=server: _serve_power(s, act))
+                               if server is not None else
+                               None))   # no server -> kind unlisted, not
+                                        # a silent no-op lambda
                     _assist.update(core=core, runtime=rt)
                 except Exception as exc:                # noqa: BLE001
                     LOG.exception("assistant runtime init failed")
                     _assist["err"] = f"{type(exc).__name__}: {exc}"
+                    _assist["err_at"] = _now()
         return _assist["core"], _assist["err"]
 
     class Handler(http.server.BaseHTTPRequestHandler):
