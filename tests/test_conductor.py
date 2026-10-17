@@ -4370,7 +4370,7 @@ const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '
 const nodes=new Map(), handlers={};
 const elem=id=>{ if(!nodes.has(id)){ const el=
   {innerHTML:'',hidden:true,textContent:'',value:'',checked:false,
-   disabled:false,title:'',_cls:new Set()};
+   disabled:false,title:'',dataset:{},_cls:new Set()};
   el.classList={toggle:(c,on)=>{on?el._cls.add(c):el._cls.delete(c);},
     contains:c=>el._cls.has(c)};
   el.closest=()=>null;
@@ -4446,6 +4446,23 @@ const check=(id,v)=>{ elem(id).checked=v;
   await check('rq-worktrees',false);
   assert.equal(elem('pend-note').hidden,true);
   assert.equal(elem('rq-worktrees')._cls.has('pendchg'),false);
+  // a MIXED baseline (the TOML carries per-step values the single field
+  // cannot express) stays framed no matter the checkbox position - and
+  // the note says 'mixed', not 'changed'
+  const saveBase=reqs.review.baseline;
+  reqs.review.baseline={...saveBase,worktrees:null};
+  await vm.runInContext('refreshPending()',ctx);
+  assert.equal(elem('rq-worktrees')._cls.has('pendchg'),true);
+  assert.match(elem('pend-note').innerHTML,/mixed across the proposal/);
+  assert.doesNotMatch(elem('pend-note').innerHTML,/Options changed/);
+  assert.match(elem('rq-worktrees').title,/cannot represent/);
+  await check('rq-worktrees',true);
+  assert.equal(elem('rq-worktrees')._cls.has('pendchg'),true);
+  await check('rq-worktrees',false);
+  reqs.review.baseline=saveBase;
+  await vm.runInContext('refreshPending()',ctx);
+  assert.equal(elem('rq-worktrees')._cls.has('pendchg'),false);
+  assert.equal(elem('rq-worktrees').title,'');
   // a generation input -> Regenerate is the only way, Apply neutralized
   await type('rq-raw','widen the scope');
   assert.match(elem('pend-note').innerHTML,/request text/);

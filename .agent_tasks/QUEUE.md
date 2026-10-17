@@ -1091,3 +1091,26 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   refreshPending, suppressed mid-planning like the note). The run
   modal's tasks table gained a review column (unreviewed pill /
   reviewed / -).
+- DONE 2026-10-17 (follow-up chip + merge-target/mixed-pend fixes,
+  interactive): the 'follow-up'/'follow-up ->' labels are now real
+  .stage-style pills (bordered, grey, hover underline) instead of bare
+  text. Merge-target field: manifested records no longer get the 'main'
+  phantom fill (guessed defaults are a new-draft convenience only - a
+  manifested field mirrors the TOML, so an empty TOML key reads empty,
+  placeholder shows the implied branch); mtSlug() resolves the field's
+  project from the TOML's step slugs when the request's own project is
+  still inferred, so single-project proposals get real branch lists +
+  the 'not a local branch' hint instead of blind validation at Apply;
+  branch lists memoize 60s in BRANCH_CACHE so modal opens don't re-spawn
+  git. pendingNow reports 'mixed' for opts whose baseline the form
+  cannot express (per-step values differ in the TOML - e.g. one
+  checkout-bound merge step among worktree steps): the pend-note says
+  'X is mixed across the proposal's steps' instead of lying that it
+  'changed', and the framed control carries a tooltip explaining Apply
+  would NORMALIZE every step to the form's value (deliberate mixes are
+  flattened - check the TOML first). Verified live: the
+  workflow-ux-safety-followup modal now shows merge_target empty +
+  master placeholder (was phantom 'main'), worktrees framed with the
+  mixed note, and proposal-ui-fixes-followup (which really does write
+  merge_target = "main") shows the 'main is not a local branch in
+  agent-conductor' hint.

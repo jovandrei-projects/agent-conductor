@@ -12448,15 +12448,19 @@ tr.agen.unreviewed td.step > span { font-weight:700; }
 .linkbtn { background:none; border:0; color:#58a6ff; cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
 .run-name { color:#58a6ff; text-decoration:underline; text-align:left; }
 .run-name:hover { color:#79c0ff; }
-/* Follow-up links are metadata chips, not actions competing with the
-   row's real links: neutral grey, and the underline only appears on
-   hover. A bad outcome (error/invalid/missing/...) colors just the
-   status word, leaving the 'follow-up' prefix grey. */
-.fulink { background:none; border:0; color:#8b949e; cursor:pointer;
-  font:inherit; padding:0; text-decoration:none; }
-.fulink:hover { color:#c9d1d9; text-decoration:underline; }
+/* Follow-up links are metadata chips - the same pill chrome as .stage
+   so the row reads as labels, not actions: neutral grey, the underline
+   only appears on hover. A bad outcome (error/invalid/missing/...)
+   colors just the status word (.fu-bad), the prefix stays grey. */
+.fulink { display:inline-block; border:1px solid #30363d; border-radius:9px;
+  padding:1px 7px; font-size:11px; line-height:1.6; background:none;
+  color:#8b949e; cursor:pointer; font:inherit; text-decoration:none;
+  white-space:nowrap; vertical-align:middle; }
+.fulink:hover { color:#c9d1d9; border-color:#8b949e;
+  text-decoration:underline; }
 span.fulink { cursor:default; }
-span.fulink:hover { color:#8b949e; text-decoration:none; }
+span.fulink:hover { color:#8b949e; border-color:#30363d;
+  text-decoration:none; }
 .fu-bad { color:#f85149; }
 /* the other half of a follow-up pair while a modal shows one side -
    lighter than .dsel (the open view's own row) */
@@ -14948,7 +14952,7 @@ function showRequestForm(rec){
   // project is still inferred).
   mtTouched=!!rec.merge_target;
   mtImplied='';
-  loadBranches(rec.project||'');
+  loadBranches(mtSlug());
   // the record only arrived now - mark the source run's row .dlinked
   // without waiting out the next refresh tick
   applySel();
@@ -14993,13 +14997,17 @@ function pendingNow(){
   // no proposal yet, no baselines shipped, or no editable form on screen:
   // the server's saved-state verdict stands alone
   if (!rec.manifest || !base || !document.getElementById('rq-raw'))
-    return {gen:[...pend.gen],opts:[...pend.opts]};
+    return {gen:[...pend.gen],opts:[...pend.opts],mixed:[]};
   const f=requestFields();
   for (const k of GEN_KEYS){
     if (base[k]==null) continue;      // unknowable - keep server verdict
     pend.gen.delete(k);
     if (!sameBase(k,f[k],base[k])) pend.gen.add(k);
   }
+  // 'mixed' = opts whose baseline the single control cannot express at
+  // all (the TOML carries differing per-step values): flagged pending
+  // whatever the field says - no toggle position reconciles a mix.
+  const mixed=new Set();
   for (const k of OPT_KEYS){
     pend.opts.delete(k);
     // null = the TOML cannot express the form value (absent key or a
@@ -15007,9 +15015,10 @@ function pendingNow(){
     // merge is the exception: an absent key IS 'auto', so a pre-field
     // baseline compares the form against the default, not 'diverged'.
     const bv = k==='merge' && base[k]==null ? 'auto' : base[k];
-    if (bv==null || !sameBase(k,f[k],bv)) pend.opts.add(k);
+    if (bv==null){ pend.opts.add(k); mixed.add(k); }
+    else if (!sameBase(k,f[k],bv)) pend.opts.add(k);
   }
-  return {gen:[...pend.gen],opts:[...pend.opts]};
+  return {gen:[...pend.gen],opts:[...pend.opts],mixed:[...mixed]};
 }
 function pendNote(p){
   if (p.opts.includes('manifest'))
@@ -15024,23 +15033,38 @@ function pendNote(p){
   const hasGen=p.gen.length>0, hasOpts=p.opts.length>0;
   if (!hasGen && !hasOpts) return '';
   const genTxt=p.gen.map(pendName).join(', ');
-  const optTxt=p.opts.map(pendName).join(', ');
+  // options whose baseline the form cannot express (mixed per-step
+  // values in the TOML) are pending forever - saying they 'changed' is
+  // a lie, and Apply FLATTENS the mix rather than reconciling it.
+  const mix=(p.mixed||[]).filter(k=>p.opts.includes(k));
+  const chg=p.opts.filter(k=>!mix.includes(k));
+  const optTxt=chg.map(pendName).join(', ');
+  const mixTxt=mix.map(pendName).join(', ');
+  const mixCap=mixTxt ? mixTxt[0].toUpperCase()+mixTxt.slice(1) : '';
+  const mixPart=mixTxt
+    ? `${mixCap} ${mix.length>1?'are':'is'} mixed across the ` +
+      `proposal's steps - a single option cannot represent that, so ` +
+      `the frame stays no matter what it is set to. <b>Apply options ` +
+      `to TOML</b> would normalize every step to the form's value ` +
+      `(check the TOML first - a deliberate mix would be flattened).` : '';
   if (hasGen && hasOpts)
     return `Two kinds of changes are pending: ${genTxt} - only ` +
       `<b>Regenerate tasks</b> rebuilds the plan around those - and ` +
-      `options (${optTxt}) that Apply options to TOML could patch. ` +
+      `options (${[optTxt,mixTxt].filter(Boolean).join(', ')}) that ` +
+      `Apply options to TOML could patch. ` +
       `Regenerate first: the new plan is built from the current request ` +
       `and writes the current options too, so a single Regenerate ` +
-      `clears both.`;
+      `clears both. ${mixPart}`;
   if (hasGen)
     return `${genTxt} changed since this proposal was generated - the ` +
       `step prompts were built from the old input. <b>Regenerate ` +
       `tasks</b> rebuilds the plan around the current fields; Apply ` +
-      `options to TOML only patches option keys.`;
-  return `Options changed (${optTxt}) since this TOML was written - ` +
-    `<b>Apply options to TOML</b> patches them in place, no planner ` +
-    `call needed. Regenerate tasks also works but re-plans the whole ` +
-    `proposal.`;
+      `options to TOML only patches option keys. ${mixPart}`;
+  return (optTxt
+      ? `Options changed (${optTxt}) since this TOML was written - ` +
+        `<b>Apply options to TOML</b> patches them in place, no planner ` +
+        `call needed. Regenerate tasks also works but re-plans the ` +
+        `whole proposal. ${mixPart}` : mixPart);
 }
 // pending key -> the form field it lives in, so the pend-note's list
 // maps onto the actual controls (a subtle amber frame, not just words)
@@ -15060,11 +15084,23 @@ function refreshPending(){
   const hot = quiet ? new Set()
     : new Set([...p.gen, ...p.opts]
         .map(k=>PEND_EL[k]).filter(Boolean));
+  const mix = quiet ? new Set()
+    : new Set((p.mixed||[]).map(k=>PEND_EL[k]).filter(Boolean));
   for (const id of new Set(Object.values(PEND_EL))){
     const el=document.getElementById(id);
     if (!el || !el.classList) continue;
     const on = hot.has(id);
     el.classList.toggle('pendchg', on);
+    // a mixed-baseline frame cannot be toggled off - say so on the
+    // element itself, and only clear a title WE set (dataset marker)
+    if (mix.has(id)){
+      el.title='the proposal TOML mixes per-step values this single ' +
+        'control cannot represent - Apply options to TOML normalizes ' +
+        'every step to this value';
+      if (el.dataset) el.dataset.pmix='1';
+    } else if (el.dataset && el.dataset.pmix){
+      el.title=''; delete el.dataset.pmix;
+    }
     const lab = el.closest && el.closest('label.check');
     if (lab && lab.classList) lab.classList.toggle('pendchg-lab', on);
   }
@@ -15109,29 +15145,59 @@ function refreshPending(){
 // objects.) The server still does the authoritative check on
 // save/generate.
 let mtBranches={slug:null,list:[]}, mtTouched=false, mtImplied='';
+// GET /api/projects/<slug>/branches spawns a git listing server-side -
+// memoize per slug for a minute so reopening a modal or switching
+// projects doesn't re-run it every time.
+const BRANCH_CACHE={}, BRANCH_TTL_MS=60000;
+// The merge-target field's project context: an explicit selection wins;
+// an inferred one falls back to the proposal TOML's step projects when
+// they all share one slug. Multi-project manifests resolve to '' - no
+// single branch list applies.
+function mtSlug(){
+  const sel=document.getElementById('rq-project');
+  if (sel && sel.value) return sel.value;
+  const rec=(modalRequest&&modalRequest.record)||{};
+  if (rec.project) return rec.project;
+  const slugs=new Set();
+  for (const m of String(rec.manifest_text||'')
+      .matchAll(/^[ \t]*project\s*=\s*"([^"]+)"/gm))
+    slugs.add(m[1]);
+  return slugs.size===1 ? [...slugs][0] : '';
+}
 async function loadBranches(slug){
   const inp=document.getElementById('rq-merge_target');
   const dl=document.getElementById('rq-branches');
   if(!inp) return;
+  // A manifested record's field mirrors the proposal TOML - never
+  // overwrite it with a guessed default: a 'main' fill on a repo whose
+  // default is 'master' flags the field pending for no reason and
+  // Apply would write the phantom into [run].merge_target. Guessed
+  // defaults are a new-draft convenience only.
+  const manifested=!!(modalRequest&&modalRequest.record&&
+                      modalRequest.record.manifest);
   if(!slug){
     mtBranches={slug:'',list:[]};
     if(dl) dl.innerHTML='';
-    mtImplied='main';
-    if(!mtTouched && !inp.value) inp.value='main';
-    inp.placeholder='main';
+    mtImplied=manifested?'':'main';
+    if(!mtTouched && !manifested && !inp.value) inp.value='main';
+    inp.placeholder=manifested?"each step project's checked-out branch"
+                              :'main';
     updateMtHint();
     return;
   }
   try {
-    const b=await api('GET',
-      `/api/projects/${encodeURIComponent(slug)}/branches`);
-    if(document.getElementById('rq-project')?.value!==slug) return;
+    const hit=BRANCH_CACHE[slug];
+    const b=(hit && Date.now()-hit.at<BRANCH_TTL_MS) ? hit.data
+      : await api('GET',
+        `/api/projects/${encodeURIComponent(slug)}/branches`);
+    BRANCH_CACHE[slug]={at:Date.now(),data:b};
+    if(mtSlug()!==slug) return;   // a newer modal/project won the race
     mtBranches={slug,list:b.branches||[]};
     if(dl) dl.innerHTML=mtBranches.list
       .map(x=>`<option value="${esc(x)}">`).join('');
     const cur=b.current||'';
     mtImplied=cur;
-    if(!mtTouched) inp.value=cur;
+    if(!mtTouched && !manifested) inp.value=cur;
     inp.placeholder=cur||'checkout branch';
   } catch(err){
     mtBranches={slug,list:[]};
@@ -15142,16 +15208,22 @@ async function loadBranches(slug){
 function updateMtHint(){
   const inp=document.getElementById('rq-merge_target');
   const hint=document.getElementById('rq-mt-hint');
-  const slug=document.getElementById('rq-project')?.value||'';
+  const slug=mtSlug();
   if(!inp||!hint) return;
+  const manifested=!!(modalRequest&&modalRequest.record&&
+                      modalRequest.record.manifest);
   const base=`An existing local branch the worktree branches are created ` +
     `from and merged back into - empty means the project checkout's ` +
     `current branch. Needs worktree isolation.`;
   const v=String(inp.value||'').trim();
   if(!slug){
-    hint.innerHTML=esc(base)+' With an inferred project the editable ' +
-      `<b>main</b> default is validated per resolved project at ` +
-      `generation.`;
+    hint.innerHTML=manifested
+      ? esc(base)+" The proposal's steps span multiple or no resolved "+
+        'projects - a target named here must exist in every repo a ' +
+        'worktree step uses.'
+      : esc(base)+' With an inferred project the editable ' +
+        `<b>main</b> default is validated per resolved project at ` +
+        `generation.`;
   } else if(v && mtBranches.slug===slug &&
             !mtBranches.list.includes(v)){
     hint.innerHTML=`<b>${esc(v)}</b> is not a local branch in ` +
