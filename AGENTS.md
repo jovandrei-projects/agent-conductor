@@ -715,6 +715,22 @@ Requires `devin` on PATH and `devin auth login` to have been run once
 (`devin auth status` is checked at run start; conductor aborts cleanly if
 not logged in).
 
+What's new tour: `tour_state.py` (repo root, stdlib-only) owns the
+walkthrough's persisted state - `data/tour-state.json` is exactly
+`{watermark, viewed[], snoozed[]}`. The watermark is a `{commit, at}`
+pair: a RESOLVED sha bounding `git log <commit>..<boundary.commit>` plus
+an ISO instant bounding the record feeds - never symbolic HEAD, never a
+serve_boot id, never touched at serve start. First init writes
+`{commit:null, at:null}` (nothing acknowledged) rather than pinning
+HEAD; an unresolvable recorded commit stays recorded and refuses
+advancement instead of resetting. `mark_viewed` is the only watermark
+mover - only when the caller reports no 'new' entries, and only as far
+as the feed's captured boundary (never a fresh HEAD); `snooze` defers
+without acknowledging, `unview` flags `unviewed_at` keeping the
+descriptor's `{base,tip}` range so entries behind the watermark stay
+retrievable and resurface as new. All mutations are lock-serialized
+tmp+replace writes.
+
 ## Traps
 
 Append as they are hit.
