@@ -12448,15 +12448,19 @@ tr.agen.unreviewed td.step > span { font-weight:700; }
 .linkbtn { background:none; border:0; color:#58a6ff; cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
 .run-name { color:#58a6ff; text-decoration:underline; text-align:left; }
 .run-name:hover { color:#79c0ff; }
-/* Follow-up links are metadata chips, not actions competing with the
-   row's real links: neutral grey, and the underline only appears on
-   hover. A bad outcome (error/invalid/missing/...) colors just the
-   status word, leaving the 'follow-up' prefix grey. */
-.fulink { background:none; border:0; color:#8b949e; cursor:pointer;
-  font:inherit; padding:0; text-decoration:none; }
-.fulink:hover { color:#c9d1d9; text-decoration:underline; }
+/* Follow-up links are metadata chips - the same pill chrome as .stage
+   so the row reads as labels, not actions: neutral grey, the underline
+   only appears on hover. A bad outcome (error/invalid/missing/...)
+   colors just the status word (.fu-bad), the prefix stays grey. */
+.fulink { display:inline-block; border:1px solid #30363d; border-radius:9px;
+  padding:1px 7px; font-size:11px; line-height:1.6; background:none;
+  color:#8b949e; cursor:pointer; font:inherit; text-decoration:none;
+  white-space:nowrap; vertical-align:middle; }
+.fulink:hover { color:#c9d1d9; border-color:#8b949e;
+  text-decoration:underline; }
 span.fulink { cursor:default; }
-span.fulink:hover { color:#8b949e; text-decoration:none; }
+span.fulink:hover { color:#8b949e; border-color:#30363d;
+  text-decoration:none; }
 .fu-bad { color:#f85149; }
 /* the other half of a follow-up pair while a modal shows one side -
    lighter than .dsel (the open view's own row) */
@@ -14993,13 +14997,17 @@ function pendingNow(){
   // no proposal yet, no baselines shipped, or no editable form on screen:
   // the server's saved-state verdict stands alone
   if (!rec.manifest || !base || !document.getElementById('rq-raw'))
-    return {gen:[...pend.gen],opts:[...pend.opts]};
+    return {gen:[...pend.gen],opts:[...pend.opts],mixed:[]};
   const f=requestFields();
   for (const k of GEN_KEYS){
     if (base[k]==null) continue;      // unknowable - keep server verdict
     pend.gen.delete(k);
     if (!sameBase(k,f[k],base[k])) pend.gen.add(k);
   }
+  // 'mixed' = opts whose baseline the single control cannot express at
+  // all (the TOML carries differing per-step values): flagged pending
+  // whatever the field says - no toggle position reconciles a mix.
+  const mixed=new Set();
   for (const k of OPT_KEYS){
     pend.opts.delete(k);
     // null = the TOML cannot express the form value (absent key or a
@@ -15007,9 +15015,10 @@ function pendingNow(){
     // merge is the exception: an absent key IS 'auto', so a pre-field
     // baseline compares the form against the default, not 'diverged'.
     const bv = k==='merge' && base[k]==null ? 'auto' : base[k];
-    if (bv==null || !sameBase(k,f[k],bv)) pend.opts.add(k);
+    if (bv==null){ pend.opts.add(k); mixed.add(k); }
+    else if (!sameBase(k,f[k],bv)) pend.opts.add(k);
   }
-  return {gen:[...pend.gen],opts:[...pend.opts]};
+  return {gen:[...pend.gen],opts:[...pend.opts],mixed:[...mixed]};
 }
 function pendNote(p){
   if (p.opts.includes('manifest'))
@@ -15024,23 +15033,37 @@ function pendNote(p){
   const hasGen=p.gen.length>0, hasOpts=p.opts.length>0;
   if (!hasGen && !hasOpts) return '';
   const genTxt=p.gen.map(pendName).join(', ');
-  const optTxt=p.opts.map(pendName).join(', ');
+  // options whose baseline the form cannot express (mixed per-step
+  // values in the TOML) are pending forever - saying they 'changed' is
+  // a lie, and Apply FLATTENS the mix rather than reconciling it.
+  const mix=(p.mixed||[]).filter(k=>p.opts.includes(k));
+  const chg=p.opts.filter(k=>!mix.includes(k));
+  const optTxt=chg.map(pendName).join(', ');
+  const mixTxt=mix.map(pendName).join(', ');
+  const mixPart=mixTxt
+    ? ` ${mixTxt} ${mix.length>1?'are':'is'} mixed across the ` +
+      `proposal's steps - a single option cannot represent that, so ` +
+      `the frame stays no matter what it is set to. <b>Apply options ` +
+      `to TOML</b> would normalize every step to the form's value ` +
+      `(check the TOML first - a deliberate mix would be flattened).` : '';
   if (hasGen && hasOpts)
     return `Two kinds of changes are pending: ${genTxt} - only ` +
       `<b>Regenerate tasks</b> rebuilds the plan around those - and ` +
-      `options (${optTxt}) that Apply options to TOML could patch. ` +
+      `options (${[optTxt,mixTxt].filter(Boolean).join(', ')}) that ` +
+      `Apply options to TOML could patch. ` +
       `Regenerate first: the new plan is built from the current request ` +
       `and writes the current options too, so a single Regenerate ` +
-      `clears both.`;
+      `clears both.${mixPart}`;
   if (hasGen)
     return `${genTxt} changed since this proposal was generated - the ` +
       `step prompts were built from the old input. <b>Regenerate ` +
       `tasks</b> rebuilds the plan around the current fields; Apply ` +
-      `options to TOML only patches option keys.`;
-  return `Options changed (${optTxt}) since this TOML was written - ` +
-    `<b>Apply options to TOML</b> patches them in place, no planner ` +
-    `call needed. Regenerate tasks also works but re-plans the whole ` +
-    `proposal.`;
+      `options to TOML only patches option keys.${mixPart}`;
+  return (optTxt
+      ? `Options changed (${optTxt}) since this TOML was written - ` +
+        `<b>Apply options to TOML</b> patches them in place, no planner ` +
+        `call needed. Regenerate tasks also works but re-plans the ` +
+        `whole proposal.` : '') + mixPart;
 }
 // pending key -> the form field it lives in, so the pend-note's list
 // maps onto the actual controls (a subtle amber frame, not just words)
