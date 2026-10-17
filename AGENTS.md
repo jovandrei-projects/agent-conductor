@@ -115,8 +115,11 @@ sessions count too), and a step that finds no free slot waits `queued`
 with `slot_wait`/`slot_waited_s` + a note naming the holders - queued
 steps hold NO slot so the pool always drains. Slot events
 (`slot_acquired`/`slot_wait`/`slot_released`) land in events.jsonl, the
-dashboard meta line shows `slots N/M` plus the queued count, and
+dashboard topbar's `agents N/M` button opens the pool modal (live
+holder/queued breakdown, cap stepper + Apply, never-kills warning), and
 `sweep_agent_slots` (sweep + serve startup) reclaims dead-owner leases.
+Note `slot_wait` stays stamped on a record after the lease lands - only
+`status='queued'` means still waiting.
 Parallel sessions get a PARALLEL_NOTE prompt block: share the box, own
 your checkout/leases/ports, never fight a peer or the user over a shared
 resource - if a genuinely exclusive resource is held, end `STATUS:
