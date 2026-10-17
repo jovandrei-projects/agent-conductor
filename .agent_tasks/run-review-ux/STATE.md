@@ -52,17 +52,22 @@ See `DESIGN.md` for full reasoning + sources. Headlines:
 ### Phase 2 - implementation (manifest steps, other sessions)
 
 - [ ] review-workflow - the model above
-- [ ] task-outcome-summary - SUMMARY: line -> rec["outcome"] -> modal/table
-- [ ] task-table-navigation - name-targeted clicks + selection highlight
-- [ ] modal-refresh-stability - scroll-stable modal rebuilds
+- [x] task-outcome-summary - SUMMARY: line -> rec["outcome"] -> modal/table
+      (landed on master, merge d57e9c2)
+- [x] task-table-navigation - name-targeted clicks + selection highlight
+      (landed on master, merge 12fbe2b)
+- [x] modal-refresh-stability - scroll-stable modal rebuilds
+      (landed on master, merge 8cb3988)
 - [ ] cumulative-elapsed-time - interval accumulation + runs elapsed col
-- [ ] execution-context-labels - run-level wt chip + watcher identity
+- [x] execution-context-labels - run-level wt chip + watcher identity
+      (landed on master, merge 6b1418c)
 - [ ] manual-merge-guard - disable/refuse while run live (driver included)
 - [ ] integration-verification + follow-up-plan
 
 ## Where it stopped
 
-Design complete and verified (276/276 `python run_tests.py`). Next session
+Design step merged to master (284fb2a, 2026-10-16) after a bookkeeping
+both-append resolution on QUEUE.md + efficiency_stats.md. Next session
 = `review-workflow` step: implement per DESIGN.md - `completion_seq` bumps
 at the enumerated write sites, `review-*` sentinels + endpoints +
 `collect_dashboard` fields, modal buttons + ctx-menu items, `.stage`
