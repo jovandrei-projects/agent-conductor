@@ -407,7 +407,13 @@ pending means Regenerate first since it writes the options too. Reverting
 a field to its baseline clears the mark; launch refuses while either
 bucket is pending; a failed generation/apply keeps the pending state; a
 hand-edited TOML moves the option baseline (the form then shows drift
-until reconciled). Records published before baselines existed keep the
+until reconciled). A third `mixed` bucket holds option keys whose TOML
+baseline is a per-step mix the single form control cannot express
+(`worktrees`/`merge`/`merge_target` when `is None`): it frames the
+control with an explanatory tooltip but is NOT drift - it never flags
+`stale` and never blocks Start (Apply remains the explicit normalize-
+every-step path, warned in the note as flattening a deliberate mix).
+Records published before baselines existed keep the
 old `stale` flag as an opaque `fields` gen marker until a publish
 re-baselines them; `ask`/`plan_model`/`plan_effort`/`label` never stale.
 The form's follow-up checkbox asks the planner for a
@@ -419,7 +425,13 @@ appends the step itself. The produced file is *intake, not execution*:
 record (`Ready to run`, `source_run`/`source_manifest` linked - only a
 human's Start run launches it). The file's own text is validated by
 `validate_proposal` and copied to an owned `manifests/<id>-<name>.toml`;
-the source stays read-only and is never trashed. Idempotency lives in
+the source stays read-only and is never trashed. One repair runs before
+validation everywhere a proposal is published (`_publish_proposal` and
+`_followup_apply` both route through `_clamp_description`): an overlong
+`[run].description` (300-char cap, stated to the planner and the
+follow-up writer in their prompts) is trimmed to 300 with an ellipsis
+rather than dead-ending the record `error` - a writer that overshoots by
+a sentence used to wedge Apply and Regenerate on the same line forever. Idempotency lives in
 `data/requests/followups.index` (sha'd per source), so repeated scans,
 restarts and rewrites reconcile one record instead of duplicating - a
 changed source re-copies and revalidates unless the record was

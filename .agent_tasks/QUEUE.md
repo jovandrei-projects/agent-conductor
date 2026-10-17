@@ -1114,3 +1114,20 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   mixed note, and proposal-ui-fixes-followup (which really does write
   merge_target = "main") shows the 'main is not a local branch in
   agent-conductor' hint.
+- DONE 2026-10-17 (description cap repair + mixed unblocks Start,
+  interactive): run-review-ux-followup wedged at 'error' - its
+  follow-up worker wrote a 332-char [run].description (cap is 300) and
+  every Save/Apply/Regenerate re-failed on the same line. Fixed at the
+  root: both writer prompts now state the cap, and _clamp_description
+  repairs an overlong description (single-line or multiline span) before
+  _publish_proposal and _followup_apply validate - the cap itself is
+  unchanged, hand drafts still fail as written. Pending semantics split
+  a third 'mixed' bucket out of 'opts': a TOML whose worktrees/merge/
+  merge_target baselines are per-step mixes is unrepresentable by the
+  single control, so it frames + tooltips but no longer marks stale or
+  blocks Start (Apply stays live as the explicit normalize-every-step
+  path). The stuck record self-healed - the fixed source re-imported on
+  sha change and now reads Ready to run. Verified live: chips 'Ready to
+  run wt 4/5 follow-up', worktrees framed with the mixed tooltip, note
+  says 'mixed' not 'changed', Apply+Start both enabled, merge_target
+  empty with 'master' implied (no phantom 'main').

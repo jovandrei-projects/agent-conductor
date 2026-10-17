@@ -96,7 +96,7 @@
 
 [run]
 name = "run-review-ux-followup"
-description = "Land the five parked run-review-ux branches (review marks, cumulative elapsed time, manual merge guard, design docs - already union-verified on the integration-verification branch), make the 600s verify cap configurable, harden the two gate flakes this run exposed, and do the deferred real-browser pass over the combined dashboard."
+description = "Land the five parked run-review-ux branches (review marks, cumulative elapsed, merge guard, design docs - union-verified already), make the 600s verify cap configurable, harden the two gate flakes, and run the deferred real-browser pass."
 on_failure = "continue"
 checkpoint = true
 merge_resolver = true

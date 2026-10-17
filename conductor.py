@@ -248,7 +248,7 @@ FOLLOWUP_STEP = '''
 name = "follow-up-plan"
 project = "{slug}"
 timeout_min = 30
-prompt = 'This run just ended. Review what it accomplished against the request it ran from: per-step logs, STATUS/NEXT/OUTCOME lines and notes are under {runs} (the newest dir ending in -{run}), and progress files live under this project .agent_tasks/. Then write a NEW conductor TOML manifest proposing ONLY the still-unfinished or newly discovered work, saved as {manifests}/{run}-followup.toml - if nothing remains, write the file anyway but with no [[step]] entries (a run table + comments saying so), which registers as "no work remains" rather than a runnable job. The file is imported into the proposals list automatically - write it exactly once, do not implement or launch it, and do not schedule anything: only a human can start it.'
+prompt = 'This run just ended. Review what it accomplished against the request it ran from: per-step logs, STATUS/NEXT/OUTCOME lines and notes are under {runs} (the newest dir ending in -{run}), and progress files live under this project .agent_tasks/. Then write a NEW conductor TOML manifest proposing ONLY the still-unfinished or newly discovered work, saved as {manifests}/{run}-followup.toml - if nothing remains, write the file anyway but with no [[step]] entries (a run table + comments saying so), which registers as "no work remains" rather than a runnable job. It must pass proposal validation: [run].name a short safe slug, [run].description one sentence of AT MOST 300 characters (overlong descriptions fail validation and the proposal lands broken), checkpoint = true, every [[step]].project a registered projects.toml slug. The file is imported into the proposals list automatically - write it exactly once, do not implement or launch it, and do not schedule anything: only a human can start it.'
 '''
 
 RESOLVE_BODY = """\
@@ -7028,7 +7028,7 @@ def _pending_actions(rec: dict) -> dict:
     (no gen_inputs) keeps the old sticky flag as an opaque 'fields' gen
     marker until a publish re-baselines it; a manifest that does not read
     or parse reports the pseudo-key 'manifest' (Apply can't patch it)."""
-    out = {"gen": [], "opts": []}
+    out = {"gen": [], "opts": [], "mixed": []}
     if not rec.get("manifest"):
         return out
     base = rec.get("gen_inputs")
@@ -7063,9 +7063,26 @@ def _pending_actions(rec: dict) -> dict:
                 "followup": bool(rec.get("followup")),
                 "merge_target": (rec.get("merge_target") or "").strip()}
         for key, value in form.items():
-            if opts.get(key) is None or value != opts[key]:
+            bv = opts.get(key)
+            if key == "model" and bv is None:
+                bv = ""        # absent [defaults].model pins nothing
+            # a None baseline on a mixed-capable key means the TOML
+            # carries per-step values the single field cannot express -
+            # unrepresentable, not drift: it must not flag 'stale' or
+            # block launch (Apply can still normalize it on purpose)
+            if key in _MIXED_OPTS and bv is None:
+                out["mixed"].append(key)
+            elif bv is None or value != bv:
                 out["opts"].append(key)
     return out
+
+
+# option keys where a None manifest baseline means "the TOML mixes
+# per-step values" rather than "absent" - worktrees (some steps
+# isolated, some not), merge (differing per-step timing), merge_target
+# (differing per-step targets). The single form control cannot express
+# those, so pendingNow flags them 'mixed' instead of 'changed'.
+_MIXED_OPTS = {"worktrees", "merge", "merge_target"}
 
 
 def _request_baseline(rec: dict) -> dict:
@@ -7097,8 +7114,49 @@ def _request_baseline(rec: dict) -> dict:
     return out
 
 
+def _clamp_description(text: str) -> str:
+    """Trim an overlong [run].description to the 300-char cap before it
+    can dead-end a publish. A planner/worker that overshoots by one
+    sentence otherwise wedges the record 'error' forever - every save,
+    apply and regenerate re-fails on the same line. The cap itself is
+    still enforced by validate_proposal (empty still fails); this only
+    rescues the length, preserving the sentence's leading content.
+    No-op on unparseable text - the validator reports that instead."""
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return text
+    desc = doc.get("run", {}).get("description")
+    if not isinstance(desc, str) or len(desc) <= 300:
+        return text
+    lines = text.splitlines()
+    run = next((t for t in _toml_tables(lines) if t[0] == "run"), None)
+    if not run:
+        return text
+    i = _toml_key_at(lines, run[1], run[2], "description")
+    if i is None:
+        return text
+    # the value may span several lines (a ''' or triple-quoted literal) -
+    # replace the whole span, not just the key's first line
+    m = re.match(r"^\s*description\s*=\s*(.*)$", lines[i])
+    val = m.group(1) if m else ""
+    end = i + 1
+    for q in ("'''", '"""'):
+        if val.startswith(q) and val.count(q) == 1:
+            j = i + 1
+            while j < run[2] and q not in lines[j]:
+                j += 1
+            end = min(j + 1, run[2])
+            break
+    lines[i:end] = ["description = " +
+                    json.dumps(desc[:297].rstrip() + "...")]
+    out = "\n".join(lines)
+    return out + ("\n" if text.endswith("\n") else "")
+
+
 def _publish_proposal(rec: dict, text: str, requests_dir: Path,
                       manifests_dir: Path, runs_dir: Path) -> dict:
+    text = _clamp_description(text)
     cfg = validate_proposal(text, manifests_dir)
     if rec.get("followup") and not any(
             s.name == "follow-up-plan" for s in cfg.steps):
@@ -7414,6 +7472,10 @@ def _followup_apply(rec: dict, text: str, manifests_dir: Path,
     request inside the normal proposal machinery (_manifest_path, Apply,
     Discard, launch); the source file is only ever read."""
     _assert_unwatched(runs_dir, requests_dir, manifests_dir)
+    # an overlong [run].description is a dead record, not a defect worth
+    # keeping: the owned copy gets the clamped text, the worker's source
+    # file is untouched
+    text = _clamp_description(text)
     try:
         doc = tomllib.loads(text)
     except tomllib.TOMLDecodeError:
@@ -8107,9 +8169,9 @@ then a final STATUS: done line. No Markdown fences or other text.
 The ONLY task specification is the human request below; do not invent repo details.
 Registered project slugs (use these, never paths): {slugs}
 Preferred project (if supplied): {rec['project'] or '(infer from request)'}
-[run] needs name (short safe slug), description (one useful sentence),
-on_failure = {json.dumps(rec.get('on_failure') or 'continue')}, and
-checkpoint = true.
+[run] needs name (short safe slug), description (one useful sentence,
+300 characters MAX - longer fails validation), on_failure =
+{json.dumps(rec.get('on_failure') or 'continue')}, and checkpoint = true.
 [defaults] needs model = {json.dumps(rec['model'])}, effort =
 {json.dumps(rec['effort'])}, mode = "bypass", and timeout_min.
 Set max_attempts = {int(rec.get('max_attempts') or 3)} in [defaults]: a step
@@ -15005,6 +15067,9 @@ function showRequestForm(rec){
 const GEN_KEYS=['raw','project','attachments'];
 const OPT_KEYS=['model','effort','on_failure','max_attempts','worktrees',
   'merge_resolver','merge','followup','merge_target'];
+// mirrors conductor._MIXED_OPTS - keys whose manifest baseline may
+// legitimately be null because the TOML carries a per-step mix
+const MIXED_KEYS=new Set(['worktrees','merge','merge_target']);
 const PEND_LABEL={raw:'request text',project:'target project',
   attachments:'image attachments',fields:'request fields',
   model:'step model',effort:'step effort',on_failure:'failure policy',
@@ -15025,6 +15090,10 @@ function pendingNow(){
   const rec=(modalRequest&&modalRequest.record)||{};
   const srv=rec.pending||{};
   const pend={gen:new Set(srv.gen||[]),opts:new Set(srv.opts||[])};
+  // mixed-baseline keys live apart from 'opts' (changed): nothing the
+  // field can be set to matches a per-step mix, and a valid mixed TOML
+  // must not block Start - only real drift does.
+  const mixed=new Set(srv.mixed||[]);
   // a pre-pending record carries only the lumped flag - an unattributed
   // 'fields' marker, same fallback _pending_actions makes server-side
   if (rec.stale && rec.pending===undefined) pend.gen.add('fields');
@@ -15039,18 +15108,16 @@ function pendingNow(){
     pend.gen.delete(k);
     if (!sameBase(k,f[k],base[k])) pend.gen.add(k);
   }
-  // 'mixed' = opts whose baseline the single control cannot express at
-  // all (the TOML carries differing per-step values): flagged pending
-  // whatever the field says - no toggle position reconciles a mix.
-  const mixed=new Set();
   for (const k of OPT_KEYS){
-    pend.opts.delete(k);
-    // null = the TOML cannot express the form value (absent key or a
-    // mixed worktree set) - diverged whichever way the field sits.
-    // merge is the exception: an absent key IS 'auto', so a pre-field
-    // baseline compares the form against the default, not 'diverged'.
-    const bv = k==='merge' && base[k]==null ? 'auto' : base[k];
-    if (bv==null){ pend.opts.add(k); mixed.add(k); }
+    if (!(k in base)) continue;        // not shipped - keep server verdict
+    pend.opts.delete(k); mixed.delete(k);
+    // A null baseline splits three ways server-side (_manifest_options):
+    // 'model' absent means nothing pinned - '' is the match; worktrees,
+    // merge and merge_target null means the TOML MIXES per-step values
+    // the single control cannot express - unrepresentable, not drift;
+    // a null on any other key is unknowable - real drift.
+    const bv = k==='model' && base[k]==null ? '' : base[k];
+    if (bv==null){ (MIXED_KEYS.has(k)?mixed:pend.opts).add(k); }
     else if (!sameBase(k,f[k],bv)) pend.opts.add(k);
   }
   return {gen:[...pend.gen],opts:[...pend.opts],mixed:[...mixed]};
@@ -15065,13 +15132,14 @@ function pendNote(p){
       '(which ones is not recorded for this older draft) - ' +
       '<b>Regenerate tasks</b> is the safe refresh; it also writes the ' +
       'current options into the new TOML.';
-  const hasGen=p.gen.length>0, hasOpts=p.opts.length>0;
+  const hasGen=p.gen.length>0, hasOpts=p.opts.length>0 ||
+    (p.mixed||[]).length>0;
   if (!hasGen && !hasOpts) return '';
   const genTxt=p.gen.map(pendName).join(', ');
   // options whose baseline the form cannot express (mixed per-step
   // values in the TOML) are pending forever - saying they 'changed' is
   // a lie, and Apply FLATTENS the mix rather than reconciling it.
-  const mix=(p.mixed||[]).filter(k=>p.opts.includes(k));
+  const mix=(p.mixed||[]);
   const chg=p.opts.filter(k=>!mix.includes(k));
   const optTxt=chg.map(pendName).join(', ');
   const mixTxt=mix.map(pendName).join(', ');
@@ -15117,7 +15185,7 @@ function refreshPending(){
   // planning like the note itself (the change is being regenerated).
   const quiet = stage==='generating'||stage==='questions';
   const hot = quiet ? new Set()
-    : new Set([...p.gen, ...p.opts]
+    : new Set([...p.gen, ...p.opts, ...(p.mixed||[])]
         .map(k=>PEND_EL[k]).filter(Boolean));
   const mix = quiet ? new Set()
     : new Set((p.mixed||[]).map(k=>PEND_EL[k]).filter(Boolean));
@@ -15148,7 +15216,9 @@ function refreshPending(){
   }
   const ap=document.getElementById('rq-apply');
   if (ap){
-    const usable=!p.gen.length && p.opts.length>0 &&
+    // Apply patches CHANGED options and NORMALIZES mixed ones alike -
+    // both are patchable, so either enables it
+    const usable=!p.gen.length && (p.opts.length>0 || mix.size>0) &&
                  !p.opts.includes('manifest');
     ap.disabled=!usable;
     ap.title= p.gen.length
@@ -15158,12 +15228,16 @@ function refreshPending(){
       ? 'disabled - the proposal TOML does not parse; fix it in the ' +
         'editor or regenerate'
       : usable
-      ? 'patch ' + p.opts.map(pendName).join(', ') +
+      ? 'patch ' + [...p.opts, ...(p.mixed||[])]
+          .map(pendName).join(', ') +
         ' into the proposal TOML without a planner call'
       : 'options already match the proposal TOML - nothing to apply';
   }
   const run=document.getElementById('rq-run');
   if (run){
+    // a mixed option stays pending forever by nature - it is NOT drift,
+    // so it cannot block launch; only real diffs (gen inputs, changed
+    // options) do
     run.disabled=!!(p.gen.length||p.opts.length);
     run.title= run.disabled
       ? 'disabled while fields differ from the proposal - Regenerate ' +

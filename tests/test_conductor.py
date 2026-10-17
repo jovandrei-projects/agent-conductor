@@ -4514,8 +4514,12 @@ const check=(id,v)=>{ elem(id).checked=v;
   assert.match(elem('pend-note').innerHTML,/mixed across the proposal/);
   assert.doesNotMatch(elem('pend-note').innerHTML,/Options changed/);
   assert.match(elem('rq-worktrees').title,/cannot represent/);
+  // mixed-only never blocks Start; Apply stays live to normalize
+  assert.equal(elem('rq-run').disabled,false);
+  assert.equal(elem('rq-apply').disabled,false);
   await check('rq-worktrees',true);
   assert.equal(elem('rq-worktrees')._cls.has('pendchg'),true);
+  assert.equal(elem('rq-run').disabled,false);
   await check('rq-worktrees',false);
   reqs.review.baseline=saveBase;
   await vm.runInContext('refreshPending()',ctx);
@@ -6388,19 +6392,19 @@ prompt = "Organize the catalog and verify results."
     def test_opt_change_and_revert_clears_pending(self):
         rec = self.ready()
         out = self.save(rec["id"], {"worktrees": True})
-        self.assertEqual(out["pending"], {"gen": [], "opts": ["worktrees"]})
+        self.assertEqual(out["pending"], {"gen": [], "opts": ["worktrees"], "mixed": []})
         self.assertTrue(out["stale"])
         out = self.save(rec["id"], {"worktrees": False})
-        self.assertEqual(out["pending"], {"gen": [], "opts": []})
+        self.assertEqual(out["pending"], {"gen": [], "opts": [], "mixed": []})
         self.assertFalse(out["stale"])
 
     def test_gen_change_and_revert_clears_pending(self):
         rec = self.ready()
         out = self.save(rec["id"], {"raw": "widen the scope"})
-        self.assertEqual(out["pending"], {"gen": ["raw"], "opts": []})
+        self.assertEqual(out["pending"], {"gen": ["raw"], "opts": [], "mixed": []})
         out = self.save(rec["id"],
                         {"raw": "Please tidy the catalog carefully"})
-        self.assertEqual(out["pending"], {"gen": [], "opts": []})
+        self.assertEqual(out["pending"], {"gen": [], "opts": [], "mixed": []})
         self.assertFalse(out["stale"])
 
     def test_attachments_are_a_gen_input(self):
@@ -6419,13 +6423,13 @@ prompt = "Organize the catalog and verify results."
     def test_gen_and_opts_pending_independently(self):
         rec = self.ready()
         out = self.save(rec["id"], {"effort": "high"})
-        self.assertEqual(out["pending"], {"gen": [], "opts": ["effort"]})
+        self.assertEqual(out["pending"], {"gen": [], "opts": ["effort"], "mixed": []})
         out = self.save(rec["id"], {"raw": "widen the scope"})
         self.assertEqual(out["pending"]["gen"], ["raw"])
         self.assertEqual(out["pending"]["opts"], ["effort"])
         # reverting one side clears only that side
         out = self.save(rec["id"], {"effort": "max"})
-        self.assertEqual(out["pending"], {"gen": ["raw"], "opts": []})
+        self.assertEqual(out["pending"], {"gen": ["raw"], "opts": [], "mixed": []})
 
     def test_saved_gen_divergence_still_refuses_apply(self):
         """The old check compared the payload to the last save, so a
@@ -6472,6 +6476,58 @@ prompt = "Organize the catalog and verify results."
                                            self.manifests, self.runs,
                                            ["devin"])
         self.assertEqual(out["status"], "launching")
+
+    def test_mixed_worktrees_are_mixed_not_drift(self):
+        """A TOML that mixes worktree=True/False across steps cannot be
+        expressed by the single form checkbox - it lands in 'mixed', not
+        'opts', stays unstale, and does not block launch."""
+        rec = self.ready()
+        out = self.save(rec["id"], {"manifest": self.proposal(
+            extra_steps='''
+[[step]]
+name = "isolated"
+worktree = true
+prompt = "Isolated step."''')})
+        self.assertEqual(out["pending"],
+                         {"gen": [], "opts": [], "mixed": ["worktrees"]})
+        self.assertFalse(out["stale"])
+        # a deliberately-mixed proposal launches as written - no
+        # normalize-or-regenerate gate stands in its way
+        with mock.patch.object(conductor, "_launch_process",
+                               return_value=4321):
+            out = conductor.launch_request(rec["id"], self.requests,
+                                           self.manifests, self.runs,
+                                           ["devin"])
+        self.assertEqual(out["status"], "launching")
+
+    def test_overlong_description_is_clamped_on_publish(self):
+        """Planner/follow-up writers overflow the 300-char cap; publish
+        clamps instead of dead-ending the record at 'error'."""
+        rec = self.ready()
+        out = self.save(rec["id"], {"manifest": self.proposal(
+            description="x" * 350)})
+        self.assertEqual(out["status"], "ready")
+        self.assertLessEqual(len(out["description"]), 300)
+        self.assertTrue(out["description"].endswith("..."))
+        # and the on-disk TOML is the clamped text, not a festering bomb
+        cfg = conductor.validate_proposal(
+            Path(out["manifest"]).read_text(encoding="utf-8"))
+        self.assertLessEqual(len(cfg.description), 300)
+
+    def test_clamp_handles_multiline_description(self):
+        """A triple-quoted description must be replaced span-wide, not
+        line-wide (repeating the key would be a hard TOML error)."""
+        text = self.proposal(description='"""\n' + "y" * 350 + '\n"""')
+        # sanity: it really is over the cap before repair
+        self.assertGreater(len(conductor.tomllib.loads(text)
+                               ["run"]["description"]), 300)
+        out = conductor._clamp_description(text)
+        desc = conductor.tomllib.loads(out)["run"]["description"]
+        self.assertLessEqual(len(desc), 300)
+        # a manual draft still fails validation as written - repair is a
+        # publish-path courtesy, not a relaxation of the rule
+        with self.assertRaises(conductor.RequestError):
+            conductor.validate_proposal(text)
 
     def test_failed_apply_keeps_pending_and_manual_toml(self):
         rec = self.ready()
@@ -6532,7 +6588,7 @@ prompt = "Organize the catalog and verify results."
         det = conductor.request_details(rec["id"], self.requests,
                                         self.manifests)
         self.assertEqual(det["status"], "ready")
-        self.assertEqual(det["pending"], {"gen": [], "opts": []})
+        self.assertEqual(det["pending"], {"gen": [], "opts": [], "mixed": []})
         self.assertIn('effort = "high"',
                       Path(det["manifest"]).read_text(encoding="utf-8"))
 
@@ -6541,7 +6597,7 @@ prompt = "Organize the catalog and verify results."
         out = self.save(rec["id"], {"plan_model": "gpt-6-luna",
                                    "plan_effort": "low", "ask": True,
                                    "label": "renamed"})
-        self.assertEqual(out["pending"], {"gen": [], "opts": []})
+        self.assertEqual(out["pending"], {"gen": [], "opts": [], "mixed": []})
         self.assertFalse(out["stale"])
 
     def test_manual_toml_edit_rebaselines_options(self):
@@ -6561,7 +6617,7 @@ prompt = "Organize the catalog and verify results."
             conductor.launch_request(rec["id"], self.requests,
                                      self.manifests, self.runs, ["devin"])
         out = self.save(rec["id"], {"effort": "high"})
-        self.assertEqual(out["pending"], {"gen": [], "opts": []})
+        self.assertEqual(out["pending"], {"gen": [], "opts": [], "mixed": []})
 
     def test_pending_state_survives_reopen(self):
         rec = self.ready()
@@ -6609,7 +6665,7 @@ prompt = "Organize the catalog and verify results."
                                       self.manifests, self.runs)
         self.assertFalse(out["stale"])
         self.assertEqual(out["pending"] if "pending" in out else
-                         self.pending(rec["id"]), {"gen": [], "opts": []})
+                         self.pending(rec["id"]), {"gen": [], "opts": [], "mixed": []})
 
 
 class MergeTargetRequestTests(unittest.TestCase):
@@ -11243,6 +11299,26 @@ prompt = "Finish the leftovers."
         self.assertEqual(run_row["followup"]["request"], rec["id"])
         st = json.loads((run / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(st["followup"]["request"], rec["id"])
+
+    def test_overlong_description_repairs_at_intake(self):
+        """A follow-up writer that overshoots the 300-char description cap
+        used to wedge the imported proposal at 'error' - every Apply and
+        regenerate re-failed on the same line. Intake clamps the text
+        before validation so the proposal lands 'ready'."""
+        self.run_dir("rest")
+        src = self.followup_file("rest", text=self.proposal(
+            "rest-followup", description="y" * 350))
+        lines = conductor.discover_followups(
+            self.runs, self.requests, self.manifests)
+        self.assertTrue(any("registered" in l for l in lines), lines)
+        rec = self.recs()[0]
+        self.assertEqual(rec["status"], "ready")
+        self.assertLessEqual(len(rec["description"]), 300)
+        cfg = conductor.validate_proposal(
+            Path(rec["manifest"]).read_text(encoding="utf-8"))
+        self.assertLessEqual(len(cfg.description), 300)
+        # the source file is the worker's artifact - left for the human
+        self.assertIn("y" * 350, src.read_text(encoding="utf-8"))
 
     def test_repeated_passes_never_duplicate_or_launch(self):
         self.run_dir("rest")
