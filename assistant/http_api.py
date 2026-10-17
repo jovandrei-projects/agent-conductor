@@ -44,26 +44,35 @@ def _int(q, key, default, lo=1, hi=500):
         return default
 
 
-def _before_cursor(q):
+def _before_cursor(q, style):
+    """Parse the ?before= cursor for the route's paging scheme:
+    'keyset' = '<last_active_at>|<id>' (conversations), 'seq' = the
+    numeric message cursor. A cursor in the wrong shape is a 400, never
+    an uncaught TypeError."""
     raw = (q or {}).get("before")
     if not raw:
         return None
     if isinstance(raw, list):
         raw = raw[0]
     raw = str(raw)
-    if "|" in raw:                          # 'last_active_at|id'
+    if style == "keyset":
+        if "|" not in raw:
+            raise AssistantError("invalid 'before' cursor", 400)
         t, i = raw.split("|", 1)
+        if not t or not i:
+            raise AssistantError("invalid 'before' cursor", 400)
         return (t, i)
-    try:                                    # messages: plain seq cursor
+    try:
         return int(raw)
     except ValueError:
-        return None
+        raise AssistantError("invalid 'before' cursor", 400) from None
 
 
 # Each handler: (core, match_groups, body_dict_or_None, raw_body, query)
 def _h_list_convs(core, g, body, raw, q):
     return 200, core.list_conversations(
-        limit=_int(q, "limit", 50, 1, 100), before=_before_cursor(q))
+        limit=_int(q, "limit", 50, 1, 100),
+        before=_before_cursor(q, "keyset"))
 
 
 def _h_create_conv(core, g, body, raw, q):
@@ -78,14 +87,14 @@ def _h_create_conv(core, g, body, raw, q):
 def _h_get_conv(core, g, body, raw, q):
     out = core.open_conversation(
         g[0], limit=_int(q, "limit", 50, 1, 200),
-        before=_before_cursor(q))
+        before=_before_cursor(q, "seq"))
     return 200, out
 
 
 def _h_list_msgs(core, g, body, raw, q):
     return 200, core.list_messages(
         g[0], limit=_int(q, "limit", 50, 1, 200),
-        before=_before_cursor(q))
+        before=_before_cursor(q, "seq"))
 
 
 def _h_post_msg(core, g, body, raw, q):
@@ -115,9 +124,16 @@ def _h_conv_settings(core, g, body, raw, q):
 
 
 def _h_confirm(core, g, body, raw, q):
-    a = core.decide_action(g[1], bool((body or {}).get("approve")))
-    if (body or {}).get("approve") and (body or {}).get("execute"):
-        a = core.execute_action(a["id"], ack=(body or {}).get("ack"))
+    appr = (body or {}).get("approve")
+    if appr is not None and not isinstance(appr, bool):
+        raise AssistantError("'approve' must be a boolean")
+    if (body or {}).get("execute") is not None and not isinstance(
+            (body or {}).get("execute"), bool):
+        raise AssistantError("'execute' must be a boolean")
+    a = core.decide_action(g[1], appr is True, conv_id=g[0])
+    if appr is True and (body or {}).get("execute") is True:
+        a = core.execute_action(a["id"], ack=(body or {}).get("ack"),
+                                conv_id=g[0])
     return 200, a
 
 
@@ -224,3 +240,7 @@ def dispatch(core: AssistantCore, method: str, path: str, *,
         return 400, {"error": "invalid JSON body"}
     except sqlite3.IntegrityError:
         return 409, {"error": "duplicate write refused by constraint"}
+    except Exception:                                  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        return 500, {"error": "internal error"}

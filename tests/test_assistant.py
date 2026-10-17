@@ -424,6 +424,55 @@ class UsageAccountingTests(unittest.TestCase):
                                    (10 * 0.3 + 5 * 1.5) / 1e6)
             c.close()
 
+    def test_explicit_none_never_clobbers_the_snapshot(self):
+        """A terminal write carrying a PARTIAL price dict (one field
+        explicitly None) must keep the dispatch-stamped rate - None means
+        'no new value', never 'erase the snapshot'."""
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            xid = ask(c, cv["id"], "a")["exchange"]["id"]
+            c.set_price_snapshot(xid, self.PRICE)
+            c.complete_exchange(
+                xid, "a", usage={"prompt_t": 10, "completion_t": 5},
+                model={"uid": "u", "label": "L"},
+                price={"in": None, "cached": 0.03, "out": 1.5,
+                       "fetched_at": None, "source": "docs-v2"})
+            row = c.store.get_exchange(xid)
+            self.assertEqual(row["price_in"], 0.2)      # kept, not NULL
+            self.assertEqual(row["price_cached"], 0.03)
+            self.assertEqual(row["price_fetched_at"], 1_760_000_000.0)
+            self.assertEqual(row["price_source"], "docs-v2")
+            # and the stored row still prices against the kept rates
+            self.assertAlmostEqual(
+                row["usd"], (10 * 0.2 + 5 * 1.5) / 1e6)
+            c.close()
+
+    def test_partial_terminal_cannot_be_errored(self):
+        """'partial' is a terminal state - a later fail_exchange (a
+        stranded dispatcher) must not reopen it."""
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            xid = ask(c, cv["id"], "a")["exchange"]["id"]
+            c.complete_exchange(xid, "half", status="partial")
+            v = c.fail_exchange(xid, "stranded")
+            self.assertEqual(v["status"], "partial")
+            c.close()
+
+    def test_terminal_cancel_race_keeps_done(self):
+        """cancel on an already-terminal row is a no-op - and the
+        in-transaction guard keeps it a no-op even when the row turned
+        after the cancel's pre-check read."""
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            xid = ask(c, cv["id"], "a")["exchange"]["id"]
+            finish(c, xid)
+            v = c.cancel_exchange(xid)
+            self.assertEqual(v["status"], "done")
+            c.close()
+
     def test_failed_exchange_is_priced_not_free(self):
         """A dispatch that consumed tokens and died is billed - 'error'
         never implies zero cost."""
@@ -1062,6 +1111,34 @@ class HttpApiTests(unittest.TestCase):
                 c, "POST", "/api/assistant/attachments", body=b"",
                 query={"conversation": [cid]})
             self.assertEqual(code, 400)
+            c.close()
+
+    def test_before_cursor_wrong_shape_is_a_400(self):
+        """A keyset cursor on the messages route (or a seq cursor on the
+        conversations route) is a client error - never an uncaught
+        TypeError bubbling out as a 500."""
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            code, cv = self.post(c, "/api/assistant/conversations",
+                                 {"origin": {"view": "dashboard"}})
+            cid = cv["id"]
+            code, b = http_api.dispatch(
+                c, "GET",
+                f"/api/assistant/conversations/{cid}/messages",
+                query={"before": ["2026-10-17T00:00:00|conv-x"]})
+            self.assertEqual(code, 400)          # keyset on a seq route
+            code, b = http_api.dispatch(
+                c, "GET", "/api/assistant/conversations",
+                query={"before": ["5"]})
+            self.assertEqual(code, 400)          # seq on the keyset route
+            code, b = http_api.dispatch(
+                c, "GET", "/api/assistant/conversations",
+                query={"before": ["|"]})
+            self.assertEqual(code, 400)          # empty halves
+            code, items = http_api.dispatch(
+                c, "GET", f"/api/assistant/conversations/{cid}/messages",
+                query={"before": ["999"]})
+            self.assertEqual(code, 200)          # valid seq still pages
             c.close()
 
     def test_cancel_route(self):
