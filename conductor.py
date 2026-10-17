@@ -17484,6 +17484,7 @@ function openPool(){
   if (!closeThen(closeDetail(false, true), openPool)) return;
   poolView = true; poolCapDraft = null;
   renderPool();
+  applySel();          // the assistant's view chip follows the modal open
   if (modalScroll==null){
     const d = document.getElementById('detail');
     if (d) d.scrollTop = 0;
@@ -19473,6 +19474,8 @@ globalThis.aiView = () => ({
   modalRequest: modalRequest && {id: modalRequest.id,
     status: modalRequest.status},
   modalQA: modalQA && {id: modalQA.id},
+  pool: poolView,
+  trash: showTrash,
   power: !document.getElementById('powerwrap').hidden,
   only: [...only], facets: [...facets], projs: [...projs],
   selectedRun,

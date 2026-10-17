@@ -24,6 +24,7 @@ capability grant; the read-only gate is enforced elsewhere), plus the
 view's bounded record data.
 """
 import json
+import os
 import time
 from pathlib import Path
 
@@ -78,6 +79,19 @@ FIELD_MEANINGS = {
                       "run, in order",
     "pending_questions": "planner questions still awaiting an answer",
     "exec_intervals": "per-dispatch {start,end} spans elapsed_s sums over",
+    "cap": "machine-wide ceiling on concurrent Devin sessions (the agent "
+           "pool) - raising it frees queued steps, lowering it never "
+           "kills a running agent",
+    "in_use": "agent slots held right now - one per dispatched step for "
+              "its whole run_step life (retries + resolvers count)",
+    "holders": "the steps currently holding a pool slot (run + step "
+               "names only)",
+    "queued_for_slot": "steps waiting for a free pool slot - they hold "
+                       "no slot while queued so the pool always drains",
+    "queued_other": "steps waiting on something else (device lease, "
+                    "merge lock, wave position) - they do not hold or "
+                    "wait for pool slots",
+    "expires_at": "trash entries purge permanently ~48h after deletion",
 }
 
 _VIEW_WORKFLOWS = {
@@ -103,6 +117,12 @@ _VIEW_WORKFLOWS = {
     "questions": ["answer option cards or free text", "skip a question"],
     "power": ["Restart dashboard", "Stop dashboard (workers keep "
               "running)"],
+    "pool": ["raise/lower the machine-wide agent cap + Apply - raising "
+             "frees queued steps, lowering never kills a running agent",
+             "see which step holds each slot", "see who is queued for a "
+             "slot (and who waits on devices/merge locks instead)"],
+    "trash": ["Restore an entry", "Empty trash (permanent)", "entries "
+              "auto-purge ~48h after deletion"],
 }
 
 
@@ -145,6 +165,8 @@ class ConductorContext:
             "request": self._v_request,
             "questions": self._v_questions,
             "power": self._v_power,
+            "pool": self._v_pool,
+            "trash": self._v_trash,
         }
 
     def register_provider(self, view: str, fn) -> None:
@@ -496,3 +518,57 @@ class ConductorContext:
                 "note": "transient dialog over the dashboard - restart "
                         "respawns serve (workers keep running), Stop shuts "
                         "only the dashboard down"}
+
+    def _v_pool(self, refs, filters, selection) -> dict:
+        """The machine-wide agent-slot pool modal: the cap, who holds
+        each slot right now, and which steps are queued for one."""
+        try:
+            sp = conductor._slots_view()
+        except Exception:                  # noqa: BLE001 - never 500 on ctx
+            sp = {}
+        slot_waiters = []
+        other_queued = 0
+        for sj in sorted(self._runs.glob("*/state.json"), reverse=True):
+            try:
+                st = json.loads(sj.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            eff = conductor.effective_statuses(st)
+            for name, rec in (st.get("steps") or {}).items():
+                if eff.get(name, rec.get("status")) != "queued":
+                    continue
+                if rec.get("slot_wait"):
+                    if len(slot_waiters) < STEP_LIST_MAX:
+                        slot_waiters.append(
+                            {"run": st.get("run") or sj.parent.name,
+                             "step": name})
+                else:
+                    other_queued += 1
+        return {
+            "title": "machine-wide agent pool",
+            "record": {
+                "cap": sp.get("cap"), "in_use": sp.get("in_use"),
+                "holders": sp.get("holders") or [],
+                "queued_for_slot": slot_waiters,
+                "queued_other": other_queued,
+                "cpu_count": os.cpu_count(),
+                "free_ram_gb": conductor.free_ram_gb()}}
+
+    def _v_trash(self, refs, filters, selection) -> dict:
+        """The recoverable-trash view: entries rest here ~48h before a
+        sweep purges them - restores land back on the dashboard."""
+        try:
+            entries = conductor.list_trash(
+                conductor._trash_root(self._runs), self._requests)
+        except Exception:                  # noqa: BLE001
+            entries = []
+        return {
+            "title": "recoverable trash",
+            "record": {
+                "entries": [
+                    {"id": e.get("id"), "kind": e.get("kind"),
+                     "name": _clip(e.get("name"), 200),
+                     "deleted_at": e.get("deleted_at"),
+                     "expires_at": e.get("expires_at")}
+                    for e in entries[:STEP_LIST_MAX]],
+                "entries_omitted": max(0, len(entries) - STEP_LIST_MAX)}}

@@ -517,6 +517,57 @@ class ContextEnrichTests(unittest.TestCase):
             env = ctx.enrich({"view": "builds", "refs": {}})
             self.assertEqual(env["record"]["n"], 3)
 
+    def test_pool_view_reports_cap_holders_and_waiters(self):
+        """The agent-pool modal's provider reads the real slot pool and
+        scans run states for queued steps still waiting on a slot."""
+        with tempfile.TemporaryDirectory() as td:
+            ctx = make_ctx(Path(td))
+            runs = Path(td) / "data" / "runs"
+            # a queued step mid slot-wait plus an ordinary queued step -
+            # on a run whose driver is alive, else effective_statuses
+            # honestly reports the orphaned queue entries as 'lost'
+            rund = runs / "20261017-120000-live-run"
+            rund.mkdir()
+            (rund / "state.json").write_text(json.dumps({
+                "run": "live-run", "driver_pid": os.getpid(),
+                # now, not a fixture stamp: pid_alive treats a live pid
+                # whose creation time is far from started_at as recycled
+                "started_at": conductor.now_iso(),
+                "steps": {
+                    "queued-for-slot": {"status": "queued",
+                                        "slot_wait": True},
+                    "queued-other": {"status": "queued",
+                                     "device_wait": True}}}),
+                encoding="utf-8")
+            env = ctx.enrich({"view": "pool", "refs": {}})
+            rec = env["record"]
+            for k in ("cap", "in_use", "holders", "queued_for_slot",
+                      "queued_other", "cpu_count"):
+                self.assertIn(k, rec)
+            self.assertEqual(
+                [q["step"] for q in rec["queued_for_slot"]],
+                ["queued-for-slot"])
+            self.assertEqual(rec["queued_other"], 1)
+            self.assertTrue(any("slot" in w for w in env["workflows"]))
+
+    def test_trash_view_lists_recoverable_entries(self):
+        """The trash provider lists the recoverable entries
+        conductor.list_trash reports, bounded and clipped."""
+        with tempfile.TemporaryDirectory() as td:
+            ctx = make_ctx(Path(td))
+            trash = Path(td) / "data" / "trash" / "20261017-010000-abc123"
+            trash.mkdir(parents=True)
+            (trash / "meta.json").write_text(json.dumps({
+                "id": "20261017-010000-abc123", "kind": "run",
+                "name": "old-run", "deleted_at": "2026-10-17T01:00:00",
+                "expires_at": "2026-10-19T01:00:00", "items": ["x"]}),
+                encoding="utf-8")
+            env = ctx.enrich({"view": "trash", "refs": {}})
+            ents = env["record"]["entries"]
+            self.assertEqual(len(ents), 1)
+            self.assertEqual(ents[0]["name"], "old-run")
+            self.assertEqual(ents[0]["kind"], "run")
+
 
 class CoreIntegrationTests(unittest.TestCase):
     def _core(self, td, enricher=None, retrieval=None):

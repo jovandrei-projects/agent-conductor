@@ -125,7 +125,8 @@ class MarkupWiringTests(unittest.TestCase):
     def test_bridge_exports_present(self):
         js = self.h.split("<script>\n", 1)[1].split("</script>", 1)[0]
         for needle in ("globalThis.aiView = () => ({",
-                       "modalQA: modalQA", "globalThis.aiNav = {",
+                       "modalQA: modalQA", "pool: poolView",
+                       "trash: showTrash", "globalThis.aiNav = {",
                        "agent(k)", "openSummary(k)", "openRunSummary(k)",
                        "showRunDetails(k)", "openRequest(id)"):
             self.assertIn(needle, js)
@@ -1472,6 +1473,152 @@ setRoute((url,opt)=>{
 })().then(()=>process.exitCode=0).catch(e=>{console.error(e);
   process.exitCode=1;});
 ''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
+@unittest.skipUnless(shutil.which("node"), "Node unavailable")
+class ViewContextTests(unittest.TestCase):
+    """View-keyed conversations + the two-line header: launchers only
+    open (never minimize) and aim the chat at the newest conversation
+    for the view on screen; a fresh chat's about selector can retarget
+    until the first send locks it."""
+
+    def test_header_two_line_layout(self):
+        """Line 1: plain-text title + new-chat/history/size/minimize.
+        Line 2: the metadata chips (model, read-only, about, usage)."""
+        head = CHAT_JS.split('class="ai-head"', 1)[1]
+        head = head.split("'<div class=\"ai-sub\">'", 1)[0]
+        for needle in ('id="ai-title"', 'data-ai-new', 'id="ai-hist"',
+                       'id="ai-size"', 'id="ai-min"'):
+            self.assertIn(needle, head)
+        self.assertNotIn('id="ai-name"', head)
+        self.assertNotIn('id="ai-state"', head)
+        sub = CHAT_JS.split('class="ai-sub"', 1)[1].split('</div>', 1)[0]
+        for needle in ('id="ai-name"', 'id="ai-state"', 'id="ai-ctx"',
+                       'id="ai-ctxsel"', 'id="ai-usage"'):
+            self.assertIn(needle, sub)
+        # the rail's own new-chat button shares the delegated handler
+        self.assertIn('id="ai-new" data-ai-new', CHAT_JS)
+
+    def test_launcher_opens_view_scoped_conversation(self):
+        """A launcher click never minimizes an open chat, and it lands
+        on the newest conversation whose origin matches the live view -
+        or a fresh chat pinned to that view when none exists."""
+        p = run_node(r'''
+(async()=>{
+  const dask=nodes.get('dask');
+  const click=()=>handlers.click({target:{closest:s=>
+    s==='[data-ask-ai]'?dask:null},preventDefault:()=>{}});
+  // the agent-pool modal is on screen
+  window.aiView=()=>({pool:true,agents:[]});
+  click();
+  assert.equal(nodes.get('aichat').hidden,false);
+  await flush();
+  // a second launcher click keeps the chat open (never toggles shut)
+  click();
+  await flush();
+  assert.equal(nodes.get('aichat').hidden,false);
+  // it landed on the existing pool conv rather than a fresh chat
+  assert(fetches.some(f=>f.url.includes('/conversations/conv-pool')),
+    'matched conv loaded');
+  assert.equal(window.AskAI._s.conv.id,'conv-pool');
+  assert.equal(window.AskAI._s.ctxPin.view,'pool');
+  // navigate to a view with no conv -> a fresh chat pins to it
+  window.aiView=()=>({detailKey:'r9|build',agents:
+    [{run_key:'r9',step:'build'}]});
+  click();
+  await flush();
+  assert.equal(window.AskAI._s.conv,null,'no conv for that view yet');
+  assert.equal(window.AskAI._s.ctxPin.view,'agent');
+  assert.equal(window.AskAI._s.ctxPin.refs.step,'build');
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js=r'''
+setRoute((url,opt)=>{
+  if(url.includes('/exchanges')||url.includes('/usage')||
+     url.includes('/actions')) return {items:[],totals:{}};
+  if(url.includes('/conversations/conv-pool'))
+    return {conversation:{id:'conv-pool',title:'pool chat',
+      origin_view:{view:'pool',refs:{}}},items:[]};
+  if(url.includes('/conversations'))
+    return {items:[{id:'conv-dash',title:'dash',
+        origin_view:{view:'dashboard',refs:{}},last_active_at:2},
+      {id:'conv-pool',title:'pool chat',
+        origin_view:{view:'pool',refs:{}},last_active_at:1}]};
+  return {items:[]};
+});''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_fresh_conv_about_selector_locks_on_first_send(self):
+        """Fresh convs get an <select> about control (follow screen /
+        pin live view / dashboard); the first user message freezes the
+        topic and the slot collapses back to the static chip."""
+        p = run_node(r'''
+(async()=>{
+  const S=window.AskAI._s;
+  window.AskAI.open();
+  await flush();
+  const sel=nodes.get('ai-ctxsel'), chip=nodes.get('ai-ctx');
+  window.aiView=()=>({pool:true,agents:[]});
+  window.aiSync();
+  assert.equal(sel.hidden,false,'fresh chat offers the selector');
+  assert.equal(chip.hidden,true,'chip yields to the select');
+  assert.match(sel.innerHTML,/follows the screen/);
+  // "pin the live view" adopts the agent-pool view
+  nodes.get('aichat')._h.change({target:{id:'ai-ctxsel',
+    value:'pinlive'}});
+  assert.equal(S.ctxPin.view,'pool');
+  assert.equal(window.AskAI.ctx().view,'pool','next question pinned');
+  // back to follow-the-screen, then an explicit dashboard pin
+  nodes.get('aichat')._h.change({target:{id:'ai-ctxsel',
+    value:'dash'}});
+  assert.equal(S.ctxPin.view,'dashboard');
+  nodes.get('aichat')._h.change({target:{id:'ai-ctxsel',
+    value:'pinlive'}});
+  assert.equal(S.ctxPin.view,'pool');
+  // first send: the optimistic user message flips fresh->started, the
+  // select goes away and the chip shows the frozen topic
+  S.conv={id:'c9',model:'m',effort:'',fast:0,readonly:1};
+  S.msgs=[{id:'u1',role:'user',text:'q',ctx_ref:'',
+    settings_json:'{}'}];
+  window.AskAI._paint();
+  assert.equal(sel.hidden,true,'started conv loses the selector');
+  assert.equal(chip.hidden,false);
+  assert.equal(chip.textContent,'about: agent pool');
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js="setRoute(()=>({items:[]}));")
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_new_chat_inherits_section(self):
+        """'+' keeps the outgoing conversation's section (its pin or
+        stored origin); with nothing to inherit it defaults to the
+        dashboard."""
+        p = run_node(r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const S=window.AskAI._s;
+  S.conv={id:'c1',model:'m',effort:'',fast:0,readonly:1,
+    origin_view:{view:'run',refs:{run_key:'request:abc'}}};
+  S.msgs=[{id:'u1',role:'user',text:'q',ctx_ref:'',settings_json:'{}'}];
+  S.ctxPin={view:'run',refs:{run_key:'request:abc'}};
+  const newBtn={closest:s=>s==='[data-ai-new]'?{getAttribute:()=>'1'}
+    :null};
+  nodes.get('aichat')._h.click({target:newBtn});
+  assert.equal(S.conv,null);
+  assert.equal(S.ctxPin.view,'run','new chat inherits the section');
+  assert.equal(S.ctxPin.refs.run_key,'request:abc');
+  // and with nothing to inherit, the default is the dashboard
+  S.ctxPin=null; S.conv=null; S.msgs=[];
+  nodes.get('aichat')._h.click({target:newBtn});
+  assert.equal(S.ctxPin.view,'dashboard','falls back to dashboard');
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js="setRoute(()=>({items:[]}));")
         self.assertEqual(p.returncode, 0, p.stderr)
 
 

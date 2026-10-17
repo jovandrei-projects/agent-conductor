@@ -43,6 +43,13 @@ excerpts of real records as citations.
   merge parked for a deliberate run merge (pending_merges).
 - **request stages**: draft / generating / questions / ready / stale /
   launching / launched / discarded / interrupted.
+- **agent pool** - the machine-wide Devin-session slot ceiling (topbar
+  `agents N/M`). Every dispatched step holds one slot for its whole
+  run_step life; a step that finds none waits `queued` + `slot_wait`
+  holding NO slot, so the pool always drains. Raising the cap frees
+  queued steps; lowering it never kills a running agent.
+- **trash** - recoverable deletions (runs, requests) that auto-purge
+  ~48h after deletion; Restore puts an entry back on the dashboard.
 - **STATUS: / NEXT: / OUTCOME:** - the worker's closing contract lines;
   NEXT: is a suggestion for follow-up, not a fact.
 

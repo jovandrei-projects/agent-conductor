@@ -66,22 +66,31 @@
   #aichat.expanded { top: 8px; height: calc(100vh - 16px); }
 }
 
-/* header: agent/model name button + state pill + view chip + controls */
+/* header line 1: the conversation title (plain text - never a chip)
+   on the left, the icon buttons pinned right */
 #aichat .ai-head {
   display: flex; align-items: center; gap: 8px; flex: none;
   padding: 8px 10px 6px;
   background: #161b22;
 }
-/* second header line: the view chip + the usage chip live here so the
-   400px title row never has to crush them into useless ellipses */
+#aichat .ai-tt {
+  flex: 0 1 auto; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  font-size: 13px; font-weight: 600; color: #e6edf3;
+}
+/* header line 2: the metadata chips - model name, read-only pill, the
+   "about" view chip/select and the usage dropdown. The title row never
+   has to crush them; inside the row they shrink+ellipsis before the
+   usage chip does */
 #aichat .ai-sub {
   display: flex; align-items: center; gap: 8px; flex: none;
   padding: 0 10px 7px; border-bottom: 1px solid #30363d;
   background: #161b22;
 }
-#aichat .ai-sub .ai-ctx { max-width: 38%; }
-#aichat .ai-sub .ai-tt { max-width: 40%; color: #c9d1d9;
-  font-weight: 600; }
+#aichat .ai-sub .ai-ctxwrap {
+  flex: 0 1 auto; min-width: 0; display: inline-flex; max-width: 46%;
+}
+#aichat .ai-sub .ai-name { max-width: 30%; }
 #aichat .ai-sub .ai-usage { flex: none; max-width: none; }
 #aichat .ai-name {
   background: transparent; border: 0; color: #e6edf3; font: inherit;
@@ -102,13 +111,23 @@
 #aichat .ai-pill.rw { color: #f85149; border-color: #f85149; }
 /* the text cells (name/ctx/usage) shrink+ellipsis first, the icon
    buttons are flex:none - a wide usage label can never push the
-   header controls out of the 400px card */
-#aichat .ai-ctx, #aichat .ai-tt {
-  flex: 0 1 auto; min-width: 0; overflow: hidden;
+   header controls out of the 400px card. The "about" slot is either a
+   static chip (started conv) or a <select> (fresh conv, still
+   retargetable) - both get the same pill look, and the select keeps a
+   native dropdown arrow so its editability is visible */
+#aichat .ai-ctx, #aichat .ai-ctxsel {
+  flex: 0 1 auto; min-width: 0; max-width: 100%; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; font-size: 11px;
-  color: #8b949e;
+  color: #8b949e; font-family: inherit;
   border: 1px solid #30363d; border-radius: 9px; padding: 1px 8px;
 }
+#aichat .ai-ctxsel {
+  background: #0d1117; color: #c9d1d9; cursor: pointer;
+  padding-right: 4px;
+}
+#aichat .ai-ctxsel:hover { border-color: #58a6ff; color: #e6edf3; }
+#aichat .ai-ctxsel:focus-visible { outline: 2px solid #58a6ff; }
+#aichat .ai-ctxsel option { background: #0d1117; color: #e6edf3; }
 #aichat .ai-flex { flex: 1; min-width: 0; }
 #aichat .ai-usage { flex: 0 1 auto; min-width: 0; font-size: 11px;
   color: #8b949e; }

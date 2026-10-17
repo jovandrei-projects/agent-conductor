@@ -21,12 +21,23 @@
  *
  * Host bridge (provided by the dashboard's inline script):
  *   window.aiView() -> {detailKey, summaryView, runModalKey,
- *     modalRequest, modalQA, power, only, facets, projs, selectedRun,
- *     agents}
+ *     modalRequest, modalQA, pool, trash, power, only, facets, projs,
+ *     selectedRun, agents}
  *   window.aiNav = {agent(key), run(key), summary(key),
  *     runSummary(key), request(id)}
  *   window.aiSync is installed HERE and called by the host's applySel
  *   so the view chip tracks modal changes without polling.
+ *
+ * View-keyed conversations: an Ask-AI launcher click only ever OPENS
+ * the chat (never minimizes it) and targets the conversation for the
+ * view on screen - the newest one whose origin matches, else a fresh
+ * chat pinned to that view. The "about" chip is a <select> while a
+ * conversation is still fresh (no user message sent yet): it can
+ * follow the screen, pin to the live view, or pin to the dashboard.
+ * Once the first message lands the topic locks - the conv's stored
+ * origin_view (or the local pin map, when a pin was edited on an
+ * already-materialized conv) drives both history matching and the
+ * context the next question freezes.
  */
 (function () {
 'use strict';
@@ -145,6 +156,8 @@ var S = {
   pinBottom: true,
   lastFocus: null,
   ctxEnv: null,                // last computed next-question envelope
+  ctxPin: null,                // {view, refs} the conv is pinned to, or
+                               // null = the about chip follows the screen
   attach: [],                  // pending uploads for the CURRENT conv
   pendAtt: {},                 // conv id -> stashed pending uploads
   renaming: null,              // conv id whose rail row is an <input>
@@ -183,6 +196,7 @@ function restoreConv(id) {
   if (!c) return false;
   S.conv = c.conv; S.msgs = c.msgs; S.exch = c.exch;
   S.exchByAid = c.exchByAid; S.usage = c.usage; S.actions = c.actions;
+  S.ctxPin = pinFromConv(c.conv);
   return true;
 }
 function draftKey() {
@@ -201,8 +215,11 @@ function findAgent(akey) {
 }
 
 /* The envelope the NEXT question freezes onto its turn. view slug names
-   the surface; refs carry stable record ids the server re-resolves. */
-function curCtx() {
+   the surface; refs carry stable record ids the server re-resolves.
+   liveCtx() is whatever is on screen right now; curCtx() is the
+   pin-aware variant - a conversation pinned to a view keeps answering
+   against it after the screen moves on. */
+function liveCtx() {
   var v = (window.aiView ? window.aiView() : {}) || {};
   var view = 'dashboard', refs = {};
   /* precedence mirrors z-order: overlays (power, planner questions,
@@ -247,6 +264,10 @@ function curCtx() {
   } else if (v.runModalKey) {
     view = 'run';
     refs.run_key = v.runModalKey;
+  } else if (v.pool) {
+    view = 'pool';
+  } else if (v.trash) {
+    view = 'trash';
   }
   var sel = '';
   try {
@@ -266,6 +287,16 @@ function curCtx() {
   };
 }
 
+function curCtx() {
+  var env = liveCtx();
+  if (S.ctxPin) {
+    env.view = S.ctxPin.view || 'dashboard';
+    /* copy - a caller mutating refs must never reach into the pin */
+    env.refs = Object.assign({}, S.ctxPin.refs || {});
+  }
+  return env;
+}
+
 function ctxLabel(env) {
   env = env || {};
   var v = env.view || 'dashboard', r = env.refs || {};
@@ -278,19 +309,128 @@ function ctxLabel(env) {
     case 'request':
       return 'request ' + (r.request_id || '(new)');
     case 'questions': return 'planner questions';
+    case 'pool': return 'agent pool';
+    case 'trash': return 'trash';
     case 'power': return 'power dialog';
     default: return 'dashboard';
   }
 }
 
-/* chip under the header: which view the NEXT question freezes to */
+/* -------------------------------------------------------- ctx pins
+ * A conversation's topic is (view + stable refs). `S.ctxPin` holds it
+ * for the visible thread: seeded from the conv's stored origin_view on
+ * load, editable while the conv is still fresh, and frozen once the
+ * first user message exists. `ac-ai-pins` persists pins that were
+ * edited AFTER the conv row materialized server-side (its origin_view
+ * is immutable), so history matching sees the edited topic too. */
+function pinMap() { return thaw(store('ac-ai-pins')); }
+function setPinMap(id, pin) {
+  if (!id) return;
+  var m = pinMap();
+  if (pin && pin.view) m[id] = { view: pin.view, refs: pin.refs || {} };
+  else delete m[id];
+  var ks = Object.keys(m);             // bounded: drop the oldest keys
+  while (ks.length > 64) delete m[ks.shift()];
+  try { store('ac-ai-pins', JSON.stringify(m)); } catch (e) {}
+}
+function pinFromConv(c) {
+  if (!c) return null;
+  var m = pinMap();
+  if (c.id && m[c.id] && m[c.id].view) return m[c.id];
+  var ov = thaw(c.origin_view);
+  return ov && ov.view ? { view: ov.view, refs: ov.refs || {} } : null;
+}
+function isFresh() {
+  /* a chat stays retargetable until its first user message exists -
+     the optimistic send bubble counts, so the topic locks the moment
+     the user commits rather than when the server ack lands */
+  for (var i = 0; i < S.msgs.length; i++)
+    if (S.msgs[i].role === 'user') return false;
+  return true;
+}
+function viewKeyOf(env) {
+  /* the "same view" identity a launcher matches on: the view slug plus
+     whichever stable refs it carries. Order-independent across views
+     because each provider fills its own ref slot. */
+  env = env || {};
+  var r = env.refs || {};
+  return (env.view || 'dashboard') + '|' +
+    [r.run_key, r.step, r.summary_key, r.request_id]
+      .map(function (x) { return x == null ? '' : String(x); })
+      .join('|');
+}
+function convViewKey(c) {
+  var pin = pinFromConv(c);
+  return viewKeyOf(pin || { view: 'dashboard' });
+}
+function bestConvFor(env) {
+  /* /conversations lists newest-first by last activity, so the first
+     key match IS the last conversation for this view */
+  var key = viewKeyOf(env);
+  var list = S.convList || [];
+  for (var i = 0; i < list.length; i++)
+    if (convViewKey(list[i]) === key) return list[i];
+  return null;
+}
+
+/* the "about" affordance on the second header line: a static chip once
+   the conv started, a select while it is still fresh */
 function syncView() {
-  var el = byId('ai-ctx');
-  if (!el) return;
   var env = curCtx();
   S.ctxEnv = env;
-  el.textContent = 'about: ' + ctxLabel(env);
-  el.title = 'the next question is answered against this view';
+  var fresh = isFresh();
+  var chip = byId('ai-ctx'), sel = byId('ai-ctxsel');
+  if (chip) {
+    /* keep textContent live in both modes: pinned or not, the frozen
+       chip and the select's pinned option label share this label */
+    chip.textContent = 'about: ' + ctxLabel(env);
+    chip.title = 'the next question is answered against this view';
+    chip.hidden = !!(fresh && sel);
+  }
+  if (!sel) return;
+  sel.hidden = !fresh;
+  if (!fresh) return;
+  var live = liveCtx(), liveL = ctxLabel(live);
+  var opts, cur;
+  if (S.ctxPin) {
+    cur = 'pin';
+    opts = [['pin', 'about: ' + ctxLabel(env)],
+            ['screen', 'follows the screen (' + liveL + ')'],
+            ['pinlive', 'pin: ' + liveL]];
+    if (env.view !== 'dashboard')
+      opts.push(['dash', 'about: dashboard']);
+  } else {
+    cur = 'screen';
+    opts = [['screen', 'follows the screen (' + liveL + ')'],
+            ['pinlive', 'pin: ' + liveL]];
+    if (live.view !== 'dashboard')
+      opts.push(['dash', 'about: dashboard']);
+  }
+  /* rebuild the option list only when its content actually changed -
+     repaints are frequent (every poll tick paints), and a rebuilt
+     select would drop the user's open dropdown */
+  var sig = cur + '|' +
+    opts.map(function (o) { return o.join('\u0001'); }).join('\u0002');
+  if (sel._ctxsig === sig) return;
+  sel._ctxsig = sig;
+  sel.innerHTML = opts.map(function (o) {
+    return '<option value="' + o[0] + '">' + esc(o[1]) + '</option>';
+  }).join('');
+  sel.value = cur;
+  sel.title = 'what this new chat is about - it locks in once the ' +
+    'first message sends';
+}
+
+function ctxSelChange(v) {
+  if (v === 'screen') S.ctxPin = null;
+  else if (v === 'dash') S.ctxPin = { view: 'dashboard', refs: {} };
+  else if (v === 'pinlive') {
+    var env = liveCtx();
+    S.ctxPin = { view: env.view, refs: env.refs || {} };
+  }
+  /* else 'pin': unchanged - it was already the selected state */
+  if (convId()) setPinMap(convId(), S.ctxPin);
+  paint();
 }
 
 /* ------------------------------------------------------------- paint */
@@ -901,6 +1041,7 @@ async function ensureConv() {
   });
   S.conv = normConv(out.conversation || out);
   S.convRef = uid('conv');            // next attempt gets a fresh ref
+  if (S.ctxPin) setPinMap(convId(), S.ctxPin);
   store('ac-ai-conv', convId());
   return S.conv;
 }
@@ -910,6 +1051,7 @@ async function loadConv(id) {
     '/conversations/' + encodeURIComponent(id));
   if (!out.conversation) throw new Error('conversation not found');
   S.conv = normConv(out.conversation);
+  S.ctxPin = pinFromConv(S.conv);
   S.msgs = out.items || [];
   /* slots pushed into S.attach during the load window belong to OTHER
      conversations (their ensureConv created its own) - re-park them
@@ -1005,12 +1147,14 @@ async function delConv(id) {
   if (S.convList)
     S.convList = S.convList.filter(function (r) { return r.id !== id; });
   delete S.msgCache[id];
+  setPinMap(id, null);                 // drop its topic override too
   var ci = S.msgCacheN.indexOf(id);
   if (ci >= 0) S.msgCacheN.splice(ci, 1);
   if (convId() === id) {               // the open chat is gone - reset
     S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
     S.usage = null; S.actions = {}; S.armed = {}; S.pollXid = null;
     S.convRef = uid('conv');
+    S.ctxPin = null;                   // a blank chat follows the screen
     store('ac-ai-conv', '');
     var ta = byId('ai-text');
     if (ta) ta.value = store(draftKey()) || '';
@@ -1845,15 +1989,17 @@ function applyMode() {
   }
 }
 
-function openChat(mode) {
+function openChat(mode, opts) {
   if (document.activeElement && document.activeElement !== byId('aifab'))
     S.lastFocus = document.activeElement;
   S.mode = mode || (S.mode === 'closed' ? 'compact' : S.mode);
   if (S.mode === 'closed') S.mode = 'compact';
   store('ac-ai-open', S.mode);
   applyMode();
-  /* first open (or a fresh reload) resumes the last conversation */
-  if (!S.conv) {
+  /* first open (or a fresh reload) resumes the last conversation -
+     a launcher call passes noResume because askAbout picks the conv
+     itself, and a blind resume would race its loadConv */
+  if (!S.conv && !(opts && opts.noResume)) {
     var stored = store('ac-ai-conv');
     var goal = stored
       ? loadConv(stored).catch(function () {
@@ -1902,6 +2048,11 @@ function openConv(id) {
   if (!restoreConv(id)) {
     S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
     S.usage = null; S.actions = {};
+    /* seed the topic from the list row while the full conv loads -
+       the about chip paints right instead of blanking to 'follow' */
+    var row = (S.convList || []).filter(function (r) {
+      return r.id === id; })[0];
+    S.ctxPin = pinFromConv(row || null);
   }
   S.armed = {};
   S.renaming = null;
@@ -1918,14 +2069,54 @@ function newConv() {
   if (ta) store(draftKey(), ta.value);   // stash before switching
   stashAttach();
   cacheConv();
+  /* the new chat inherits the outgoing conversation's section - its
+     pin or its recorded origin - and falls back to the dashboard when
+     there is nothing to inherit */
+  var keep = S.ctxPin || pinFromConv(S.conv) ||
+    { view: 'dashboard', refs: {} };
   S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
   S.usage = null; S.actions = {}; S.armed = {};
   S.renaming = null;
   S.pollXid = null;                    // the previous conv's poller dies
   S.convRef = uid('conv');           // fresh create, fresh dedupe ref
+  S.ctxPin = keep;
   store('ac-ai-conv', '');
   if (ta) ta.value = store(draftKey()) || '';
   paint();
+}
+
+function startFresh(env) {
+  /* a launcher found no conversation for its view: reset to the blank
+     chat pinned to that view. The old thread (if any) stays in the
+     history - nothing here discards a stored conversation. */
+  teardownDict();
+  var ta = byId('ai-text');
+  if (ta) store(draftKey(), ta.value);
+  stashAttach();
+  cacheConv();
+  S.conv = null; S.msgs = []; S.exch = {}; S.exchByAid = {};
+  S.usage = null; S.actions = {}; S.armed = {};
+  S.renaming = null;
+  S.pollXid = null;
+  S.convRef = uid('conv');
+  S.ctxPin = { view: env.view, refs: env.refs || {} };
+  store('ac-ai-conv', '');
+  if (ta) ta.value = store(draftKey()) || '';
+  paint();
+}
+
+async function askAbout() {
+  /* every launcher OPENS the chat - it never minimizes it - and aims
+     it at the conversation for the view on screen: the newest chat
+     whose topic matches, else a fresh chat pinned to that view. */
+  var env = liveCtx();
+  if (S.mode === 'closed') openChat('compact', { noResume: true });
+  else applyMode();
+  await loadConvs();
+  var match = bestConvFor(env);
+  if (match && match.id !== convId()) { openConv(match.id); return; }
+  if (match) { paint(); return; }      // already on that view's chat
+  startFresh(env);
 }
 
 /* ------------------------------------------------------------- init */
@@ -1940,10 +2131,13 @@ function injectDom() {
     '<div id="aichat" role="dialog" aria-modal="false" ' +
       'aria-label="Ask AI assistant" hidden>' +
     '<div class="ai-head">' +
-      '<button type="button" id="ai-name" class="ai-name"></button>' +
-      '<button type="button" id="ai-state" class="ai-pill ro">' +
-        'read-only</button>' +
+      /* first line: the conversation title is PLAIN TEXT, never a
+         chip - the icon buttons pin right and the title ellipsizes */
+      '<span id="ai-title" class="ai-tt" title=""></span>' +
       '<span class="ai-flex"></span>' +
+      '<button type="button" id="ai-newtop" class="ai-hbtn" ' +
+        'data-ai-new aria-label="New chat" title="New chat - starts ' +
+        'about this conversation&#39;s section">&#65291;</button>' +
       '<button type="button" id="ai-hist" class="ai-hbtn" ' +
         'aria-label="Conversation history" ' +
         'title="Conversation history">&#9776;</button>' +
@@ -1954,12 +2148,19 @@ function injectDom() {
         'aria-label="Minimize chat" title="Minimize - the conversation ' +
         'keeps running">\u2014</button>' +
     '</div>' +
-    /* second header line: the view chip + usage chip could never share
-       the 400px title row without ellipsizing one of them into
-       uselessness - they get their own strip */
+    /* second header line: the metadata chips (model / read-only /
+       about / usage) - they could never share the title row without
+       ellipsizing one of them into uselessness */
     '<div class="ai-sub">' +
-      '<span id="ai-title" class="ai-tt" title=""></span>' +
-      '<span id="ai-ctx" class="ai-ctx">about: dashboard</span>' +
+      '<button type="button" id="ai-name" class="ai-name"></button>' +
+      '<button type="button" id="ai-state" class="ai-pill ro">' +
+        'read-only</button>' +
+      '<span id="ai-ctxwrap" class="ai-ctxwrap">' +
+        '<span id="ai-ctx" class="ai-ctx">about: dashboard</span>' +
+        '<select id="ai-ctxsel" class="ai-ctx ai-ctxsel" hidden ' +
+          'aria-label="Conversation context" ' +
+          'title="what this new chat is about"></select>' +
+      '</span>' +
       '<span class="ai-flex"></span>' +
       '<details id="ai-usage" class="ai-usage">' +
         '<summary id="ai-usage-sum" ' +
@@ -2017,7 +2218,8 @@ function injectDom() {
     '<div id="ai-rail" class="ai-rail" hidden ' +
       'aria-label="Conversation history">' +
       '<div class="ai-rail-h"><span class="ai-rail-t">Chats</span>' +
-      '<button type="button" id="ai-new">+ New chat</button></div>' +
+      '<button type="button" id="ai-new" data-ai-new>+ New chat</button>' +
+      '</div>' +
       '<div id="ai-convs" class="ai-convs"></div>' +
     '</div>' +
     '<div id="aisetwrap" hidden>' +
@@ -2071,7 +2273,7 @@ function chatClick(e) {
     S.rail = !S.rail; if (S.rail) loadConvs(); paint(); return; }
   if ((el = t.closest('#ai-name'))) { openSettings(); return; }
   if ((el = t.closest('#ai-state'))) { openSettings(); return; }
-  if ((el = t.closest('#ai-new'))) { newConv(); return; }
+  if ((el = t.closest('[data-ai-new]'))) { newConv(); return; }
   if ((el = t.closest('[data-ai-ren]'))) {
     startRename(el.getAttribute('data-ai-ren')); return; }
   if ((el = t.closest('[data-ai-del]'))) {
@@ -2098,7 +2300,9 @@ function bind() {
   document.addEventListener('click', function (e) {
     var t = e.target && e.target.closest ? e.target : null;
     var lb = t && t.closest && t.closest('[data-ask-ai]');
-    if (lb) { e.preventDefault(); toggleChat(); return; }
+    /* launchers only ever open - Ask AI on a view retargets the chat
+       to that view's conversation instead of closing what's open */
+    if (lb) { e.preventDefault(); askAbout(); return; }
     /* light-dismiss the header usage dropdown - a native <details>
        stays open until its summary is clicked again, so a click on any
        neutral surface closes it here (a click inside it is left alone) */
@@ -2164,6 +2368,12 @@ function bind() {
       if (e.target && e.target.id === 'ai-text') {
         store(draftKey(), e.target.value);
       }
+    });
+    /* the fresh-conv about selector - a <select> reports through
+       'change', not 'click' */
+    chat.addEventListener('change', function (e) {
+      if (e.target && e.target.id === 'ai-ctxsel')
+        ctxSelChange(e.target.value);
     });
     var list = byId('ai-list');
     if (list) list.addEventListener('scroll', function () {
@@ -2293,7 +2503,10 @@ var AskAI = {
   expand: function () { setExpanded(true); },
   compact: function () { setExpanded(false); },
   openSettings: openSettings, nav: navSrc, send: send,
+  askAbout: askAbout, newConv: newConv,
   ctx: curCtx, ctxLabel: ctxLabel, syncView: syncView,
+  _viewKeyOf: viewKeyOf, _convViewKey: convViewKey,
+  _liveCtx: liveCtx, _isFresh: isFresh,
   _s: S, _paint: paint, _aapi: aapi, _paintAtt: paintAtt,
   _attachFiles: attachFiles, _dictUI: dictUI,
   _msgHtml: msgHtml, _settingsForm: settingsForm,
