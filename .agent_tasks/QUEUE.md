@@ -15,7 +15,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 2 | Pre-live hygiene: liveness probe, lost/sweep, sessions cleanup, cloud marks | done | hygiene/ | os.kill probe bug found + fixed (was killing live workers) |
 | 3 | Dashboard favicon: baton-over-orchestra glyph | done | favicon/ | second dispatch; first was eaten by trap-10 commit swallow |
 | 4 | Worktree merge matrix: exhaustive tests + merge_resolver + lab fixtures | done | wt-matrix/ | landed on dev/merge-tests (commits 5ba30c4, 7f7dcd9); live lab run 21/21, 8 real conflicts resolved |
-| 5 | Dashboard request drafts + proposal review/start, run filters/token help, silent Windows probes | done | â€” | 98/98 mock tests + demo green; live planner not dispatched |
+| 5 | Dashboard request drafts + proposal review/start, run filters/token help, silent Windows probes | done | — | 98/98 mock tests + demo green; live planner not dispatched |
 | 6 | Task prompt editing: pre-dispatch Edit prompt, resume notes for ran steps, full prompt text in modal | done | task-prompt-editing/ | 172/172 mock tests + demo green; prompt-/rnote- sentinels survive resume |
 | 7 | Planner 'ask me questions' checkbox: questionnaire modal before manifest, answers feed a refine pass | done | planner-questions/ | 193/193 mock tests + demo green; live planner not dispatched |
 | 8 | Stop proposal during preparation: stopgen sentinel + _GEN_PROCS kill + per-attempt gen_id scoping, restores draft/ready | done | stop-proposal-preparation/ | 216/216 mock tests + demo + real-proc smoke green |
@@ -27,6 +27,22 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-17 (resolve-deferred-merge-controls, merge resolution):
+  unioned `deferred-merge-controls` onto master (merge d7a1cc9) - the
+  `merge` request field coexists with `merge_target`/`summarize`, and the
+  run modal keeps the task table + runCtl lifecycle gating while gaining
+  the Pending merges panel (selective `{"steps"}` POST, alt-exclusive
+  ticks, merge_busy/executing gating, re-render on poll). Conflicts were
+  doc both-appends plus ~14 conductor.py regions (field lists, form rows,
+  modal render, listener splices). The resolution fixed three seams the
+  suite caught: the ctx-menu merge item now opens the run-details panel
+  (selection happens there), pending-merge ticks folded into the single
+  `change` listener the file pickers share (stub DOMs keep only the
+  last-registered handler), and a null merge baseline reads 'auto' with
+  `requestFields` coercing an unread select the same way. Post-merge
+  suite: 508 ran - 4 pre-existing date-boundary planner failures
+  (default_model_effort flips swe-2 -> gpt-6-luna on 2026-10-17, identical
+  on pre-merge HEAD), 1 StopProposal flake green on rerun.
 - DONE 2026-10-16 (cumulative-elapsed-time, wave step of run
   20261016-100852-run-review-ux): elapsed time is cumulative across
   dispatches instead of the last dispatch's span. Root cause: run_step
@@ -346,7 +362,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   `?raw=1` markdown and the standalone page are unchanged, so direct URLs
   stay usable). The in-modal view gets the same `.dnav` chrome as the task
   nav - sibling-named arrows + `task N of M`, disabled at the pipeline
-  ends, ArrowLeft/Right shared - and an 'Open as page â†—' escape hatch.
+  ends, ArrowLeft/Right shared - and an 'Open as page ↗' escape hatch.
   New `modalHist` Back stack: task -> request/runbook and request -> run
   details push the view they leave ({kind,key|id,scroll}); Back restores
   the exact task/request/run incl. scroll offset, skipping entries whose

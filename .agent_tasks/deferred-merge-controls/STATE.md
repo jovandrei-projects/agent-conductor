@@ -1,7 +1,7 @@
 # Task: deferred-merge-controls
 
 **Status:** done
-**Started:** 2026-10-16   **Last touched:** 2026-10-16
+**Started:** 2026-10-16   **Last touched:** 2026-10-17
 
 ## Objective
 
@@ -68,6 +68,17 @@ existing `merge_run(only=)` op - no git logic in the UI.
 Done: 258/258 tests + demo green, committed (a649a85 + docs commit). One
 bug the suite caught and fixed: `syncMergeTiming` assumed `.dataset`
 exists - older minimal node stubs crash; guarded.
+
+Merged onto master as d7a1cc9 via resolve-deferred-merge-controls
+(2026-10-17): ~14-region union keeping merge_target/summarize alongside
+merge timing and the Pending merges panel atop the runCtl lifecycle. The
+resolution fixed three seams: the ctx-menu merge item routes to the
+run-details panel (ticking happens there), pending-merge ticks share the
+single 'change' listener with the file pickers (stub DOMs keep only the
+last-registered handler), and a null merge baseline reads 'auto'.
+Post-merge suite: 508 ran, 4 pre-existing date-boundary planner failures
+(default_model_effort flips swe-2 -> gpt-6-luna on 2026-10-17; identical
+on pre-merge HEAD), 1 StopProposal flake green on rerun.
 
 ## Verification
 
