@@ -756,6 +756,70 @@ prompt = "first"
             self.assertEqual(out["conflicted"], [])
             self.assertEqual(out["skipped"], [])
 
+    def test_merge_run_start_detaches_a_real_merge(self):
+        """The dashboard endpoint spawns `conductor.py merge` detached: the
+        request returns a pid at once, a second click 409s while the child
+        runs, the child's claim names a live pid, and the merge lands even
+        if this (the 'server') process did nothing but wait."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "stuck"
+project = "{proj.as_posix()}"
+prompt = "sleep_after=30 write A.txt"
+worktree = true
+timeout_min = 0.02
+''')
+            self.assertEqual(run_manifest(m, runs), 1)
+            st, rd = state_of(runs)
+            self.assertEqual(st["steps"]["stuck"]["status"], "timed_out")
+            out = conductor.merge_run_start(rd.name, runs,
+                                            shlex.split(MOCK))
+            self.assertEqual(out["merging"], rd.name)
+            pid = out["pid"]
+            self.assertTrue(conductor.pid_alive(pid))
+            self.assertEqual(conductor._MERGE_PIDS.get(rd.name), pid)
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.merge_run_start(rd.name, runs,
+                                          shlex.split(MOCK))
+            self.assertEqual(e.exception.status, 409)
+            try:
+                deadline = time.time() + 120
+                while conductor.pid_alive(pid) and time.time() < deadline:
+                    time.sleep(0.2)
+                self.assertFalse(conductor.pid_alive(pid),
+                                 "detached merge never finished")
+            finally:
+                conductor._MERGE_PIDS.pop(rd.name, None)
+            st, _ = state_of(runs)
+            self.assertTrue(st["steps"]["stuck"]["merged"])
+            self.assertTrue((proj / "A.txt").is_file())
+            self.assertFalse(
+                (rd / "merge.launch.log").read_text().strip() == "")
+
+    def test_merge_run_start_refuses_when_nothing_pending(self):
+        """A run with nothing to merge answers the empty result in-line -
+        no child is spawned."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            _, rd = state_of(runs)
+            out = conductor.merge_run_start(rd.name, runs, ["devin"])
+            self.assertEqual(out["merged"], [])
+            self.assertNotIn("merging", out)
+            self.assertIsNone(conductor._MERGE_PIDS.get(rd.name))
+
 
 @slow
 class ManualMergeGuardTests(unittest.TestCase):

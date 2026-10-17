@@ -6075,7 +6075,9 @@ _DRAINING: set[str] = set()
 # in PLANNER_SPOOL/<id>/, and only the short publish is deferred until
 # data/requests + manifests/ are safe to write. The spool also survives a
 # serve restart - drain_planner_spool replays whatever it finds.
-PLANNER_SPOOL = Path(tempfile.gettempdir()) / "agent-conductor-planner"
+PLANNER_SPOOL = Path(os.environ.get("CONDUCTOR_PLANNER_SPOOL")
+                     or (Path(tempfile.gettempdir())
+                         / "agent-conductor-planner"))
 WATCH_POLL_S = 5.0            # _wait_writable poll interval
 PLANNER_ORPHAN_GRACE_S = 60   # gen.log this fresh may still be written by
                               # an orphaned planner - drain waits it out
@@ -6111,8 +6113,10 @@ class PlannerQuestions(Exception):
 
 
 def default_model_effort(today: dt.date | None = None) -> tuple[str, str]:
+    # swe-2 promo runs until 2026-11-01; gpt-6-luna takes over as the
+    # default the day it ends.
     return (("swe-2", "max") if (today or dt.date.today())
-            <= dt.date(2026, 10, 16) else ("gpt-6-luna", "max"))
+            < dt.date(2026, 11, 1) else ("gpt-6-luna", "max"))
 
 
 def _request_path(request_id: str, requests_dir: Path) -> Path:
@@ -6131,11 +6135,27 @@ def _spool_rec(request_id: str) -> dict | None:
     """The generation thread's live request overlay, if one is parked in
     the spool. While it exists it is more current than the request file,
     which is only rewritten once the workspace is unwatched."""
-    try:
-        rec = json.loads((_spool_dir(request_id) / "request.json")
-                         .read_text(encoding="utf-8"))
-    except (OSError, ValueError, RequestError):
-        return None
+    path = _spool_dir(request_id) / "request.json"
+    rec = None
+    for attempt in range(4):
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None                    # genuinely absent
+        except (ValueError, RequestError):
+            return None                    # corrupt or bad id shape
+        except OSError:
+            # Transient only: a share-lock (AV/indexer) or a mid-replace
+            # read surfaces as a brief PermissionError on Windows, and
+            # reading "no overlay" here has real consequences - a stop
+            # skips the overlay drop it came to do, a save_draft thinks
+            # it lost ownership, and the surviving 'generating' overlay
+            # then wedges the request for the whole orphan grace.
+            if attempt == 3:
+                return None
+            time.sleep(0.05)
+            continue
+        break
     return rec if isinstance(rec, dict) and rec.get("id") == request_id \
         else None
 
@@ -8501,6 +8521,20 @@ def _finish_generation(request_id: str, requests_dir: Path,
     finally:
         with REQUEST_LOCK:
             _GENERATING.discard(gen_id)
+            # Every exit path above either publishes/flushes the overlay
+            # or leaves it to a newer attempt's gen_id. An overlay still
+            # marked 'generating' with OUR gen after we exit is always a
+            # lie (a transient spool read could once have skipped the
+            # handoff) - drop it so _request_status exposes the request
+            # file instead of wedging on the 660s orphan grace.
+            cur = _spool_rec(request_id)
+            if (cur or {}).get("gen_id") == gen_id \
+                    and cur.get("status") == "generating":
+                try:
+                    (_spool_dir(request_id) / "request.json").unlink(
+                        missing_ok=True)
+                except OSError:
+                    pass
 
 
 def drain_planner_spool(root: Path | None = None) -> list[str]:
@@ -8857,12 +8891,32 @@ def _detached_kwargs() -> dict:
     return kw
 
 
+# Detached dashboard spawns (run/resume/merge/summarize) deliberately
+# outlive this process - but a dropped Popen object GCs to a
+# "subprocess is still running" ResourceWarning while its child is
+# mid-flight. Keep each handle here; poll() of finished ones sets the
+# returncode so they prune (and GC) silently.
+_DETACHED_PROCS: list = []
+
+
 def _launch_process(cmd: list[str], log_path: Path) -> int:
-    """Spawn a conductor `run`/`resume` subprocess from the dashboard."""
+    """Spawn a conductor `run`/`resume`/`merge`/`summarize` subprocess
+    from the dashboard."""
     with open(log_path, "wb") as out:
         proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=out,
                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                 env=clean_devin_env(), **_detached_kwargs())
+    # Prune finished handles; a test-mocked Popen without poll() is kept
+    # rather than crash every later launch.
+    alive = []
+    for p in _DETACHED_PROCS:
+        try:
+            if p.poll() is None:
+                alive.append(p)
+        except Exception:
+            alive.append(p)
+    _DETACHED_PROCS[:] = alive
+    _DETACHED_PROCS.append(proc)
     return proc.pid
 
 
@@ -9400,6 +9454,11 @@ def _merge_deferred_group(d: Path, st: dict, grp: dict, names: list[str],
 
 _MERGE_BUSY: set[str] = set()
 _MERGE_LOCK = threading.Lock()
+# Detached `conductor.py merge` children spawned via merge_run_start -
+# consulted like _RESUME_PIDS so a dashboard merge stays refused while
+# its child still runs (and the child's run claim covers every other
+# process, including a restarted serve that lost this table).
+_MERGE_PIDS: dict[str, int] = {}
 
 
 def merge_run(name: str, runs_dir: Path = RUNS_DIR,
@@ -9430,6 +9489,70 @@ def merge_run(name: str, runs_dir: Path = RUNS_DIR,
     finally:
         with _MERGE_LOCK:
             _MERGE_BUSY.discard(name)
+
+
+def merge_run_start(name: str, runs_dir: Path = RUNS_DIR,
+                    devin_argv: list[str] | None = None,
+                    only: list[str] | None = None) -> dict:
+    """POST /api/runs/<run>/merge - spawn the merge out of process (the
+    same detach discipline as resume/summarize launches). A staged merge
+    can run resolver sessions for tens of minutes; run in-request it dies
+    with this process - a service stop tree-kills the serve AND its
+    mid-merge resolvers, orphaning a real git merge in a watched
+    checkout. The child re-validates everything under its own run claim;
+    the checks here only refuse requests that cannot possibly succeed."""
+    if not RUN_DIR_RE.fullmatch(name):
+        raise RequestError("Invalid run dir", 404)
+    d = (runs_dir / name).resolve()
+    if d.parent != runs_dir.resolve() or not (d / "state.json").is_file():
+        raise RequestError("Run not found", 404)
+    try:
+        st = json.loads((d / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RequestError("Cannot read run state", 500) from exc
+    _merge_refuse_executing(run_executing(st))
+    pid = _RESUME_PIDS.get(name)
+    if pid and pid_alive(pid):
+        raise RequestError("A resume is already running for this run", 409)
+    pid = _MERGE_PIDS.get(name)
+    if pid and pid_alive(pid):
+        raise RequestError("A merge is already running for this run", 409)
+    holder = _merge_claim_held(d)
+    if holder:
+        raise RequestError(
+            f"A {holder.get('by') or 'merge'} is in flight for this run "
+            "- merge once it finishes", 409)
+    steps = st.get("steps") or {}
+    onlyset = set(only) if only else None
+    pending = {n for n, r in steps.items()
+               if r.get("branch") and r.get("merged") is not True
+               and not r.get("deferred")}
+    if onlyset is not None:
+        pending &= onlyset
+    if not pending and not (st.get("pending_merges") or {}):
+        return {"dir": name, "merged": [], "conflicted": [], "skipped": [],
+                "unverified": [], "verify_failed": [], "moved": [],
+                "busy": [], "kept": []}
+    manifest = st.get("manifest")
+    if not manifest or not Path(manifest).is_file():
+        raise RequestError("Run's manifest is gone; merge the branches "
+                           "by hand from each kept worktree", 409)
+    cmd = [sys.executable, str(ROOT / "conductor.py"), "merge", name,
+           "--runs-dir", str(runs_dir)]
+    # The run's own worker binary wins over the server's env default -
+    # same rule as resume: a mock-devin run resolves merges with it too.
+    dv = (st.get("devin_argv")
+          or (shlex.split(st["devin"]) if st.get("devin") else None)
+          or devin_argv)
+    if dv and dv != ["devin"]:
+        cmd += ["--devin", shlex.join(dv)]
+    if only:
+        cmd += ["--steps", *only]
+    try:
+        _MERGE_PIDS[name] = _launch_process(cmd, d / "merge.launch.log")
+    except OSError as exc:
+        raise RequestError("Could not start the merge process", 500) from exc
+    return {"merging": name, "pid": _MERGE_PIDS[name]}
 
 
 def _merge_refuse_executing(why: str | None) -> None:
@@ -10188,7 +10311,7 @@ def delete_run(run_name: str, body: dict, runs_dir: Path = RUNS_DIR,
     if pid and pid_alive(pid):
         raise RequestError("A resume is already running for this run", 409)
     with _MERGE_LOCK:
-        if run_name in _MERGE_BUSY:
+        if run_name in _MERGE_BUSY or pid_alive(_MERGE_PIDS.get(run_name)):
             raise RequestError("A merge is already running for this run",
                                409)
     holder = _merge_claim_held(d)
@@ -11748,7 +11871,9 @@ def collect_dashboard(runs_dir: Path,
                      # auto-policy branches that never landed.
                      "pending_merges": pm_groups,
                      "pending_branches": pm_legacy,
-                     "merge_busy": sj.parent.name in _MERGE_BUSY,
+                     "merge_busy": sj.parent.name in _MERGE_BUSY
+                     or pid_alive(_MERGE_PIDS.get(sj.parent.name))
+                     or _merge_claim_held(sj.parent) is not None,
                      "description": st.get("description") or
                      (request or {}).get("description"),
                      "started_at": st.get("started_at"),
@@ -15672,6 +15797,16 @@ document.addEventListener('click', async e=>{
       const out=await api('POST',
         `/api/runs/${encodeURIComponent(t.dataset.mergeRun)}/merge`,
         {steps});
+      if (out.merging){
+        // The merge now runs as a detached conductor process (a resolver
+        // session can take tens of minutes and must outlive this server):
+        // outcomes land in the pending list + event log as they happen.
+        const note=`merge running in background (pid ${out.pid}) - ` +
+          `each pending change updates live; merge.launch.log in the ` +
+          `run dir is the process log`;
+        if (rk){ mergeResult[rk]=note; await refresh(); showRunDetails(rk); }
+        else alert(note);
+        return; }
       const bits=[];
       if (out.merged?.length) bits.push(`merged: ${out.merged.join(', ')}`);
       if (out.conflicted?.length)
@@ -16606,8 +16741,8 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/merge", path)):
                     only = body.get("steps") if isinstance(
                         body.get("steps"), list) else None
-                    self._json(merge_run(m.group(1), runs_dir, devin_argv,
-                                         only=only))
+                    self._json(merge_run_start(
+                        m.group(1), runs_dir, devin_argv, only=only), 202)
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/stop", path)):
                     self._json(stop_run(m.group(1), body, runs_dir), 202)
                 elif (m := re.fullmatch(r"/api/runs/([^/]+)/pause", path)):
@@ -16655,10 +16790,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     # dashboard button can do is pop a REAL terminal for it.
                     # logout first: a stale credentials.toml makes plain `login`
                     # short-circuit with "already logged in" (trap 4).
-                    subprocess.Popen(
+                    _DETACHED_PROCS.append(subprocess.Popen(
                         'start "" cmd /k "devin auth logout & '
                         'devin auth login --force-manual-token-flow"',
-                        shell=True, env=clean_devin_env())
+                        shell=True, env=clean_devin_env()))
                     _AUTH_CACHE[0] = 0.0      # next tick re-probes
                     self._json({})
                 elif path == "/api/auth/recheck":
