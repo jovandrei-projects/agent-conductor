@@ -23,15 +23,28 @@ Context + retrieval live in sibling modules so this file stays wiring:
   views plus a ``register_provider`` hook for custom surfaces).
 - ``assistant_host.retrieval.ConductorRetrieval`` - bounded search/fetch
   over runs + requests producing navigable citation sources.
+- ``assistant_host.modelpick`` - catalog-aware model/effort/fast/vision
+  resolution; the settings validator + runtime resolver both run it.
 - ``static_preamble()`` - the host's standing knowledge text
   (``host_conductor_static.md`` next to this file).
+
+open_runtime() adds the conversational surface on top: the
+DevinPrintProvider (authenticated ``devin -p [-r]`` spawns in
+data/assistant/workspace - the verified transport), the AssistantRuntime
+dispatcher, catalog-backed settings validation, and the seeded product
+default (gpt-6-luna, low thinking, fast).
 """
 import functools
+import os
+import shlex
 from pathlib import Path
 
 import conductor
 from assistant.core import AssistantCore
+from assistant.providers.devin_print import DevinPrintProvider
+from assistant.runtime import AssistantRuntime
 from assistant.store import Store
+from assistant_host import modelpick
 from assistant_host.context import ConductorContext
 from assistant_host.retrieval import ConductorRetrieval
 
@@ -53,11 +66,17 @@ def static_preamble(path=None) -> str:
         return ""
 
 
+def default_devin_argv() -> list[str]:
+    """Same derivation serve uses for its workers."""
+    return shlex.split(os.environ.get("CONDUCTOR_DEVIN") or "devin")
+
+
 def open_core(*, data_dir: Path = ASSISTANT_DIR,
               runs_dir: Path = conductor.RUNS_DIR,
               requests_dir: Path = conductor.REQUESTS_DIR,
               devin_argv=None, dispatcher=None, actions=None,
-              retrieval=None, enricher=None, catalog=None) -> AssistantCore:
+              retrieval=None, enricher=None, catalog=None,
+              settings_validator=None) -> AssistantCore:
     """Build AssistantCore on this project's data dir with the conductor
     seams attached. `catalog` defaults to the pricing-merged model list
     the settings modal shows; `retrieval`/`enricher` default to the
@@ -81,7 +100,85 @@ def open_core(*, data_dir: Path = ASSISTANT_DIR,
         retrieval=retrieval, enricher=enricher,
         catalog=catalog or functools.partial(
             _default_catalog, devin_argv or ["devin"]),
+        settings_validator=settings_validator,
         now=conductor._now)
+
+
+def _price_snapshot(uid: str, label: str | None) -> dict | None:
+    """Rates + provenance for one exchange's price snapshot: the
+    self-serve table entry by uid, else by the label the session
+    ACTUALLY reported - never an assumed match."""
+    try:
+        table = conductor.price_table()
+    except Exception:                       # noqa: BLE001
+        return None
+    ent, used = table.get(uid), uid
+    if ent is None and label:
+        for cand, e in table.items():
+            if (e.get("label") or "").lower() == str(label).lower():
+                ent, used = e, cand
+                break
+    if not ent:
+        return None
+    return {"in": ent.get("in"), "cached": ent.get("cr"),
+            "out": ent.get("out"),
+            "fetched_at": conductor._PRICE_CACHE.get("fetched"),
+            "source": conductor._PRICE_CACHE.get("source") or "docs"}
+
+
+def _seed_defaults(core: AssistantCore) -> None:
+    """The product's initial preference (verified gpt-6-luna, low
+    thinking, fast). A PREFERENCE, not an availability claim - dispatch
+    re-validates against the live catalog and fails honestly when the
+    family is unavailable. Written only on first open; existing stored
+    values are never overwritten."""
+    if core.store.get_setting("default.model"):
+        return
+    for k, v in modelpick.DEFAULT_SETTINGS.items():
+        core.store.set_setting(f"default.{k}", v)
+
+
+def open_runtime(*, data_dir: Path = ASSISTANT_DIR,
+                 runs_dir: Path = conductor.RUNS_DIR,
+                 requests_dir: Path = conductor.REQUESTS_DIR,
+                 projects=None, devin_argv=None, actions=None,
+                 provider=None, reconcile=True) -> tuple:
+    """The full host stack: core + provider + dispatcher, wired together.
+    Returns (core, runtime). `reconcile` re-owns inflight exchanges after
+    a serve restart; tests inject a fake provider and reconcile=False."""
+    argv = list(devin_argv or default_devin_argv())
+    data_dir = Path(data_dir)
+    workspace = data_dir / "workspace"
+    spool = data_dir / "spool"
+    provider = provider or DevinPrintProvider(
+        argv, env=conductor.clean_devin_env,
+        spawn_kwargs=conductor.hidden_subprocess_kwargs(),
+        kill=conductor.kill_tree, alive=conductor.pid_alive)
+
+    def options():
+        return conductor.model_options(argv)
+
+    def resolve(snap, attachments_present=False):
+        return modelpick.resolve_settings(
+            snap, options() or {},
+            attachments_present=attachments_present)
+
+    runtime = AssistantRuntime(
+        None, provider, workspace=workspace, spool_dir=spool,
+        resolve=resolve, price_for=_price_snapshot,
+        preamble=static_preamble(), now=conductor._now)
+    core = open_core(
+        data_dir=data_dir, runs_dir=runs_dir, requests_dir=requests_dir,
+        devin_argv=argv, dispatcher=runtime, actions=actions,
+        settings_validator=modelpick.make_validator(options),
+        catalog=lambda: modelpick.annotate_catalog(
+            _default_catalog(argv), options() or {}, core.defaults()))
+    runtime.bind(core)
+    runtime._retrieval = runtime._retrieval or core.retrieval
+    _seed_defaults(core)
+    if reconcile:
+        runtime.reconcile()
+    return core, runtime
 
 
 def _default_catalog(devin_argv) -> list[dict]:
