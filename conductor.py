@@ -8846,6 +8846,13 @@ def _planner_response(rec: dict, projects: dict,
             "gap still remains.\n\n")
     known_verify = {s: p["verify"] for s, p in projects.items()
                     if p.get("verify")}
+    branch_bits = []
+    for s, p in sorted(projects.items()):
+        bs = list_local_branches(p["path"])[:20]
+        if bs:
+            branch_bits.append(f"{s}: {', '.join(bs)}")
+    branches_hint = ("Existing local branches per project: "
+                     + "; ".join(branch_bits) + ". " if branch_bits else "")
     verify_hint = (f"Registered verify commands: {known_verify} - set "
                    "verify under [defaults] (or per [[step]]) to the "
                    "command for each step's project. A failed verify "
@@ -8876,6 +8883,8 @@ user intent and a project permitted for cloud. No prompt_file or preamble.
 merge_target = "<branch>" (optional, [run] or per [[step]]) names an existing
 local branch the step's worktree branch is created from and merged back into
 instead of the checkout's current branch; it requires worktree = true.
+{branches_hint}Omit merge_target unless the human named one - a guessed
+branch name fails validation.
 depends_on = ["step-name", ...] (optional, per [[step]], never [defaults])
 holds a step until every named step reaches a terminal state - 'failed'
 counts, so a merge glitch never strands later work; a dep must name an
@@ -8939,8 +8948,20 @@ STATUS: done
             if rid:
                 with REQUEST_LOCK:
                     _GEN_PROCS[rid] = proc
+            # The detached planner may outlive its owner - job.json gets
+            # its pid so a drain under a dead owner still waits it out
+            # (a --print session writes the log only at turn end, so an
+            # empty log is NOT proof of a dead planner).
             try:
-                rc, timed_out, _hung, stopped, _ext = wait_worker(
+                jf = log.parent / "job.json"
+                if jf.is_file() and getattr(proc, "pid", None):
+                    job = json.loads(jf.read_text(encoding="utf-8"))
+                    job["planner_pid"] = proc.pid
+                    jf.write_text(json.dumps(job), encoding="utf-8")
+            except (OSError, ValueError):
+                pass
+            try:
+                rc, timed_out, hung, stopped, _ext = wait_worker(
                     proc, log, 600,
                     stop_flags=(sflag,) if sflag is not None else ())
             finally:
@@ -8957,10 +8978,14 @@ STATUS: done
             rec["_gen_session_ids"] = sids
         if stopped or (sflag is not None and sflag.is_file()):
             raise GenerationStopped(f"request {rid} proposal stopped")
-        if timed_out or rc != 0:
+        text = log.read_text(encoding="utf-8", errors="replace")
+        # A STATUS: line ends the planner's turn - its reply is complete,
+        # so a nonzero rc afterwards (CLI exit-path failure, or our own
+        # kill at STATUS grace) must not discard a finished proposal.
+        if timed_out or (rc != 0 and not hung
+                         and not STATUS_RE.search(text)):
             raise RequestError("Planner did not finish; check CLI auth and "
                                "retry generation", 502)
-        text = log.read_text(encoding="utf-8", errors="replace")
     matches = re.findall(r"^BEGIN_MANIFEST\s*\n(.*?)^END_MANIFEST\s*$",
                          text, re.M | re.S)
     if not matches:
@@ -9221,6 +9246,12 @@ def _finish_generation(request_id: str, requests_dir: Path,
             "request_id": request_id, "requests_dir": str(requests_dir),
             "manifests_dir": str(manifests_dir), "runs_dir": str(runs_dir),
             "gen_id": gen_id,
+            # Ownership for cross-process drain liveness: _GENERATING only
+            # covers THIS process, so a foreign drain (a second serve, a
+            # status call - anything running collect_dashboard) must check
+            # pids. SERVE_BOOT is module-load time = this process's start.
+            "owner_pid": os.getpid(),
+            "owner_boot": SERVE_BOOT,
             "base_updated_at": base.get("updated_at"),
             "base_status": base.get("status"),
             "base_stopped_at": base.get("generation_stopped_at"),
@@ -9399,10 +9430,16 @@ def drain_planner_spool(root: Path | None = None) -> list[str]:
             continue
         # _GENERATING is keyed by attempt gen_id - a live generation's
         # spool carries it in job.json (and the overlay once written).
-        live = {_job_meta(d).get("gen_id"),
+        job = _job_meta(d)
+        live = {job.get("gen_id"),
                 (_spool_rec(d.name) or {}).get("gen_id")}
         if _GENERATING.intersection(live - {None}) \
                 or d.name in _DRAINING:
+            continue
+        # _GENERATING only covers THIS process: a live foreign owner (a
+        # second serve, a parallel generation) is not an orphan - a drain
+        # here would mark its still-running generation 'interrupted'.
+        if pid_alive(job.get("owner_pid"), job.get("owner_boot")):
             continue
         _DRAINING.add(d.name)
         threading.Thread(target=_drain_spool, args=(d,), daemon=True).start()
@@ -9439,6 +9476,13 @@ def _drain_generating(rid: str, overlay: dict, spool: Path,
     """A generation that never finished: publish a spooled draft, extract
     one from a finished-but-uncaptured planner log, wait out an orphan
     that is still writing, else land the interruption as an error."""
+    job = _job_meta(spool)
+    # A dead owner's detached planner may still be writing (a --print
+    # session writes the log only at turn end, so an empty/stale log is
+    # NOT proof of death) - leave the spool for the next pass.
+    if pid_alive(job.get("planner_pid"),
+                 overlay.get("generation_started_at")):
+        return
     draft = spool / "draft.toml"
     current = overlay.get("draft_started_at") == overlay.get(
         "generation_started_at") and overlay.get("draft_started_at")
@@ -13281,13 +13325,20 @@ th { position:sticky; top:var(--topbar-h,110px); z-index:7;
   font-size:11px; text-transform:uppercase; padding:4px 10px 4px 0;
   border-bottom:1px solid #21262d; }
 td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+/* a left gutter inside every first cell: the left-edge state markers
+   (unreviewed cyan, selected/dsel blue) paint an inset stripe there, so
+   the stripe sits in the gutter instead of overlapping the cell text */
+.wrapw td:first-child, .wrapw th:first-child { padding-left:8px; }
+/* the agents table's run name: extra right padding keeps a long,
+   ellipsized name from visually colliding with the model column */
+td.rcell { padding-right:18px; }
 td.wrap { white-space:normal; color:#8b949e; font-size:12px; }
 td.step { white-space:normal; }  /* wt/merged chips wrap under a long name */
 /* tr.agen is not clickable as a row anymore - its named controls (step
    name -> details, run name -> filter) carry pointer cursors themselves,
    so the row does not advertise a click that does nothing. */
 tr.runrow { cursor:pointer; }
-tr.runrow:hover td { background:#172532; }
+tr.runrow:hover td { background:#26405a; }
 tr.runrow.selected td { background:#1c3041; }
 tr.runrow.selected td:first-child { box-shadow:inset 3px 0 #58a6ff; }
 .dots span { animation:blink 1.2s infinite; color:#58a6ff; }
@@ -13296,8 +13347,11 @@ tr.runrow.selected td:first-child { box-shadow:inset 3px 0 #58a6ff; }
 @keyframes blink { 0%,100%{opacity:.15} 50%{opacity:1} }
 tr.agen td { transition:background .12s; }
 tr.agen:hover td { background:#26405a; }
+/* .hl is the hover's run group: the hovered row's siblings plus a linked
+   follow-up pair. It stays a notch under the directly hovered row -
+   hover beats .hl, and a row that is BOTH gets the strongest shade. */
 tr.hl td { background:#1c2833; }
-tr.agen.hl:hover td { background:#2a4a68; }
+tr.hl:hover td { background:#2a4a68; }
 /* .dsel marks the row whose details are on screen - the open task modal's
    agent row, an open run/request/questionnaire/summary modal's run row. It
    is independent of the pointer (hover no longer erases it) and distinct
@@ -13338,6 +13392,9 @@ body.compact td br { display:none; }
    let them clip inline after the name); its one rule is below. */
 .toksub { color:#8b949e; font-size:12px; }
 body.compact td .toksub { display:none; }
+/* .toks is .toksub's look without the compact hide - the agents table's
+   tokens column keeps its labeled numbers at both densities */
+.toks { color:#8b949e; font-size:12px; }
 /* Chips on the .rlabels line must never clip invisibly at the td edge:
    compact squeezes td.wrap to nowrap, which pins every chip to one line -
    a pill starting mid-line can shrink to max-width:100% yet still
@@ -13746,12 +13803,9 @@ const kfmt = n => n==null?'-':(n>=1000
 // turn = in + cached (the tooltip carries it).
 const billed = t => t && t.prompt!=null
   ? Math.max(t.prompt-(t.cached||0),0) : null;
-const fmtT = t => (!t||t.prompt==null) ? '-' :
-  `in ${kfmt(billed(t))} · out ${kfmt(t.completion)}` +
-  ` · cached ${kfmt(t.cached||0)}` +
-  (t.llm_steps ? ` · ${t.llm_steps} turns` : '');
-// compact density: bare in/out/cached + LLM turns - order is fixed and
-// spelled out in TOK_HELP + the cell title
+// token readout: billed-in/out/cached + LLM turns, order fixed and
+// spelled out in TOK_HELP + the cell title - the one labeled short
+// form both tables use at every density
 const fmtTc = t => (!t||t.prompt==null) ? '-' :
   `${kfmt(billed(t))}/${kfmt(t.completion)}/${kfmt(t.cached||0)}` +
   (t.llm_steps ? ` ${t.llm_steps}L` : '');
@@ -13873,12 +13927,12 @@ let AGENTS = [];          // last payload, for the detail modal
 // same widths line up across tables)
 const AGENT_COLS = '<colgroup>' +
   '<col style="width:8%"><col style="width:20%">' +
-  '<col style="width:8%"><col class="hide-s" style="width:6%">' +
+  '<col style="width:9%"><col class="hide-s" style="width:6%">' +
   '<col class="hide-s" style="width:5%"><col class="hide-s" style="width:5%">' +
   '<col style="width:6%"><col style="width:6%">' +
   '<col class="hide-s" style="width:10%"><col class="hide-s" style="width:5%">' +
   '<col style="width:6%"><col class="hide-s" style="width:5%">' +
-  '<col style="width:10%">' +
+  '<col style="width:9%">' +
   '</colgroup>';
 
 let detailIdx = null;
@@ -15512,7 +15566,13 @@ function showRunDetails(key, keepStack){
     `<h3>Pending merges (${pmCount})</h3>` +
     `<div class="sub" style="margin-bottom:8px">finished work still ` +
     `sitting on worktree branches - tick entries to merge them into ` +
-    `the target branch now. Unticked entries stay parked untouched; ` +
+    `the target branch now, or ` +
+    `<a href="#" data-pm-all="1" ` +
+    `title="tick every mergeable entry - disabled (unverified/live) ` +
+    `entries stay unticked and each alternative group keeps one ` +
+    `pick">select all</a> · ` +
+    `<a href="#" data-pm-clear="1" title="untick every entry">clear</a>. ` +
+    `Unticked entries stay parked untouched; ` +
     `unverified entries are never merged.</div>` +
     (r.merge_busy ? `<div class="notice warn">A merge is in progress ` +
       `for this run - new clicks are ignored.</div>`:'') +
@@ -15532,8 +15592,7 @@ function showRunDetails(key, keepStack){
           'branches - verified entries are staged, re-verified and ' +
           'merged atomically; unticked entries stay parked')}">` +
     `Merge selected pending work</button>` +
-    `<span class="sub" id="pm-msg" style="margin-left:8px">` +
-    `${sel.size?'':'tick the work to merge'}</span>` +
+    `<span class="sub" id="pm-msg" style="margin-left:8px"></span>` +
     `</div></div>` : '';
   // Run control is its own panel too: resume re-runs every non-done step
   // in a fresh session (parked branches get another merge attempt first)
@@ -17363,16 +17422,16 @@ function render(d){
         'cumulative driver execution time'}">${runElapsed(r,now)}</td>` +
       `<td class="counts">` +
       `${counts||'<span class="toksub">not planned</span>'}` +
-      // .toksub, not .sub: these labeled lines are meant to render in
-      // compact too (fmtTc is the compact form) - the blanket td .sub
-      // hide made the compact branch unreachable
+      // the run table shows token lines at full density only (compact
+      // hides .toksub); they always render in fmtTc short form - the
+      // same labeled numbers the agents table's tokens column shows
       (r.plan_tokens ? `<br><span class="toksub" ` +
         `title="${esc(tokTitle(r.plan_tokens))}">planner: ` +
-        `${density==='compact' ? fmtTc(r.plan_tokens) : fmtT(r.plan_tokens)}` +
+        `${fmtTc(r.plan_tokens)}` +
         (r.plan_cost?` · ${fmtC(r.plan_cost)}`:'') + `</span>` : '') +
       (r.tokens ? `<br><span class="toksub" ` +
         `title="${esc(tokTitle(r.tokens))}">steps: ` +
-        `${density==='compact' ? fmtTc(r.tokens) : fmtT(r.tokens)}` +
+        `${fmtTc(r.tokens)}` +
         (r.cost?` · ${fmtC(r.cost)}`:'') + `</span>` : '') +
       (runUsd!=null ? `<br><span class="toksub" ` +
         `title="estimated self-serve ` +
@@ -17509,7 +17568,7 @@ function render(d){
         // identity - a request-backed run's key survives its dir changing;
         // a task with no run association keeps plain text: there is no
         // filter target to apply.
-        `<td>${aRk && a.run!=null && a.run!==''
+        `<td class="rcell">${aRk && a.run!=null && a.run!==''
           ? `<button type="button" class="linkbtn run-link" ` +
             `data-filter-run="${esc(aRk)}" ` +
             `title="show only run ${esc(a.run)} and its tasks">` +
@@ -17523,8 +17582,13 @@ function render(d){
         `<td class="hide-s">${esc(a.mode||'-')}${a.cloud?' cloud':''}</td>` +
         `<td>${loc(a.started_at)}</td>` +
         `<td data-el="${a._i}">${elapsed(a,now)}</td>` +
+        // same labeled fmtTc form as the run table's steps:/planner:
+        // lines, at BOTH densities - 'tokens:' is the label here since
+        // a task row has no planner/steps split
         `<td class="hide-s" title="${esc(tokTitle(a.tokens))}">` +
-        `${density==='compact' ? fmtTc(a.tokens) : fmtT(a.tokens)}</td>` +
+        `${a.tokens&&a.tokens.prompt!=null
+          ? `<span class="toks">tokens: ${fmtTc(a.tokens)}</span>`
+          : '-'}</td>` +
         `<td class="hide-s" title="${esc(costTitle(a.cost))}">` +
         `${fmtC(a.cost)}</td>` +
         `<td>${loc(a.ended_at)}</td>` + sessTd +
@@ -17778,6 +17842,38 @@ document.addEventListener('click', async e=>{
     showRunDetails(nrunEl.dataset.navRun, true);
     const d = document.getElementById('detail');
     if (d) d.scrollTop = 0;
+    return; }
+  // pending-merge 'select all' / 'clear': ticks every mergeable box -
+  // disabled (unverified/live) entries stay unticked, and each
+  // alternative group keeps exactly one pick (a ticked member wins the
+  // slot, else the first enabled variant)
+  const pmSelEl = t.closest && t.closest('[data-pm-all],[data-pm-clear]');
+  if (pmSelEl){
+    e.preventDefault();
+    if (modalRunKey==null) return;
+    const sel = mergeSel[modalRunKey] || (mergeSel[modalRunKey] = new Set());
+    const boxes=[...document.querySelectorAll('#detail input[data-pm]')];
+    if (pmSelEl.dataset.pmClear!==undefined){
+      boxes.forEach(b=>{ b.checked=false; sel.delete(b.dataset.pm); });
+    } else {
+      const groups={};
+      boxes.forEach(b=>{ const alt=b.dataset.pmAlt;
+        if (alt!==undefined && alt!=='') (groups[alt]??=[]).push(b); });
+      const keep=new Set(Object.values(groups).map(g=>
+        g.find(b=>b.checked && !b.disabled) ||
+        g.find(b=>!b.disabled)).filter(Boolean));
+      boxes.forEach(b=>{
+        if (b.disabled) return;
+        const alt=b.dataset.pmAlt;
+        const ok = alt===undefined || alt==='' || keep.has(b);
+        b.checked=ok;
+        if (ok) sel.add(b.dataset.pm); else sel.delete(b.dataset.pm);
+      });
+    }
+    const pb=document.getElementById('pm-go');
+    if (pb) pb.classList.toggle('idle', !sel.size);
+    const pmMsg=document.getElementById('pm-msg');
+    if (pmMsg && !sel.size) pmMsg.textContent='';
     return; }
   // context-menu task entries - keyed by agentKey so a re-sorted table
   // can't open the wrong row (same keying the modal refresh uses)
@@ -18428,7 +18524,7 @@ document.addEventListener('change', e=>{
   const pb=document.getElementById('pm-go');
   if (pb) pb.classList.toggle('idle', !sel.size);
   const pmMsg=document.getElementById('pm-msg');
-  if (pmMsg && !sel.size) pmMsg.textContent='tick the work to merge';
+  if (pmMsg && !sel.size) pmMsg.textContent='';
 });
 document.addEventListener('keydown', e=>{
   // the open row menu owns the keyboard: Esc dismisses (focus returns to

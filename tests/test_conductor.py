@@ -1722,6 +1722,38 @@ prompt = "Review the catalog tests."
             self.assertTrue(
                 seen["flags"] & subprocess.CREATE_NEW_PROCESS_GROUP)
 
+    def test_planner_finished_turn_survives_nonzero_exit(self):
+        # A STATUS: line completes the planner's reply - a nonzero rc
+        # afterwards (killed at STATUS grace, or a CLI exit-path failure)
+        # must not discard the finished proposal. rc!=0 with no STATUS
+        # stays a 'did not finish' error.
+        for wait, log_body, raises in (
+                ((1, False, True, False, 0.0), "STATUS: done\n", False),
+                ((1, False, False, False, 0.0), "STATUS: done\n", False),
+                ((1, False, False, False, 0.0), "", True),
+                ((0, True, False, False, 0.0), "STATUS: done\n", True)):
+            rec = self.new()
+            proposal = self.proposal()
+
+            class FakeProc:
+                def __init__(self, cmd, **kwargs):
+                    if "--prompt-file" not in cmd:
+                        return
+                    kwargs["stdout"].write(
+                        ("BEGIN_MANIFEST\n" + proposal +
+                         "END_MANIFEST\n" + log_body).encode())
+                    kwargs["stdout"].flush()
+
+            with mock.patch.object(conductor.subprocess, "Popen", FakeProc), \
+                    mock.patch.object(conductor, "wait_worker",
+                                      return_value=wait):
+                if raises:
+                    with self.assertRaises(conductor.RequestError):
+                        conductor._planner_response(rec, {}, ["devin"])
+                else:
+                    text = conductor._planner_response(rec, {}, ["devin"])
+                    self.assertEqual(text.strip(), proposal.strip())
+
     def test_planner_tokens_recorded_on_request(self):
         rec = self.new()
         proposal = self.proposal()
@@ -2451,6 +2483,29 @@ prompt = "Polish the catalog."
         # the partial log was preserved, not lost with the spool
         self.assertEqual((self.requests / f"{rec['id']}.gen.log")
                          .read_text(), "planner died mid-thought\n")
+
+    def test_drain_leaves_a_spool_whose_owner_is_alive(self):
+        """_GENERATING is per-process: a second serve/status process
+        draining the shared spool must not mark a live foreign generation
+        'interrupted' - owner_pid/planner_pid in job.json are the
+        cross-process liveness check (a --print log stays empty the whole
+        turn, so log freshness alone is not proof of death)."""
+        rec = self.new()
+        spool = self._spool_fixture(rec, log="")     # 0-byte --print log
+        job = json.loads((spool / "job.json").read_text())
+        job["gen_id"] = rec.get("gen_id") or "live-gen"
+        job["owner_pid"] = os.getpid()              # this test process
+        job["owner_boot"] = conductor.SERVE_BOOT
+        job["planner_pid"] = os.getpid()
+        (spool / "job.json").write_text(json.dumps(job))
+
+        adopted = conductor.drain_planner_spool(self.spool)
+        time.sleep(0.3)                             # let any drain run
+        self.assertNotIn(rec["id"], adopted)
+        self.assertTrue(spool.exists())             # spool untouched
+        rec = conductor.request_details(rec["id"], self.requests,
+                                        self.manifests)
+        self.assertNotIn("interrupted", str(rec.get("error")))
 
     def test_drain_never_republishes_a_superseded_draft(self):
         """A regenerate crashed before its own draft: the previous
@@ -4400,13 +4455,13 @@ assert.match(elem('runs').innerHTML,/>1 running</);
 assert.match(elem('runs').innerHTML,/>1 done</);
 assert.match(elem('runs').innerHTML,/class="dot run"/);
 assert.match(elem('runs').innerHTML,/est \$1\.50/);
-// run row: step-token line names every field under the 'steps:' label
-assert.match(elem('runs').innerHTML,/steps: in 1k · out 200 · cached 0 · 2 turns · \$1\.50/);
-// agent row: cost cell; tokens render as labeled fields (in/out/cached/
-// turns) - the bare '1k/200 ·2st' compact form is gone.
+// run row: step-token line under the 'steps:' label, in the shared
+// billed-in/out/cached + turns short form
+assert.match(elem('runs').innerHTML,/steps: 1k\/200\/0 2L · \$1\.50/);
+// agent row: cost cell; the tokens cell carries the same labeled short
+// form the run table uses ('tokens:' is the row's label)
 assert.match(elem('agents').innerHTML,/\$0\.12/);
-assert.match(elem('agents').innerHTML,/in 1k · out 200 · cached 0 · 2 turns/);
-assert.doesNotMatch(elem('agents').innerHTML,/1k\/200/);
+assert.match(elem('agents').innerHTML,/tokens: 1k\/200\/0 2L/);
 // compact density: bare billed-in/out/cached + turns (in = prompt -
 // cached, the billed part - Desktop's "input" number)
 assert.strictEqual(vm.runInContext(
@@ -5016,14 +5071,27 @@ assert.match(elem('runs').innerHTML,
         (b) The planner:/steps:/est token lines carry .toksub and are
         HIDDEN at compact density - the leaner table drops them, and
         the numbers stay reachable at full density and in the run
-        modal. The markup itself is still emitted in fmtTc short form,
-        so toggling densities needs no refetch."""
+        modal. The markup is always emitted in the shared fmtTc short
+        form, so toggling densities needs no refetch."""
         html = conductor._DASH_HTML
         self.assertRegex(
             html, r'body\.compact td \.toksub \{[^}]*display:\s*none')
         self.assertRegex(html, r'\.toksub \{[^}]*color:#8b949e')
+        # the agents table's tokens label shares the muted look but is
+        # exempt from the compact hide (.toks, no compact rule)
+        self.assertRegex(html, r'\.toks \{[^}]*color:#8b949e')
         self.assertRegex(
             html, r'body\.compact td \.sub \{[^}]*display:\s*none')
+        # hover hierarchy: the row under the pointer is a notch stronger
+        # than the run group .hl, and both shades for a hovered .hl row
+        self.assertRegex(html, r'tr\.hl td \{[^}]*#1c2833')
+        self.assertRegex(html, r'tr\.hl:hover td \{[^}]*#2a4a68')
+        self.assertRegex(html, r'tr\.runrow:hover td \{[^}]*#26405a')
+        # the unreviewed/selected left-edge stripe gets its own gutter
+        self.assertRegex(
+            html, r'\.wrapw td:first-child[^}]*padding-left:8px')
+        # long run names keep air between run and model columns
+        self.assertRegex(html, r'td\.rcell \{[^}]*padding-right:18px')
         js = html.split("<script>\n", 1)[1].split("</script>", 1)[0]
         harness = r'''
 const vm=require('node:vm'), assert=require('node:assert/strict');
@@ -5071,16 +5139,16 @@ assert.ok(sp.indexOf('Needs review') < sp.indexOf('>sp<'),
 const rq=row('req');
 assert.match(rq,/class="rlabels">[^]*?class="stage generating"[^>]*>Preparing proposal/);
 assert.match(rq,/class="genline"[^>]*>reading the repo</);
-// (b) the token labels carry .toksub, exempt from the compact hide
+// (b) the token labels carry .toksub in the shared fmtTc short form
 const tok=row('tokrun');
-assert.match(tok,/class="toksub"[^>]*>planner: in 4k · out 1k · cached 6k · 2 turns · \$0\.02</);
-assert.match(tok,/class="toksub"[^>]*>steps: in 50k · out 9k · cached 150k · 11 turns · \$1\.50</);
+assert.match(tok,/class="toksub"[^>]*>planner: 4k\/1k\/6k 2L · \$0\.02</);
+assert.match(tok,/class="toksub"[^>]*>steps: 50k\/9k\/150k 11L · \$1\.50</);
 assert.match(tok,/class="toksub"[^>]*>est \$1\.52</);
 assert.doesNotMatch(tok,/class="sub"[^>]*>steps:/);
 // 'not planned' is a label too - same compact exemption
 assert.match(row('req'),/class="toksub">not planned</);
-// compact pass: same labels in fmtTc short form (fmtTc finally reaches
-// the runs table - it was dead code inside the hidden .sub spans)
+// compact pass: same labels, same fmtTc short form - the markup is
+// density-independent and only the .toksub hide differs
 vm.runInContext("setDensity('compact')",ctx);
 render();
 runs=elem('runs').innerHTML;
@@ -5091,10 +5159,10 @@ assert.match(tokc,/class="toksub"[^>]*>est \$1\.52</);
 const spc=row('stale-paused');
 assert.match(spc,/class="rlabels">[^]*?class="stage paused"[^>]*>paused - resume ready</);
 assert.match(spc,/class="stage error"[^>]*>Needs review</);
-// back to full: the long labeled form returns, markup unchanged
+// back to full: identical markup - only the CSS hide flips
 vm.runInContext("setDensity('full')",ctx);
 render();
-assert.match(row('tokrun'),/steps: in 50k · out 9k · cached 150k · 11 turns/);
+assert.match(row('tokrun'),/steps: 50k\/9k\/150k 11L/);
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
                            capture_output=True, text=True, encoding="utf-8",
@@ -6527,7 +6595,8 @@ const tgt=o=>Object.assign({closest:()=>null,preventDefault:()=>{},
 const document={getElementById:elem,querySelector:()=>null,
   querySelectorAll:sel=>sel.includes('data-pm-alt')
     ?boxes.filter(b=>b.dataset.pmAlt===sel.split('"')[1])
-    :sel.includes('[data-pm]')?boxes.filter(b=>b.checked&&!b.disabled):[],
+    :sel.includes(':checked')?boxes.filter(b=>b.checked&&!b.disabled)
+    :sel.includes('[data-pm]')?boxes.slice():[],
   activeElement:null,addEventListener:(ev,fn)=>{handlers[ev]=fn;}};
 const state={serve_boot:'b',generated_at:'x',agents:[
     {run_key:'rk',run_dir:'runs/r1',step:'seq1',status:'done',slug:'proj'}],
@@ -6611,6 +6680,22 @@ vm.runInContext(src,ctx);
     disabled:false})});
   assert.equal(posts.length,1);   // unchanged
   assert.match(elem('pm-msg').textContent,/Tick at least one/);
+  // 'select all' ticks every enabled entry; an alternative group keeps
+  // exactly one pick (nothing ticked = the first enabled variant);
+  // 'clear' unticks everything
+  await handlers.click({target:tgt({closest:s=>
+    s.includes('pm-all')?{dataset:{pmAll:'1'}}:null})});
+  assert.equal(boxes[0].checked,true);
+  assert.equal(boxes[1].checked,true);    // altA: first enabled in group
+  assert.equal(boxes[2].checked,false);
+  assert.equal(boxes[3].checked,false);   // disabled never ticks
+  assert.equal(boxes[4].checked,true);
+  const selAll=[...vm.runInContext('mergeSel["rk"]',ctx)];
+  assert.deepEqual([...selAll].sort(),['altA','legacy','seq1']);
+  await handlers.click({target:tgt({closest:s=>
+    s.includes('pm-clear')?{dataset:{pmClear:'1'}}:null})});
+  boxes.forEach(b=>assert.equal(b.checked,false));
+  assert.equal(vm.runInContext('mergeSel["rk"].size',ctx),0);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
