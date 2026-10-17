@@ -25,6 +25,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 12 | Run/task review UX: ack state + outcome summaries + nav/timing/merge-guard pass | in progress | run-review-ux/ | manifest run 20261016-100852-run-review-ux; design in run-review-ux/DESIGN.md; all impl steps merged incl. integration-verification (merge e6655ad), 1 step left (follow-up-plan) |
 | 13 | Project-aware merge targets: merge_target key + conductor merge worktree + persisted target + dashboard branch selector | done | project-merge-targets/ | 247/247 mock tests + demo green; wave step of run 20261016-013719-workflow-ux-safety; landed on master via merge 6a40935 |
 | 14 | Ask AI assistant: persistent contextual chat on dashboard + every modal, history db, view-context, citations, images, dictation, model settings, read-only gate, controlled actions, usage/cost | in progress | ask-ai/ | manifest run 20261017-051357-dashboard-ask-ai; research+design done (ask-ai/DESIGN.md): devin -p -r transport + gpt-6-luna-low-priority + vision + permission gate all live-verified; ACP session/new blocked on devin 3000.6.2 session-db migration; persistent-chat-core + view-context-and-retrieval + assistant-runtime done (assistant/ pkg + sqlite store; ConductorContext + ConductorRetrieval + static preamble; devin_print provider + AssistantRuntime dispatcher + tool loop + reconcile; modelpick catalog validation; /api/assistant/* registered in serve; live -p/-r smoke verified on gpt-6-luna-low-priority; persistent-chat-interface done (assistant/static chat.js+md.js+chat.css, #dask shell launcher, aiView/aiNav bridge, /api/assistant/static/*, 16 UI tests + :8806 smoke); images-and-dictation done (id-gated /api/assistant/attachments raw POST + row-id GET, composer paste/pick/preview/remove/bind, SpeechRecognition mic with unavailable/permission states + teardown; 24 UI + 134 assistant tests + 667-test quick suite green, headless-Chromium :8806 probe). guarded-dashboard-actions done (ConductorActions adapter over the same conductor.py functions: 28-kind whitelist, propose-time validation, launch-tier second-confirm acks, readonly re-check at execute, rejected proposals audited as failed rows, action cards + armed confirm in chat.js; 37 new tests, schema v4 actions.explain; 170 assistant + 702-test suite green). usage-and-price-visibility done (dispatch-time rate snapshots + priced fail/cancel paths, extra total_* counter passthrough into usage_extra, by-model rollup + unpriced honesty in GET .../usage, expandable per-exchange <details> usage breakdown + header conversation panel + settings price provenance in chat.js; 18 new tests, 130 assistant tests green). integration-and-design-review done (fetch-by-key re-resolution + nav/label synthesis, kinds/status filters, batch seq, fast-without-effort resolve, bounded pow, raced-terminal/attachment/ack fixes, conv-scoped actions + attachments, usage-details repaint, settings focus/outage, z-order, in-text nav links; 734-test suite green minus 1 transient file-lock, 46-browser-check probe, 2 live exchanges ~$0.034 verified incl. --noEmit + apartment-3d camera answers with working citations). Next: follow-up-plan |
+| 15 | Dashboard What's new tour: persistent state + feeds + API + walkthrough UI + optional LLM polish | in progress | dashboard-whats-new/ | manifest run 20261017-145726-dashboard-whats-new; tour-state done (tour_state.py + 26 tests; parked branch merged into tour-feeds), tour-feeds done (tour_feeds.py + 28 tests), tour-api next |
 
 ## Not yet filed as tasks
 
@@ -1211,3 +1212,31 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   driver_started_at ('still has a live conductor') - driver_alive is
   patched out for that assertion, its subject is prep-history never
   being runnable.
+- DONE 2026-10-17 (tour-state, wave step of run
+  20261017-145726-dashboard-whats-new): persistent state + watermark for
+  the dashboard 'What's new' tour, new stdlib-only module tour_state.py
+  (conductor.py untouched - routes/UI are later steps). State lives in
+  data/tour-state.json as exactly {watermark, viewed[], snoozed[]};
+  every mutation is a module-lock-serialized read-modify-write persisted
+  by tmp+os.replace (Windows PermissionError retry like save_state).
+  Watermark = {commit, at, origin}: commit is a RESOLVED sha bounding
+  `git log <commit>..<boundary.commit>`, at an ISO instant bounding the
+  record feeds (created_at/ended_at/registered). It is never symbolic
+  HEAD and never serve_boot; nothing touches it at serve start - a
+  restart neither acknowledges nor erases unviewed changes. First init
+  writes {commit:null, at:null, origin:'init'} - nothing acknowledged -
+  rather than silently pinning HEAD, so a lost/corrupt file re-presents
+  changes instead of hiding them (corrupt files are quarantined
+  .corrupt-<ts>, bytes kept). An unavailable recorded revision stays
+  recorded and reports watermark_status available=False; advancement is
+  refused while it is unresolvable. Transitions: mark_viewed is the only
+  watermark mover and only when the caller's remaining_new is empty -
+  it lands at the feed's captured boundary, never fresh HEAD, so commits
+  arriving mid-acknowledgment stay new; snooze defers (mutually
+  exclusive membership, doesn't pin the watermark); unview flags
+  unviewed_at and keeps the descriptor's {base,tip} range so entries
+  behind the watermark stay retrievable and resurface as new.
+  26 new TourState tests in tests/test_tour_state.py (init, serve_boot,
+  dead revision, boundary math incl. stale/descendant/time-clamp guards,
+  transitions, history-after-advance, mid-ack arrivals, 20-thread no-
+  lost-update).
