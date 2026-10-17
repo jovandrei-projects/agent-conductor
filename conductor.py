@@ -2833,9 +2833,11 @@ def summarize_run_start(name: str, runs_dir: Path = RUNS_DIR,
 _ST_CLASS = {
     "done": "st-ok",
     "failed": "st-bad", "timed_out": "st-bad", "lost": "st-bad",
-    "blocked": "st-bad",
+    "blocked": "st-bad", "error": "st-bad",
     "stopped": "st-warn", "partial": "st-warn", "queued": "st-warn",
-    "running": "st-run", "skipped": "st-other", "superseded": "st-other",
+    "needs_merge": "st-warn", "needs_work": "st-warn",
+    "running": "st-run", "skipped": "st-other", "idle": "st-other",
+    "superseded": "st-other",
 }
 
 
@@ -12404,12 +12406,18 @@ a { color:#58a6ff; text-decoration:none; }
    escaped markup the standalone page wraps, themed to the dialog */
 #detail .sumdoc { color:#c9d1d9; }
 #detail .sumdoc h1 { font-size:15px; font-weight:600; color:#e6edf3; border-bottom:1px solid #21262d; padding-bottom:5px; margin:2px 80px 10px 0; }
-#detail .sumdoc h2 { font-size:13px; font-weight:600; color:#79b8ff; margin:14px 0 5px; }
+#detail .sumdoc h2 { font-size:13px; font-weight:600; color:#79b8ff; margin:14px 0 5px; text-transform:none; }
 #detail .sumdoc h3, #detail .sumdoc h4 { font-size:12px; font-weight:600; color:#8b949e; margin:12px 0 4px; }
 /* an LLM-written run.summary.md gets accent headings so it reads as a
    generated report, not as more conductor chrome */
 #detail .sumdoc .llmsum h1, #detail .sumdoc .llmsum h2,
 #detail .sumdoc .llmsum h3, #detail .sumdoc .llmsum h4 { color:#ffa657; }
+/* a run summary's '<step> - <status>' headings are live: the step name
+   opens the task modal, the status word takes the .stc color, a 'mark
+   as reviewed' link toggles the flag, and a reviewed step's heading
+   strikes through */
+#detail .sumdoc .sumh-rev { font-size:11px; font-weight:400; }
+#detail .sumdoc .sumh-reviewed .sumh-text { text-decoration:line-through; opacity:.65; }
 #detail .sumdoc ul { padding-left:20px; margin:6px 0; }
 #detail .sumdoc li { margin:3px 0; }
 #detail .sumdoc p { margin:8px 0; }
@@ -13110,8 +13118,9 @@ function restoreModalScroll(s){
 // anchor restore above.
 // status word -> .stc color class (task modal + summary docs share it)
 const STCLASS = {done:'ok',failed:'bad',timed_out:'bad',lost:'bad',
-  blocked:'bad',stopped:'warn',partial:'warn',queued:'warn',
-  running:'run',skipped:'other'};
+  blocked:'bad',error:'bad',stopped:'warn',partial:'warn',
+  queued:'warn',needs_merge:'warn',needs_work:'warn',
+  running:'run',skipped:'other',idle:'other',superseded:'other'};
 const FOCUS_ATTRS = ['modalBack','nav','snav','summary','runSummary',
   'agentDetail','editPrompt','arcAll','arcNone','arcCopy','stopAgent',
   'intrOpen','intrSend','intrCancel','skipStep','unskipStep',
@@ -13575,6 +13584,21 @@ function renderSummaryFrame(a, frag, err){
           `${sbtn(sibs[pos+1],1)}</span>` : '') +
       `</div>` : '';
   const runKey_ = a.run_key||a.run_dir;
+  // the same per-task review mark the task modal's Actions zone owns -
+  // surfaced here too since reading the summary IS the review
+  const revBtn = (!a.aux && a.run_dir)
+    ? `<div class="actions" style="margin-bottom:8px">` +
+      `<button type="button" ` +
+      `class="btn${a.needs_review?'':' secondary'} sum-review" ` +
+      `data-review-step="${esc(base(a.run_dir))}" ` +
+      `data-step="${esc(a.step)}" ` +
+      `data-review-set="${a.needs_review?1:0}" ` +
+      `data-review-seq="${a.completion_seq??''}" ` +
+      `title="a private 'you looked at this' flag - it changes nothing ` +
+      `about the outcome and never marks the run itself">` +
+      `${a.needs_review?'Mark as reviewed':'Mark as needing review'}` +
+      `</button><span class="sub">a personal review mark for this ` +
+      `task - the run keeps its own.</span></div>` : '';
   document.getElementById('dbody').innerHTML =
     bar +
     `<h3 id="modal-title" class="sumtitle">Session summary - ` +
@@ -13583,6 +13607,7 @@ function renderSummaryFrame(a, frag, err){
       `<button type="button" class="linkbtn" ` +
       `data-run-details="${esc(runKey_)}">${esc(a.run||runKey_)}` +
       `</button></div>` : '') +
+    revBtn +
     (err!=null ? `<div class="notice error">${esc(err)}</div>`
       : frag==null ? `<div class="notice">Loading summary&hellip;</div>`
       : `<div class="sumdoc">${frag}</div>`);
@@ -13629,7 +13654,81 @@ async function openRunSummary(key, push=true){
       `below is the interim answer.</div>`:'') +
     (err!=null ? `<div class="notice error">${esc(err)}</div>`
       : `<div class="sumdoc">${frag}</div>`);
+  decorateRunSum(document.querySelector('#detail .sumdoc'), key);
   applyModalScroll();
+}
+// A run summary's '<step> - <status>' headings are live controls, not
+// prose: the step name (rendered in its canonical lowercase, even when
+// an LLM summary shouted it) opens the task modal via the existing
+// data-agent-detail hook - Back returns here - the status word takes
+// the .stc color, and a review link toggles the same flag the task
+// modal owns; a reviewed step's heading strikes through. The decorated
+// step is remembered on the heading's dataset so the refresh pass can
+// rebuild it from live state without re-parsing mutated text.
+function decorateRunSum(root, rkey){
+  if (!root || !root.querySelectorAll) return;
+  const byName = {};
+  for (const a of AGENTS)
+    if (!a.aux && (a.run_key||a.run_dir||'')===rkey)
+      byName[String(a.step).toLowerCase()] = a;
+  root.querySelectorAll('h2,h3,h4').forEach(h=>{
+    if (!h.dataset) return;
+    if (!h.dataset.sumstep){
+      const m = (h.textContent||'').match(
+        /^\s*([A-Za-z0-9_.-]+)\s*[-\u2013\u2014]\s*([A-Za-z_?]+)\s*$/);
+      if (!m) return;
+      if (!byName[m[1].toLowerCase()]) return;
+      if (m[2]!=='?' && !(m[2].toLowerCase() in STCLASS)) return;
+      h.dataset.sumstep = m[1].toLowerCase();
+      h.dataset.sumstat = m[2].toLowerCase();
+    }
+    const a = byName[h.dataset.sumstep];
+    if (!a) return;
+    const st = h.dataset.sumstat;
+    const rev = !!(a.review && a.review.reviewed===true &&
+                   !a.needs_review);
+    if (h.classList) h.classList.toggle('sumh-reviewed', rev);
+    const rlab = a.needs_review ? 'mark as reviewed'
+                                : 'mark as needing review';
+    h.innerHTML =
+      `<span class="sumh-text"><button type="button" ` +
+      `class="linkbtn sumh-name" ` +
+      `data-agent-detail="${esc(agentKey(a))}" ` +
+      `title="open this task's details">${esc(a.step)}</button> - ` +
+      `<span class="stc st-${STCLASS[st]||'other'}">${esc(st)}</span>` +
+      `</span>` +
+      (a.run_dir
+        ? ` <button type="button" class="linkbtn sumh-rev" ` +
+          `data-review-step="${esc(base(a.run_dir))}" ` +
+          `data-step="${esc(a.step)}" ` +
+          `data-review-set="${a.needs_review?1:0}" ` +
+          `data-review-seq="${a.completion_seq??''}" ` +
+          `title="a private 'you looked at this' flag for this task">` +
+          `${rlab}</button>` : '');
+  });
+}
+// Summary views are painted once and don't join the refresh repaint -
+// but the review state they surface is live, so each payload change
+// re-decorates in place: step headings in a run summary, the review
+// button in a session summary.
+function refreshSummaryMarks(){
+  if (!summaryView || document.getElementById('backdrop').hidden) return;
+  const k = String(summaryView.key);
+  if (k.startsWith('run|')){
+    decorateRunSum(document.querySelector('#detail .sumdoc'),
+                   k.slice(4));
+    return;
+  }
+  const a = AGENTS.find(x=>agentKey(x)===k);
+  const rb = a && document.querySelector('#detail .sum-review');
+  if (a && rb && rb.dataset){
+    rb.disabled = false;
+    rb.dataset.reviewSet = a.needs_review?'1':'0';
+    rb.dataset.reviewSeq = a.completion_seq??'';
+    rb.textContent = a.needs_review
+      ? 'Mark as reviewed' : 'Mark as needing review';
+    rb.className = 'btn'+(a.needs_review?'':' secondary')+' sum-review';
+  }
 }
 function summaryNav(d){
   const a=AGENTS.find(x=>agentKey(x)===(summaryView&&summaryView.key));
@@ -14388,7 +14487,7 @@ function showRunDetails(key, keepStack){
       `data-run-summary="${esc(key)}" ` +
       `title="read this run's summary - the LLM-written executive ` +
       `report when one was generated, otherwise each step's own ` +
-      `closing report">Run summary</button>` +
+      `closing report">See run summary</button>` +
       `<button type="button" class="btn secondary" ` +
       `data-summarize-run="${esc(base(r.dir))}" ` +
       `data-rk="${esc(key)}"` +
@@ -14541,7 +14640,7 @@ function ctxAgentItems(a){
   it.push({label:'Open details', attrs:ctxAttrs({'agent-detail':key}),
     title:'task details - same as the step name'});
   if (a.run_dir)
-    it.push({label:a.aux?'Run summary':'Session summary',
+    it.push({label:a.aux?'See run summary':'Session summary',
       attrs:ctxAttrs({'summary':key}),
       title:a.aux
         ? "this run's executive summary, opened in this dialog"
@@ -14842,9 +14941,12 @@ function showRequestForm(rec){
   const canEdit=editable && stage!=='new';
   document.getElementById('dbody').innerHTML =
     (modalHist.length ? `<div class="dnav"><span class="dnav-l">${backBtnHTML()}</span></div>` : '') +
+    // the proposal's own name sits in the title bar - the stage word
+    // alone ('Request details') doesn't say WHICH proposal is open
     `<h3 id="modal-title">${stage==='new'?'New request':
       stage==='ready'?'Review proposed run':
-      stage==='launched'?'Original request': 'Request details'}</h3>` +
+      stage==='launched'?'Original request': 'Request details'}` +
+      `${(rec.run||rec.label) ? ' - '+esc(rec.run||rec.label) : ''}</h3>` +
     (stage==='new'?'':`<span class="stage ${esc(stage)}">` +
       `${esc(STAGES[stage]||stage)}</span>`) +
     // a follow-up proposal names the run that drafted it - the link opens
@@ -14966,8 +15068,8 @@ function showRequestForm(rec){
       `${rec.summarize?' checked':''}${disabled}><span>When the run ends, ` +
       `spawn one small session that writes an executive summary ` +
       `(<code>run.summarize = true</code>) - the run modal's ` +
-      `"Run summary" reads it; without it the per-step closing reports ` +
-      `still roll up</span></label>` +
+      `"See run summary" reads it; without it the per-step closing ` +
+      `reports still roll up</span></label>` +
     `<label class="check"><input type="checkbox" id="rq-ask"` +
       `${rec.ask?' checked':''}${disabled}><span>Ask me questions if ` +
       `needed: when the planner hits a genuine ambiguity while drafting, ` +
@@ -16283,6 +16385,10 @@ function render(d){
       showRunDetails(modalRunKey);
     else closeDetail(true);
   }
+  // the open summary view isn't repainted on refresh - its document is
+  // static - but the review marks it surfaces are live; re-decorate in
+  // place so a click flips pill/link/strikethrough without a reopen
+  refreshSummaryMarks();
   const modalRun = modalRequest?.id && d.runs.find(r=>r.request_id===modalRequest.id);
   const modalStage = modalRun && (modalRun.stage||'launched');
   // an open request modal follows its stage - 'questions' swaps it for

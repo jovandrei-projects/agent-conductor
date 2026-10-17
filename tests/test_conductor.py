@@ -1377,7 +1377,8 @@ assert.match(elem('runs').innerHTML,/Draft · unsent/);
 assert.match(elem('agents').innerHTML,/phase-4/);
 (async()=>{
   await vm.runInContext('openRequest('+JSON.stringify(id)+')',ctx);
-  assert.match(elem('dbody').innerHTML,/Review proposed run/);
+  // the proposal's own name sits in the title bar, not just the stage
+  assert.match(elem('dbody').innerHTML,/Review proposed run - catalog-cleanup/);
   assert.match(elem('dbody').innerHTML,/Proposed steps \(4\)/);
   assert.match(elem('dbody').innerHTML,/Edit proposed TOML/);
   assert.match(elem('dbody').innerHTML,/data-action="run"/);
@@ -9980,9 +9981,32 @@ prompt = "first"
     def test_run_summary_buttons_wired(self):
         self.assertIn('data-run-summary="', conductor._DASH_HTML)
         self.assertIn('data-summarize-run="', conductor._DASH_HTML)
-        self.assertIn("Run summary", conductor._DASH_HTML)
+        self.assertIn("See run summary", conductor._DASH_HTML)
         self.assertIn("Generate LLM summary", conductor._DASH_HTML)
         self.assertIn("/summary?frag=1", conductor._DASH_HTML)
+
+    def test_run_summary_live_headings_wired(self):
+        """Run-summary '<step> - <status>' headings are live: clickable
+        step name -> task modal, colored status, per-step review link,
+        strikethrough when reviewed, and a refresh hook that re-decorates
+        after review POSTs without re-fetching the document."""
+        h = conductor._DASH_HTML
+        for needle in ("decorateRunSum", "sumh-reviewed", "sumh-rev",
+                       "data-agent-detail=\"", "data-review-step=\"",
+                       "mark as reviewed", "mark as needing review",
+                       "refreshSummaryMarks",
+                       "#detail .sumdoc h2 { font-size:13px; font-weight:600; color:#79b8ff; margin:14px 0 5px; text-transform:none; }",
+                       ".sumh-reviewed .sumh-text { text-decoration:line-through"):
+            self.assertIn(needle, h)
+
+    def test_session_summary_review_button_wired(self):
+        """The session-summary view carries the same per-task review
+        button the task modal owns - rendered inline under the run link,
+        with the delegated data-review-step/step/set/seq convention."""
+        h = conductor._DASH_HTML
+        self.assertIn("sum-review", h)
+        self.assertIn("Mark as reviewed", h)
+        self.assertIn("Mark as needing review", h)
 
     def test_modal_ux_wiring(self):
         """The modal-revamp bits the layout depends on: three-zone nav
