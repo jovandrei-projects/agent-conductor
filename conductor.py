@@ -13206,7 +13206,7 @@ a { color:#58a6ff; text-decoration:none; }
 #powerbox .actions .btn.danger:hover:not(:disabled) { border-color:#f85149; }
 #pwstat { margin-top:10px; min-height:15px; }
 #detail { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); width:min(780px,92vw); max-height:82vh; background:#161b22; border:1px solid #30363d; border-radius:10px; padding:18px 22px; overflow:auto; z-index:51; font-size:13px; box-sizing:border-box; }
-#detail h3 { margin:0 80px 10px 0; font-size:14px; }
+#detail h3 { margin:0 170px 10px 0; font-size:14px; }
 #detail .kv { display:grid; grid-template-columns:96px 1fr; gap:4px 12px; }
 #detail .k { color:#8b949e; }
 #detail pre { white-space:pre-wrap; color:#8b949e; background:#0d1117; border-radius:6px; padding:8px 10px; font-size:12px; max-height:180px; overflow:auto; }
@@ -13245,7 +13245,7 @@ a { color:#58a6ff; text-decoration:none; }
 /* the summary modal embeds _summary_body's fragment (?frag=1) - the same
    escaped markup the standalone page wraps, themed to the dialog */
 #detail .sumdoc { color:#c9d1d9; }
-#detail .sumdoc h1 { font-size:15px; font-weight:600; color:#e6edf3; border-bottom:1px solid #21262d; padding-bottom:5px; margin:2px 80px 10px 0; }
+#detail .sumdoc h1 { font-size:15px; font-weight:600; color:#e6edf3; border-bottom:1px solid #21262d; padding-bottom:5px; margin:2px 170px 10px 0; }
 #detail .sumdoc h2 { font-size:13px; font-weight:600; color:#79b8ff; margin:14px 0 5px; text-transform:none; }
 #detail .sumdoc h3, #detail .sumdoc h4 { font-size:12px; font-weight:600; color:#8b949e; margin:12px 0 4px; }
 /* an LLM-written run.summary.md gets accent headings so it reads as a
@@ -13264,7 +13264,7 @@ a { color:#58a6ff; text-decoration:none; }
 #detail .sumdoc code { background:#0d1117; border-radius:4px; padding:1px 5px; font-size:12px; }
 #detail .sumdoc strong { color:#e6edf3; }
 /* the summary modal's own title - quiet, like the doc header under it */
-#detail h3.sumtitle { font-size:13px; font-weight:500; color:#8b949e; margin:0 80px 4px 0; }
+#detail h3.sumtitle { font-size:13px; font-weight:500; color:#8b949e; margin:0 170px 4px 0; }
 /* the task prompt box: a fixed visual slot in modal and summary alike,
    so a one-line task doesn't collapse the layout */
 #detail pre.taskpre, #detail .sumdoc pre.taskpre { min-height:110px; }
