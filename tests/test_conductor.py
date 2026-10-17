@@ -79,6 +79,12 @@ def run_manifest(manifest: Path, runs_dir: Path, resume=None) -> int:
 QUICK = bool(os.environ.get("QUICK_TESTS"))
 slow = unittest.skipIf(QUICK, "skipped by --quick (real conductor e2e)")
 
+# A fresh process's first collect_dashboard() kicks a ~15s docs fetch whose
+# daemon thread writes runs_dir.parent/pricing.json - under a tempdir
+# fixture the write can land mid-cleanup (WinError 145). Pricing tests
+# re-arm the fetch by patching _PRICE_TRIED back to 0.
+conductor._PRICE_TRIED = time.time()
+
 
 class ProjectsRegistryTests(unittest.TestCase):
     def test_projects_local_toml_merges_over_base(self):

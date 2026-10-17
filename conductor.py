@@ -16809,7 +16809,7 @@ document.addEventListener('click', async e=>{
           `each pending change updates live; merge.launch.log in the ` +
           `run dir is the process log`;
         if (rk){ mergeResult[rk]=note; await refresh(); showRunDetails(rk); }
-        else alert(note);
+        else await showAlert(note);
         return; }
       const bits=[];
       if (out.merged?.length) bits.push(`merged: ${out.merged.join(', ')}`);
