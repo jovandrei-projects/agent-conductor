@@ -277,6 +277,23 @@ or a mid-merge/dirty stage keeps everything pending (stage kept for
 inspection); a moved target drops the scratch stage - pending branches
 are always the durable state, never deleted by cleanup paths.
 
+Worker services: every dispatched local step leases one loopback port
+from `8806-8859` (just past the C:\Projects registry's last assignment,
+so a worker never receives a registered project port) for its whole
+lifetime. Leases are files in `%TEMP%/agent-conductor-ports` - O_EXCL
+file claims arbitrate between concurrent conductors, a `127.0.0.1` bind
+probe is the truth for lease-less listeners (a bound port is skipped,
+never taken over or killed), and a recorded owner pid + creation stamp
+makes a dead conductor's leases reclaimable (`sweep`, `serve` startup).
+The worker learns its context through `CONDUCTOR_*` env vars
+(`WORK_DIR`/`REPO_DIR`/`RUN`/`STEP`/`BRANCH`/`SERVICE_PORT`/`SERVICE_URL`)
+plus a prompt block naming its isolated checkout and leased port;
+`conductor.py serve` run inside a worker binds that leased port instead
+of 8773. The step record keeps `service_port`/`service_url` for review
+and notes when the port is still bound after the worker exits (a leaked
+dev server - reported, never port-killed: a bound port doesn't prove who
+owns it). Cloud steps get nothing - they bind nothing local.
+
 `manifests/` holds real manifests (hand-written `<project>-<what>.toml` and
 UI-generated `<YYYYMMDD-HHMMSS>-<random>-<run>.toml`, flat; see its README);
 `examples/` is reference-only. `projects.toml` registers slug -> path +

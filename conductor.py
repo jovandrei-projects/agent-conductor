@@ -35,6 +35,7 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -132,7 +133,7 @@ You are working in {project_dir} (already your working directory). Read its
 AGENTS.md first, then .agent_tasks/QUEUE.md and the STATE.md of any task that
 is not `done` - those files are the shared memory between sessions; this
 conversation has no history beyond them.
-
+{service_note}
 ## Task
 
 {body}
@@ -698,13 +699,15 @@ def devin_cmd(devin_argv: list[str], step: Step, prompt_path: Path,
 
 
 def render_prompt(step: Step, slug: str, project_dir: Path,
-                  manifest_dir: Path, preamble: str | None) -> str:
+                  manifest_dir: Path, preamble: str | None,
+                  service_note: str = "") -> str:
     if step.prompt_file:
         body = (manifest_dir / step.prompt_file).read_text(encoding="utf-8")
     else:
         body = step.prompt
     return (preamble or PREAMBLE).format(body=body, project=slug,
-                                       project_dir=project_dir)
+                                       project_dir=project_dir,
+                                       service_note=service_note)
 
 
 def clean_devin_env() -> dict:
@@ -3772,20 +3775,247 @@ def _capture_session_id(rec: dict, devin_argv: list[str], work_dir: Path,
         return
 
 
+# ------------------------------------------------------- worker service ports
+# A worker that needs a dev server (vite, `npm run dev`, `conductor.py
+# serve` on this repo) must never collide with the main workspace's
+# listeners or a sibling run's - an isolated checkout still shares the
+# port space. Each dispatched LOCAL step leases one loopback port for its
+# whole lifetime; the worker learns it via prompt text + CONDUCTOR_* env
+# vars. Leases are files under %TEMP%/agent-conductor-ports (same pattern
+# as the flag sentinels - trap 5: never inside the run dir): the O_EXCL
+# create is the atomic claim between concurrent conductors, the socket
+# bind probe is the truth for processes that never took a lease, and the
+# recorded owner pid (with its creation stamp) makes a dead conductor's
+# leftover leases reclaimable instead of leaking ports forever.
+
+SERVICE_PORT_MIN = 8806     # just past the C:\Projects registry's last
+SERVICE_PORT_MAX = 8859     # assigned port (8805) - never hand a worker a
+                            # registered project port, even a free one
+# A lease file younger than this that is not yet parseable belongs to an
+# allocator mid-claim (O_EXCL create -> write is a two-step window), not a
+# corrupt leftover - leave it alone.
+LEASE_CLAIM_GRACE_S = 5.0
+
+
+def _port_lease_dir() -> Path:
+    return Path(tempfile.gettempdir()) / "agent-conductor-ports"
+
+
+def _port_free(port: int) -> bool:
+    """OS truth: can anything bind 127.0.0.1:port right now?"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+
+
+def _own_pid_stamp() -> str | None:
+    """ISO stamp of THIS process's creation - stored in the lease as
+    `pid_created` so pid_alive()'s reuse window rejects a recycled pid
+    instead of trusting the number. Windows-only probe; posix callers get
+    None and rely on plain liveness."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, os.getpid())
+        if not h:
+            return None
+        try:
+            ep = _proc_started_epoch(h)
+        finally:
+            k32.CloseHandle(h)
+        return (dt.datetime.fromtimestamp(ep).isoformat(timespec="seconds")
+                if ep else None)
+    except Exception:
+        return None
+
+
+def _lease_owner_alive(lease: Path) -> bool:
+    """Is the conductor that claimed this lease still running? A lease is
+    live while its owner pid is alive (creation-stamp guarded); unreadable
+    or dead-owner leases are stale. A fresh unreadable file is a claim in
+    flight - treated as live for LEASE_CLAIM_GRACE_S."""
+    try:
+        if time.time() - lease.stat().st_mtime < LEASE_CLAIM_GRACE_S:
+            return True
+        info = json.loads(lease.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    pid = info.get("pid")
+    return bool(isinstance(pid, int) and pid > 0
+                and pid_alive(pid, info.get("pid_created")))
+
+
+def alloc_service_port(owner: dict | None = None,
+                       lease_dir: Path | None = None) -> int | None:
+    """Lease a distinct loopback port for one step's worker. Returns the
+    port, or None when the range is exhausted (the step proceeds without
+    one - a missing port never fails a run).
+
+    Order: claim the lease file atomically FIRST (O_EXCL arbitrates between
+    concurrent conductors), THEN verify the port is bindable (a foreign
+    listener - the main dashboard, another project's server - is never
+    ours to take, so the claim is dropped and the scan moves on).
+    `owner` is stored in the lease for review; pid/pid_created are filled
+    in here so staleness survives a crashed conductor.
+    """
+    ld = lease_dir or _port_lease_dir()
+    rec = {"pid": os.getpid(), "pid_created": _own_pid_stamp(),
+           "created_at": now_iso(), **(owner or {})}
+    try:
+        ld.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass                       # bind probe still works without leases
+    for port in range(SERVICE_PORT_MIN, SERVICE_PORT_MAX + 1):
+        lease = ld / f"svc-{port}.json"
+        try:
+            if lease.is_file():
+                if _lease_owner_alive(lease):
+                    continue
+                lease.unlink(missing_ok=True)   # stale - reclaim the port
+        except OSError:
+            continue
+        try:
+            fd = os.open(str(lease),
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except OSError:
+            continue             # live lease, or a racing conductor won it
+        if not _port_free(port):
+            # A foreign listener holds the port - never ours to take:
+            # close the claim fd first, then drop the lease file (Windows
+            # refuses to unlink an open file).
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                lease.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(rec))
+        except OSError:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                lease.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        return port
+    return None
+
+
+def release_service_port(port: int | None,
+                         lease_dir: Path | None = None) -> bool | None:
+    """Drop the step's lease at step end. Returns None when there was no
+    port, True when the port is bindable afterward, False when something
+    still holds it - almost always a dev server the worker left running
+    (kill_tree already took its process tree; a survivor is a detached
+    child, which no parent-scoped kill can reach). We report rather than
+    hunt the listener: binding a port proves nothing about WHO owns the
+    replacement, so a port-scoped kill could hit a foreign service."""
+    if port is None:
+        return None
+    try:
+        (lease_dir or _port_lease_dir()
+         ).joinpath(f"svc-{port}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+    return _port_free(port)
+
+
+def sweep_service_ports(lease_dir: Path | None = None) -> list[str]:
+    """Reclaim lease files whose owner conductor is dead (crashed/killed
+    mid-step). A live owner's lease stays; a still-bound port stays
+    untouched - sweeping drops bookkeeping, never listeners."""
+    ld = lease_dir or _port_lease_dir()
+    out: list[str] = []
+    try:
+        leases = sorted(ld.glob("svc-*.json"))
+    except OSError:
+        return out
+    for lease in leases:
+        if _lease_owner_alive(lease):
+            continue
+        try:
+            lease.unlink()
+            out.append(f"service port lease {lease.name} reclaimed "
+                       "(dead owner)")
+        except OSError:
+            pass
+    return out
+
+
+def env_service_port() -> int | None:
+    """The port leased to the worker this process runs under, if any.
+    `conductor.py serve` honors it so a dashboard launched from a worktree
+    worker binds the step's own port instead of the main workspace's."""
+    try:
+        p = int(os.environ.get("CONDUCTOR_SERVICE_PORT") or 0)
+        return p if 0 < p < 65536 else None
+    except ValueError:
+        return None
+
+
+def _service_note(work_dir: Path, repo_dir: Path,
+                  port: int | None) -> str:
+    """Worker-context block rendered into the prompt's {service_note}
+    slot: which checkout is this step's (a worktree step must not touch
+    the shared checkout it will merge into) and which loopback port is
+    leased to it. Empty when there is nothing extra to declare."""
+    parts: list[str] = []
+    if os.path.normcase(str(work_dir.resolve())) != \
+            os.path.normcase(str(repo_dir.resolve())):
+        parts.append(
+            f"Work ONLY inside {work_dir} - it is this step's isolated "
+            f"git worktree. The shared checkout at {repo_dir} is the "
+            f"merge target other agents may be using: never write to it, "
+            f"launch servers from it, or kill its processes.")
+    if port is not None:
+        parts.append(
+            f"A loopback port is leased to this step alone: {port} "
+            f"(exported as $CONDUCTOR_SERVICE_PORT; base URL "
+            f"http://127.0.0.1:{port} in $CONDUCTOR_SERVICE_URL). If the "
+            f"task needs a local dev server or dashboard, bind it there - "
+            f"not to a project's registered/default port - and never take "
+            f"over or kill a listener you did not spawn: it belongs to "
+            f"the main workspace or another run.")
+    return ("\n" + "\n\n".join(parts) + "\n") if parts else ""
+
+
 def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
              run_dir: Path, devin_argv: list[str], state: dict,
              do_checkpoint: bool = True, branch: str | None = None,
              post_commit: bool = True,
-             resume_note: str | None = None) -> str:
+             resume_note: str | None = None,
+             repo_dir: Path | None = None) -> str:
     """Run one step; return final status: done|partial|blocked|failed|timed_out
     |stopped|skipped.
 
     work_dir is where the session runs and where checkpoints/verify happen -
-    the project dir, or a git worktree for parallel steps. When a worktree is
+    the project dir, or a git worktree for parallel steps. repo_dir is the
+    project's own checkout (defaults to work_dir); for worktree steps it is
+    the shared checkout the branch merges into - the worker is told it is
+    off-limits. When a worktree is
     used the caller owns the pre-step checkpoint (on the main checkout), so
     do_checkpoint=False. post_commit=False skips the post-step `git add -A &&
     commit` sweep - required for the merge resolver, whose work_dir sits in
     an in-progress merge where a blind commit could adopt conflict markers.
+
+    Every local (non-cloud) step leases a loopback service port for its
+    whole duration: the prompt + CONDUCTOR_* env vars tell the worker to
+    bind any dev server there rather than a default/registered port, and
+    the lease is released when the step ends. The port lands in the step
+    record so the dashboard can show which service address the worker used.
 
     The step's record in state.json doubles as the agent registry entry:
     status/started_at are set while it queues, pid once the child process
@@ -3907,6 +4137,23 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         rnotes = _flag_text(rnote_flag(run_dir, step.name))
         body_src = _body_with_notes(body_base, rnotes)
 
+    repo_dir = repo_dir or work_dir
+    # Lease this step's worker a distinct loopback port BEFORE the prompt
+    # is rendered (the lease note rides inside it). Worktree or not, a
+    # local worker that boots a dev server gets its own address instead of
+    # a project default port some other workspace may already hold. Cloud
+    # workers bind nothing local - skip them.
+    service_port = None
+    if not step.cloud:
+        service_port = alloc_service_port(
+            {"run": run_dir.name, "step": step.name,
+             "run_dir": str(run_dir), "work_dir": str(work_dir)})
+        if service_port is None:
+            LOG.warning("no free service port for %s (range %d-%d "
+                        "exhausted)", step.name, SERVICE_PORT_MIN,
+                        SERVICE_PORT_MAX)
+    service_note = _service_note(work_dir, repo_dir, service_port)
+
     prompt_path = run_dir / "prompts" / f"{step.name}.md"
     prompt_path.parent.mkdir(exist_ok=True)
     # Always render from body_src: it is the resolved body - manifest
@@ -3917,7 +4164,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         prompt_file=None)
     prompt_path.write_text(
         render_prompt(render_step, slug, work_dir, cfg.path.parent,
-                      cfg.preamble), encoding="utf-8")
+                      cfg.preamble, service_note=service_note),
+        encoding="utf-8")
     stdout_log = run_dir / f"{step.name}.stdout.log"
     export_path = run_dir / f"{step.name}.export.json"
 
@@ -3948,7 +4196,10 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                                   else None),
                    task=task_summary(body_src),
                    prompt=str(prompt_path), stdout_log=str(stdout_log),
-                   export=str(export_path))
+                   export=str(export_path),
+                   service_port=service_port,
+                   service_url=(f"http://127.0.0.1:{service_port}"
+                                if service_port is not None else None))
         # The purpose marker keeps its own machine-readable field now
         # that `task` holds display text; a re-dispatch under a prompt
         # override may legitimately drop it, so clear a stale value.
@@ -3970,6 +4221,7 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                            note="not a git repo root; checkpoint required")
                 _bump_completion(rec)
                 save_state(run_dir, state)
+            release_service_port(service_port)
             return "failed"
         git_commit(work_dir, f"conductor: checkpoint before {step.name}",
                    allow_empty=True)
@@ -3981,6 +4233,27 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     if device_lease is not None:
         step_env["ANDROID_SERIAL"] = device_lease.serial
         step_env["CONDUCTOR_DEVICE_SERIAL"] = device_lease.serial
+    # The worker's environment carries its context explicitly: the actual
+    # checkout it owns (a worktree for isolated steps), the shared repo
+    # root it must not serve over, the run/step it belongs to, and the
+    # leased service port. Tooling spawned by the session inherits these.
+    # Drop any inherited context values first (a conductor run from inside
+    # a worker would otherwise leak the PARENT step's identity/port into
+    # this worker).
+    for k in ("CONDUCTOR_RUN", "CONDUCTOR_STEP", "CONDUCTOR_RUN_DIR",
+              "CONDUCTOR_WORK_DIR", "CONDUCTOR_REPO_DIR", "CONDUCTOR_BRANCH",
+              "CONDUCTOR_SERVICE_PORT", "CONDUCTOR_SERVICE_URL"):
+        step_env.pop(k, None)
+    step_env.update(CONDUCTOR_RUN=run_dir.name, CONDUCTOR_STEP=step.name,
+                    CONDUCTOR_RUN_DIR=str(run_dir),
+                    CONDUCTOR_WORK_DIR=str(work_dir),
+                    CONDUCTOR_REPO_DIR=str(repo_dir))
+    if branch:
+        step_env["CONDUCTOR_BRANCH"] = branch
+    if service_port is not None:
+        step_env["CONDUCTOR_SERVICE_PORT"] = str(service_port)
+        step_env["CONDUCTOR_SERVICE_URL"] = \
+            f"http://127.0.0.1:{service_port}"
 
     t0 = _now()
     timed_out = False
@@ -4018,7 +4291,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                 prompt_file=None)
             prompt_path.write_text(
                 render_prompt(intr_step, slug, work_dir, cfg.path.parent,
-                              cfg.preamble), encoding="utf-8")
+                              cfg.preamble, service_note=service_note),
+                encoding="utf-8")
             log_event(run_dir, event="step_interrupt_respawn",
                       step=step.name, interrupt=interrupts)
         else:
@@ -4041,7 +4315,8 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
                     prompt_file=None)
                 prompt_path.write_text(
                     render_prompt(retry_step, slug, work_dir,
-                                  cfg.path.parent, cfg.preamble),
+                                  cfg.path.parent, cfg.preamble,
+                                  service_note=service_note),
                     encoding="utf-8")
                 log_event(run_dir, event="step_retry", step=step.name,
                           attempt=attempt)
@@ -4231,6 +4506,12 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
     else:
         status = "done"
 
+    # The worker is dead and the step is decided - drop the port lease.
+    # A False probe means a listener outlived the worker's process tree:
+    # record it for review but never kill by port - the bound port does
+    # not prove which process owns it.
+    port_freed = release_service_port(service_port)
+
     with STATE_LOCK:
         rec["session_id"] = (sorted(new_sessions)[-1] if new_sessions
                              else tail_session_ref(stdout_log))
@@ -4284,6 +4565,10 @@ def run_step(step: Step, slug: str, work_dir: Path, cfg: Manifest,
         if rnotes and rnotes.strip():
             notes.append("dashboard resume notes were appended to the "
                          "prompt")
+        if port_freed is False:
+            notes.append(f"leased port {service_port} was still bound "
+                         "after the worker exited - a dev server it "
+                         "spawned is likely still running there")
         if notes:
             rec["note"] = "; ".join(notes)
         # The newest OUTCOME report wins rec['outcome']; every earlier one
@@ -4872,12 +5157,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             save_state(run_dir, state)
 
         if len(prepared) == 1:
-            step, slug, work_dir, _repo, branch, rnote, _dg = prepared[0]
+            step, slug, work_dir, repo_dir, branch, rnote, _dg = prepared[0]
             statuses = {step.name: run_step(step, slug, work_dir, cfg,
                                             run_dir, devin_argv, state,
                                             do_checkpoint=(branch is None),
                                             branch=branch,
-                                            resume_note=rnote)}
+                                            resume_note=rnote,
+                                            repo_dir=repo_dir)}
             hub_update(tid, state)
         else:
             statuses = {}
@@ -4887,8 +5173,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                                   run_dir, devin_argv, state,
                                   do_checkpoint=(branch is None),
                                   branch=branch,
-                                  resume_note=rnote): step.name
-                        for step, slug, work_dir, _r, branch, rnote, _g
+                                  resume_note=rnote,
+                                  repo_dir=repo_dir): step.name
+                        for step, slug, work_dir, repo_dir, branch, rnote, _g
                         in prepared}
                 for f in concurrent.futures.as_completed(futs):
                     statuses[futs[f]] = f.result()
@@ -5265,6 +5552,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     lines += sweep_sessions(runs_dir, devin_argv,
                             getattr(args, "keep_hours", 48.0))
     lines += [f"followup: {ln}" for ln in discover_followups(runs_dir)]
+    lines += sweep_service_ports()
     print("\n".join(lines) if lines else "nothing stale")
     return 0
 
@@ -10731,6 +11019,8 @@ def collect_dashboard(runs_dir: Path,
                 "session_gone": session_gone,
                 "exit_code": rec.get("exit_code"),
                 "status_line": rec.get("status_line"),
+                "service_port": rec.get("service_port"),
+                "service_url": rec.get("service_url"),
                 "branch": rec.get("branch"), "merged": rec.get("merged"),
                 "merged_at": rec.get("merged_at"),
                 "timeout_min": timeout_min,
@@ -12246,6 +12536,7 @@ function showDetail(i, keepStack){
     ['session',(a.session_id||'-')+(a.session_gone?' (deleted from sidebar)':'')],
     ['verify',a.verify_ok==null?'-':(a.verify_ok?'pass':'FAIL')],
     ['exit',a.exit_code],['work dir',a.work_dir],
+    ['service',a.service_url?a.service_url+(a.alive?' (leased to this step)':' (released)'):'-'],
     ['branch',a.branch],['device',a.device||'-'],
     ['merged',a.merged===true?'yes'+(a.merged_at?' @ '+a.merged_at:'')
       :a.merged],
@@ -15384,6 +15675,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     devin_argv = shlex.split(os.environ.get("CONDUCTOR_DEVIN") or "devin")
     for line in sweep_sessions(runs_dir, devin_argv):
         print(f"sweep: {line}")
+    for line in sweep_service_ports():
+        print(f"sweep: {line}")
     # A restarted serve adopts generations whose owner died: the spool
     # replays deferred publishes and lands parked questions/errors.
     for rid in drain_planner_spool():
@@ -15393,8 +15686,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
     for line in discover_followups(runs_dir):
         print(f"sweep: {line}")
     handler = make_dashboard_handler(runs_dir, devin_argv)
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), handler)
-    print(f"conductor dashboard: http://127.0.0.1:{args.port}  "
+    # --port wins; a worker-spawned serve falls back to the port its step
+    # leased (CONDUCTOR_SERVICE_PORT), never the main workspace's 8773.
+    port = args.port or env_service_port() or SERVE_PORT
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    print(f"conductor dashboard: http://127.0.0.1:{port}  "
           f"(watching {runs_dir})")
     try:
         httpd.serve_forever()
@@ -15514,7 +15810,10 @@ def main(argv: list[str] | None = None) -> int:
                            action="store_false", default=True,
                            help="allow the machine to sleep during the run")
         if name == "serve":
-            p.add_argument("--port", type=int, default=SERVE_PORT)
+            p.add_argument("--port", type=int, default=None,
+                           help="dashboard port (default: the step-leased "
+                                "CONDUCTOR_SERVICE_PORT when set, else "
+                                f"{SERVE_PORT})")
         if name == "status":
             p.add_argument("run_dir", nargs="?", default=None)
         if name == "merge":
