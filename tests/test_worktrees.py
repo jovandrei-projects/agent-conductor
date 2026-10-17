@@ -2448,5 +2448,271 @@ merge_target = "dev-b"
             self.assertEqual(conductor.current_branch(proj), main)
 
 
+# ------------------------------------------------- [run] parallel = true
+
+class ParallelPoolTests(unittest.TestCase):
+    """parallel = true replaces wave= grouping with one shared pool per
+    run (a trailing follow-up-plan still runs last); same-project members
+    keep needing worktree isolation, and the machine-wide slot pool still
+    bounds how many actually dispatch at once."""
+
+    def _cfg(self, names, parallel=True):
+        steps = [conductor.Step(name=n, project="x", prompt="p")
+                 for n in names]
+        return (conductor.Manifest(
+            path=Path("m.toml"), name="t", on_failure="stop",
+            checkpoint=True, preamble=None, max_hours=None,
+            max_parallel=None, parallel=parallel, merge_resolver=False,
+            merge_policy="auto", merge_target=None, steps=steps),
+            [(Path("p"), "s", s) for s in steps])
+
+    def test_parallel_rejects_wave_keys(self):
+        """parallel + wave= is a load error: the pool already schedules
+        every step, so a leftover grouping key would be a silent lie."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            m = write_manifest(
+                base, wt_steps(proj, [("a", "write A.txt")]),
+                extra='parallel = true\n')
+            with self.assertRaises(conductor.ManifestError) as e:
+                conductor.load_manifest(m)
+            self.assertIn("parallel", str(e.exception))
+
+    def test_plan_groups_pool_and_followup_tail(self):
+        cfg, resolved = self._cfg(["a", "b", "c", "follow-up-plan"])
+        groups = conductor.plan_groups(resolved, cfg)
+        self.assertEqual([[s.name for *_d, s in g] for g in groups],
+                         [["a", "b", "c"], ["follow-up-plan"]])
+        cfg2, resolved2 = self._cfg(["a", "b"], parallel=False)
+        self.assertEqual(
+            [[s.name for *_d, s in g]
+             for g in conductor.plan_groups(resolved2, cfg2)],
+            [["a"], ["b"]])
+
+    def test_same_project_pool_still_needs_worktree(self):
+        """Two pool members on one project without worktree fail the same
+        wave-collision check - the pool changes scheduling, not rules."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            steps = "".join(f'''
+[[step]]
+name = "{n}"
+project = "{proj.as_posix()}"
+prompt = "write {n}.txt"''' for n in ("p1", "p2"))
+            m = write_manifest(base, steps, extra='parallel = true\n')
+            cfg = conductor.load_manifest(m)
+            resolved = [(*conductor.resolve_project(s, {}, base), s)
+                        for s in cfg.steps]
+            with self.assertRaises(conductor.ManifestError) as e:
+                conductor.validate_groups(
+                    conductor.plan_groups(resolved, cfg))
+            self.assertIn("worktree", str(e.exception))
+
+    def test_parallel_run_is_faster_than_sequential(self):
+        """Wall-clock check: three 1s-sleep worktree steps on one project
+        take ~3x as long sequentially as under parallel = true."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            steps = "".join(f'''
+[[step]]
+name = "{n}"
+project = "{proj.as_posix()}"
+prompt = "sleep=1 write {n}.txt"
+worktree = true''' for n in ("s1", "s2", "s3"))
+            runs = base / "runs"
+            # isolate the machine-global slot pool from real conductors
+            with mock.patch.dict(os.environ,
+                                 {"CONDUCTOR_SLOT_DIR": str(base / "slots")}):
+                t0 = time.time()
+                m = write_manifest(base, steps)          # sequential
+                self.assertEqual(run_manifest(m, runs), 0)
+                seq_s = time.time() - t0
+                base2 = base / "b2"
+                base2.mkdir()
+                proj2 = make_project(base2)
+                steps2 = steps.replace(proj.as_posix(), proj2.as_posix())
+                m2 = write_manifest(base2, steps2,
+                                    extra='parallel = true\n'
+                                          'max_parallel = 3\n')
+                t0 = time.time()
+                self.assertEqual(run_manifest(m2, base2 / "runs"), 0)
+                par_s = time.time() - t0
+            st, _ = state_of(base2 / "runs")
+            for n in ("s1", "s2", "s3"):
+                self.assertEqual(st["steps"][n]["status"], "done")
+                self.assertTrue(st["steps"][n]["merged"])
+            self.assertTrue(st["parallel"])
+            self.assertLess(par_s, seq_s)
+
+
+class AgentSlotPoolTests(unittest.TestCase):
+    """The machine-global agent-slot lease: O_EXCL claim, owner+worker
+    liveness, release, dead-owner sweep, and the queued wait."""
+
+    def _mk(self, base: Path):
+        run_dir = base / "run"
+        run_dir.mkdir()
+        return run_dir, {"run": "t", "steps": {}}
+
+    def test_lease_blocks_second_claim_and_release_frees(self):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td) / "slots"
+            run_dir, state = self._mk(Path(td))
+            step = conductor.Step(name="s1", project="x", prompt="p")
+            slot = conductor._slot_try_lease(1, run_dir, state, step, sd)
+            self.assertIsNotNone(slot)
+            self.assertIsNone(conductor._slot_try_lease(
+                1, run_dir, state, step, sd))          # index held
+            self.assertIsNotNone(conductor._slot_try_lease(
+                2, run_dir, state, step, sd))          # next index free
+            self.assertEqual(len(conductor._slot_holders(sd)), 2)
+            conductor._slot_release(slot, run_dir)
+            self.assertEqual(len(conductor._slot_holders(sd)), 1)
+
+    def test_sweep_reclaims_dead_owner(self):
+        with tempfile.TemporaryDirectory() as td:
+            sd = Path(td) / "slots"
+            sd.mkdir()
+            dead = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead.wait()
+            (sd / "slot-9.json").write_text(json.dumps({
+                "token": "t", "owner_pid": dead.pid,
+                "worker_pid": None}), encoding="utf-8")
+            out = conductor.sweep_agent_slots(sd)
+            self.assertEqual(len(out), 1)
+            self.assertFalse((sd / "slot-9.json").exists())
+
+    def test_acquire_queues_until_a_slot_frees(self):
+        """Cap=1 with a held slot: the acquirer waits as 'queued' +
+        slot_wait in state, then takes the freed slot."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            sd = base / "slots"
+            run_dir, state = self._mk(base)
+            step = conductor.Step(name="s1", project="x", prompt="p")
+            held = conductor._slot_try_lease(1, run_dir, state, step, sd)
+            got = []
+            with mock.patch.object(conductor, "agent_slot_cap",
+                                   return_value=1), \
+                 mock.patch.object(conductor, "SLOT_POLL_S", 0.05), \
+                 mock.patch.object(conductor, "SLOT_WAIT_SAVE_S", 0.0):
+                t = threading.Thread(target=lambda: got.append(
+                    conductor._agent_slot_acquire(
+                        step, run_dir, state, "proj", sd)))
+                t.start()
+                deadline = time.time() + 10
+                while time.time() < deadline and \
+                        not state["steps"].get("s1", {}).get("slot_wait"):
+                    time.sleep(0.05)
+                rec = state["steps"]["s1"]
+                self.assertEqual(rec["status"], "queued")
+                self.assertTrue(rec["slot_wait"])
+                conductor._slot_release(held, run_dir)
+                t.join(10)
+            self.assertEqual(len(got), 1)
+            self.assertIsInstance(got[0], conductor._AgentSlot)
+            conductor._slot_release(got[0], run_dir)
+
+    def test_acquire_bails_when_stopped_while_queued(self):
+        """A stop sentinel landing mid-queue ends the step 'skipped'
+        without ever holding a slot."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            sd = base / "slots"
+            run_dir, state = self._mk(base)
+            step = conductor.Step(name="s1", project="x", prompt="p")
+            held = conductor._slot_try_lease(1, run_dir, state, step, sd)
+            got = []
+            with mock.patch.object(conductor, "agent_slot_cap",
+                                   return_value=1), \
+                 mock.patch.object(conductor, "SLOT_POLL_S", 0.05):
+                t = threading.Thread(target=lambda: got.append(
+                    conductor._agent_slot_acquire(
+                        step, run_dir, state, "proj", sd)))
+                t.start()
+                time.sleep(0.4)
+                conductor.stop_flag(run_dir).touch()
+                t.join(10)
+            self.assertEqual(got, ["skipped"])
+            self.assertEqual(state["steps"]["s1"]["status"], "skipped")
+            conductor._slot_release(held, run_dir)
+
+
+class MergeQueueTests(unittest.TestCase):
+    """_RepoMergeLock(wait=(state, run_dir, rec)) turns the fail-fast lock
+    into a queue for run-path merges: the waiter records merge_queue on
+    the step while a live holder owns the lock, lands once it frees, and
+    still bails on halt sentinels."""
+
+    def test_waits_for_live_holder_then_acquires(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            run_dir = base / "run"
+            run_dir.mkdir()
+            state = {"steps": {"s": {"name": "s"}}}
+            rec = state["steps"]["s"]
+            lock = proj / ".git" / "conductor-merge.lock"
+            lock.write_text(json.dumps({"pid": os.getpid(),
+                                        "at": conductor.now_iso()}))
+            out = []
+
+            def _take():
+                try:
+                    with conductor._RepoMergeLock(
+                            proj, wait=(state, run_dir, rec)):
+                        out.append("acquired")
+                except conductor.RequestError as exc:
+                    out.append(f"err:{exc}")
+
+            with mock.patch.object(conductor, "MERGE_LOCK_POLL_S", 0.05):
+                t = threading.Thread(target=_take)
+                t.start()
+                deadline = time.time() + 10
+                while time.time() < deadline and \
+                        "merge_queue" not in rec:
+                    time.sleep(0.05)
+                self.assertIn("merge_queue", rec)
+                self.assertEqual(out, [])
+                lock.unlink()
+                t.join(10)
+            self.assertEqual(out, ["acquired"])
+            self.assertNotIn("merge_queue", rec)
+
+    def test_wait_bails_on_stop_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            run_dir = base / "run"
+            run_dir.mkdir()
+            state = {"steps": {"s": {"name": "s"}}}
+            rec = state["steps"]["s"]
+            lock = proj / ".git" / "conductor-merge.lock"
+            lock.write_text(json.dumps({"pid": os.getpid(),
+                                        "at": conductor.now_iso()}))
+            out = []
+
+            def _take():
+                try:
+                    with conductor._RepoMergeLock(
+                            proj, wait=(state, run_dir, rec)):
+                        out.append("acquired")
+                except conductor.RequestError as exc:
+                    out.append(str(exc))
+
+            with mock.patch.object(conductor, "MERGE_LOCK_POLL_S", 0.05):
+                t = threading.Thread(target=_take)
+                t.start()
+                time.sleep(0.4)
+                conductor.stop_flag(run_dir).touch()
+                t.join(10)
+            self.assertEqual(len(out), 1)
+            self.assertIn("halted", out[0])
+            self.assertNotIn("merge_queue", rec)
+
+
 if __name__ == "__main__":
     unittest.main()

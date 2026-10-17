@@ -101,10 +101,26 @@ fire on `timed_out` only - a post-STATUS hang (trap 12) already counts as
 turn end, and `failed`/`blocked` stay terminal.
 
 Concurrency: `run.max_parallel` caps how many agents run at once across the
-whole run; wave members beyond the cap wait in a queue (marked `queued` in
-state). Default is conservative: ~1 agent per 4 logical cores, max 4 -
-each agent is a full Devin session with tool subprocesses, not a thread.
-The run records the effective cap + free RAM in `state.json`.
+whole run; wave/pool members beyond the cap wait in a queue (marked
+`queued` in state). Default is conservative: ~1 agent per 4 logical cores,
+max 4 - each agent is a full Devin session with tool subprocesses, not a
+thread. The run records the effective cap + free RAM in `state.json`.
+A second, machine-wide ceiling sits under all of it: the AGENT SLOT POOL
+in `%TEMP%/agent-conductor-slots` (`CONDUCTOR_SLOT_DIR` overrides),
+`CONDUCTOR_MAX_AGENTS`-sized (default 4..8 scaled to cpu_count, never
+below 4) O_EXCL leases like the device/port registries. Every dispatched
+step acquires one slot after its device lease and before spawn, holds it
+for the whole `run_step` life (attempts, interrupt respawns, resolver
+sessions count too), and a step that finds no free slot waits `queued`
+with `slot_wait`/`slot_waited_s` + a note naming the holders - queued
+steps hold NO slot so the pool always drains. Slot events
+(`slot_acquired`/`slot_wait`/`slot_released`) land in events.jsonl, the
+dashboard meta line shows `slots N/M` plus the queued count, and
+`sweep_agent_slots` (sweep + serve startup) reclaims dead-owner leases.
+Parallel sessions get a PARALLEL_NOTE prompt block: share the box, own
+your checkout/leases/ports, never fight a peer or the user over a shared
+resource - if a genuinely exclusive resource is held, end `STATUS:
+blocked` naming it instead of racing.
 
 Android devices: parallel STEPS are not parallel DEVICES - adb serials are
 shared machine state, and without `device` a mobile worker picks its own
@@ -209,8 +225,12 @@ started/ended/elapsed fields - `{'dur': span}` when endpoints are gone,
 never fabricated endpoints; nothing recorded renders as `-`.
 
 Parallel: adjacent `[[step]]` entries sharing `wave = N` run concurrently,
-bounded by the cap. Steps on the *same* project in a wave need
-`worktree = true` - each runs in `data/worktrees/<run>/<step>` on branch
+bounded by the cap - OR `[run] parallel = true` puts EVERY step in one
+shared pool scheduled as slots free (`wave=` keys are rejected at load as
+redundant; a trailing `follow-up-plan` step still runs last, in its own
+group after the pool drains). Steps on the *same* project in a wave or a
+parallel pool need `worktree = true` - each runs in
+`data/worktrees/<run>/<step>` on branch
 `conductor/<run>/<step>`. Merging is always the parent's job: workers
 never merge; the conductor waits for the whole wave, then merges each
 branch itself, sequentially, in manifest order. A conflict fails the step
@@ -226,7 +246,12 @@ aborts a stale `conductor/*` merge-in-progress first - a human's merge is
 never touched. All merges - post-wave, resume-finalize, dashboard,
 deferred staging - serialize on a per-repo `.git/conductor-merge.lock`
 (pid + timestamp, broken when the holder pid is dead) since two drivers
-have raced merges and stale-aborts on the same checkout before. Every
+have raced merges and stale-aborts on the same checkout before. Run paths
+(post-wave, resume-finalize) QUEUE on the lock (`wait=`) instead of
+failing: the step record carries `merge_queue`=<holder pid> + a note while
+it waits, a `merge_wait` event lands, and halt sentinels still bail it
+out; dashboard/deferred merge entry points keep the fail-fast 409 'busy'.
+Every
 merge outcome lands in `events.jsonl`: `step_merged` /
 `step_merge_conflict` per step (`how` = wave/resume/manual, `was` = the
 status it replaces, `resolver` when a resolve-* session saved it),
