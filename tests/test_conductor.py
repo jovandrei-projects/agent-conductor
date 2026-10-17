@@ -1291,6 +1291,64 @@ const row={dataset:{runKey:'/first'}};
         self.assertEqual(p.returncode, 0, p.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_project_filter_chips_and_group_names(self):
+        """data-proj toggles the project filter: sticky-bar chips, the
+        runs table's projects cell and each 'agents by project' group
+        name are the same affordance, and the runs table stays scoped
+        (a run hides once none of its agents match)."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,textContent:''}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  addEventListener:(event,handler)=>{handlers[event]=handler;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-17T00:00:00',agents:[
+  {step:'a1',run:'r',run_dir:'/r',slug:'agent-conductor',status:'done'},
+  {step:'a2',run:'r',run_dir:'/r',slug:'apartment-3d',status:'done'},
+  {step:'a3',run:'r2',run_dir:'/r2',slug:'apartment-3d',status:'running'}],
+  runs:[
+  {run:'r',dir:'/r',projects:['agent-conductor','apartment-3d'],counts:{done:2}},
+  {run:'r2',dir:'/r2',projects:['apartment-3d'],counts:{running:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const click=async(target)=>handlers.click({target,preventDefault:()=>{}});
+// sticky-bar project chips list every slug with its agent count
+assert.match(elem('filters').innerHTML,/project:<\/span>/);
+assert.match(elem('filters').innerHTML,/data-proj="agent-conductor"[^>]*>1 agent-conductor/);
+assert.match(elem('filters').innerHTML,/data-proj="apartment-3d"[^>]*>2 apartment-3d/);
+// group names and run-row project chips are the same toggle
+assert.match(elem('agents').innerHTML,/data-proj="agent-conductor"[^>]*>agent-conductor<\/button>/);
+assert.match(elem('runs').innerHTML,/data-proj="agent-conductor"/);
+(async()=>{
+  await click({dataset:{proj:'apartment-3d'}});
+  assert.match(elem('filters').innerHTML,/apartment-3d ×/);
+  assert.match(elem('filters').innerHTML,/clear filters/);
+  assert.doesNotMatch(elem('agents').innerHTML,/>a1</);
+  assert.match(elem('agents').innerHTML,/>a2</);
+  // a selected project's own group header offers to clear it
+  assert.match(elem('agents').innerHTML,/clear the project filter/);
+  // the project filter scopes the runs table too: 'r' stays (has an
+  // apartment-3d kid), nothing else would change about it
+  await click({dataset:{proj:'agent-conductor'}});   // adds a second slug
+  assert.match(elem('agents').innerHTML,/>a1</);
+  await click({dataset:{proj:'apartment-3d'}});      // toggles it off again
+  assert.doesNotMatch(elem('agents').innerHTML,/>a2</);
+  assert.doesNotMatch(elem('runs').innerHTML,/data-run-details="\/r2"/);
+  await click({dataset:{reset:''}});                 // clear filters resets all
+  assert.match(elem('agents').innerHTML,/>a2</);
+  assert.match(elem('runs').innerHTML,/data-run-details="\/r2"/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_draft_and_review_modal_never_start_implementation(self):
         js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
             "</script>", 1)[0]
@@ -9990,6 +10048,69 @@ class PowerDialogTests(unittest.TestCase):
         self.assertNotIn('!confirm(', h)
         self.assertNotIn(' alert(', h)
         self.assertNotIn('{alert(', h)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_power_rechecks_safety_at_press_time(self):
+        """Stop/Restart re-fetch /api/serve/power when clicked - the
+        open-time report may be stale. An unsafe press shows the fresh
+        warnings and only ARMS the button; the second press proceeds."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,textContent:'',disabled:false}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  addEventListener:(event,handler)=>{handlers[event]=handler;}};
+// live state flips safe->unsafe mid-dialog; POSTs are recorded
+const calls=[]; let live={merges:[],tasks:[]};
+const fetch=async(path,opt)=>{
+  calls.push(((opt&&opt.method)||'GET')+' '+path);
+  if (path==='/api/serve/power' && opt && opt.method==='POST')
+    return {ok:true,json:async()=>({ok:true})};
+  if (path==='/api/serve/power') return {ok:true,json:async()=>live};
+  return {ok:true,json:async()=>({serve_boot:'b',agents:[],runs:[]})};
+};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:(f)=>f(),fetch});
+vm.runInContext(src,ctx);
+const click=async(target)=>handlers.click({target,preventDefault:()=>{}});
+// openPower/powerAct are fired without await by the click handler -
+// drain their pending fetch/await chains before asserting
+const flush=async()=>{for(let i=0;i<30;i++) await Promise.resolve();};
+(async()=>{
+  await click({id:'power-btn',dataset:{}});        // openPower: safe report
+  await flush();
+  assert.match(elem('pwbody').innerHTML,/safe to restart/);
+  live={merges:[{where:'repo',why:'MERGE_HEAD'}],tasks:[]};  // got unsafe
+  await click({id:'pw-restart',dataset:{}});
+  await flush();
+  // press-time recheck caught it: warning re-rendered, nothing posted,
+  // buttons back enabled
+  assert.match(elem('pwbody').innerHTML,/merge activity in progress/);
+  assert.match(elem('pwstat').textContent,/press Restart again/);
+  assert.deepEqual(calls.filter(c=>c.startsWith('POST')),[]);
+  await click({id:'pw-restart',dataset:{}});        // informed override
+  await flush();
+  assert.deepEqual(calls.filter(c=>c.startsWith('POST')),
+                   ['POST /api/serve/power']);
+  // a different action is not armed by restart's warning
+  await click({id:'power-btn',dataset:{}});
+  await flush();
+  await click({id:'pw-stop',dataset:{}});
+  await flush();
+  assert.match(elem('pwstat').textContent,/press Stop again/);
+  assert.equal(calls.filter(c=>c.startsWith('POST')).length,1);
+  await click({id:'pw-stop',dataset:{}});
+  await flush();
+  assert.equal(calls.filter(c=>c.startsWith('POST')).length,2);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
 
     def test_log_mtime_in_modal(self):
         """The task modal's 'last update' row reads the stdout log's
