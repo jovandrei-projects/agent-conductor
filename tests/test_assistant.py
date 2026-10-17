@@ -219,6 +219,101 @@ class ConversationTests(unittest.TestCase):
             c.close()
 
 
+class ConversationLifecycleTests(unittest.TestCase):
+    """Rename / auto-title / stored-size / delete - the history rail's
+    management surface."""
+
+    def test_first_message_titles_an_untitled_conv(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            self.assertEqual(cv["title"], "")
+            ask(c, cv["id"], "why is the merge queued?\nsecond line",
+                cmid="cm-t00001")
+            got = c.get_conversation(cv["id"])
+            self.assertEqual(got["title"],
+                             "why is the merge queued? second line")
+            c.close()
+
+    def test_auto_title_never_overwrites_user_title(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c, title="my chat")
+            ask(c, cv["id"], "first", cmid="cm-t00002")
+            self.assertEqual(c.get_conversation(cv["id"])["title"],
+                             "my chat")
+            c.close()
+
+    def test_rename_and_empty_restores_autofill(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            out = c.rename_conversation(cv["id"], "  named  ")
+            self.assertEqual(out["title"], "named")
+            c.rename_conversation(cv["id"], "   ")
+            self.assertEqual(c.get_conversation(cv["id"])["title"], "")
+            ask(c, cv["id"], "again", cmid="cm-t00003")
+            self.assertEqual(c.get_conversation(cv["id"])["title"],
+                             "again")
+            c.close()
+
+    def test_list_conversations_carries_size_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            r = ask(c, cv["id"], "x" * 500, cmid="cm-s00001")
+            finish(c, r["exchange"]["id"], "y" * 300)
+            page = c.list_conversations()
+            item = [i for i in page["items"] if i["id"] == cv["id"]][0]
+            self.assertGreaterEqual(item["size_bytes"], 800)
+            c.close()
+
+    def test_delete_drops_everything_and_clears_last_active(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            r = ask(c, cv["id"], "gone soon", cmid="cm-d00001")
+            finish(c, r["exchange"]["id"])
+            self.assertEqual(
+                c.last_active_conversation()["id"], cv["id"])
+            c.delete_conversation(cv["id"])
+            self.assertIsNone(c.store.get_conversation(cv["id"]))
+            with self.assertRaises(AssistantError):
+                c.list_messages(cv["id"])
+            self.assertIsNone(c.last_active_conversation())
+            c.close()
+
+    def test_delete_refuses_a_live_exchange(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            ask(c, cv["id"], "in flight", cmid="cm-d00002")
+            with self.assertRaises(AssistantError) as cm:
+                c.delete_conversation(cv["id"])
+            self.assertEqual(cm.exception.status, 409)
+            self.assertIsNotNone(c.store.get_conversation(cv["id"]))
+            c.close()
+
+    def test_delete_via_http_route(self):
+        with tempfile.TemporaryDirectory() as td:
+            c = make_core(td)
+            cv = conv(c)
+            code, out = http_api.dispatch(
+                c, "POST",
+                f"/api/assistant/conversations/{cv['id']}/title",
+                body=b'{"title": "http name"}')
+            self.assertEqual((code, out["title"]), (200, "http name"))
+            code, out = http_api.dispatch(
+                c, "POST",
+                f"/api/assistant/conversations/{cv['id']}/delete",
+                body=b"{}")
+            self.assertEqual(code, 200)
+            code, out = http_api.dispatch(
+                c, "GET", f"/api/assistant/conversations/{cv['id']}")
+            self.assertEqual(code, 404)
+            c.close()
+
+
 class ExchangeTests(unittest.TestCase):
     def test_post_creates_exchange_and_pending_reply(self):
         with tempfile.TemporaryDirectory() as td:

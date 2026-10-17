@@ -235,14 +235,52 @@ class AssistantCore:
         if len(rows) > limit:
             rows, last = rows[:limit], rows[limit - 1]
             nxt = [last["last_active_at"], last["id"]]
+        sizes = self.store.conversation_sizes([r["id"] for r in rows])
         for r in rows:
             r["origin_view"] = ctxmod.thaw(r.get("origin_view"))
+            r["size_bytes"] = sizes.get(r["id"], 0)
         return {"items": rows, "next_before": nxt}
 
     def get_conversation(self, conv_id: str) -> dict:
         conv = dict(self._conv(conv_id))
         conv["origin_view"] = ctxmod.thaw(conv.get("origin_view"))
         return conv
+
+    def rename_conversation(self, conv_id: str, title) -> dict:
+        """User-set title; empty restores the untitled state so the next
+        message can auto-name it again."""
+        conv = self._conv(conv_id)
+        title = str(title or "").strip()[:TITLE_MAX]
+        self._guarded(self.store.path.parent)
+        now = self._iso()
+        with self.store.txn() as conn:
+            conn.execute(
+                "UPDATE conversations SET title=?, updated_at=?"
+                " WHERE id=?", (title, now, conv_id))
+        return self.get_conversation(conv["id"])
+
+    def delete_conversation(self, conv_id: str) -> dict:
+        """Drop the conversation + its messages/exchanges/actions/
+        attachment rows and unlink the stored upload files. Refuses while
+        a reply is still in flight - a queued/running exchange owns the
+        provider process and must be cancelled first."""
+        conv = self._conv(conv_id)
+        live = [x for x in self.store.list_exchanges(conv_id)
+                if x["status"] in ("queued", "running")]
+        if live:
+            raise AssistantError(
+                "a reply is still in flight - cancel it before "
+                "deleting the conversation", 409)
+        self._guarded(self.store.path.parent)
+        paths = self.store.delete_conversation(conv_id)
+        for p in paths:
+            try:                                # best-effort; rows are
+                Path(p).unlink(missing_ok=True)  # already gone
+            except OSError:
+                pass
+        if self.store.get_setting("last_active") == conv_id:
+            self.store.set_setting("last_active", "")
+        return {"deleted": conv["id"]}
 
     def open_conversation(self, conv_id: str, *, limit: int = 50,
                           before: int | None = None) -> dict:
@@ -362,6 +400,7 @@ class AssistantCore:
 
         self._guarded(self.store.path.parent)
         with self.store.txn() as conn:
+            att_rows = []
             msg = self.store.find_message(conn, conv_id, client_msg_id)
             if msg is not None:
                 x = self.store.latest_exchange_for(msg["id"])
@@ -405,9 +444,11 @@ class AssistantCore:
                 "price_fetched_at": None, "price_source": None,
                 "usd": None, "error": None, "sources": None,
                 "requests": None})
+            title = self._auto_title(conv, text, bool(att_rows))
             conn.execute(
-                "UPDATE conversations SET last_active_at=?, updated_at=?"
-                " WHERE id=?", (now, now, conv_id))
+                "UPDATE conversations SET title=?, last_active_at=?,"
+                " updated_at=? WHERE id=?",
+                (title, now, now, conv_id))
             self.store.set_setting("last_active", conv_id)
 
         result = {"message": self.store.get_message(msg["id"]),
@@ -420,6 +461,19 @@ class AssistantCore:
             except Exception as exc:      # noqa: BLE001 - record, stay queued
                 self.mark_launch_failed(x["id"], str(exc)[:400])
         return result
+
+    @staticmethod
+    def _auto_title(conv: dict, text: str, has_files: bool) -> str:
+        """A conversation the user never named borrows its label from the
+        first thing they asked - one line, trimmed. An explicit empty
+        rename restores '' so this re-fills; a user title is never
+        overwritten."""
+        if (conv.get("title") or "").strip():
+            return conv["title"]
+        line = " ".join(str(text or "").split())
+        if not line:
+            return "image chat" if has_files else ""
+        return (line[:77] + "\u2026") if len(line) > 78 else line
 
     def _bind_attachments(self, conn, conv_id: str, ids: list) -> list[dict]:
         """Resolve client-supplied attachment ids to row refs for the

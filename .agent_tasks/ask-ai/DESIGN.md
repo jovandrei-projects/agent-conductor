@@ -519,6 +519,11 @@ Add routes under `/api/assistant/` inside `make_dashboard_handler`
   (settings modal data)
 - `POST /api/assistant/conversations/<id>/actions/<aid>/confirm` -
   human confirms/rejects a proposed action -> executes via ActionAdapter
+- `POST /api/assistant/conversations/<id>/title {title}` - rename;
+  empty restores auto-title-from-first-message
+- `POST /api/assistant/conversations/<id>/delete` - drops the
+  conversation + messages/exchanges/actions/attachment rows and unlinks
+  upload files; 409 while a reply is in flight
 - `GET  /api/assistant/static/<name>` - chat.js/chat.css/md.js
 - `GET  /api/assistant/last` - last-active conversation for reload
   restore (also tracked client-side)

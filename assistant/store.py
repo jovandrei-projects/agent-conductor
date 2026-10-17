@@ -297,6 +297,60 @@ class Store:
         self.execute(f"UPDATE conversations SET {cols} WHERE id=?",
                      (*fields.values(), conv_id))
 
+    def conversation_sizes(self, conv_ids) -> dict:
+        """Rough stored-bytes per conversation: character content plus
+        recorded attachment byte counts. It answers 'how much history is
+        this chat keeping' - an audit estimate for the UI, not
+        sqlite page accounting."""
+        ids = [c for c in conv_ids if ID_RE.fullmatch(str(c or ""))]
+        if not ids:
+            return {}
+        marks = ",".join("?" for _ in ids)
+        out = {c: 0 for c in ids}
+        for r in self.query(
+            "SELECT conversation_id c, COALESCE(SUM(LENGTH(text)"
+            " + LENGTH(attachments) + LENGTH(IFNULL(ctx_ref, ''))"
+            " + LENGTH(IFNULL(settings_json, ''))), 0) b"
+            f" FROM messages WHERE conversation_id IN ({marks})"
+            " GROUP BY conversation_id", ids):
+            out[r["c"]] = out.get(r["c"], 0) + int(r["b"])
+        for r in self.query(
+            "SELECT conversation_id c, COALESCE(SUM(LENGTH(sources)"
+            " + LENGTH(requests) + LENGTH(IFNULL(error, ''))), 0) b"
+            f" FROM exchanges WHERE conversation_id IN ({marks})"
+            " GROUP BY conversation_id", ids):
+            out[r["c"]] = out.get(r["c"], 0) + int(r["b"])
+        for r in self.query(
+            "SELECT conversation_id c, COALESCE(SUM(LENGTH(payload)"
+            " + LENGTH(IFNULL(confirm_text, ''))"
+            " + LENGTH(IFNULL(result, ''))), 0) b"
+            f" FROM actions WHERE conversation_id IN ({marks})"
+            " GROUP BY conversation_id", ids):
+            out[r["c"]] = out.get(r["c"], 0) + int(r["b"])
+        for r in self.query(
+            "SELECT conversation_id c, COALESCE(SUM(bytes), 0) b"
+            f" FROM attachments WHERE conversation_id IN ({marks})"
+            " GROUP BY conversation_id", ids):
+            out[r["c"]] = out.get(r["c"], 0) + int(r["b"])
+        return out
+
+    def delete_conversation(self, conv_id: str) -> list[str]:
+        """Drop one conversation and every row it owns, in dependency
+        order (FK is enforced, nothing cascades implicitly). Returns the
+        attachment file paths for the caller to unlink - files are the
+        caller's filesystem, rows are the store's."""
+        with self.txn() as conn:
+            paths = [r["path"] for r in conn.execute(
+                "SELECT path FROM attachments WHERE conversation_id=?",
+                (conv_id,)).fetchall() if r["path"]]
+            for table in ("actions", "attachments", "exchanges",
+                          "messages", "conversations"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE "
+                    + ("id=?" if table == "conversations"
+                       else "conversation_id=?"), (conv_id,))
+        return paths
+
     # ---------------------------------------------------------- messages
     def insert_message(self, conn, rec: dict) -> dict:
         conn.execute(
