@@ -1383,7 +1383,9 @@ prompt = "Organize the catalog and verify results."
     def new(self):
         return conductor.create_request(
             {"raw": "Please tidy the catalog carefully", "project": "proj",
-             "model": "swe-2", "effort": "max"}, self.requests, self.runs)
+             "model": "swe-2", "effort": "max",
+             "plan_model": "swe-2", "plan_effort": "max"},
+            self.requests, self.runs)
 
     def ready(self):
         rec = self.new()
@@ -1659,7 +1661,8 @@ prompt = "Review the catalog tests."
 
     def test_questions_park_generation_until_answered(self):
         rec = conductor.create_request(
-            {"raw": "Tidy the catalog", "project": "proj", "ask": True},
+            {"raw": "Tidy the catalog", "project": "proj", "ask": True,
+             "model": "swe-2", "effort": "max"},
             self.requests, self.runs)
         calls = []
 
@@ -1734,7 +1737,8 @@ prompt = "Review the catalog tests."
 
     def test_skip_all_refines_immediately(self):
         rec = conductor.create_request(
-            {"raw": "Tidy", "project": "proj", "ask": True},
+            {"raw": "Tidy", "project": "proj", "ask": True,
+             "model": "swe-2", "effort": "max"},
             self.requests, self.runs)
         seen = []
 
@@ -1774,7 +1778,8 @@ prompt = "Review the catalog tests."
 
     def test_regenerate_clears_a_parked_questionnaire(self):
         rec = conductor.create_request(
-            {"raw": "Tidy", "project": "proj", "ask": True},
+            {"raw": "Tidy", "project": "proj", "ask": True,
+             "model": "swe-2", "effort": "max"},
             self.requests, self.runs)
         with mock.patch.object(
                 conductor, "_planner_response",
@@ -2649,7 +2654,9 @@ prompt = "Organize the catalog and verify results."
     def new(self):
         return conductor.create_request(
             {"raw": "Please tidy the catalog carefully", "project": "proj",
-             "model": "swe-2", "effort": "max"}, self.requests, self.runs)
+             "model": "swe-2", "effort": "max",
+             "plan_model": "swe-2", "plan_effort": "max"},
+            self.requests, self.runs)
 
     def ready(self):
         rec = self.new()
@@ -2988,7 +2995,9 @@ prompt = "Organize the catalog and verify results."
     def new(self):
         return conductor.create_request(
             {"raw": "Please tidy the catalog carefully", "project": "proj",
-             "model": "swe-2", "effort": "max"}, self.requests, self.runs)
+             "model": "swe-2", "effort": "max",
+             "plan_model": "swe-2", "plan_effort": "max"},
+            self.requests, self.runs)
 
     def cleanup_flag(self, rid):
         flag = conductor.gen_stop_flag(rid)
@@ -3333,7 +3342,9 @@ prompt = "Organize the catalog and verify results."
     def new(self):
         return conductor.create_request(
             {"raw": "Please tidy the catalog carefully", "project": "proj",
-             "model": "swe-2", "effort": "max"}, self.requests, self.runs)
+             "model": "swe-2", "effort": "max",
+             "plan_model": "swe-2", "plan_effort": "max"},
+            self.requests, self.runs)
 
     def cleanup_flag(self, rid):
         flag = conductor.gen_stop_flag(rid)
@@ -9196,6 +9207,149 @@ prompt = "first"
         for gone in ('Open as page', 'req-open', 'tok-help',
                      'Session summary</a>', 'Back: '):
             self.assertNotIn(gone, h)
+
+
+class PowerDialogTests(unittest.TestCase):
+    """The dashboard's Stop/Restart: a themed dialog backed by
+    /api/serve/power that flags live merges (restart orphans them) and
+    live steps before it acts, plus the askConfirm/showAlert replacement
+    for native confirm()/alert() chrome."""
+
+    def _serve(self, td: str):
+        runs = Path(td) / "runs"
+        runs.mkdir(exist_ok=True)
+        handler = conductor.make_dashboard_handler(
+            runs, ["no-such-devin"], Path(td) / "reqs",
+            Path(td) / "manifests")
+        server = conductor.http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True) \
+            .start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return runs, server
+
+    def _call(self, port, method, path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        hdrs = {"Origin": f"http://127.0.0.1:{port}"}
+        if body is not None:
+            hdrs["Content-Type"] = "application/json"
+            body = json.dumps(body)
+        conn.request(method, path, body=body, headers=hdrs)
+        res = conn.getresponse()
+        data = res.read().decode("utf-8")
+        conn.close()
+        return res.status, json.loads(data) if data else {}
+
+    def test_safety_report_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs, server = self._serve(td)
+            # _flag_dir + PROJECTS_FILE are machine-global - patch both
+            # or a REAL live merge (lock on the checkout, claim in the
+            # flag dir) leaks into the report
+            with mock.patch.object(conductor, "_flag_dir",
+                                   lambda: Path(td) / "flags"), \
+                    mock.patch.object(conductor, "PROJECTS_FILE",
+                                      Path(td) / "none.toml"):
+                status, out = self._call(server.server_port, "GET",
+                                         "/api/serve/power")
+            self.assertEqual(status, 200)
+            self.assertEqual(out, {"tasks": [], "merges": []})
+
+    def test_safety_reports_live_step_and_merge(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs, server = self._serve(td)
+            rd = runs / "20261015-000000-t"
+            rd.mkdir()
+            (rd / "state.json").write_text(json.dumps({
+                "run": "t", "steps": {"s1": {
+                    "status": "running",
+                    "started_at": conductor.now_iso(),
+                    "timeout_min": 60}}}), encoding="utf-8")
+            # a conductor merge lock + MERGE_HEAD on a registered project
+            proj = make_project(Path(td))
+            gd = proj / ".git"
+            (gd / "conductor-merge.lock").write_text(
+                json.dumps({"pid": 99999999,
+                            "at": conductor.now_iso()}),
+                encoding="utf-8")
+            (gd / "MERGE_HEAD").write_text("deadbeef\n", encoding="utf-8")
+            pf = Path(td) / "projects.toml"
+            pf.write_text(f'[project.proj]\npath = '
+                          f'"{proj.as_posix()}"\n', encoding="utf-8")
+            with mock.patch.object(conductor, "PROJECTS_FILE", pf), \
+                    mock.patch.object(conductor, "_flag_dir",
+                                      lambda: Path(td) / "flags"):
+                status, out = self._call(server.server_port, "GET",
+                                         "/api/serve/power")
+            self.assertEqual(status, 200)
+            self.assertEqual(len(out["tasks"]), 1)
+            self.assertEqual(out["tasks"][0]["step"], "s1")
+            # MERGE_HEAD alone flags even when the lock's pid is dead
+            self.assertEqual(len(out["merges"]), 1)
+            self.assertIn("MERGE_HEAD", out["merges"][0]["why"])
+
+    def test_power_post_stop_and_restart_guard(self):
+        with tempfile.TemporaryDirectory() as td:
+            runs, server = self._serve(td)
+            # a hand-built test server has no serve_args: restart is a
+            # clean refusal, not an AttributeError 500
+            status, out = self._call(server.server_port, "POST",
+                                     "/api/serve/power",
+                                     {"action": "restart"})
+            self.assertEqual(status, 400)
+            self.assertIn("serve", out["error"])
+            status, out = self._call(server.server_port, "POST",
+                                     "/api/serve/power",
+                                     {"action": "bogus"})
+            self.assertEqual(status, 400)
+            status, out = self._call(server.server_port, "POST",
+                                     "/api/serve/power",
+                                     {"action": "stop"})
+            self.assertEqual(status, 200)
+            # the shutdown timer fires after the response - the port
+            # stops answering within a couple of seconds
+            for _ in range(50):
+                try:
+                    self._call(server.server_port, "GET", "/api/state")
+                except OSError:
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail("server still answering after stop")
+
+    def test_power_and_ask_wiring(self):
+        h = conductor._DASH_HTML
+        for needle in ('id="power-btn"', 'id="askwrap"', 'data-ask',
+                       'function openPower', 'function powerAct',
+                       "/api/serve/power", 'id="pw-restart"',
+                       'id="pw-stop"'):
+            self.assertIn(needle, h)
+        # native dialogs fully replaced
+        self.assertNotIn('!confirm(', h)
+        self.assertNotIn(' alert(', h)
+        self.assertNotIn('{alert(', h)
+
+    def test_log_mtime_in_modal(self):
+        """The task modal's 'last update' row reads the stdout log's
+        mtime - a live step's freshness visible between polls."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            d = conductor.collect_dashboard(runs)
+            a = d["agents"][0]
+            self.assertTrue(a["log_mtime"])
+            self.assertIn("T", a["log_mtime"])
+            self.assertIn("['last update',a.log_mtime]",
+                          conductor._DASH_HTML)
 
 
 class ModalDetailNavTests(unittest.TestCase):

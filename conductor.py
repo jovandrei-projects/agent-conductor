@@ -10293,6 +10293,18 @@ def stdout_tail(path: str | None, lines: int = 15) -> str | None:
                               data.decode("utf-8", "replace"))[-lines:])
 
 
+def file_mtime_iso(path: str | Path | None) -> str | None:
+    """A file's last-write stamp - the modal's 'last update' row for
+    stdout logs (a live step's log keeps ticking between polls)."""
+    if not path:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(
+            Path(path).stat().st_mtime).isoformat(timespec="seconds")
+    except OSError:
+        return None
+
+
 def _state_md(work_dir: str | None, step: str | None,
               project_dir: str | None = None) -> str | None:
     """The project's own task-state file for this step, when present.
@@ -10473,6 +10485,7 @@ def summary_agent(st: dict, key: str, run_dir: Path,
                               rs.get("model_actual")),
         "stdout_log": str(log) if log.is_file() else None,
         "tail": stdout_tail(str(log)) if log.is_file() else None,
+        "log_mtime": file_mtime_iso(log) if log.is_file() else None,
         "export": str(exp) if exp.is_file() else None,
         "arc": cached_arc(str(exp)) if exp.is_file() else None,
         "prompt": None, "prompt_editable": False,
@@ -10584,6 +10597,84 @@ def _pending_agent(st: dict, sd: dict, key: str, run_dir: str,
             "merged": None, "cloud": sd.get("cloud"), "tokens": None,
             "cost": None, "alive": False, "outcome": None,
             "outcomes": None, "note": None}
+
+
+def serve_safety(runs_dir: Path) -> dict:
+    """What the dashboard's Stop/Restart dialog warns about: live merge
+    activity (repo merge locks, MERGE_HEADs, run merge-claim flags -
+    a restart mid-merge can orphan the op) and still-live steps (a
+    restart does not kill workers, but queued launches and post-wave
+    merges stop until a new driver/serve takes over)."""
+    tasks, merges = [], []
+    for sj in sorted(runs_dir.glob("*/state.json")):
+        try:
+            st = json.loads(sj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        drv = driver_alive(st)
+        for name, rec in (st.get("steps") or {}).items():
+            if step_live(rec, drv):
+                tasks.append({"run": st.get("run") or sj.parent.name,
+                              "dir": sj.parent.name, "step": name,
+                              "status": rec.get("status")})
+    try:
+        projects = load_projects()
+    except Exception:
+        projects = {}
+    for slug, ent in projects.items():
+        repo = Path(ent["path"])
+        gd = _git_dir(repo)
+        if gd is None:
+            continue
+        why = []
+        try:
+            info = json.loads((gd / "conductor-merge.lock")
+                              .read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            info = {}
+        pid = info.get("pid")
+        if pid and pid != os.getpid() and pid_alive(pid):
+            why.append(f"merge lock held by pid {pid}")
+        if (gd / "MERGE_HEAD").is_file():
+            why.append("merge in progress (MERGE_HEAD)")
+        if why:
+            merges.append({"where": slug, "dir": str(repo),
+                           "why": " · ".join(why)})
+    try:
+        claims = sorted(_flag_dir().glob("merge-*"))
+    except OSError:
+        claims = []
+    for f in claims:
+        try:
+            info = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        pid = info.get("pid")
+        if pid and pid != os.getpid() and pid_alive(pid):
+            merges.append({"where": "run merge", "dir": "",
+                           "why": f"claim {f.name} held by pid {pid}"})
+    return {"tasks": tasks, "merges": merges}
+
+
+def _respawn_serve(args: argparse.Namespace) -> None:
+    """Spawn the detached replacement dashboard for Stop/Restart ->
+    restart: same port (the child retries the bind until this process
+    releases it), same runs dir, inherited env (CONDUCTOR_DEVIN etc.)."""
+    argv = [sys.executable, str(Path(__file__).resolve()), "serve",
+            "--port", str(args.port), "--wait-port"]
+    if getattr(args, "runs_dir", None):
+        argv += ["--runs-dir", str(args.runs_dir)]
+    kw: dict = {"stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "cwd": str(Path(__file__).resolve().parent)}
+    if os.name == "nt":
+        kw["creationflags"] = (subprocess.CREATE_NO_WINDOW
+                               | subprocess.DETACHED_PROCESS
+                               | subprocess.CREATE_NEW_PROCESS_GROUP)
+    else:
+        kw["start_new_session"] = True
+    subprocess.Popen(argv, **kw)
 
 
 def collect_dashboard(runs_dir: Path,
@@ -10824,6 +10915,7 @@ def collect_dashboard(runs_dir: Path,
                            or plan.get("wt")),
                 "stdout_log": rec.get("stdout_log"),
                 "tail": stdout_tail(rec.get("stdout_log")),
+                "log_mtime": file_mtime_iso(rec.get("stdout_log")),
                 "export": rec.get("export"), "prompt": rec.get("prompt"),
                 "arc": cached_arc(rec.get("export")),
                 "state_md": _state_md(
@@ -11207,6 +11299,17 @@ body.compact td .genline { display:inline-block; max-width:100%;
 a { color:#58a6ff; text-decoration:none; }
 [hidden] { display:none !important; }
 #backdrop { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:50; }
+/* themed confirm/alert + power dialogs - native confirm()/alert()
+   chrome replaced so every prompt matches the dashboard palette */
+#askwrap, #powerwrap { position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:70; display:flex; align-items:center; justify-content:center; }
+#askbox, #powerbox { background:#161b22; border:1px solid #30363d; border-radius:10px; padding:16px 20px; max-width:460px; width:min(460px,90vw); font-size:13px; box-shadow:0 12px 36px rgba(0,0,0,.5); }
+#asktitle { font-weight:600; margin-bottom:8px; }
+#askmsg { color:#c9d1d9; margin-bottom:14px; white-space:pre-wrap; }
+#askbtns { display:flex; gap:8px; justify-content:flex-end; }
+#powerbox h3 { margin:0 0 10px; font-size:14px; }
+#powerbox ul { margin:6px 0; padding-left:18px; }
+#powerbox .actions { margin-top:14px; }
+#pwstat { margin-top:8px; min-height:15px; }
 #detail { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); width:min(780px,92vw); max-height:82vh; background:#161b22; border:1px solid #30363d; border-radius:10px; padding:18px 22px; overflow:auto; z-index:51; font-size:13px; box-sizing:border-box; }
 #detail h3 { margin:0 80px 10px 0; font-size:14px; }
 #detail .kv { display:grid; grid-template-columns:96px 1fr; gap:4px 12px; }
@@ -11396,9 +11499,10 @@ td :is(a,button):focus-visible { outline-offset:-2px; }
 #detail .mpop .mnone { color:#6e7681; font-size:11px; font-style:italic;
   padding:4px 10px; }
 #detail .actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:16px 0 0; }
-#detail .notice { color:#8b949e; background:#0d1117; border-left:3px solid #30363d; padding:8px 10px; margin:10px 0; }
-#detail .notice.warn { border-color:#d29922; color:#e6edf3; }
-#detail .notice.error { border-color:#f85149; color:#ffb2aa; }
+#detail .notice, #powerbox .notice { color:#8b949e; background:#0d1117; border-left:3px solid #30363d; padding:8px 10px; margin:10px 0; }
+#detail .notice.warn, #powerbox .notice.warn { border-color:#d29922; color:#e6edf3; }
+#detail .notice.error, #powerbox .notice.error { border-color:#f85149; color:#ffb2aa; }
+#powerbox .notice.ok { border-color:#3fb950; color:#c9d1d9; }
 #detail details.proposal { margin-top:14px; }
 #detail details.proposal summary { cursor:pointer; color:#58a6ff; }
 #detail .proposal-list { margin-top:12px; padding-left:20px; }
@@ -11442,6 +11546,8 @@ tr.ctxanchor td { background:#1c3041; }
     <span class="sub" id="meta">loading&hellip;</span>
     <span class="tb-gap"></span>
     <button type="button" class="btn" id="new-request">New request</button>
+    <button type="button" class="btn secondary" id="power-btn"
+      title="stop or restart this dashboard - warns about merges and live tasks first">&#x23FB;</button>
     <div class="seg" id="density" role="group" aria-label="Row density">
       <button type="button" data-density="compact">Compact</button>
       <button type="button" data-density="full" class="on">Full</button>
@@ -11456,6 +11562,8 @@ tr.ctxanchor td { background:#1c3041; }
 <h2>agents by project</h2><div id="agents"></div>
 <div id="ctxmenu" role="menu" aria-label="row actions" hidden></div>
 <div id="backdrop" hidden><div id="detail" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button type="button" class="x" id="dx">Close ×</button><div id="dbody"></div></div></div>
+<div id="askwrap" hidden><div id="askbox" role="alertdialog" aria-modal="true"><div id="asktitle"></div><div id="askmsg"></div><div id="askbtns" class="actions"></div></div></div>
+<div id="powerwrap" hidden><div id="powerbox" role="dialog" aria-modal="true"><h3>Dashboard power</h3><div id="pwbody"></div><div class="actions"><button type="button" class="btn" id="pw-restart">Restart</button><button type="button" class="btn danger" id="pw-stop">Stop</button><button type="button" class="btn secondary" id="pw-cancel">Cancel</button></div><div class="sub" id="pwstat"></div></div></div>
 <script>
 const COLORS = {done:'#3fb950',partial:'#d29922',blocked:'#d29922',
 stopped:'#d29922',
@@ -11944,8 +12052,107 @@ let detailHTML = '';    // markup last painted into #dbody for the OPEN
                         // task view - a byte-identical repaint skips the
                         // DOM write entirely, so scroll, selection,
                         // focus and hover all survive untouched
-function closeDetail(force=false, keepStack=false){
-  if (!force && modalRequest?.dirty && !confirm('Discard unsaved edits?')) return false;
+// --- themed ask/alert ---------------------------------------------------
+// Native confirm()/alert() draw the browser's chrome - every prompt on
+// this page routes through #askbox instead so dialogs keep the dashboard
+// palette. _ask resolves with the clicked button's index (-1 on a
+// backdrop/Escape dismiss); askConfirm maps that to a bool, showAlert
+// just waits for dismissal.
+let _askRes = null;
+function _ask(msgHtml, opts = {}){
+  return new Promise(res => {
+    _askRes = res;
+    document.getElementById('asktitle').textContent = opts.title || '';
+    document.getElementById('askmsg').innerHTML = msgHtml;
+    document.getElementById('askbtns').innerHTML = (opts.btns ||
+      [{label:'OK'}]).map((b, i) =>
+      `<button type="button" class="btn${b.cls ? ' ' + b.cls : ''}" ` +
+      `data-ask="${i}">${esc(b.label)}</button>`).join('');
+    document.getElementById('askwrap').hidden = false;
+    const last = document.querySelector('#askbtns .btn:last-child');
+    if (last) last.focus();
+  });
+}
+function _askDone(i){
+  document.getElementById('askwrap').hidden = true;
+  const r = _askRes; _askRes = null;
+  if (r) r(i);
+}
+const askConfirm = (msg, opts = {}) =>
+  _ask(`<div>${esc(msg)}</div>`, {title: opts.title || 'Confirm',
+    btns: [{label: opts.cancel || 'Cancel', cls: 'secondary'},
+           {label: opts.ok || 'OK', cls: opts.danger ? 'danger' : ''}]})
+    .then(i => i === 1);
+const showAlert = (msg, title) =>
+  _ask(`<div>${esc(msg)}</div>`, {title: title || ''}).then(() => {});
+// --- dashboard power ----------------------------------------------------
+// The topbar power button opens #powerwrap with the server's own safety
+// report (/api/serve/power): live merges flagged red (a restart orphans
+// them mid-flight), live steps flagged amber (they survive but nothing
+// new launches and a merge firing mid-restart can miss). Restart respawns
+// a detached `conductor.py serve --wait-port` child; the boot-id check in
+// refresh() reloads open tabs once it's back - the poll below just makes
+// it immediate.
+async function openPower(){
+  const w = document.getElementById('powerwrap');
+  document.getElementById('pwstat').textContent = '';
+  document.getElementById('pwbody').innerHTML =
+    '<div class="notice">checking live state&hellip;</div>';
+  w.hidden = false;
+  let s;
+  try { s = await api('GET', '/api/serve/power'); }
+  catch (e) {
+    document.getElementById('pwbody').innerHTML =
+      `<div class="notice error">${esc(e.message || e)}</div>`;
+    return;
+  }
+  const m = s.merges || [], t = s.tasks || [];
+  document.getElementById('pwbody').innerHTML =
+    (m.length
+      ? `<div class="notice error"><b>merge activity in progress</b>` +
+        `<ul>${m.map(x => `<li>${esc(x.where)} - ${esc(x.why)}</li>`)
+          .join('')}</ul>` +
+        `restarting now can orphan a merge mid-flight and leave the ` +
+        `repo's merge state or lock needing manual cleanup - waiting ` +
+        `for it to finish is the safe choice</div>` : '') +
+    (t.length
+      ? `<div class="notice warn"><b>${t.length} task(s) live</b><ul>` +
+        `${t.map(x => `<li>${esc(x.run)} / ${esc(x.step)} ` +
+          `(${esc(x.status)})</li>`).join('')}</ul>` +
+        `workers keep running through a restart, but no new steps ` +
+        `launch and a merge firing mid-restart can miss its ` +
+        `window</div>` : '') +
+    (!m.length && !t.length
+      ? `<div class="notice ok">nothing merging or running - ` +
+        `safe to restart</div>` : '');
+}
+async function powerAct(action){
+  const stat = document.getElementById('pwstat');
+  const btns = document.querySelectorAll('#powerbox .btn');
+  btns.forEach(b => b.disabled = true);
+  stat.textContent = action === 'restart'
+    ? 'restarting - this page reloads when the dashboard is back\u2026'
+    : 'stopping\u2026';
+  try { await api('POST', '/api/serve/power', {action}); }
+  catch (e) {
+    stat.textContent = 'Request failed: ' + (e.message || e);
+    btns.forEach(b => b.disabled = false);
+    return;
+  }
+  if (action === 'stop'){
+    stat.textContent =
+      'Dashboard stopped - start it again with `python conductor.py serve`.';
+    return;
+  }
+  for (;;){
+    await new Promise(r => setTimeout(r, 1000));
+    try {
+      const d = await api('GET', '/api/state');
+      if (d && d.serve_boot !== BOOT){ location.reload(); return; }
+    } catch (e) { /* down between processes - keep polling */ }
+  }
+}
+function _closeDetailNow(keepStack){
   // closing the questionnaire mid-way dismisses the auto-popup for THIS
   // question set - the request's Answer button still re-opens it, and a
   // fresh question round pops again (its qids differ)
@@ -11957,6 +12164,24 @@ function closeDetail(force=false, keepStack=false){
   document.getElementById('backdrop').hidden = true;
   applySel();        // every row mark clears with the dialog it belongs to
   return true;
+}
+function closeDetail(force=false, keepStack=false){
+  // synchronous unless a dirty request form needs the themed prompt -
+  // then it returns a Promise<bool> instead of a bool. Async callers
+  // `await` either shape; sync callers route through closeThen, which
+  // re-runs the would-be opener after a confirm (the retry's own
+  // closeDetail sees modalRequest already cleared and takes the
+  // synchronous path)
+  if (!force && modalRequest?.dirty)
+    return askConfirm('Discard unsaved edits?').then(ok =>
+      ok ? _closeDetailNow(keepStack) : false);
+  return _closeDetailNow(keepStack);
+}
+function closeThen(c, retry){
+  if (c === true) return true;
+  if (c && typeof c.then === 'function')
+    c.then(ok => { if (ok) retry(); });
+  return false;
 }
 // The steps of one run (or proposal) ARE the pipeline - collect_dashboard
 // stamps each row with `seq` = its manifest/proposal position, so prev/next
@@ -12040,7 +12265,12 @@ function applyModalScroll(){
   modalScroll=null;
 }
 function modalBack(){
-  if (modalRequest?.dirty && !confirm('Discard unsaved edits?')) return;
+  if (modalRequest?.dirty){
+    askConfirm('Discard unsaved edits?').then(ok => {
+      if (ok){ modalRequest=null; modalBack(); }
+    });
+    return;
+  }
   while (modalHist.length){
     const top=modalHist.pop();
     // the open*() calls below run their own closeDetail(keepStack) -
@@ -12079,7 +12309,7 @@ async function openSummary(key, push=true){
   // summarizer has no per-step report of its own
   if (a.aux) return openRunSummary(a.run_key||a.run_dir, push);
   const snap = push ? snapshotModal() : null;
-  if (!closeDetail(false, true)) return;   // the stack is managed here
+  if (!(await closeDetail(false, true))) return;   // the stack is managed here
   if (snap && !(snap.kind==='summary'&&snap.key===key)) pushHist(snap);
   summaryView={key};
   if (modalScroll==null) modalScroll=0;    // fresh open lands at the top;
@@ -12146,7 +12376,7 @@ async function openRunSummary(key, push=true){
   const r=(lastData?.runs||[]).find(x=>runKey(x)===key);
   if (!r || r.stage) return;
   const snap = push ? snapshotModal() : null;
-  if (!closeDetail(false, true)) return;
+  if (!(await closeDetail(false, true))) return;
   if (snap && !(snap.kind==='summary'&&snap.key==='run|'+key))
     pushHist(snap);
   summaryView={key:'run|'+key};
@@ -12292,7 +12522,8 @@ function showDetail(i, keepStack){
   const sameView = detailKey===key && !modalRequest && !modalQA &&
     !runModalKey && !summaryView &&
     !document.getElementById('backdrop').hidden;
-  if (!sameView && !closeDetail(false, !!keepStack)) return;
+  if (!sameView && !closeThen(closeDetail(false, !!keepStack),
+      ()=>showDetail(i, keepStack))) return;
   detailIdx = i; detailKey = key;
   const pk = detailKey;
   const pd = promptDrafts[pk];   // unsaved edit (undefined = none open)
@@ -12338,8 +12569,9 @@ function showDetail(i, keepStack){
     ['branch',a.branch],['device',a.device||'-'],
     ['merged',a.merged===true?'yes'+(a.merged_at?' @ '+a.merged_at:'')
       :a.merged],
-    ['prompt file',a.prompt],['stdout',a.stdout_log],['export',a.export],
-    ['state file',a.state_md]];
+    ['prompt file',a.prompt],['stdout',a.stdout_log],
+    ['last update',a.log_mtime],
+    ['export',a.export],['state file',a.state_md]];
   // A conductor-internal step (resolve-*) names its machine purpose - the
   // marker itself no longer renders inside the task text.
   if(a.purpose) kv.splice(4,0,['purpose',a.purpose]);
@@ -12625,7 +12857,8 @@ function showRunDetails(key, keepStack){
   // a non-null snapshot means a modal view is on screen - this is a
   // modal->modal jump, so the Back stack survives the closeDetail below
   const snap = keepStack ? null : snapshotModal();
-  if (!closeDetail(false, !!(keepStack || snap))) return;
+  if (!closeThen(closeDetail(false, !!(keepStack || snap)),
+      ()=>showRunDetails(key, keepStack))) return;
   if (snap && !(snap.kind==='run' && snap.key===key)) pushHist(snap);
   runModalKey = key;
   const total = Object.values(r.counts||{}).reduce((s,n)=>s+n,0);
@@ -13115,7 +13348,7 @@ function mpopPick(inp,idx){
   mpopClose(inp);
 }
 function openNew(){
-  if (!closeDetail()) return;
+  if (!closeThen(closeDetail(), openNew)) return;
   const defaults=lastData?.defaults||{model:'swe-2',effort:'max'};
   modalRequest={id:null,status:'new',dirty:false,originalManifest:''};
   showRequestForm({status:'new',raw:'',label:'',project:'',...defaults});
@@ -13531,7 +13764,7 @@ async function openRequest(id, keepStack){
   // a non-null snapshot means a modal view is on screen - this is a
   // modal->modal jump, so the Back stack survives the closeDetail below
   const snap = keepStack ? null : snapshotModal();
-  if (!closeDetail(false, !!(keepStack || snap))) return;
+  if (!(await closeDetail(false, !!(keepStack || snap)))) return;
   // re-opening the SAME request (post-save reload, stage follow) is not a
   // new history entry - the earlier back chain stays untouched
   if (snap && !(snap.kind==='request' && snap.id===id)) pushHist(snap);
@@ -13580,22 +13813,22 @@ async function requestAction(action){
   const manifestEl=document.getElementById('rq-manifest');
   const editedManifest=!!manifestEl &&
     manifestEl.value!==modalRequest.originalManifest;
-  if (action==='discard' && !confirm('Discard this request, its proposal ' +
+  if (action==='discard' && !await askConfirm('Discard this request, its proposal ' +
       'TOML, and all planned steps? They move to Trash, recoverable for ' +
       '48h (Undo right after, or the Trash view).')) return;
   // Regenerate replaces the generated tasks when it succeeds, so it
   // always confirms - and names any unsaved TOML edits it would drop
-  if (action==='generate' && rec.manifest && !confirm(
+  if (action==='generate' && rec.manifest && !await askConfirm(
       'Regenerate the proposal?' +
       (editedManifest ? ' Your unsaved TOML edits are dropped and ' : ' ') +
       'the current generated TOML is replaced only if generation ' +
       'succeeds.')) return;
-  if (action==='stop' && !confirm(
+  if (action==='stop' && !await askConfirm(
       'Stop preparing this proposal? The planner session is cancelled - ' +
       'your request and any previous proposal are kept.')) return;
   if (action==='run'){
     if (modalRequest.dirty){ formError('Save and review edits before starting.'); return; }
-    if (!confirm(`Start ${rec.run} now? This will execute ${rec.proposed_steps?.length||0} ` +
+    if (!await askConfirm(`Start ${rec.run} now? This will execute ${rec.proposed_steps?.length||0} ` +
                  `agent steps and make git checkpoints.`)) return;
   }
   const buttons=document.querySelectorAll('#detail [data-action]');
@@ -13658,7 +13891,7 @@ async function openQuestions(id){
   catch(e){ modalQA=null; return; }
   if (!(rec.pending_questions||[]).length){ modalQA=null;
     openRequest(id); return; }           // answered meanwhile -> normal form
-  if (!closeDetail()){ modalQA=null; return; }
+  if (!(await closeDetail())){ modalQA=null; return; }
   modalQA={id,rec,sel:new Set(),free:''};
   showQuestion();
   document.getElementById('backdrop').hidden=false;
@@ -14388,6 +14621,17 @@ document.addEventListener('click', async e=>{
   }
   if (t.id==='dx' || t.id==='backdrop'){
     closeDetail(); return; }
+  // themed ask/alert buttons resolve the pending _ask promise; a click
+  // on the dimmed frame itself dismisses like Cancel
+  const askBtn = t.closest && t.closest('[data-ask]');
+  if (askBtn){ _askDone(+askBtn.dataset.ask); return; }
+  if (t.id==='askwrap'){ _askDone(-1); return; }
+  // dashboard power dialog
+  if (t.id==='power-btn'){ openPower(); return; }
+  if (t.id==='pw-cancel' || t.id==='powerwrap'){
+    document.getElementById('powerwrap').hidden=true; return; }
+  if (t.id==='pw-restart'){ powerAct('restart'); return; }
+  if (t.id==='pw-stop'){ powerAct('stop'); return; }
   if (t.id==='new-request'){
     openNew(); return; }
   if (t.dataset && t.dataset.density){
@@ -14537,18 +14781,18 @@ document.addEventListener('click', async e=>{
       });
     return; }
   if (t.dataset && t.dataset.resumeRun){
-    if(!confirm('Resume this run? Every non-done step re-runs in a fresh ' +
+    if(!await askConfirm('Resume this run? Every non-done step re-runs in a fresh ' +
                 'session with a fresh timeout - covers paused, stopped ' +
                 'and interrupted (crashed) runs alike.')) return;
     t.disabled=true; t.textContent='Resuming…';
     try {
       await api('POST',`/api/runs/${encodeURIComponent(t.dataset.resumeRun)}/resume`,{});
       await refresh();
-    } catch(err){ alert('Resume failed: '+err.message); t.disabled=false;
+    } catch(err){ await showAlert('Resume failed: '+err.message); t.disabled=false;
       t.textContent='Resume unfinished steps'; }
     return; }
   if (t.dataset && t.dataset.mergeRun){
-    if(!confirm('Merge the pending worktree branches of this run into ' +
+    if(!await askConfirm('Merge the pending worktree branches of this run into ' +
                 'their ' +
                 'main checkouts? Clean merges land and drop the worktree; ' +
                 'conflicts stay parked for manual resolution (or a ' +
@@ -14575,14 +14819,14 @@ document.addEventListener('click', async e=>{
         bits.push(`prior merge attempt kept for inspection: ${out.kept.join(', ')}`);
       await refresh();
       if (rk) showRunDetails(rk);
-      alert(bits.length ? bits.join(' | ') : 'Nothing pending to merge.');
-    } catch(err){ alert('Merge failed: '+err.message); t.disabled=false;
+      await showAlert(bits.length ? bits.join(' | ') : 'Nothing pending to merge.');
+    } catch(err){ await showAlert('Merge failed: '+err.message); t.disabled=false;
       t.textContent='Merge pending branches'; }
     return; }
   if (t.dataset && (t.dataset.skipStep || t.dataset.unskipStep)){
     const un = !!t.dataset.unskipStep;
     const dir = t.dataset.skipStep || t.dataset.unskipStep;
-    if(!confirm(un
+    if(!await askConfirm(un
         ? `Unskip '${t.dataset.step}'? It runs in its original queue ` +
           `position - if its turn already passed this run, on the ` +
           `next resume.`
@@ -14596,13 +14840,13 @@ document.addEventListener('click', async e=>{
         `${encodeURIComponent(t.dataset.step)}/skip`,{skip:!un});
       closeDetail(true); await refresh();
       if (un && out.turn_passed)
-        alert(`Unskipped - '${t.dataset.step}' already passed its turn ` +
+        await showAlert(`Unskipped - '${t.dataset.step}' already passed its turn ` +
               `this run, so it re-runs on the next resume.`);
-    } catch(err){ alert((un?'Unskip':'Skip')+' failed: '+err.message);
+    } catch(err){ await showAlert((un?'Unskip':'Skip')+' failed: '+err.message);
       t.disabled=false; }
     return; }
   if (t.dataset && t.dataset.stopAgent){
-    if(!confirm(`Stop step '${t.dataset.step}'? Its devin process tree ` +
+    if(!await askConfirm(`Stop step '${t.dataset.step}'? Its devin process tree ` +
                 `is killed (committed work stays) and the step records ` +
                 `'stopped'. The run proceeds to the next step; resume ` +
                 `re-runs it.`)) return;
@@ -14612,7 +14856,7 @@ document.addEventListener('click', async e=>{
         `/api/runs/${encodeURIComponent(t.dataset.stopAgent)}/steps/` +
         `${encodeURIComponent(t.dataset.step)}/stop`,{});
       closeDetail(true); await refresh();
-    } catch(err){ alert('Stop failed: '+err.message); t.disabled=false; }
+    } catch(err){ await showAlert('Stop failed: '+err.message); t.disabled=false; }
     return; }
   const intrOpenEl = t.closest && t.closest('[data-intr-open]');
   if (intrOpenEl){
@@ -14647,7 +14891,7 @@ document.addEventListener('click', async e=>{
     if (!instructions){
       msg('Write the instructions first - they are what the resumed ' +
           'session continues with.'); return; }
-    if(!confirm(`Interrupt '${step}'? Its worker is killed now and the ` +
+    if(!await askConfirm(`Interrupt '${step}'? Its worker is killed now and the ` +
                 `same step resumes in a fresh session carrying your ` +
                 `instructions (plus ${(intrAttach[key]||[]).length} ` +
                 `attached image(s)). Committed work and the worktree ` +
@@ -14671,7 +14915,7 @@ document.addEventListener('click', async e=>{
       intrSend.disabled=false; }
     return; }
   if (t.dataset && t.dataset.stopGen){
-    if(!confirm('Stop preparing this proposal? The planner session is ' +
+    if(!await askConfirm('Stop preparing this proposal? The planner session is ' +
                 'cancelled - the request stays editable and any previous ' +
                 'proposal is kept.')) return;
     t.disabled=true;
@@ -14679,19 +14923,19 @@ document.addEventListener('click', async e=>{
       await api('POST',
         `/api/requests/${encodeURIComponent(t.dataset.stopGen)}/stop`,{});
       closeDetail(true); await refresh();
-    } catch(err){ alert('Stop failed: '+err.message); t.disabled=false; }
+    } catch(err){ await showAlert('Stop failed: '+err.message); t.disabled=false; }
     return; }
   if (t.dataset && t.dataset.setTimeout){
     const inp=document.getElementById('d-timeout');
     const mins=parseFloat(inp?.value);
-    if(!(mins>=1)){ alert('Enter a timeout in minutes (1-1440).'); return; }
+    if(!(mins>=1)){ await showAlert('Enter a timeout in minutes (1-1440).'); return; }
     t.disabled=true;
     try {
       await api('POST',
         `/api/runs/${encodeURIComponent(t.dataset.setTimeout)}/steps/` +
         `${encodeURIComponent(t.dataset.step)}/timeout`,{minutes:mins});
       await refresh();
-    } catch(err){ alert('Timeout update failed: '+err.message);
+    } catch(err){ await showAlert('Timeout update failed: '+err.message);
       t.disabled=false; }
     return; }
   if (t.dataset && (t.dataset.savePrompt || t.dataset.revertPrompt)){
@@ -14706,7 +14950,7 @@ document.addEventListener('click', async e=>{
         {prompt:revert?null:(ta?ta.value:null)});
       delete promptDrafts[detailKey];
       await refresh();
-    } catch(err){ alert((revert?'Revert':'Prompt save')+' failed: ' +
+    } catch(err){ await showAlert((revert?'Revert':'Prompt save')+' failed: ' +
       err.message); t.disabled=false; }
     return; }
   if (t.dataset && t.dataset.saveNotes){
@@ -14719,11 +14963,11 @@ document.addEventListener('click', async e=>{
         {notes:ta?ta.value:''});
       delete notesDrafts[detailKey];
       await refresh();
-    } catch(err){ alert('Notes save failed: '+err.message);
+    } catch(err){ await showAlert('Notes save failed: '+err.message);
       t.disabled=false; }
     return; }
   if (t.dataset && t.dataset.pauseRun){
-    if(!confirm('Pause this run? In-flight steps run to completion, ' +
+    if(!await askConfirm('Pause this run? In-flight steps run to completion, ' +
                 'then the run holds - NO further step launches ' +
                 'regardless of on_failure. It stays resumable across a ' +
                 'dashboard or machine restart. To kill live work ' +
@@ -14733,15 +14977,15 @@ document.addEventListener('click', async e=>{
       const out=await api('POST',
         `/api/runs/${encodeURIComponent(t.dataset.pauseRun)}/pause`,{});
       closeDetail(true); await refresh();
-      alert(out.pausing?.length
+      await showAlert(out.pausing?.length
         ? `Pause set: ${out.pausing.join(', ')} finishes first, ` +
           `then the run holds.` :
           'Pause set - nothing was in flight; the run is held.');
-    } catch(err){ alert('Pause failed: '+err.message); t.disabled=false; }
+    } catch(err){ await showAlert('Pause failed: '+err.message); t.disabled=false; }
     return; }
   if (t.dataset && (t.dataset.stopRun || t.dataset.drainRun)){
     const drain=!!t.dataset.drainRun, dir=t.dataset.stopRun||t.dataset.drainRun;
-    if(!confirm(drain
+    if(!await askConfirm(drain
         ? 'Drain this run: let in-flight steps finish, then end the run ' +
           'without launching more?'
         : 'Stop this run NOW? Every live step is tree-killed (committed ' +
@@ -14753,10 +14997,10 @@ document.addEventListener('click', async e=>{
       const out=await api('POST',
         `/api/runs/${encodeURIComponent(dir)}/stop`,{drain});
       closeDetail(true); await refresh();
-      if (!drain) alert(out.stopping?.length
+      if (!drain) await showAlert(out.stopping?.length
         ? `Stopping: ${out.stopping.join(', ')}` :
           'Stop requested - nothing was live.');
-    } catch(err){ alert('Stop failed: '+err.message); t.disabled=false; }
+    } catch(err){ await showAlert('Stop failed: '+err.message); t.disabled=false; }
     return; }
   if (t.dataset && t.dataset.archRun){
     const on=t.dataset.archSet==='1';
@@ -14766,7 +15010,7 @@ document.addEventListener('click', async e=>{
         `/api/runs/${encodeURIComponent(t.dataset.archRun)}/archive`,
         {archived:on});
       closeDetail(true); await refresh();
-    } catch(err){ alert((on?'Archive':'Unarchive')+' failed: ' +
+    } catch(err){ await showAlert((on?'Archive':'Unarchive')+' failed: ' +
       err.message); t.disabled=false; }
     return; }
   // Review marks: run-level (data-review-run) and task-level
@@ -14788,7 +15032,7 @@ document.addEventListener('click', async e=>{
         `/review`,
         {reviewed, seq: (rawSeq===''||rawSeq==null) ? null : +rawSeq});
       await refresh();
-    } catch(err){ alert('Review update failed: '+err.message);
+    } catch(err){ await showAlert('Review update failed: '+err.message);
       t.disabled=false; }
     return; }
   if (t.dataset && t.dataset.deleteRun){
@@ -14796,7 +15040,7 @@ document.addEventListener('click', async e=>{
     const r=(lastData?.runs||[]).find(x=>base(x.dir)===dir);
     const unmerged=AGENTS.filter(a=>a.branch && a.merged!==true &&
       (a.run_key||a.run_dir)===(r?runKey(r):'')).length;
-    if(!confirm(`Delete run '${r?r.run:dir}'? Its whole record - state, ` +
+    if(!await askConfirm(`Delete run '${r?r.run:dir}'? Its whole record - state, ` +
       `logs, prompts, session exports - moves to Trash, recoverable for ` +
       `48h (Undo right after, or the Trash view). Empty trash is what ` +
       `deletes it for good.` +
@@ -14809,11 +15053,11 @@ document.addEventListener('click', async e=>{
       if (out && out.trash_id) lastTrash={id:out.trash_id,
         label:`run ${r?r.run:dir}`};
       closeDetail(true); await refresh();
-    } catch(err){ alert('Delete failed: '+err.message); t.disabled=false; }
+    } catch(err){ await showAlert('Delete failed: '+err.message); t.disabled=false; }
     return; }
   if (t.dataset && t.dataset.summarizeRun){
     const rk = t.dataset.rk;
-    if(!confirm('Spawn a Devin session to write an executive summary ' +
+    if(!await askConfirm('Spawn a Devin session to write an executive summary ' +
                 'for this run? It reads the steps\u2019 own closing ' +
                 'reports and writes run.summary.md (replacing any ' +
                 'existing one). The run itself is untouched.')) return;
@@ -14824,7 +15068,7 @@ document.addEventListener('click', async e=>{
         {});
       await refresh();
       if (rk) showRunDetails(rk, true);
-    } catch(err){ alert('Summarize failed: '+err.message);
+    } catch(err){ await showAlert('Summarize failed: '+err.message);
       t.disabled=false; t.textContent='Generate LLM summary'; }
     return; }
   // closest(), not t.dataset - like the other attr dispatches: the task
@@ -14862,8 +15106,8 @@ document.addEventListener('click', async e=>{
       const out=await api('POST',
         `/api/trash/${encodeURIComponent(id)}/restore`,{});
       lastTrash=null; await refresh();
-      alert(`Restored ${out.restored_as||out.restored||'it'}.`);
-    } catch(err){ alert('Restore failed: '+err.message); t.disabled=false; }
+      await showAlert(`Restored ${out.restored_as||out.restored||'it'}.`);
+    } catch(err){ await showAlert('Restore failed: '+err.message); t.disabled=false; }
     return; }
   if (t.dataset && t.dataset.undoDismiss!==undefined){
     lastTrash=null; if (lastData) render(lastData); return; }
@@ -14875,19 +15119,19 @@ document.addEventListener('click', async e=>{
         `/api/trash/${encodeURIComponent(id)}/restore`,{});
       if (lastTrash && lastTrash.id===id) lastTrash=null;
       await refresh();
-      alert(`Restored ${out.restored_as||out.restored||'it'}.`);
-    } catch(err){ alert('Restore failed: '+err.message); t.disabled=false; }
+      await showAlert(`Restored ${out.restored_as||out.restored||'it'}.`);
+    } catch(err){ await showAlert('Restore failed: '+err.message); t.disabled=false; }
     return; }
   if (t.dataset && t.dataset.emptyTrash!==undefined){
     const n=(lastData?.trash||[]).length;
-    if(!confirm(`Empty trash? ${n} item(s) are PERMANENTLY deleted now ` +
+    if(!await askConfirm(`Empty trash? ${n} item(s) are PERMANENTLY deleted now ` +
       `- run records, logs, prompts and proposal drafts cannot be ` +
       `recovered after this.`)) return;
     t.disabled=true;
     try {
       await api('POST','/api/trash/empty',{confirm:true});
       lastTrash=null; await refresh();
-    } catch(err){ alert('Empty trash failed: '+err.message);
+    } catch(err){ await showAlert('Empty trash failed: '+err.message);
       t.disabled=false; }
     return; }
   if (t.dataset && t.dataset.st){            // status filter chip: show only
@@ -15173,8 +15417,12 @@ document.addEventListener('keydown', e=>{
       return;
     }
   }
-  if (e.key==='Escape' && !document.getElementById('backdrop').hidden)
-    closeDetail();
+  if (e.key==='Escape'){
+    if (!document.getElementById('askwrap').hidden){ _askDone(-1); return; }
+    if (!document.getElementById('powerwrap').hidden){
+      document.getElementById('powerwrap').hidden=true; return; }
+    if (!document.getElementById('backdrop').hidden) closeDetail();
+  }
 });
 // hovering a run row highlights its agent rows across all project tables.
 // hoverRun persists across the 2s re-render so the highlight doesn't flicker.
@@ -15360,6 +15608,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     data, ctype = read_attachment(
                         urllib.parse.unquote(m[1]), attachments_dir)
                     self._send(data, ctype)
+                elif path == "/api/serve/power":
+                    # the Stop/Restart dialog's safety report: live
+                    # merges (restart orphans them) + still-live steps
+                    self._json(serve_safety(runs_dir))
                 elif path in ("/", "/index.html"):
                     self._send(_DASH_HTML.encode("utf-8"),
                                "text/html; charset=utf-8")
@@ -15393,6 +15645,25 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                                                attachments_dir), 201)
                     return
                 body = self._body()
+                if path == "/api/serve/power":
+                    # Stop/Restart the dashboard itself. The response is
+                    # flushed before the shutdown thread fires; restart
+                    # spawns the detached replacement first so the gap is
+                    # just the bind handoff (--wait-port).
+                    act = str(body.get("action") or "")
+                    if act not in ("stop", "restart"):
+                        raise RequestError(
+                            "action must be 'stop' or 'restart'")
+                    if act == "restart":
+                        sargs = getattr(self.server, "serve_args", None)
+                        if sargs is None:
+                            raise RequestError(
+                                "this server was not started by "
+                                "conductor.py serve - cannot respawn")
+                        _respawn_serve(sargs)
+                    self._json({"ok": True, "action": act})
+                    threading.Timer(0.4, self.server.shutdown).start()
+                    return
                 if path == "/api/requests":
                     self._json(create_request(body, requests_dir, runs_dir), 201)
                 elif path == "/api/requests/import":
@@ -15543,7 +15814,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
     for line in discover_followups(runs_dir):
         print(f"sweep: {line}")
     handler = make_dashboard_handler(runs_dir, devin_argv)
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), handler)
+    # --wait-port: a Stop/Restart respawn retries the bind while the
+    # outgoing process finishes shutting down and releases the socket
+    deadline = time.time() + (15 if getattr(args, "wait_port", False)
+                              else 0)
+    while True:
+        try:
+            httpd = http.server.ThreadingHTTPServer(
+                ("127.0.0.1", args.port), handler)
+            break
+        except OSError:
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.5)
+    httpd.serve_args = args          # the power endpoint respawns these
     print(f"conductor dashboard: http://127.0.0.1:{args.port}  "
           f"(watching {runs_dir})")
     try:
@@ -15665,6 +15949,10 @@ def main(argv: list[str] | None = None) -> int:
                            help="allow the machine to sleep during the run")
         if name == "serve":
             p.add_argument("--port", type=int, default=SERVE_PORT)
+            p.add_argument("--wait-port", action="store_true",
+                           help="retry the bind up to 15s - used by the "
+                                "dashboard's restart respawn while the "
+                                "outgoing process releases the socket")
         if name == "status":
             p.add_argument("run_dir", nargs="?", default=None)
         if name == "merge":

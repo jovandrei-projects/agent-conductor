@@ -26,6 +26,36 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 
 ## Not yet filed as tasks
 
+- DONE 2026-10-17 (dashboard power + themed dialogs, hand-implemented):
+  the topbar gains a power button opening a Stop/Restart dialog backed by
+  `serve_safety()` (`GET /api/serve/power`): per-repo
+  `conductor-merge.lock` holders, MERGE_HEADs and machine-global merge
+  claims render RED (a restart can orphan a merge mid-flight), still-live
+  steps render amber (workers survive per trap 15, but nothing new
+  launches and a merge firing mid-restart can miss its window), a clean
+  report renders green - the dialog warns, never blocks. Restart posts
+  `POST /api/serve/power {action:'restart'}`: `_respawn_serve` spawns a
+  detached `conductor.py serve --wait-port` child (same port+args, bind
+  retried until the old process releases), the response flushes before
+  the 0.4s shutdown Timer, and the page polls `/api/state` for the new
+  `serve_boot` id to reload itself. Stop shuts down only the dashboard -
+  workers keep running by the CREATE_NEW_PROCESS_GROUP rule. All native
+  `confirm()`/`alert()` calls are replaced by `askConfirm`/`askAlert`
+  themed overlays (#askwrap, alertdialog role, focus + Escape/backdrop
+  handling); `closeDetail` keeps a synchronous contract for clean
+  transitions and returns a Promise only when a dirty request form needs
+  the prompt, with `closeThen(c, retry)` bridging sync callers (the
+  retry's closeDetail sees modalRequest already cleared) - async callers
+  `await` either shape. Task modal gains a `last update` row
+  (`file_mtime_iso` of the step's stdout log; also on the summarizer aux
+  row). En route fix: requests created without model now pin
+  `model`/`plan_model`/`effort`/`plan_effort` in test helpers - the
+  date-gated `default_model_effort()` rolled swe-2 -> gpt-6-luna on
+  2026-10-17 mid-session and the planner model/effort guard correctly
+  refused the stale swe-2 fixture TOML. modalBack's dirty path clears
+  modalRequest before retrying (was a re-prompt loop). 465/465 tests;
+  5 new PowerDialogTests (safety report live/empty, flag+project
+  isolation, restart respawn args, stop endpoint).
 - DONE 2026-10-16 (cumulative-elapsed-time, wave step of run
   20261016-100852-run-review-ux): elapsed time is cumulative across
   dispatches instead of the last dispatch's span. Root cause: run_step
