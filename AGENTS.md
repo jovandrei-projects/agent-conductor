@@ -731,6 +731,32 @@ descriptor's `{base,tip}` range so entries behind the watermark stay
 retrievable and resurface as new. All mutations are lock-serialized
 tmp+replace writes.
 
+`tour_feeds.py` (repo root, stdlib-only, imports `tour_state`) builds
+the deterministic feed: `build_feed(state, boundary, repo_dir=,
+runs_dir=, requests_dir=, manifests_dir=)` -> `{entries, history,
+unseen_count, range, boundary, warnings}` - no LLM, no HTTP. Commits
+come from `git log <base.commit>..<tip.commit>` (null base = unbounded;
+an unresolvable base warns + falls back unbounded, never a silent
+reset) and group one card per feature area: TOUR_STOPS (repo registry
+`{id: {selector, title}}` of real _DASH_HTML anchors; `tour` uses
+`#tour-btn, #power-btn` so it anchors once the dashboard step adds the
+button) plus unanchored pseudo-areas (conductor/mobile/tests/manifests/
+tracking/mixed). Records use their OWN event stamps inside
+`(base.at, tip.at]`: requests+follow-ups on `created_at`, runs on
+`ended_at` - never run creation. Card ids embed the newest commit
+(`area:<stop>:<tip>`) or the record identity (`request:<rid>`,
+`run:<dir>:<ended_at>`, `followup:<rid>`, `curated:<stop>:<tip>`), so
+re-feeds bind viewed state but a fresh commit in a viewed area reads
+'new' again. Dedup: a finished run absorbs its `conductor/<dir>/<step>`
+merge commits + chains; `manifests/whatsnew.jsonl` curated lines
+`{stop, blurb, title?, tag?, commits|since+until|requests|runs}` fold
+into the named card when they claim exactly its own change, extract to
+a dedicated card otherwise, and get skipped (with a `warnings` note)
+when malformed or out of range. `history` re-materializes recorded
+descriptors over their stored `{base,tip}` ranges - viewed cards stay
+retrievable after the watermark advances past them; snoozed/unviewed
+descriptors re-inject into `entries`.
+
 ## Traps
 
 Append as they are hit.
