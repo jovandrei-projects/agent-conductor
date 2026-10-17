@@ -12762,6 +12762,7 @@ function streamGenTail(){
 const expanded = {};      // slug -> true: show all rows, not just latest 10
 const only = new Set();   // status chips: empty = all, else show ONLY these
 const facets = new Set();
+const projs = new Set();  // project chips/group names: empty = all slugs
 let selectedRun = null;
 const prevTail = {};      // run|step -> last tail_last shown; a change
                           // flashes the result cell (.fresh) as logs stream.
@@ -13154,26 +13155,19 @@ const showAlert = (msg, title) =>
 // The topbar power button opens #powerwrap with the server's own safety
 // report (/api/serve/power): live merges flagged red (a restart orphans
 // them mid-flight), live steps flagged amber (they survive but nothing
-// new launches and a merge firing mid-restart can miss). Restart respawns
-// a detached `conductor.py serve --wait-port` child; the boot-id check in
-// refresh() reloads open tabs once it's back - the poll below just makes
-// it immediate.
-async function openPower(){
-  const w = document.getElementById('powerwrap');
-  document.getElementById('pwstat').textContent = '';
-  document.getElementById('pwbody').innerHTML =
-    '<div class="notice">checking live state&hellip;</div>';
-  w.hidden = false;
-  let s;
-  try { s = await api('GET', '/api/serve/power'); }
-  catch (e) {
-    document.getElementById('pwbody').innerHTML =
-      `<div class="notice error">${esc(e.message || e)}</div>`;
-    return;
-  }
+// new launches and a merge firing mid-restart can miss). The SAME report
+// is re-fetched at button-press time - the dialog can sit open while a
+// merge starts behind it, so the open-time answer never authorizes the
+// click. An unsafe press re-renders the fresh report and arms once: a
+// second press on the same button is the informed override. Restart
+// respawns a detached `conductor.py serve --wait-port` child; the boot-id
+// check in refresh() reloads open tabs once it's back - the poll below
+// just makes it immediate.
+let pwArmed = null;   // action the operator saw the fresh unsafe report
+                      // for and still clicked again
+function powerBodyHtml(s){
   const m = s.merges || [], t = s.tasks || [];
-  document.getElementById('pwbody').innerHTML =
-    (m.length
+  return (m.length
       ? `<div class="notice error"><b>merge activity in progress</b>` +
         `<ul>${m.map(x => `<li>${esc(x.where)} - ${esc(x.why)}</li>`)
           .join('')}</ul>` +
@@ -13191,10 +13185,45 @@ async function openPower(){
       ? `<div class="notice ok">nothing merging or running - ` +
         `safe to restart</div>` : '');
 }
+async function openPower(){
+  pwArmed = null;
+  const w = document.getElementById('powerwrap');
+  document.getElementById('pwstat').textContent = '';
+  document.getElementById('pwbody').innerHTML =
+    '<div class="notice">checking live state&hellip;</div>';
+  w.hidden = false;
+  let s;
+  try { s = await api('GET', '/api/serve/power'); }
+  catch (e) {
+    document.getElementById('pwbody').innerHTML =
+      `<div class="notice error">${esc(e.message || e)}</div>`;
+    return;
+  }
+  document.getElementById('pwbody').innerHTML = powerBodyHtml(s);
+}
 async function powerAct(action){
   const stat = document.getElementById('pwstat');
   const btns = document.querySelectorAll('#powerbox .btn');
   btns.forEach(b => b.disabled = true);
+  // the open-time report is stale the moment it renders - re-check at
+  // press time so a merge that started since can't be orphaned silently
+  stat.textContent = 'rechecking live state…';
+  let s;
+  try { s = await api('GET', '/api/serve/power'); }
+  catch (e) {
+    stat.textContent = 'Safety recheck failed: ' + (e.message || e);
+    btns.forEach(b => b.disabled = false);
+    return;
+  }
+  document.getElementById('pwbody').innerHTML = powerBodyHtml(s);
+  if (((s.merges||[]).length || (s.tasks||[]).length) && pwArmed!==action){
+    pwArmed = action;   // the warning is now on screen - a repeat click
+                        // is an informed choice, not a stale-read accident
+    stat.textContent = 'unsafe right now - press ' +
+      (action==='restart' ? 'Restart' : 'Stop') + ' again to do it anyway';
+    btns.forEach(b => b.disabled = false);
+    return;
+  }
   stat.textContent = action === 'restart'
     ? 'restarting - this page reloads when the dashboard is back\u2026'
     : 'stopping\u2026';
@@ -13282,11 +13311,12 @@ const runSibs = () => {
   const d = lastData;
   if (!d) return [];
   const matchAgent = a => (!only.size||only.has(a.status)) &&
+    (!projs.size||projs.has(a.slug||'?')) &&
     [...facets].every(f=>matchesFacet(a,f));
   const allRuns = d.runs
     .filter(r=>!selectedRun||runKey(r)===selectedRun)
     .filter(r=>{
-      if (!only.size && !facets.size) return true;
+      if (!only.size && !facets.size && !projs.size) return true;
       const kids = d.agents.filter(
         a=>(a.run_key||a.run_dir)===runKey(r));
       return kids.length ? kids.some(matchAgent) : false;
@@ -14458,6 +14488,11 @@ function ctxAgentItems(a){
   it.push({label:'Filter by this item',
     attrs:ctxAttrs({'filter-run':a.run_key||a.run_dir||''}),
     title:'show only the run this task belongs to'});
+  if (a.slug)
+    it.push({label:'Filter to this project',
+      attrs:ctxAttrs({'proj':a.slug}),
+      title:'toggle the project filter - same as the group name or the ' +
+        'project chips up top'});
   if (a.request_id)
     it.push({label:'View request / runbook',
       attrs:ctxAttrs({'open-request':a.request_id})});
@@ -15616,7 +15651,8 @@ function render(d){
   // density is in the sig: fmtT/fmtTc token text differs per density, so
   // a Compact|Full flip must re-render even when the payload is identical.
   const sig = JSON.stringify([d.runs, d.agents.map(({tail,...r})=>r),
-    selectedRun, [...only].sort(), [...facets].sort(), expanded,
+    selectedRun, [...only].sort(), [...facets].sort(), [...projs].sort(),
+    expanded,
     runsShown===Infinity?'all':runsShown, density,
     d.trash, d.trash_ids, showTrash, lastTrash&&lastTrash.id]);
   const tailEl = document.getElementById('dtail');
@@ -15634,12 +15670,24 @@ function render(d){
   // aux bookkeeping rows (the run summarizer) are hidden in the default
   // view - they only appear as children of their run once you filter
   // into it, so they never read as pipeline work
-  const scope = d.agents.filter(a=>a.aux
+  // rscope is the run-filtered pool; the project chips list every slug in
+  // it so toggling one project never hides the others' chips. `scope`
+  // adds the project selection on top - status/tag counts, the project
+  // tables and the 'N filtered' notes all reflect it.
+  const rscope = d.agents.filter(a=>a.aux
     ? selectedRun===(a.run_key||a.run_dir)
     : (!selectedRun || (a.run_key||a.run_dir)===selectedRun));
+  const scope = rscope.filter(a=>!projs.size || projs.has(a.slug||'?'));
   const byStatus = {};
   for (const a of scope) if (!a.aux)
     byStatus[a.status]=(byStatus[a.status]||0)+1;
+  const projCounts = {};
+  for (const a of rscope) if (!a.aux)
+    projCounts[a.slug||'?']=(projCounts[a.slug||'?']||0)+1;
+  // a selected slug stays listed even with nothing in scope right now,
+  // same 'sticky selection' the tag chips get
+  const projList = [...new Set([...Object.keys(projCounts), ...projs])]
+    .sort();
   const selected = d.runs.find(r=>runKey(r)===selectedRun);
   const facetCounts = Object.fromEntries(FACETS.map(f=>
     [f,scope.filter(a=>matchesFacet(a,f)).length]));
@@ -15647,6 +15695,17 @@ function render(d){
     (selected?`<span class="filter-group"><span class="filter-label">run:</span>` +
       `<button type="button" class="chip active" data-clear-run ` +
       `aria-label="Clear run filter">${esc(selected.run)} ×</button></span>`:'') +
+    (projList.length
+      ? `<span class="filter-group"><span class="filter-label">` +
+        `project:</span>` +
+        projList.map(s=>
+          `<button type="button" class="chip${projs.has(s)?' active':''}` +
+          `${projs.size&&!projs.has(s)?' off':''}" data-proj="${esc(s)}" ` +
+          `aria-pressed="${projs.has(s)}" title="${projs.has(s)
+            ?'clear the project filter':'show only project '+esc(s)}">` +
+          `${projCounts[s]||0} ${esc(s)}${projs.has(s)?' ×':''}</button>`
+        ).join('') + '</span>'
+      : '') +
     `<span class="filter-group"><span class="filter-label">status:</span>` +
     ORDER.filter(s=>byStatus[s]).map(s=>
       `<button type="button" class="chip${only.has(s)?' active':''}` +
@@ -15673,8 +15732,8 @@ function render(d){
     `48h before a sweep purges them; Restore puts one back, Empty trash ` +
     `removes all of them for good">${d.trash_count||0} trash` +
     `${showTrash?' ×':''}</button></span>` +
-    (only.size||facets.size?` <button type="button" class="chip" ` +
-      `data-reset>clear filters</button>`:'');
+    (only.size||facets.size||projs.size?` <button type="button" ` +
+      `class="chip" data-reset>clear filters</button>`:'');
 
   // Undo bar: the entry a delete/discard just trashed stays one click
   // away until dismissed, restored, or purged (trash_ids liveness).
@@ -15721,10 +15780,11 @@ function render(d){
   // The status/tag chips also scope the runs table: a run stays visible
   // while at least one of its agents matches the active filters.
   const matchAgent = a => (!only.size||only.has(a.status)) &&
+    (!projs.size||projs.has(a.slug||'?')) &&
     [...facets].every(f=>matchesFacet(a,f));
   const allRuns = d.runs.filter(r=>!selectedRun||runKey(r)===selectedRun)
     .filter(r=>{
-      if (!only.size && !facets.size) return true;
+      if (!only.size && !facets.size && !projs.size) return true;
       const kids = d.agents.filter(a=>(a.run_key||a.run_dir)===runKey(r));
       return kids.length ? kids.some(matchAgent) : false;
     });
@@ -15923,7 +15983,12 @@ function render(d){
       `</div></td>` +
       `<td class="wrap">${r.description?esc(r.description):
         r.stage?'<span class="sub">Awaiting proposal</span>':'-'}</td>` +
-      `<td>${(r.projects||[]).map(p=>`<span class="chip">${esc(p)}</span>`).join('')}</td>` +
+      `<td>${(r.projects||[]).map(p=>
+        `<button type="button" class="chip${projs.has(p)?' active':''}" ` +
+        `data-proj="${esc(p)}" ` +
+        `title="${projs.has(p)?'clear the project filter'
+          :'filter to project '+esc(p)}">${esc(p)}</button>`).join('')}` +
+      `</td>` +
       `<td>${loc(r.started_at)}</td>` +
       `<td>${r.ended_at?loc(r.ended_at):(r.started_at?'<b>running</b>':'-')}</td>` +
       `<td data-rel="${esc(runKey(r))}" ` +
@@ -15972,7 +16037,12 @@ function render(d){
     const all = groups[slug];
     const nRun = all.filter(r=>r.status==='running').length;
     const show = expanded[slug] ? rows : rows.slice(0, SHOW_N);
-    h += `<h3 class="proj">${esc(slug)} <span class="sub">` +
+    // the group name IS the project-filter toggle (same gesture as the
+    // chips up top - a filtered-in project's name clears it again)
+    h += `<h3 class="proj"><button type="button" class="linkbtn" ` +
+      `data-proj="${esc(slug)}" title="${projs.has(slug)
+        ?'clear the project filter':'filter to project '+esc(slug)}">` +
+      `${esc(slug)}</button> <span class="sub">` +
       `${all.length} agent(s)${nRun?`, ${nRun} running`:''}` +
       `${rows.length<all.length?`, ${all.length-rows.length} filtered`:''}` +
       `${show.length<rows.length?`, showing latest ${show.length}`:''}` +
@@ -16711,7 +16781,8 @@ document.addEventListener('click', async e=>{
   if (t.dataset && t.dataset.clearRun!==undefined){
     selectedRun=null; if (lastData) render(lastData); return; }
   if (t.dataset && t.dataset.reset!==undefined){
-    only.clear(); facets.clear(); if (lastData) render(lastData); return; }
+    only.clear(); facets.clear(); projs.clear();
+    if (lastData) render(lastData); return; }
   if (t.dataset && t.dataset.arch!==undefined){   // 'N archived' view chip
     showArchived=!showArchived;
     store.setItem('ac-arch', showArchived?'1':'0');
@@ -16777,6 +16848,11 @@ document.addEventListener('click', async e=>{
       if (f==='unmerged') facets.delete('merged');
       facets.add(f);
     }
+    if (lastData) render(lastData); return;
+  }
+  if (t.dataset && t.dataset.proj){          // project filter toggle:
+    const p=t.dataset.proj;                  // sticky-bar chips, project
+    projs.has(p)?projs.delete(p):projs.add(p);  // cells, group names
     if (lastData) render(lastData); return;
   }
   if (t.dataset && t.dataset.slug){          // expand/collapse a table
