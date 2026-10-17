@@ -478,8 +478,23 @@ dashboard shows which real model adaptive picked and prices against it. When a r
 `conductor/*` branches a `Merge pending branches` button appears
 (`POST /api/runs/<dir>/merge` -> `merge_run`): it replays the post-wave
 merge loop for parked branches, spawns the `resolve-*` session when the
-manifest opts in, and 409s while any step is live - the fix for "the
-conductor died/conflicted before merging" without `--resume`.
+manifest opts in, and is the fix for "the conductor died/conflicted
+before merging" without `--resume`. The manual merge is gated on the
+run actually being done executing - `run_executing()` is the shared
+predicate (live driver pid, or a step record still backed by something
+alive), so a live conductor mid-verify/merge, between waves, or
+mid-shutdown 409s even when no step reads 'running' at that instant; a
+raised stop/pause/drain sentinel is only a request and changes nothing
+until the driver is gone. The op also takes the run's merge claim -
+`merge-<runkey>` in the flag dir, same O_EXCL+pid shape as the repo
+merge lock but machine-global - holds it for the whole operation and
+re-reads state under it, so a `run --resume` that already passed its
+own checks is caught by the recheck instead of overlapping; the resume
+path holds the same claim while it stamps driver_pid, keeping the two
+mutually exclusive. `clear_run_flags`, `sweep`/`archive` and `delete`
+respect the claim (exempted / skipped / 409), and the dashboard marks
+executing runs via the payload's `executing` field so the button and
+context item render disabled with the reason instead of hiding.
 
 Run hygiene keeps the runs table short without touching files: a run
 whose `ended_at` is older than `CONDUCTOR_ARCHIVE_HOURS` (default 48, 0

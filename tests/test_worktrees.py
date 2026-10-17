@@ -756,6 +756,329 @@ prompt = "first"
             self.assertEqual(out["skipped"], [])
 
 
+class ManualMergeGuardTests(unittest.TestCase):
+    """'Merge pending branches' must stay out of a run that is still
+    executing: the pending branches ARE the run's live work surface, so a
+    stale dashboard page or a direct `conductor.py merge` must hit the
+    same gate the disabled button shows. Only a run whose driver is
+    genuinely gone is mergeable - a stop request, a pause, or a
+    half-finished shutdown is not 'stopped'."""
+
+    def _sleeper(self):
+        return subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            **conductor.hidden_subprocess_kwargs())
+
+    def _dead_pid(self):
+        p = subprocess.Popen([sys.executable, "-c", "pass"],
+                             **conductor.hidden_subprocess_kwargs())
+        p.wait()
+        return p.pid
+
+    def _set_state(self, rd: Path, **fields):
+        st = json.loads((rd / "state.json").read_text(encoding="utf-8"))
+        st.update(fields)
+        (rd / "state.json").write_text(json.dumps(st), encoding="utf-8")
+        return st
+
+    def _parked_run(self, td):
+        """A real ENDED run holding one timed-out (pending) worktree
+        branch that merges cleanly - the shape the manual merge exists
+        for."""
+        base = Path(td)
+        proj = make_project(base)
+        runs = base / "runs"
+        m = write_manifest(base, f'''
+[[step]]
+name = "stuck"
+project = "{proj.as_posix()}"
+prompt = "sleep_after=30 write A.txt"
+worktree = true
+timeout_min = 0.02
+''')
+        self.assertEqual(run_manifest(m, runs), 1)
+        st, rd = state_of(runs)
+        self.assertEqual(st["steps"]["stuck"]["status"], "timed_out")
+        self.assertIsNot(st["steps"]["stuck"].get("merged"), True)
+        self.assertTrue(st["steps"]["stuck"].get("branch"))
+        return proj, runs, rd, m
+
+    def test_refused_while_driver_alive_then_lands_once_stopped(self):
+        """The core gate: a live driver - even with NO step currently
+        'running' (the between-wave / verify-merge window the old
+        step-only check missed) - refuses the merge. A raised stop
+        sentinel is a REQUEST, not a completed stop: still refused. Once
+        the driver is gone and the run is stamped stopped, it lands."""
+        with tempfile.TemporaryDirectory() as td:
+            proj, runs, rd, _m = self._parked_run(td)
+            branch = json.loads(
+                (rd / "state.json").read_text())["steps"]["stuck"]["branch"]
+            drv = self._sleeper()
+            try:
+                self._set_state(rd,
+                                driver_pid=drv.pid,
+                                driver_started_at=conductor.now_iso())
+                with self.assertRaises(conductor.RequestError) as e:
+                    conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+                self.assertEqual(e.exception.status, 409)
+                self.assertIn("still executing", str(e.exception))
+                # the parked branch was not touched
+                self.assertFalse(conductor.merge_in_progress(proj))
+                self.assertEqual(
+                    git(proj, "rev-parse", "--verify", branch)
+                    .returncode, 0)
+                # stop requested -> the sentinel exists but the driver is
+                # still mid-shutdown: not 'stopped' yet
+                conductor.stop_flag(rd).parent.mkdir(exist_ok=True)
+                conductor.stop_flag(rd).touch()
+                with self.assertRaises(conductor.RequestError) as e:
+                    conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+                self.assertEqual(e.exception.status, 409)
+            finally:
+                conductor.stop_flag(rd).unlink(missing_ok=True)
+                drv.terminate()
+                drv.wait()
+            # genuinely stopped: dead driver + ended_at + abort reason
+            self._set_state(rd, driver_pid=self._dead_pid(),
+                            ended_at=conductor.now_iso(),
+                            aborted="stopped")
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], ["stuck"])
+            self.assertTrue((proj / "A.txt").is_file())
+            self.assertFalse(conductor.merge_in_progress(proj))
+            st, _ = state_of(runs)
+            self.assertTrue(st["steps"]["stuck"]["merged"])
+            # the run's merge claim was released with the operation
+            self.assertFalse(conductor.merge_claim_flag(rd).exists())
+
+    def test_refused_in_the_queued_only_window(self):
+        """Between waves every step reads 'queued'/'done' - nothing is
+        'running', so the old check passed; a live driver still makes it
+        executing."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "runs"
+            rd = runs / "20261016-000000-t"
+            rd.mkdir(parents=True)
+            drv = self._sleeper()
+            try:
+                (rd / "state.json").write_text(json.dumps({
+                    "run": "t",
+                    "driver_pid": drv.pid,
+                    "driver_started_at": conductor.now_iso(),
+                    "steps": {
+                        "done1": {"status": "done", "merged": True,
+                                  "branch": "conductor/t/done1"},
+                        "next": {"status": "queued",
+                                 "branch": "conductor/t/next"}}}),
+                    encoding="utf-8")
+                with self.assertRaises(conductor.RequestError) as e:
+                    conductor.merge_run(rd.name, runs, ["devin"])
+                self.assertEqual(e.exception.status, 409)
+                self.assertIn("still executing", str(e.exception))
+            finally:
+                drv.terminate()
+                drv.wait()
+
+    def test_incomplete_shutdown_is_not_stopped(self):
+        """The shutdown-acknowledged window: driver still alive, the run
+        not yet stamped ended/aborted - 'stopping', not 'stopped'."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "runs"
+            rd = runs / "20261016-000000-t"
+            rd.mkdir(parents=True)
+            drv = self._sleeper()
+            try:
+                (rd / "state.json").write_text(json.dumps({
+                    "run": "t",
+                    "driver_pid": drv.pid,
+                    "driver_started_at": conductor.now_iso(),
+                    "steps": {
+                        "p": {"status": "failed", "merged": False,
+                              "branch": "conductor/t/p",
+                              "work_dir": str(base / "w")}}}),
+                    encoding="utf-8")
+                for flag in (conductor.stop_flag, conductor.pause_flag,
+                             conductor.drain_flag):
+                    f = flag(rd)
+                    f.parent.mkdir(exist_ok=True)
+                    f.touch()
+                    try:
+                        with self.assertRaises(conductor.RequestError) \
+                                as e:
+                            conductor.merge_run(rd.name, runs, ["devin"])
+                        self.assertEqual(e.exception.status, 409)
+                    finally:
+                        f.unlink(missing_ok=True)
+            finally:
+                drv.terminate()
+                drv.wait()
+
+    def test_dead_interrupted_run_merges(self):
+        """Interrupted is not executing: dead driver, a stale 'running'
+        record backed by a dead pid - the run can be resumed, but the
+        pending branches are durable and mergeable now."""
+        with tempfile.TemporaryDirectory() as td:
+            proj, runs, rd, _m = self._parked_run(td)
+            st = self._set_state(rd, driver_pid=self._dead_pid())
+            # an interrupted run may still carry a stale 'running' row
+            st["steps"]["ghost"] = {
+                "status": "running", "pid": self._dead_pid(),
+                "started_at": conductor.now_iso(),
+                "work_dir": str(Path(td) / "gone")}
+            (rd / "state.json").write_text(json.dumps(st),
+                                           encoding="utf-8")
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], ["stuck"])
+            self.assertTrue((proj / "A.txt").is_file())
+
+    def test_rechecks_state_under_the_claim(self):
+        """Stale-client shape: state looked finished at first read, but a
+        driver stamped itself before the claim landed - the check that
+        runs UNDER the claim must catch it."""
+        with tempfile.TemporaryDirectory() as td:
+            proj, runs, rd, _m = self._parked_run(td)
+            drv = self._sleeper()
+            try:
+                orig = conductor._claim_run_merge
+
+                def flip_then_claim(d, by):
+                    # a resume stamped itself in the gap between our first
+                    # state read and the claim
+                    self._set_state(
+                        rd, driver_pid=drv.pid,
+                        driver_started_at=conductor.now_iso())
+                    return orig(d, by)
+
+                with mock.patch.object(conductor, "_claim_run_merge",
+                                       side_effect=flip_then_claim):
+                    with self.assertRaises(conductor.RequestError) as e:
+                        conductor.merge_run(rd.name, runs,
+                                            shlex.split(MOCK))
+                self.assertEqual(e.exception.status, 409)
+                self.assertIn("still executing", str(e.exception))
+                # nothing was merged and the claim was released
+                self.assertFalse(conductor.merge_claim_flag(rd).exists())
+                st, _ = state_of(runs)
+                self.assertIsNot(st["steps"]["stuck"].get("merged"), True)
+            finally:
+                drv.terminate()
+                drv.wait()
+
+    def test_merge_claim_and_resume_are_mutually_exclusive(self):
+        """The start/resume race goes through the shared claim: a merge in
+        flight refuses resume, and a resume mid-stamp refuses merge."""
+        with tempfile.TemporaryDirectory() as td:
+            proj, runs, rd, m = self._parked_run(td)
+            claim = conductor._claim_run_merge(rd, "resume")
+            try:
+                with self.assertRaises(conductor.RequestError) as e:
+                    conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+                self.assertEqual(e.exception.status, 409)
+                self.assertIn("resume", str(e.exception))
+            finally:
+                claim.unlink()
+            # the other direction: a held merge claim blocks the
+            # dashboard resume endpoint - and a resume's own flag-clear
+            # must never delete it out from under the merge
+            claim = conductor._claim_run_merge(rd, "merge")
+            try:
+                conductor.clear_run_flags(rd)
+                self.assertTrue(claim.is_file())
+                with self.assertRaises(conductor.RequestError) as e:
+                    conductor.resume_run(rd.name, runs, ["devin"])
+                self.assertEqual(e.exception.status, 409)
+                # ...and the CLI resume refuses before stamping anything
+                rc = run_manifest(m, runs, resume=str(rd))
+                self.assertEqual(rc, 2)
+                st, _ = state_of(runs)
+                self.assertEqual(st["steps"]["stuck"]["status"],
+                                 "timed_out")
+            finally:
+                claim.unlink()
+            # with the claim released both directions are free again
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], ["stuck"])
+
+    def test_stale_claim_from_a_dead_process_is_broken(self):
+        """A claim left by a crashed merger must not wedge the run: the
+        next operation breaks it once and proceeds."""
+        with tempfile.TemporaryDirectory() as td:
+            proj, runs, rd, _m = self._parked_run(td)
+            f = conductor.merge_claim_flag(rd)
+            f.parent.mkdir(exist_ok=True)
+            f.write_text(json.dumps({"pid": self._dead_pid(),
+                                     "at": conductor.now_iso(),
+                                     "by": "merge"}), encoding="utf-8")
+            out = conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+            self.assertEqual(out["merged"], ["stuck"])
+            self.assertFalse(f.exists())
+
+    def test_second_merge_while_claimed_refuses(self):
+        """Cross-process 'busy': a held live claim is a 409 for a second
+        merge - _MERGE_BUSY only covers one process."""
+        with tempfile.TemporaryDirectory() as td:
+            proj, runs, rd, _m = self._parked_run(td)
+            claim = conductor._claim_run_merge(rd, "merge")
+            try:
+                with self.assertRaises(conductor.RequestError) as e:
+                    conductor.merge_run(rd.name, runs, shlex.split(MOCK))
+                self.assertEqual(e.exception.status, 409)
+                self.assertIn("merge", str(e.exception))
+            finally:
+                claim.unlink()
+
+    def test_resume_refused_while_driver_alive(self):
+        """The dashboard resume also must not start over a live driver -
+        the same race the merge claim covers from the other side."""
+        with tempfile.TemporaryDirectory() as td:
+            proj, runs, rd, m = self._parked_run(td)
+            drv = self._sleeper()
+            try:
+                self._set_state(rd,
+                                driver_pid=drv.pid,
+                                driver_started_at=conductor.now_iso())
+                with mock.patch.object(conductor, "_launch_process") \
+                        as launch:
+                    with self.assertRaises(conductor.RequestError) as e:
+                        conductor.resume_run(rd.name, runs, ["devin"])
+                    launch.assert_not_called()
+                self.assertEqual(e.exception.status, 409)
+            finally:
+                drv.terminate()
+                drv.wait()
+
+    def test_dashboard_marks_executing_runs(self):
+        """The button's gate is a server-computed payload field: a live
+        driver marks the row executing even with no 'running' steps."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "runs"
+            rd = runs / "20261016-000000-t"
+            rd.mkdir(parents=True)
+            drv = self._sleeper()
+            try:
+                (rd / "state.json").write_text(json.dumps({
+                    "run": "t",
+                    "driver_pid": drv.pid,
+                    "driver_started_at": conductor.now_iso(),
+                    "steps": {"a": {"status": "queued"}}}),
+                    encoding="utf-8")
+                with mock.patch.object(conductor, "refresh_prices"):
+                    d = conductor.collect_dashboard(runs, ["x"])
+                self.assertTrue(d["runs"][0]["executing"])
+                # driver gone -> the same payload no longer marks it
+                self._set_state(rd, driver_pid=self._dead_pid(),
+                                ended_at=conductor.now_iso())
+                with mock.patch.object(conductor, "refresh_prices"):
+                    d = conductor.collect_dashboard(runs, ["x"])
+                self.assertFalse(d["runs"][0]["executing"])
+            finally:
+                drv.terminate()
+                drv.wait()
+
+
 class StopControlTests(unittest.TestCase):
     """Dashboard stop controls: tempdir sentinels (never inside run_dir -
     trap 5) polled by wait_worker + the wave loop. Per-step stop, run stop,
