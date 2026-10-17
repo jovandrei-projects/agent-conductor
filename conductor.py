@@ -13351,8 +13351,13 @@ td :is(a,button):focus-visible { outline-offset:-2px; }
   background:#1c2128; border:1px solid #30363d; border-radius:8px;
   box-shadow:0 8px 24px rgba(0,0,0,.55); max-height:300px; }
 #detail .mpop.up { top:auto; bottom:100%; margin:0 0 4px; }
-#detail .mpop .mgrp { display:flex; flex-direction:column; min-height:0; }
-#detail .mpop .mgrp-all { flex:1; }
+/* the recs group is capped, never squeezed: flex-shrink would collapse
+   the group under max-height while its rows keep their size, smearing
+   them over the all-models list below (the 'dotted rows' glitch). The
+   inner .mall scrolls, same as the all-models group. */
+#detail .mpop .mgrp { display:flex; flex-direction:column; min-height:0;
+  flex:0 0 auto; max-height:160px; overflow:hidden; }
+#detail .mpop .mgrp-all { flex:1 1 auto; max-height:none; }
 #detail .mpop .mgrp + .mgrp { border-top:1px solid #30363d; margin-top:2px; }
 #detail .mpop .msec { color:#6e7681; font-size:10px; letter-spacing:.04em;
   text-transform:uppercase; padding:5px 8px 3px; flex:none; }
@@ -15675,9 +15680,10 @@ function mpopRender(inp){
   pop.innerHTML=
     (q?`<div class="mgrp" role="group" aria-label="Recommendations">` +
        `<div class="msec">Recommendations</div>` +
+       `<div class="mall">` +
        (recs.length?recs.map(m=>opt(m,'r')).join('')
         :`<div class="mnone">no matches - the full list is below</div>`) +
-       `</div>`:'') +
+       `</div></div>`:'') +
     `<div class="mgrp mgrp-all" role="group" aria-label="All models">` +
     `<div class="msec">${q?'All models':'Supported models'}</div>` +
     `<div class="mall">${all.map(m=>opt(m,'a')).join('')}</div></div>`;
