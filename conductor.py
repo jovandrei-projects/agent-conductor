@@ -2820,6 +2820,15 @@ def summarize_run_start(name: str, runs_dir: Path = RUNS_DIR,
     return {"summarizing": name, "pid": pid}
 
 
+_ST_CLASS = {
+    "done": "st-ok",
+    "failed": "st-bad", "timed_out": "st-bad", "lost": "st-bad",
+    "blocked": "st-bad",
+    "stopped": "st-warn", "partial": "st-warn", "queued": "st-warn",
+    "running": "st-run", "skipped": "st-other",
+}
+
+
 def _summary_body(md: str) -> str:
     """Inner markup of a generated summary report - the in-app summary
     modal embeds it via ``?frag=1`` while the standalone page wraps it in
@@ -2885,7 +2894,18 @@ def _summary_body(md: str) -> str:
             if not in_ul:
                 body.append("<ul>")
                 in_ul = True
-            body.append(f"<li>{inline(ln[2:])}</li>")
+            item = inline(ln[2:])
+            if ln.startswith("- **status:**"):
+                # the status token takes the same .stc color the task
+                # modal's status cell uses (only our fact-sheet bullets
+                # start this way - agent prose is unaffected)
+                item = re.sub(
+                    r"^<strong>status:</strong>\s*([a-z_]+)",
+                    lambda m: (f"<strong>status:</strong> "
+                               f'<span class="stc {_ST_CLASS.get(m.group(1), "st-other")}">'
+                               f"{m.group(1)}</span>"),
+                    item, count=1)
+            body.append(f"<li>{item}</li>")
         elif (m := re.match(r"^\d+\. ", ln)):
             close_ul()
             if not in_ol:
@@ -12172,7 +12192,10 @@ a { color:#58a6ff; text-decoration:none; }
 /* prev/next task bar - sticky like .topbar: top:0 plus margins that undo
    #detail's padding so it pins flush over the scroll gap. The right pad
    leaves room for the Close X which overlays the bar. */
-#detail .dnav { position:sticky; top:0; z-index:6; display:flex; align-items:center; gap:10px; margin:-18px -22px 12px; padding:7px 56px 7px 22px; background:#161b22; border-bottom:1px solid #30363d; border-radius:9px 9px 0 0; }
+/* margin-bottom buys real clearance: a sticky first-child with the
+   -18px top pull leaves the next line tucked ~6px under the bar's
+   bottom edge in Chrome, so the nominal gap must exceed that drift */
+#detail .dnav { position:sticky; top:0; z-index:6; display:flex; align-items:center; gap:10px; margin:-18px -22px 26px; padding:7px 56px 7px 22px; background:#161b22; border-bottom:1px solid #30363d; border-radius:9px 9px 0 0; }
 #detail .dnav-btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; min-width:38px; max-width:40%; background:#21262d; border:1px solid #30363d; color:#e6edf3; border-radius:6px; padding:4px 10px; font:inherit; font-size:12px; cursor:pointer; }
 #detail .dnav-btn.nav { min-width:130px; }
 #detail .dnav-btn span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -12184,6 +12207,16 @@ a { color:#58a6ff; text-decoration:none; }
 #detail .dnav-l { display:flex; align-items:center; gap:10px; flex:1; min-width:0; }
 #detail .dnav-r { display:flex; align-items:center; gap:6px; flex:1; justify-content:flex-end; min-width:0; }
 #detail .dnav-pos { position:absolute; left:50%; transform:translateX(-50%); color:#8b949e; font-size:12px; white-space:nowrap; }
+/* scroll-anchored repaints and focus jumps must land content below the
+   sticky bar, never tucked under it */
+#detail .dnav ~ * { scroll-margin-top:48px; }
+/* status color coding shared by the task modal's kv row and the
+   summary docs' **status:** bullets (_summary_body injects .stc too) */
+.stc.st-ok { color:#3fb950; font-weight:600; }
+.stc.st-bad { color:#f85149; font-weight:600; }
+.stc.st-warn { color:#d29922; font-weight:600; }
+.stc.st-run { color:#58a6ff; font-weight:600; }
+.stc.st-other { color:#8b949e; }
 /* the Back button sits in the same sticky .dnav bar as prev/next (or
    alone in a bar of its own on modals without pipeline nav) */
 #detail .dnav-back { flex:none; }
@@ -12850,6 +12883,10 @@ function restoreModalScroll(s){
 // draft maps already carry textarea CONTENT; this restores where the
 // caret/focus ring was - with preventScroll so it can't fight the
 // anchor restore above.
+// status word -> .stc color class (task modal + summary docs share it)
+const STCLASS = {done:'ok',failed:'bad',timed_out:'bad',lost:'bad',
+  blocked:'bad',stopped:'warn',partial:'warn',queued:'warn',
+  running:'run',skipped:'other'};
 const FOCUS_ATTRS = ['modalBack','nav','snav','summary','runSummary',
   'agentDetail','editPrompt','arcAll','arcNone','arcCopy','stopAgent',
   'intrOpen','intrSend','intrCancel','skipStep','unskipStep',
@@ -13167,6 +13204,13 @@ function modalBack(){
 // walk the same pipeSibs chain the task nav uses. The link keeps its href
 // + target=_blank so the /summary URL stays usable (copy link, middle or
 // ctrl-click opens the standalone page).
+// finished-step summaries are immutable - cache the fetched fragment so
+// prev/next walks and revisits render in one paint instead of the
+// loading-frame/fetch/reflash cycle that made the view flicker. Errors
+// are never cached (a retry is free), live steps always re-fetch, and
+// neighbors are prefetched after a successful open.
+const sumCache = {};
+const sumKeyOf = a => 's|'+base(a.run_dir||'')+'|'+a.step;
 async function openSummary(key, push=true){
   if (String(key).startsWith('run|'))
     return openRunSummary(key.slice(4), push);   // run-level summary view
@@ -13176,11 +13220,20 @@ async function openSummary(key, push=true){
   // summarizer has no per-step report of its own
   if (a.aux) return openRunSummary(a.run_key||a.run_dir, push);
   const snap = push ? snapshotModal() : null;
-  if (!(await closeDetail(false, true))) return;   // the stack is managed here
+  // already inside the summary view? sibling nav swaps the content in
+  // place - no close/open, so the backdrop never blinks
+  if (!summaryView && !(await closeDetail(false, true))) return;
   if (snap && !(snap.kind==='summary'&&snap.key===key)) pushHist(snap);
   summaryView={key};
   if (modalScroll==null) modalScroll=0;    // fresh open lands at the top;
                                          // a Back restore carries its own
+  const hit = a.run_dir && !a.alive && sumCache[sumKeyOf(a)];
+  if (hit){
+    renderSummaryFrame(a, hit.frag, hit.err);
+    document.getElementById('backdrop').hidden=false;
+    applySel();
+    return;
+  }
   renderSummaryFrame(a, null, null);       // loading frame, nav works already
   document.getElementById('backdrop').hidden=false;
   applySel();          // the summary view keeps the task's row marked
@@ -13197,7 +13250,25 @@ async function openSummary(key, push=true){
     }catch(e){ err='Summary unavailable: '+(e.message||e); }
   }
   if (!summaryView || summaryView.key!==key) return;  // moved on meanwhile
+  if (frag!=null && !a.alive) sumCache[sumKeyOf(a)]={frag};
   renderSummaryFrame(a, frag, err);
+  prefetchSibs(a);
+}
+// warm the cache one step to each side so the next arrow press is a
+// single paint even on a first visit
+function prefetchSibs(a){
+  const sibs=pipeSibs(a);
+  const pos=sibs.findIndex(x=>agentKey(x)===summaryView.key);
+  for (const b of [sibs[pos-1], sibs[pos+1]]){
+    if (!b || b.aux || !b.run_dir || b.alive) continue;
+    const ck=sumKeyOf(b);
+    if (sumCache[ck]) continue;
+    fetch('/api/runs/'+encodeURIComponent(base(b.run_dir))+
+      '/steps/'+encodeURIComponent(b.step)+'/summary?frag=1')
+      .then(r=>r.ok?r.text():null)
+      .then(t=>{ if (t!=null) sumCache[ck]={frag:t}; })
+      .catch(()=>{});
+  }
 }
 function renderSummaryFrame(a, frag, err){
   // same chrome as the task modal's .dnav, but the summary view's
@@ -13395,6 +13466,15 @@ function showDetail(i, keepStack){
   const pk = detailKey;
   const pd = promptDrafts[pk];   // unsaved edit (undefined = none open)
   const nd = notesDrafts[pk];
+  // status word colored like the table's chips; any suffix (e.g.
+  // ' - ended without the STATUS: line') stays default
+  const statusHTML = v => {
+    const s = String(v ?? '-'), m = s.match(/^[a-z_]+/);
+    if (!m) return esc(s);
+    const cls = STCLASS[m[0]] || 'other';
+    return `<span class="stc st-${cls}">${esc(m[0])}</span>` +
+           esc(s.slice(m[0].length));
+  };
   const kv = [['step',a.step],['run',a.run],['project',a.slug],
     ['status',a.status+(a.status==='failed'&&a.exit_code===0&&
       a.status_line==null?' - ended without the STATUS: line':'')],
@@ -13599,7 +13679,8 @@ function showDetail(i, keepStack){
       `with prev/next navigation">Summary</button>` : '') +
     `</h3><div class="kv">` +
     kv.map(([k,v])=>`<div class="k">${k}</div><div class="wrap">` +
-      (k==='task prompt' ? `<pre class="taskpre">${esc(v??'-')}</pre>`
+      (k==='status' ? statusHTML(v)
+        : k==='task prompt' ? `<pre class="taskpre">${esc(v??'-')}</pre>`
         : k==='run' && runKey_
         ? `<button type="button" class="linkbtn" ` +
           `data-run-details="${esc(runKey_)}">${esc(v??'-')}</button>`

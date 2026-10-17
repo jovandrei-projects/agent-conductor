@@ -9754,6 +9754,17 @@ prompt = "first"
         self.assertIn("<strong>bold</strong>", frag)
         self.assertIn("&lt;x&gt;", frag)
 
+    def test_status_bullet_gets_stc_color(self):
+        """The fact-sheet '- **status:**' bullet color-codes its token
+        like the task modal's status cell; prose 'status:' mentions are
+        untouched."""
+        frag = conductor._summary_body(
+            "- **status:** failed · **verify:** ok\n"
+            "- **started:** t\n\nstatus: quo in prose\n")
+        self.assertIn('<strong>status:</strong> '
+                      '<span class="stc st-bad">failed</span>', frag)
+        self.assertIn("status: quo in prose", frag)
+
     def test_task_fence_gets_taskpre_class(self):
         """A fence under '## Task' draws the fixed-size prompt box; any
         other fence stays a plain pre."""
