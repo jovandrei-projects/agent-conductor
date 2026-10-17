@@ -71,6 +71,7 @@ See `DESIGN.md` for full reasoning + sources. Headlines:
       (landed on master, merge e5b470d)
 - [x] integration-verification - combined merge of the three parked
       branches + full verification (below)
+      (landed on master, merge e6655ad)
 - [ ] follow-up-plan
 
 ## Where it stopped
