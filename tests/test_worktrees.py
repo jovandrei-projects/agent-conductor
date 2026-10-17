@@ -603,9 +603,13 @@ class TokenMetricTests(unittest.TestCase):
             runs = Path(td) / "runs"
             rd = runs / "20260101-000000-t"
             rd.mkdir(parents=True)
+            fmt = "%Y-%m-%dT%H:%M:%S"
+            now = time.time()
             (rd / "state.json").write_text(json.dumps({
-                "run": "t", "started_at": "2026-01-01T00:00:00",
-                "ended_at": "2026-01-01T00:10:00", "steps": {
+                "run": "t",
+                "started_at": time.strftime(fmt, time.gmtime(now - 600)),
+                "ended_at": time.strftime(fmt, time.gmtime(now - 60)),
+                "steps": {
                     "a": {"name": "a", "status": "done",
                           "tokens": {"prompt": 1000, "completion": 100,
                                      "cached": 800, "llm_steps": 3}},
