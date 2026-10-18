@@ -924,6 +924,23 @@ loopback):
 
 ## Where it stopped
 
+**Interactive UI pass (2026-10-17 ~20:0x, outside the conductor run):**
+view-keyed conversations + two-line header landed - `aiView()` gained
+`pool`/`trash`, `openPool()` fires `applySel()`, launchers now call
+`askAbout()` (open-only, retargets to the view's newest conv or a
+fresh pinned chat), `S.ctxPin` + `ac-ai-pins` back the editable "about"
+select (locks on first user message), header line 1 is the plain-text
+title + `+`/history/size/minimize, line 2 carries model/ro/about/usage.
+`_v_pool`/`_v_trash` providers + tests green (69 file-scope tests; full
+run_tests.py green except 3 transient WinError-32 tempdir-lock flakes
+that pass standalone). Swept into conductor checkpoint `dcf33c1`.
+NOTE: the assistant-fast-transport driver's merge of
+`runtime-and-settings` was left CONFLICTED when driver pid 32068 died -
+the stale merge was aborted (`resolve-runtime-and-settings` still shows
+`running` in state.json with pid None; a `sweep`/`--resume` re-marks it
+'lost' and can re-finalize the `conductor/.../runtime-and-settings`
+branch).
+
 `provider-adapter` (step 2 of the assistant-fast-transport run) is
 done: `assistant/providers/devin_acp.py` implements the TRANSPORT.md
 contract end-to-end - pooled `devin acp` per provider session, ask-mode
