@@ -1369,3 +1369,17 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   input, valid/invalid output, persisted failure fallback, cache hits,
   range-key changes, concurrent coalescing, history id stability,
   serve wiring); 96/96 tour tests green.
+
+- DONE 2026-10-17 (resolve-tour-validation, merge resolution): unioned
+  `conductor/20261017-145726-dashboard-whats-new/tour-validation` onto
+  master (merge 08d4c89) - the dashboard-whats-new run's closing
+  validation step (8-test real-HTTP e2e suite, 3 in-feature defect
+  fixes, 114/114 tour tests + 907-test full suite green per its
+  STATE.md). Two conflicts: QUEUE.md kept HEAD's newer row-14 text
+  (fast-transport ALL LANDED) AND the branch's row-15 update
+  (task 15 -> done). conductor.py's topbar kept HEAD's
+  poolbox-as-modal-button markup - the cap stepper lives inside the
+  pool modal now, so the branch's inline pool-dec/pool-inc span would
+  have been dead (no poolBump handler survives the merge) - PLUS the
+  branch's #tour-btn 'What's new' button, which the cleanly-merged
+  tour CSS/JS (.tbadge, openTour/tourAct) wires up.
