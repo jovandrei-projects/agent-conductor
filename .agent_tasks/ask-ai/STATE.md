@@ -118,13 +118,79 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
       answer, cancel->stopReason cancelled, cross-process
       session/load with history, session/list + `devin list` parity,
       per-turn usage fields, supportsImages flags.
-- [ ] provider-adapter - implement `assistant/providers/devin_acp.py`
-      per TRANSPORT.md's exact contract (injected seams, raw_metrics
-      cumulative bridge, llm_steps unreported, warm-pool lifecycle)
+- [x] provider-adapter - `assistant/providers/devin_acp.py` shipped:
+      pooled `devin acp` child per provider session (warm turns skip
+      CLI init entirely - ~4s warm probe vs ~15-30s cold -p spawn),
+      session/new|load with isLocked skip + stale-sid -> new fallback,
+      mode=ask + model-uid-only-when-different config, streamed
+      agent_message_chunk text (delta or snapshot), replayed history
+      drained + deduped by _meta timestamp, cumulative usage map from
+      responseDimensions-or-per-turn-usage (total_steps deliberately
+      absent), cachedWrite -> total_cached_write_tokens extra, uid as
+      model_label, session/cancel -> grace -> kill escalation, orphan
+      reap + prompt re-issue on attach, idle reap at 30min,
+      ProviderUnavailable/AuthUnavailable contract exceptions for CLI
+      fallback; tests/fake_devin_chat.py gained a real `acp` ndjson
+      subcommand + lockfile isLocked; 25 tests in
+      tests/test_assistant_acp.py (dispatch, warm reuse, partial
+      text, snapshot chunks, cum fallback, cancel paths, crash +
+      respawn, adopt re-issue, lock skip, auth/spawn/hang failures,
+      e2e runtime). See 'Implemented contracts (devin-acp)' below.
 - [ ] runtime-and-settings - per-conversation transport field,
       fallback recording, read-only routing, back-compat
 - [ ] chat-ui-and-verification - settings control + transport
       indicator, end-to-end verify
+
+## Implemented contracts (devin-acp)
+
+- `assistant/providers/devin_acp.py` `DevinAcpProvider(argv, env=,
+  spawn=, spawn_kwargs=, kill=, kill_pid=, alive=, run_list=, clock=,
+  sleep=, workspace=, idle_ttl=, cancel_grace=, handshake_s=,
+  session_s=, config_s=, adopt_drain_s=)` - all host seams injected;
+  the module never imports conductor.
+- Pool: `sid -> _WarmSession` (conn, cumulative counters, live turn,
+  replay buffer). One `devin acp` process per provider session;
+  `send()` = `session/prompt` on the warm session.
+- Handshake: `initialize{protocolVersion:1, fs.read=false,
+  fs.write=false, terminal=false}` + `initialized`; session/open =
+  `session/load` (sid given, skipped when `devin list` reports
+  `isLocked`) else `session/new`; then `set_config_option mode=ask`
+  every attach and `model=<uid>` only when it differs from the
+  session's own. `session/load` replays history: a bounded
+  `adopt_drain_s` sleep collects it into `ws.replay`, and the live
+  turn inherits replayed chunk sigs so stragglers cannot masquerade
+  as streamed text.
+- Text: `res.text` = concatenated `agent_message_chunk` (delta OR
+  cumulative snapshot, both handled); `agent_thought_chunk` tail is
+  the progressive fallback until message chunks land; `done` fires on
+  the prompt's JSON-RPC response, conn close, or proc exit.
+- Usage: `raw_metrics` = cumulative ATIF-keyed map - server-side
+  `responseDimensions` CumulativeMetrics win when present (absolute,
+  restart-safe), else per-turn `usage{inputTokens, outputTokens,
+  cachedReadTokens, cachedWriteTokens}` accumulates. `total_steps`
+  stays ABSENT (ACP reports no step count - NULL, not fabricated).
+  `model_label` = the session's model config `currentValue` (the uid).
+  `res.request_id` = `_meta.cognition.ai/userMessageId`.
+  `handle.export_path` is None - there is no ATIF export on ACP.
+- cancel(handle): `session/cancel` notification, `cancel_grace`
+  window for the turn to resolve, then process kill + pool drop
+  (wedged-case; the session itself persists for the next load).
+- attach(exchange)/alive_pid(pid): a live recorded pid is our orphan
+  -> `kill_pid` reaps it, `session/load` re-attaches, the exchange's
+  prompt is re-issued once (mid-turn replay does not exist); a dead
+  pid goes straight to load+re-issue. `sessions()` = `devin list`,
+  None on failure (never "gone").
+- Failures: `ProviderUnavailable` on spawn/handshake/session-open,
+  `AuthUnavailable` on credential-shaped errors (stderr + JSON-RPC
+  `_AUTH_FAIL_RE` match) - the runtime's `devin -p` fallback signal.
+- Idle reaper thread: pooled conns idle > `idle_ttl` (1800s) or closed
+  are killed and dropped; sessions persist in the store so the next
+  send() re-loads. `close()` kills all pooled children (serve
+  shutdown path).
+- `send(..., attachments=[{path,mime_type}])` optional: image/*
+  payloads within caps (10MB, 5/prompt) ride as native
+  `{type:"image"}` blocks alongside the prompt text; non-image or
+  oversized payloads keep the existing path-line fallback only.
 
 ## Implemented contracts (persistent-chat-core)
 
@@ -851,9 +917,25 @@ loopback):
   verified vision capability on the provider itself; an end-to-end
   attachment-on-send exchange was not re-spent this step.
 - ACP `session/new` remains blocked (devin 3000.6.2 session-db
-  migration) - `-p -r` is the shipped transport.
+  migration) - `-p -r` is the shipped transport. **Superseded
+  2026-10-17** - the migration error proved non-fatal on re-probe;
+  `devin_acp.py` is the shipped warm transport (see 'Fast
+  transport').
 
 ## Where it stopped
+
+`provider-adapter` (step 2 of the assistant-fast-transport run) is
+done: `assistant/providers/devin_acp.py` implements the TRANSPORT.md
+contract end-to-end - pooled `devin acp` per provider session, ask-mode
+read-only gate, streamed partial text, cumulative usage bridge with
+llm_steps honestly absent, cancel->kill escalation, orphan reap +
+prompt re-issue on adopt, isLocked skip, idle reap, and
+ProviderUnavailable/AuthUnavailable fallback signalling. The fake
+binary gained a real `acp` ndjson subcommand (locks, replay, config
+echo, cumulative dims) and 25 focused tests cover dispatch through
+e2e runtime. Next per the manifest: `runtime-and-settings` wires the
+per-conversation transport field + `devin -p` fallback, then
+`chat-ui-and-verification`. Earlier phase summary kept below.
 
 `usage-and-price-visibility` is implemented and tested (18 new tests):
 every terminal exchange carries provider-reported token deltas,
