@@ -1,6 +1,6 @@
 # Task: dashboard-whats-new
 
-**Status:** in progress
+**Status:** done
 **Started:** 2026-10-17   **Last touched:** 2026-10-17
 
 ## Objective
@@ -59,7 +59,7 @@ UI - those are the later manifest steps.
   overlay, tourSt state, 9 tests in tests/test_tour_dash.py)
 - [x] tour-llm-polish - optional cached LLM enrichment (off by default;
   tour_polish.py + 24 tests, conductor wiring, build_feed polish= hook)
-- [ ] tour-validation - end-to-end verify
+- [x] tour-validation - end-to-end verify (see "Where it stopped")
 
 ## tour_feeds contract (for tour-api)
 
@@ -186,6 +186,55 @@ tests/test_tour_dash.py (9 node-harness tests). tour-llm-polish
 landed: tour_polish.py + polish= feed hook + conductor wiring +
 tests/test_tour_polish.py (24 tests; its full-suite failures were
 shared-box flakes per its STATE note).
+
+End-to-end verification (tests/test_tour_e2e.py, 8 tests over real
+HTTP + fixture repo): full lifecycle green - discovery of git + record
+changes, curated text preferred in place, run card absorbing its merge
+chain, open/dismiss read-only, per-card viewed, snooze/unview, restart
+persistence, watermark blocked by the unread guard, a commit arriving
+mid-acknowledgment surfacing as a renamed NEW card that must be acked
+before the watermark moves, viewed history reopenable after advance,
+~60s cache, immediate mutation/count consistency, /api/state + page
+paint independent of feed build time, enrichment range-keyed caching,
+persisted-failure fallback, and default no-LLM operation.
+
+Stale-base + flake repairs surfaced by the verify gate (commits
+7a8743c, a48b08d):
+- `tail_status` on this branch's base (b0c0d4f) had no None guard;
+  master's ask-ai batch added one after the run was cut. Running steps
+  with no recorded stdout_log crashed collect_dashboard (6 tests).
+  Backported master's identical guard - the eventual merge is a no-op.
+- Tempdir-teardown flakes on the shared box: collect_dashboard's
+  session-listing daemon spawns a real `devin list` child on each
+  record's work_dir that can outlive the collect and collide with
+  TemporaryDirectory cleanup (patched live_sessions_by_dir in the four
+  run_manifest+bare-collect tests, the file's own convention), and the
+  detached summarize child's inherited launch.log handle can lag its
+  summary file (test now waits for _DETACHED_PROCS to drain, bounded).
+
+Three real defects found + fixed (commits 568a9c7, ef47273):
+- Stale-write race: a daemon feed build could overwrite the
+  post-mutation cache with pre-mutation data. tour_ctx now carries a
+  'gen' mutation epoch; _tour_build stores only when its captured epoch
+  is still current; transitions bump it with the cache drop.
+- Curated fold-in lost under polish: augments keyed by stop name were
+  orphaned when a polished card claimed the commits under another stop.
+  aug_shas tracks each fold-in's matched commits; the polished path
+  folds the augment into whichever card claimed them; aug_used is
+  tracked per augment key so a leftover deterministic card can't
+  re-fold it.
+- Mark-404 dead card: a feed pulled before a commit landed can hold a
+  card id that was renamed by re-grouping; POST 404 'unknown tour
+  entry' is permanent, so tourMark resyncs the deck via tourLoad and
+  keeps the notice (test_tour_dash.py gained
+  test_mark_unknown_entry_resyncs_the_deck -> 10 JS tests now).
+
+All 114 tour tests pass (26 state + 28 feeds + 18 api + 10 dash +
+24 polish + 8 e2e). `python run_tests.py --jobs 8` full suite:
+**green** - 8/8 shards, 907 tests (after three earlier runs exposed the
+failures above; the only residual flakes were a recycled-pid liveness
+collision and pre-deflake tempdir-handle races, all now hardened or
+confirmed passing standalone).
 
 ## Verification
 
