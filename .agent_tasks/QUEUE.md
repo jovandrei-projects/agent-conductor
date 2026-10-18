@@ -1,4 +1,4 @@
-# Task queue
+﻿# Task queue
 
 The master ordered list. One line per task. This answers "what next"; the
 task's own `STATE.md` answers "where in it".
@@ -15,7 +15,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 2 | Pre-live hygiene: liveness probe, lost/sweep, sessions cleanup, cloud marks | done | hygiene/ | os.kill probe bug found + fixed (was killing live workers) |
 | 3 | Dashboard favicon: baton-over-orchestra glyph | done | favicon/ | second dispatch; first was eaten by trap-10 commit swallow |
 | 4 | Worktree merge matrix: exhaustive tests + merge_resolver + lab fixtures | done | wt-matrix/ | landed on dev/merge-tests (commits 5ba30c4, 7f7dcd9); live lab run 21/21, 8 real conflicts resolved |
-| 5 | Dashboard request drafts + proposal review/start, run filters/token help, silent Windows probes | done | — | 98/98 mock tests + demo green; live planner not dispatched |
+| 5 | Dashboard request drafts + proposal review/start, run filters/token help, silent Windows probes | done | â€” | 98/98 mock tests + demo green; live planner not dispatched |
 | 6 | Task prompt editing: pre-dispatch Edit prompt, resume notes for ran steps, full prompt text in modal | done | task-prompt-editing/ | 172/172 mock tests + demo green; prompt-/rnote- sentinels survive resume |
 | 7 | Planner 'ask me questions' checkbox: questionnaire modal before manifest, answers feed a refine pass | done | planner-questions/ | 193/193 mock tests + demo green; live planner not dispatched |
 | 8 | Stop proposal during preparation: stopgen sentinel + _GEN_PROCS kill + per-attempt gen_id scoping, restores draft/ready | done | stop-proposal-preparation/ | 216/216 mock tests + demo + real-proc smoke green |
@@ -25,7 +25,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 12 | Run/task review UX: ack state + outcome summaries + nav/timing/merge-guard pass | in progress | run-review-ux/ | manifest run 20261016-100852-run-review-ux; design in run-review-ux/DESIGN.md; all impl steps merged incl. integration-verification (merge e6655ad), 1 step left (follow-up-plan) |
 | 13 | Project-aware merge targets: merge_target key + conductor merge worktree + persisted target + dashboard branch selector | done | project-merge-targets/ | 247/247 mock tests + demo green; wave step of run 20261016-013719-workflow-ux-safety; landed on master via merge 6a40935 |
 | 14 | Ask AI assistant: persistent contextual chat on dashboard + every modal, history db, view-context, citations, images, dictation, model settings, read-only gate, controlled actions, usage/cost | in progress | ask-ai/ | manifest run 20261017-051357-dashboard-ask-ai; research+design done (ask-ai/DESIGN.md): devin -p -r transport + gpt-6-luna-low-priority + vision + permission gate all live-verified; ACP session/new blocked on devin 3000.6.2 session-db migration; persistent-chat-core + view-context-and-retrieval + assistant-runtime done (assistant/ pkg + sqlite store; ConductorContext + ConductorRetrieval + static preamble; devin_print provider + AssistantRuntime dispatcher + tool loop + reconcile; modelpick catalog validation; /api/assistant/* registered in serve; live -p/-r smoke verified on gpt-6-luna-low-priority; persistent-chat-interface done (assistant/static chat.js+md.js+chat.css, #dask shell launcher, aiView/aiNav bridge, /api/assistant/static/*, 16 UI tests + :8806 smoke); images-and-dictation done (id-gated /api/assistant/attachments raw POST + row-id GET, composer paste/pick/preview/remove/bind, SpeechRecognition mic with unavailable/permission states + teardown; 24 UI + 134 assistant tests + 667-test quick suite green, headless-Chromium :8806 probe). guarded-dashboard-actions done (ConductorActions adapter over the same conductor.py functions: 28-kind whitelist, propose-time validation, launch-tier second-confirm acks, readonly re-check at execute, rejected proposals audited as failed rows, action cards + armed confirm in chat.js; 37 new tests, schema v4 actions.explain; 170 assistant + 702-test suite green). usage-and-price-visibility done (dispatch-time rate snapshots + priced fail/cancel paths, extra total_* counter passthrough into usage_extra, by-model rollup + unpriced honesty in GET .../usage, expandable per-exchange <details> usage breakdown + header conversation panel + settings price provenance in chat.js; 18 new tests, 130 assistant tests green). integration-and-design-review done (fetch-by-key re-resolution + nav/label synthesis, kinds/status filters, batch seq, fast-without-effort resolve, bounded pow, raced-terminal/attachment/ack fixes, conv-scoped actions + attachments, usage-details repaint, settings focus/outage, z-order, in-text nav links; 734-test suite green minus 1 transient file-lock, 46-browser-check probe, 2 live exchanges ~$0.034 verified incl. --noEmit + apartment-3d camera answers with working citations). fast-transport run 20261017-164321-assistant-fast-transport (parallel, 4 steps) ALL LANDED: transport-investigation done - warm ACP pool chosen over direct HTTP + api.devin.ai (assistant/TRANSPORT.md; ACP verified live on 3000.6.2, earlier session-db block was non-fatal); provider-adapter done (assistant/providers/devin_acp.py pooled devin-acp adapter + tests/fake_devin_chat.py acp ndjson fake + 25 tests in tests/test_assistant_acp.py green); runtime-and-settings done (per-conversation transport + fallback {from,to,reason} + read-only routing; landed merge 4a08d9c); chat-ui-and-verification done (feature-detected Transport select cli/fast + per-reply .aim-tp chip + fallback display + progressive repaint reuse; 6 ChatTransportTests; wire contract in DESIGN.md s12). Next: follow-up-plan |
-| 15 | Dashboard What's new tour: persistent state + feeds + API + walkthrough UI + optional LLM polish | in progress | dashboard-whats-new/ | manifest run 20261017-145726-dashboard-whats-new; tour-state done (tour_state.py + 26 tests; parked branch merged into tour-feeds), tour-feeds done (tour_feeds.py + 28 tests), tour-api done (conductor.py routes + 18 tests), tour-dashboard next |
+| 15 | Dashboard What's new tour: persistent state + feeds + API + walkthrough UI + optional LLM polish | done | dashboard-whats-new/ | manifest run 20261017-145726-dashboard-whats-new; all 6 steps done incl. tour-validation: both parked branches merged, 8-test real-HTTP e2e suite, 3 in-feature defects found+fixed (stale-build epoch guard on tour_ctx gen, curated fold-in surviving polish regrouping via aug_shas, mark-404 deck resync in tourMark), tail_status stale-base guard backported from master, 2 tempdir-teardown flake classes hardened; 114/114 tour tests + full suite 907 green (8/8 shards) |
 
 ## Not yet filed as tasks
 
@@ -468,7 +468,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   recycled seq would let an old ack cover new work). Endpoints: POST
   /api/runs/<d>/review and .../steps/<s>/review. Dashboard: cyan
   `.stage.unreviewed` pill + left row inset + bolded task name +
-  `· unreviewed` aria suffix (text is the carrier, not color), 'review'
+  `Â· unreviewed` aria suffix (text is the carrier, not color), 'review'
   kv row + Mark-as-reviewed/needing-review buttons in both modals and
   both context menus. A failed outcome keeps its red status + the flag
   - unreviewed never reads as success. Run-level mismatch is gated on
@@ -534,7 +534,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   `?raw=1` markdown and the standalone page are unchanged, so direct URLs
   stay usable). The in-modal view gets the same `.dnav` chrome as the task
   nav - sibling-named arrows + `task N of M`, disabled at the pipeline
-  ends, ArrowLeft/Right shared - and an 'Open as page ↗' escape hatch.
+  ends, ArrowLeft/Right shared - and an 'Open as page â†—' escape hatch.
   New `modalHist` Back stack: task -> request/runbook and request -> run
   details push the view they leave ({kind,key|id,scroll}); Back restores
   the exact task/request/run incl. scroll offset, skipping entries whose
@@ -826,9 +826,9 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   record (confirm + live/resume/merge guards); spawned devin sessions
   become trap-13-style manual cleanup. 182/182 mock tests + demo green.
 - DONE 2026-10-15 (steps-counters-clarity): run/agent token counters
-  name themselves - `fmtT` renders `in X Â· out Y Â· cached Z Â· N turns`
+  name themselves - `fmtT` renders `in X Ã‚Â· out Y Ã‚Â· cached Z Ã‚Â· N turns`
   (cached always shown; turns = LLM steps, not manifest steps) instead
-  of `X/Y+Zc Â·Nst`; run rows read `planner:`/`steps:`; `steps` column
+  of `X/Y+Zc Ã‚Â·Nst`; run rows read `planner:`/`steps:`; `steps` column
   header + tooltips + the `?` explainer use the same words.
 - DONE 2026-10-15 (run-control-taxonomy): one name per lifecycle
   action. `Pause run` is now the graceful hold (in-flight steps finish,
@@ -1338,3 +1338,34 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   lightweight/async /api/state); 72/72 tour tests green, full
   --jobs 8 suite green modulo one unrelated StopControl timing flake
   that passes in isolation.
+
+- DONE 2026-10-17 (tour-llm-polish, wave step of run
+  20261017-145726-dashboard-whats-new): strictly optional LLM enrichment,
+  off unless `CONDUCTOR_TOUR_POLISH` is set. New stdlib-only
+  tour_polish.py: `Polisher` owns data/tour-cache.json
+  ({version, ranges: {"<base.commit>..<tip.commit>": {status:
+  ok|fallback, cards, error, model, at}}}) with atomic tmp+os.replace
+  writes and a 40-range cap; one `devin -p` call per uncached range
+  (summarizer-style spawn, `--permission-mode auto`, tempdir cwd, model
+  constant `gpt-6-luna-low-priority`, bounds: ~30 commits / 32k chars in,
+  16k chars / 24 cards out, 120s duration). Returned cards validate
+  against what the model was shown: known stops only, commit refs must
+  uniquely prefix-match window shas, URLs drop a card, runs/requests
+  re-filtered against the window's real records at apply time - no
+  invented commits or record links, curated blurbs still win, card ids
+  stay `area:<stop>:<newest-sha12>` so persisted descriptors re-resolve.
+  tour_feeds.build_feed/`_collect_window` gained a `polish=(rng)->cards`
+  hook applied per window (incl. history re-materialization): polished
+  cards replace deterministic area grouping for claimed commits (marked
+  `"polished": True`), leftovers group deterministically. conductor.py:
+  `tour_ctx` records `devin_argv`, `_tour_polisher(ctx)` builds one
+  per-serve Polisher, `_tour_build` applies `cards_for` and kicks a
+  coalesced background `kick(on_done=feed invalidation)` only when
+  enabled+uncached; `/api/tour` payload gains `enrichment:
+  {enabled, status}`. Disabled/absent-provider/timeout/malformed paths
+  all persist or serve deterministic cards; generation never runs inline
+  so painting and the badge poll stay cheap. 24 new tests in
+  tests/test_tour_polish.py (disabled/unavailable provider, bounded
+  input, valid/invalid output, persisted failure fallback, cache hits,
+  range-key changes, concurrent coalescing, history id stability,
+  serve wiring); 96/96 tour tests green.

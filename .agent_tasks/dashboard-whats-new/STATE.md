@@ -1,6 +1,6 @@
 # Task: dashboard-whats-new
 
-**Status:** in progress
+**Status:** done
 **Started:** 2026-10-17   **Last touched:** 2026-10-17
 
 ## Objective
@@ -54,11 +54,12 @@ UI - those are the later manifest steps.
   tiny unseen count in /api/state (conductor.py tour_ctx block before
   collect_dashboard + routes in make_dashboard_handler; 18 tests in
   tests/test_tour_api.py)
-- [ ] tour-dashboard - vanilla-JS walkthrough in _DASH_HTML. The
-  What's-new button MUST use id `tour-btn` - TOUR_STOPS["tour"] selects
-  `#tour-btn, #power-btn` (degrades to the power button until it exists).
-- [ ] tour-llm-polish - optional cached LLM enrichment (off by default)
-- [ ] tour-validation - end-to-end verify
+- [x] tour-dashboard - vanilla-JS walkthrough in _DASH_HTML (#tour-btn +
+  #tour-badge in the topbar, #tourwrap/#tourring/#tourcard spotlight
+  overlay, tourSt state, 9 tests in tests/test_tour_dash.py)
+- [x] tour-llm-polish - optional cached LLM enrichment (off by default;
+  tour_polish.py + 24 tests, conductor wiring, build_feed polish= hook)
+- [x] tour-validation - end-to-end verify (see "Where it stopped")
 
 ## tour_feeds contract (for tour-api)
 
@@ -112,15 +113,128 @@ kwarg and exposes the ctx as `Handler.tour_ctx`).
 - GET paths are read-only end to end (`tour_state.load` never writes);
   the state file appears only on the first mutation.
 
+## tour dashboard UI surface (for tour-validation)
+
+All client state is `tourSt` (null = closed). `#tour-btn` lives in the
+topbar beside `#power-btn`; `#tour-badge` inside it is the unread pill,
+painted ONLY from `d.tour_unseen` in `render()` (before the sig early-
+return so sig-identical polls still refresh it) - null keeps it hidden,
+no GET /api/tour is ever issued for the badge. POST responses repaint it
+via `tourBadge(r.unseen_count)`.
+
+- `#tourwrap` (z60, between modal z50/51 and dialogs z70) is the one
+  overlay; `#tourring`'s `box-shadow: 0 0 0 9999px` IS the page dim and
+  its transparent center pops the anchor through (unanchored cards get
+  `#tourwrap.dim` + centered card). `#tourcard` carries `Update i of N`,
+  escaped title/blurb/commits/related chips, Prev/Next + Skip +
+  Mark viewed, and a `<details class="tourhist">` viewed section fed by
+  `feed.history` (reopens entries behind the watermark, `unview` pulls
+  one back into the deck and re-GETs the feed).
+- Related chips reuse `data-run-details`/`data-open-request`, so the
+  normal click dispatch opens the existing modals; `applySel` toggles
+  `#tourwrap.suspended` whenever `#backdrop` is visible, so a modal owns
+  the screen and closing it resumes the same card.
+- Skip/Escape/backdrop-click all land in `tourClose()` - no POST ever;
+  Escape order is askwrap -> powerwrap -> backdrop(modal) -> tour.
+  Mark viewed POSTs first, only advances + repaints the badge on
+  success, stays put with a retryable error on failure.
+- scroll(capture)/resize listeners bind on open and unbind on close;
+  reduced-motion disables the ring pulse and scrolls 'auto'.
+
+## tour_polish contract (for tour-validation)
+
+- Module `tour_polish.py` (stdlib-only, no conductor import). Off unless
+  `CONDUCTOR_TOUR_POLISH` env is truthy; model = `MODEL` constant
+  (`gpt-6-luna-low-priority`, env `CONDUCTOR_TOUR_POLISH_MODEL`), bounds:
+  `MAX_COMMITS` 30, `PROMPT_MAX_CHARS` 32k, `MAX_CARDS` 24,
+  `REPLY_MAX_CHARS` 16k, `TIMEOUT_S` 120 (`CONDUCTOR_TOUR_POLISH_TIMEOUT_S`).
+- Provider = `devin -p` print session (same spawn pattern as the run
+  summarizer, `--permission-mode auto`, tempdir cwd); credentials stay in
+  the devin CLI's credentials.toml. Tests inject `provider=(prompt)->str`.
+- `Polisher(cache_path, repo_dir, devin_argv=, provider=, enabled=, ...)`:
+  `range_key(rng)` = `"<base.commit>..<tip.commit>"` (at-bounds excluded -
+  model input is commits only); `attempt(rng)` synchronous coalesced
+  generate+persist; `kick(rng, on_done=)` async; `cards_for(rng)` ->
+  validated card list | None (fallback/miss => None); `record(rng)`,
+  `generating(rng)`. Cache `data/tour-cache.json` = `{version, ranges:
+  {key: {status: ok|fallback, cards, error, model, at}}}`, atomic
+  tmp+os.replace, 40-range cap.
+- Feed integration: `build_feed(..., polish=callable)` ->
+  `_collect_window(polish=)`; polished cards REPLACE the deterministic
+  area grouping for claimed commits, keep `area:<stop>:<newest12>` ids,
+  get `"polished": True`; curated fold-ins still override generated text;
+  runs/requests re-filtered against the window's real records; leftovers
+  group deterministically. History re-materialization consults the same
+  cache keyed by the descriptor's stored range.
+- conductor: `tour_ctx(..., devin_argv=)` gains `"devin_argv"`;
+  `_tour_polisher(ctx)` builds one Polisher per serve (None when module
+  absent); `_tour_build` applies `cards_for` + kicks `kick(on_done=
+  invalidate feed)` only when enabled+uncached; payload gains
+  `enrichment: {enabled, status: ok|fallback|generating|pending}`.
+- Everything degrades to deterministic commit-subject cards: disabled,
+  no provider, timeout, malformed/invalid reply, or a persisted fallback
+  record. GET paths never generate inline and never write tour state.
+
 ## Where it stopped
 
-tour-api landed: conductor.py `tour_ctx`/`_tour_build`/`tour_feed`/
-`tour_unseen`/`tour_transition` + routes, tests/test_tour_api.py (18
-tests; 72/72 tour tests green; full --jobs 8 suite: 1 unrelated
-StopControl flake, green in isolation). Next: tour-dashboard - the
-vanilla-JS walkthrough in _DASH_HTML. The What's-new button MUST use
-id `tour-btn` (TOUR_STOPS['tour'] falls back to #power-btn); badge
-reads `tour_unseen` from /api/state, never GET /api/tour for it.
+tour-validation picked up the two parked sibling branches: merged
+conductor/.../tour-dashboard (2 _DASH_HTML conflicts: .notice selector
+set + topbar button row, both kept) and conductor/.../tour-llm-polish
+(docs-only conflicts) into this branch so the assembled feature can be
+verified end to end. tour-dashboard landed: _DASH_HTML walkthrough +
+tests/test_tour_dash.py (9 node-harness tests). tour-llm-polish
+landed: tour_polish.py + polish= feed hook + conductor wiring +
+tests/test_tour_polish.py (24 tests; its full-suite failures were
+shared-box flakes per its STATE note).
+
+End-to-end verification (tests/test_tour_e2e.py, 8 tests over real
+HTTP + fixture repo): full lifecycle green - discovery of git + record
+changes, curated text preferred in place, run card absorbing its merge
+chain, open/dismiss read-only, per-card viewed, snooze/unview, restart
+persistence, watermark blocked by the unread guard, a commit arriving
+mid-acknowledgment surfacing as a renamed NEW card that must be acked
+before the watermark moves, viewed history reopenable after advance,
+~60s cache, immediate mutation/count consistency, /api/state + page
+paint independent of feed build time, enrichment range-keyed caching,
+persisted-failure fallback, and default no-LLM operation.
+
+Stale-base + flake repairs surfaced by the verify gate (commits
+7a8743c, a48b08d):
+- `tail_status` on this branch's base (b0c0d4f) had no None guard;
+  master's ask-ai batch added one after the run was cut. Running steps
+  with no recorded stdout_log crashed collect_dashboard (6 tests).
+  Backported master's identical guard - the eventual merge is a no-op.
+- Tempdir-teardown flakes on the shared box: collect_dashboard's
+  session-listing daemon spawns a real `devin list` child on each
+  record's work_dir that can outlive the collect and collide with
+  TemporaryDirectory cleanup (patched live_sessions_by_dir in the four
+  run_manifest+bare-collect tests, the file's own convention), and the
+  detached summarize child's inherited launch.log handle can lag its
+  summary file (test now waits for _DETACHED_PROCS to drain, bounded).
+
+Three real defects found + fixed (commits 568a9c7, ef47273):
+- Stale-write race: a daemon feed build could overwrite the
+  post-mutation cache with pre-mutation data. tour_ctx now carries a
+  'gen' mutation epoch; _tour_build stores only when its captured epoch
+  is still current; transitions bump it with the cache drop.
+- Curated fold-in lost under polish: augments keyed by stop name were
+  orphaned when a polished card claimed the commits under another stop.
+  aug_shas tracks each fold-in's matched commits; the polished path
+  folds the augment into whichever card claimed them; aug_used is
+  tracked per augment key so a leftover deterministic card can't
+  re-fold it.
+- Mark-404 dead card: a feed pulled before a commit landed can hold a
+  card id that was renamed by re-grouping; POST 404 'unknown tour
+  entry' is permanent, so tourMark resyncs the deck via tourLoad and
+  keeps the notice (test_tour_dash.py gained
+  test_mark_unknown_entry_resyncs_the_deck -> 10 JS tests now).
+
+All 114 tour tests pass (26 state + 28 feeds + 18 api + 10 dash +
+24 polish + 8 e2e). `python run_tests.py --jobs 8` full suite:
+**green** - 8/8 shards, 907 tests (after three earlier runs exposed the
+failures above; the only residual flakes were a recycled-pid liveness
+collision and pre-deflake tempdir-handle races, all now hardened or
+confirmed passing standalone).
 
 ## Verification
 
