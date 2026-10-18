@@ -35,7 +35,10 @@ dispatcher, catalog-backed settings validation, and the seeded product
 default (gpt-6-luna, low thinking, fast).
 """
 import functools
+import importlib
+import inspect
 import os
+import pkgutil
 import shlex
 from pathlib import Path
 
@@ -153,18 +156,119 @@ def _seed_defaults(core: AssistantCore) -> None:
         core.store.set_setting(f"default.{k}", v)
 
 
+def _fast_provider(argv: list, *, workspace: Path, spool: Path,
+                   data_dir: Path):
+    """Best-effort construction of the 'fast' transport adapter.
+
+    The adapter module ships from the provider-adapter step; its module
+    name is discovered, not hardcoded - any ``assistant.providers``
+    module besides ``devin_print`` whose registered factory, module-level
+    ``build()``/``create()`` function, or concrete ProviderAdapter
+    subclass can be constructed from the offered seams becomes the fast
+    lane. Every failure degrades to None: the runtime then routes
+    'fast' conversations onto the CLI transport with the reroute
+    recorded on the exchange row.
+    """
+    try:
+        import assistant.providers as pkg
+        from assistant.providers import ProviderAdapter
+    except Exception:                       # noqa: BLE001
+        return None
+    seams = {"argv": argv, "devin_argv": argv,
+             "env": conductor.clean_devin_env,
+             "spawn_kwargs": conductor.hidden_subprocess_kwargs(),
+             "kill": conductor.kill_tree, "alive": conductor.pid_alive,
+             "workspace": Path(workspace), "spool_dir": Path(spool),
+             "spool": Path(spool), "data_dir": Path(data_dir),
+             "runs_dir": conductor.RUNS_DIR,
+             "requests_dir": conductor.REQUESTS_DIR,
+             "now": conductor._now, "log": conductor.LOG}
+
+    def _call(fn):
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return fn()
+        kw = {k: v for k, v in seams.items() if k in sig.parameters}
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD
+               for p in sig.parameters.values()):
+            kw = {**seams, **kw}
+        return fn(**kw)
+
+    # 1) import every non-baseline provider module so adapters can
+    #    register themselves, then honor explicit registrations
+    try:
+        mods = sorted(m.name for m in
+                      pkgutil.iter_modules(pkg.__path__)
+                      if not m.name.startswith("_")
+                      and m.name != "devin_print")
+    except Exception:                       # noqa: BLE001
+        mods = []
+    loaded = {}
+    for name in mods:
+        try:
+            loaded[name] = importlib.import_module(
+                f"assistant.providers.{name}")
+        except Exception:                   # noqa: BLE001
+            continue
+    for name, factory in sorted(
+            (pkg.registered_transports() or {}).items()):
+        if name == "cli":
+            continue
+        try:
+            p = _call(factory)
+            if p is not None:
+                return p
+        except Exception:                   # noqa: BLE001
+            continue
+    # 2) unregistered modules: a build/create factory or a concrete
+    #    ProviderAdapter subclass defined in the module
+    for name in mods:
+        mod = loaded.get(name)
+        if mod is None:
+            continue
+        for fname in ("build", "create", "provider"):
+            fn = getattr(mod, fname, None)
+            if callable(fn):
+                try:
+                    p = _call(fn)
+                    if isinstance(p, ProviderAdapter):
+                        return p
+                except Exception:           # noqa: BLE001
+                    continue
+        for attr in vars(mod).values():
+            try:
+                if isinstance(attr, type) \
+                        and issubclass(attr, ProviderAdapter) \
+                        and attr is not ProviderAdapter \
+                        and not inspect.isabstract(attr) \
+                        and attr.__module__ == mod.__name__:
+                    p = _call(attr)
+                    if p is not None:
+                        return p
+            except TypeError:
+                continue
+            except Exception:               # noqa: BLE001
+                continue
+    return None
+
+
 def open_runtime(*, data_dir: Path = ASSISTANT_DIR,
                  runs_dir: Path = conductor.RUNS_DIR,
                  requests_dir: Path = conductor.REQUESTS_DIR,
                  manifests_dir: Path = conductor.MANIFESTS_DIR,
                  trash_dir: Path | None = None, projects=None,
                  devin_argv=None, actions=None, power=None,
-                 provider=None, reconcile=True) -> tuple:
-    """The full host stack: core + provider + dispatcher + actions,
+                 provider=None, fast_provider=None, providers=None,
+                 reconcile=True) -> tuple:
+    """The full host stack: core + providers + dispatcher + actions,
     wired together. Returns (core, runtime). `reconcile` re-owns inflight
     exchanges after a serve restart; tests inject a fake provider and
     reconcile=False. `power` is the optional serve_power seam (serve
-    passes the bound server; tests/standalone leave it unwired)."""
+    passes the bound server; tests/standalone leave it unwired).
+    `providers`/`fast_provider` override the transport map; the fast
+    transport is auto-discovered only on the default provider path -
+    an injected `provider` keeps tests fully in-memory."""
     argv = list(devin_argv or default_devin_argv())
     data_dir = Path(data_dir)
     workspace = data_dir / "workspace"
@@ -175,10 +279,22 @@ def open_runtime(*, data_dir: Path = ASSISTANT_DIR,
             runs_dir=runs_dir, requests_dir=requests_dir,
             manifests_dir=manifests_dir, trash_dir=trash_dir,
             devin_argv=argv, power=power)
+    default_provider = provider is None
     provider = provider or DevinPrintProvider(
         argv, env=conductor.clean_devin_env,
         spawn_kwargs=conductor.hidden_subprocess_kwargs(),
         kill=conductor.kill_tree, alive=conductor.pid_alive)
+    providers = {"cli": provider}
+    for name, p in (providers or {}).items():
+        if p is not None:
+            providers[str(name)] = p
+    if fast_provider is not None:
+        providers["fast"] = fast_provider
+    elif "fast" not in providers and default_provider:
+        fp = _fast_provider(argv, workspace=workspace, spool=spool,
+                            data_dir=data_dir)
+        if fp is not None:
+            providers["fast"] = fp
 
     def options():
         return conductor.model_options(argv)
@@ -191,7 +307,8 @@ def open_runtime(*, data_dir: Path = ASSISTANT_DIR,
     runtime = AssistantRuntime(
         None, provider, workspace=workspace, spool_dir=spool,
         resolve=resolve, price_for=_price_snapshot,
-        preamble=static_preamble(), now=conductor._now)
+        preamble=static_preamble(), now=conductor._now,
+        providers=providers)
     core = open_core(
         data_dir=data_dir, runs_dir=runs_dir, requests_dir=requests_dir,
         devin_argv=argv, dispatcher=runtime, actions=actions,

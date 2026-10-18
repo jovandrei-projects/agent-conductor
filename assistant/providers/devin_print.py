@@ -38,7 +38,8 @@ import threading
 import time
 from pathlib import Path
 
-from . import PollResult, ProviderAdapter, ProviderHandle
+from . import (PollResult, ProviderAdapter, ProviderHandle,
+              register_transport)
 
 OUT_BUF_MAX = 262_144        # stdout narration cap kept per dispatch
 PARTIAL_CHARS = 4000         # progressive text budget handed to poll()
@@ -343,3 +344,6 @@ class DevinPrintProvider(ProviderAdapter):
 def _is_windows() -> bool:
     import os
     return os.name == "nt"
+
+
+register_transport("cli", DevinPrintProvider)

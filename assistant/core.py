@@ -35,7 +35,12 @@ ATTACH_PER_MESSAGE_MAX = 20   # same bound as the host request form
 ATTACH_PER_CONV_MAX = 200     # uploads are never deleted; bound the pile
 ATTACH_READ_MAX = 25 * 1024 * 1024   # serve cap > the host's 20MB write cap
 
-SETTINGS_KEYS = ("model", "effort", "fast", "readonly")
+SETTINGS_KEYS = ("model", "effort", "fast", "readonly", "transport")
+# Provider transports a conversation may request. 'cli' = the verified
+# `devin --print` baseline; 'fast' = the read-only fast transport wired
+# by the host (absent adapter -> the runtime falls back to 'cli').
+TRANSPORTS = ("cli", "fast")
+DEFAULT_TRANSPORT = "fast"   # the feature's point: prefer fast when wired
 SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 EXCHANGE_LIVE = ("queued", "running")
 EXCHANGE_TERMINAL = ("done", "partial", "error", "cancelled")
@@ -75,7 +80,7 @@ def price_usage(usage: dict, rates: dict | None) -> float | None:
 
 
 def _clean_settings(patch: dict) -> dict:
-    """Validate a {model,effort,fast,readonly} partial update."""
+    """Validate a {model,effort,fast,readonly,transport} partial update."""
     if not isinstance(patch, dict):
         raise AssistantError("settings must be an object")
     unknown = set(patch) - set(SETTINGS_KEYS)
@@ -91,6 +96,13 @@ def _clean_settings(patch: dict) -> dict:
     for k in ("fast", "readonly"):
         if k in patch:
             out[k] = bool(patch[k])
+    if "transport" in patch:
+        v = str(patch["transport"] or "").strip().lower()
+        if v not in TRANSPORTS:
+            raise AssistantError(
+                f"invalid transport {patch['transport']!r} - one of "
+                f"{list(TRANSPORTS)}")
+        out["transport"] = v
     return out
 
 
@@ -177,7 +189,10 @@ class AssistantCore:
                 "effort": self.store.get_setting("default.effort", ""),
                 "fast": self.store.get_setting_json("default.fast", False),
                 "readonly":
-                self.store.get_setting_json("default.readonly", True)}
+                self.store.get_setting_json("default.readonly", True),
+                "transport":
+                self.store.get_setting("default.transport",
+                                       DEFAULT_TRANSPORT)}
 
     def set_defaults(self, patch: dict) -> dict:
         self._guarded(self.store.path.parent)
@@ -213,6 +228,7 @@ class AssistantCore:
                "model": vals["model"], "effort": vals["effort"],
                "fast": int(vals["fast"]),
                "readonly": int(vals["readonly"]),
+               "transport": vals["transport"],
                "provider_session_id": None}
         self._guarded(self.store.path.parent)
         with self.store.txn() as conn:
@@ -239,11 +255,15 @@ class AssistantCore:
         for r in rows:
             r["origin_view"] = ctxmod.thaw(r.get("origin_view"))
             r["size_bytes"] = sizes.get(r["id"], 0)
+            # pre-transport rows (NULL) are the CLI transport
+            r["transport"] = r.get("transport") or "cli"
         return {"items": rows, "next_before": nxt}
 
     def get_conversation(self, conv_id: str) -> dict:
         conv = dict(self._conv(conv_id))
         conv["origin_view"] = ctxmod.thaw(conv.get("origin_view"))
+        # pre-transport rows (NULL) are the CLI transport
+        conv["transport"] = conv.get("transport") or "cli"
         return conv
 
     def rename_conversation(self, conv_id: str, title) -> dict:
@@ -309,14 +329,15 @@ class AssistantCore:
         return self.get_conversation(row["id"]) if row else None
 
     def update_settings(self, conv_id: str, patch: dict) -> dict:
-        """Per-conversation settings (model/effort/fast/readonly). Applies
-        to the NEXT exchange only - history keeps its per-message
-        snapshots."""
+        """Per-conversation settings (model/effort/fast/readonly/
+        transport). Applies to the NEXT exchange only - history keeps
+        its per-message snapshots."""
         conv = self._conv(conv_id)
         vals = _clean_settings(patch)
         self._validate_settings(
             {"model": conv["model"], "effort": conv["effort"],
              "fast": bool(conv["fast"]), "readonly": bool(conv["readonly"]),
+             "transport": conv.get("transport") or "cli",
              **vals})
         self._guarded(self.store.path.parent)
         now = self._iso()
@@ -394,6 +415,8 @@ class AssistantCore:
         snap = {**{k: conv[k] for k in ("model", "effort")},
                 "fast": bool(conv["fast"]),
                 "readonly": bool(conv["readonly"]),
+                # NULL (pre-feature) rows read as the CLI transport
+                "transport": conv.get("transport") or "cli",
                 **per_msg}
         self._validate_settings(snap)
         now = self._iso()
@@ -498,11 +521,17 @@ class AssistantCore:
     # -------------------------------------------------------- exchanges
     def begin_exchange(self, xid: str, *, pid=None, provider_session_id=None,
                        prompt_path=None, export_path=None,
-                       model_uid=None) -> dict:
+                       model_uid=None, transport=None,
+                       fallback=None) -> dict:
         x = self._xid(xid)
         if x["status"] != "queued":
             return x
         self._guarded(self.store.path.parent)
+        fields = {}
+        if transport:
+            fields["transport"] = transport
+        if fallback:
+            fields["fallback"] = json.dumps(fallback, ensure_ascii=False)
         with self.store.txn() as conn:
             self.store.update_exchange(
                 conn, xid, status="running", started_at=self._iso(),
@@ -510,7 +539,7 @@ class AssistantCore:
                 provider_session_id=provider_session_id
                 or x.get("provider_session_id"),
                 prompt_path=prompt_path, export_path=export_path,
-                model_uid=model_uid or x.get("model_uid"))
+                model_uid=model_uid or x.get("model_uid"), **fields)
         return self.store.get_exchange(xid)
 
     def claim_request(self, xid: str, provider_session_id: str,
@@ -532,18 +561,26 @@ class AssistantCore:
         return {**self.store.get_exchange(xid), "dup": False}
 
     def note_dispatch(self, xid: str, *, pid=None, prompt_path=None,
-                      export_path=None, model_uid=None) -> dict:
+                      export_path=None, model_uid=None, transport=None,
+                      fallback=None) -> dict:
         """Record the live dispatch of a later hop (begin_exchange covers
         the queued->running first hop only). The resolved model_uid is
         stamped at dispatch so session-continuity checks compare against
-        what actually launched, not only completed rows."""
+        what actually launched, not only completed rows. `transport`
+        rewrites the answering transport (a mid-exchange fallback stamps
+        the CLI row); `fallback` records the reroute audit."""
         x = self._xid(xid)
         self._guarded(self.store.path.parent)
+        fields = {}
+        if transport:
+            fields["transport"] = transport
+        if fallback:
+            fields["fallback"] = json.dumps(fallback, ensure_ascii=False)
         with self.store.txn() as conn:
             self.store.update_exchange(
                 conn, xid, pid=pid, prompt_path=prompt_path,
                 export_path=export_path,
-                model_uid=model_uid or x.get("model_uid"))
+                model_uid=model_uid or x.get("model_uid"), **fields)
         return self.store.get_exchange(xid)
 
     def note_provider_session(self, xid: str, session_id: str) -> dict:
@@ -807,6 +844,12 @@ class AssistantCore:
                             else (out.get(col) or []))
             except ValueError:
                 out[col] = []
+        try:        # the reroute audit object ({from,to,reason} | None)
+            out["fallback"] = (json.loads(out["fallback"])
+                               if isinstance(out.get("fallback"), str)
+                               else out.get("fallback"))
+        except ValueError:
+            out["fallback"] = None
         out["usage_extra"] = _usage_extra(out["requests"])
         return out
 
@@ -821,6 +864,12 @@ class AssistantCore:
                               else (r.get(col) or []))
                 except ValueError:
                     r[col] = []
+            try:
+                r["fallback"] = (json.loads(r["fallback"])
+                                 if isinstance(r.get("fallback"), str)
+                                 else r.get("fallback"))
+            except ValueError:
+                r["fallback"] = None
             r["usage_extra"] = _usage_extra(r["requests"])
         return rows
 
@@ -1187,6 +1236,23 @@ class AssistantCore:
         # the host may return the full annotated payload (models +
         # default_resolution) or a bare models list
         return c if isinstance(c, dict) else {"models": c}
+
+    def transport_options(self) -> list[dict]:
+        """The transport choices for the settings surface - id, label,
+        and whether the adapter is wired in THIS process. Asks the
+        dispatcher (AssistantRuntime.transport_status); without one only
+        the CLI baseline exists."""
+        st = getattr(self._dispatcher, "transport_status", None)
+        if callable(st):
+            try:
+                out = st()
+                if isinstance(out, list) and out:
+                    return out
+            except Exception:                       # noqa: BLE001
+                pass
+        return [{"id": "cli", "label": "CLI (devin --print)",
+                 "available": True},
+                {"id": "fast", "label": "Fast", "available": False}]
 
     def close(self):
         self.store.close()

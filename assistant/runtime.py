@@ -45,6 +45,7 @@ What this module owns, per the manifest's runtime requirements:
   restart) are re-owned - a still-live provider pid is adopted and
   polled to its finish, a dead one is re-dispatched on the same session.
 """
+import inspect
 import json
 import logging
 import re
@@ -179,6 +180,7 @@ class _Job:
         self.xid = xid
         self.conv_id = conv_id
         self.handle = None              # current hop's ProviderHandle
+        self.adapter = None             # provider serving this exchange
         self.cancel_requested = False
         self.last_partial = ""
         self.last_cum = None            # cumulative counters at last hop
@@ -193,7 +195,17 @@ class AssistantRuntime:
     ``cancel`` on a cancel request.
 
     Injected seams:
-    - provider: a ProviderAdapter (host wires DevinPrintProvider).
+    - provider: the ProviderAdapter for the 'cli' transport (host wires
+      DevinPrintProvider).
+    - providers: optional {transport_id: ProviderAdapter} map - the
+      'fast' slot is the read-only fast transport (its adapter module is
+      discovered by the host wiring). Each exchange's frozen settings
+      snapshot picks the transport; the fast lane serves read-only
+      conversations only - mutation-capable and attachment-carrying
+      conversations it can't serve route to 'cli', and any init-level
+      failure on it falls back to 'cli' with the reroute recorded on
+      the exchange row (the user's question never fails for a
+      transport problem).
     - resolve: callable(settings_snapshot, attachments_present) ->
       {uid, label, effort, fast, vision...} or raises AssistantError -
       the host's catalog-aware model/effort/fast/vision resolution.
@@ -211,9 +223,14 @@ class AssistantRuntime:
                  workspace, spool_dir, resolve=None, price_for=None,
                  preamble="", retrieval=None, calculate=None,
                  max_hops=MAX_HOPS, hop_timeout=HOP_TIMEOUT_S,
-                 poll_s=POLL_S, max_concurrent=4, now=None, logger=None):
+                 poll_s=POLL_S, max_concurrent=4, now=None, logger=None,
+                 providers=None):
         self.core = core                  # may be None until bind()
-        self.provider = provider
+        self._providers = {"cli": provider}
+        for name, p in (providers or {}).items():
+            if p is not None:
+                self._providers[str(name)] = p
+        self.provider = self._providers.get("cli") or provider
         self.workspace = Path(workspace)
         self.spool = Path(spool_dir)
         self._resolve = resolve
@@ -264,7 +281,7 @@ class AssistantRuntime:
         self._land_partial(job)
         if job.handle is not None:
             try:
-                self.provider.cancel(job.handle)
+                (job.adapter or self.provider).cancel(job.handle)
             except Exception:               # noqa: BLE001 - best effort
                 self._log.exception("provider cancel failed")
 
@@ -281,8 +298,12 @@ class AssistantRuntime:
                     continue
                 job = _Job(xid, x["conversation_id"])
                 job.sid = x.get("provider_session_id")
+                # adopt on the transport the row was dispatched under -
+                # NULL means a pre-transport record (the CLI transport)
+                job.adapter = self._providers.get(
+                    x.get("transport") or "cli") or self.provider
                 if (x.get("status") == "running" and x.get("pid")
-                        and self.provider.alive_pid(x["pid"])):
+                        and job.adapter.alive_pid(x["pid"])):
                     job.adopted = x          # poll the orphan to its end
                 self._live[xid] = job
             threading.Thread(target=self._run, args=(job,), daemon=True,
@@ -324,6 +345,22 @@ class AssistantRuntime:
         attachments = self._attachments(user_msg)
         env = self._envelope(user_msg)
 
+        # ---------- transport selection (frozen per-message snapshot).
+        # The 'fast' transport serves read-only conversations only; a
+        # conversation whose readonly flag is off routes to the CLI
+        # transport - and so does an unavailable fast adapter or an
+        # attachment it cannot carry. The reroute reason is recorded on
+        # the exchange row (transports never fail the user's question).
+        transport, provider, fallback = self._select_transport(
+            snap, attachments)
+        if job.adopted is not None and job.adapter is not None:
+            # a reconciled exchange keeps the transport it was actually
+            # dispatched under, even if settings moved since
+            transport = x.get("transport") or transport
+            provider = job.adapter
+            fallback = None
+        job.adapter = provider
+
         # ---------- settings resolution (server-side validation)
         try:
             resolved = self._resolve_settings(snap, attachments)
@@ -348,12 +385,13 @@ class AssistantRuntime:
                     + detail + "."))
             return
 
-        # ---------- provider session continuity
-        sid = self._session_for(conv, uid)
+        # ---------- provider session continuity (per transport: a
+        # session id only resumes on the transport it was created under)
+        sid = self._session_for(conv, uid, transport)
         fresh = sid is None
         session_note = ""
         if not fresh:
-            known = self.provider.sessions(self.workspace)
+            known = provider.sessions(self.workspace)
             if isinstance(known, set) and sid not in known:
                 fresh, session_note = True, "session-gone"
                 sid = None
@@ -385,17 +423,24 @@ class AssistantRuntime:
         error = None
         truncated_hops = False
         last_label = None
+        # an adopted row was already begun by the dead process - its
+        # later hops go through note_dispatch like any running row; a
+        # re-dispatched dead-pid row skips begin_exchange's queued gate
+        # too (it is already 'running')
+        begun = job.adopted is not None or x["status"] != "queued"
         prompt = self._prompt_initial(
             conv, user_msg, env, snap, resolved, attachments,
             fresh=fresh, session_note=session_note)
+        prompt_kind = "fresh" if fresh else "resume"
         hops = 0
         while True:
             n = len(reqs) + 1
             if job.cancel_requested:
                 return
             adopted = job.adopted is not None
+            job.adapter = provider
             if adopted:
-                handle = self.provider.attach(job.adopted)
+                handle = provider.attach(job.adopted)
                 job.adopted = None
                 ppath = epath = None
                 started = None
@@ -410,11 +455,46 @@ class AssistantRuntime:
                                  encoding="utf-8")
                 started = self._now()
                 try:
-                    handle = self.provider.send(
-                        str(ppath), session_id=sid, model_uid=uid,
-                        export_path=str(epath), workspace=self.workspace,
+                    handle = self._send(
+                        provider, str(ppath), sid=sid, uid=uid,
+                        epath=str(epath), attachments=attachments,
                         readonly=bool(snap.get("readonly", True)))
                 except Exception as exc:            # noqa: BLE001
+                    # A send failure on the fast transport is an init
+                    # problem (credentials, endpoint, spawn) - the
+                    # question is re-asked on the CLI transport, never
+                    # failed for a transport reason.
+                    if hops == 0 and self._fallback_ok(transport):
+                        core.record_request(xid, {
+                            "n": n, "kind": prompt_kind,
+                            "transport": transport, "pid": None,
+                            "session_id": sid,
+                            "request_id": f"{sid or 'nosession'}#h{n}",
+                            "prompt_path": str(ppath),
+                            "export_path": str(epath),
+                            "started_at": started, "ended_at": self._now(),
+                            "exit_code": None,
+                            "error": f"transport init failed: "
+                                     f"{type(exc).__name__}: {exc}",
+                            "usage": None, "cum": None})
+                        reqs = self._requests_so_far(xid)
+                        transport = "cli"
+                        provider, sid, fresh, prev_cum = self._to_cli(
+                            conv, uid, xid)
+                        job.adapter = provider
+                        job.sid = sid
+                        job.base_cum = job.last_cum = prev_cum
+                        final_cum = prev_cum
+                        fallback = {"from": "fast", "to": "cli",
+                                    "reason": "the fast transport failed "
+                                              f"to start: {exc}"}
+                        prompt = self._prompt_initial(
+                            conv, user_msg, env, snap, resolved,
+                            attachments, fresh=fresh,
+                            session_note=("transport-fallback"
+                                          if fresh else ""))
+                        prompt_kind = "fresh" if fresh else "resume"
+                        continue
                     core.fail_exchange(
                         xid, f"provider spawn failed: {exc}",
                         partial_text=(f"**Error:** could not start the "
@@ -422,17 +502,20 @@ class AssistantRuntime:
                     return
             job.handle = handle
             if not adopted:
-                if x.get("status") == "queued" and n == 1:
+                if not begun:
                     core.begin_exchange(xid, pid=handle.pid,
                                         provider_session_id=sid,
                                         prompt_path=str(ppath),
                                         export_path=str(epath),
-                                        model_uid=uid)
+                                        model_uid=uid, transport=transport,
+                                        fallback=fallback)
+                    begun = True
                 else:
                     core.note_dispatch(xid, pid=handle.pid,
                                        prompt_path=str(ppath),
                                        export_path=str(epath),
-                                       model_uid=uid)
+                                       model_uid=uid, transport=transport,
+                                       fallback=fallback)
             res = self._poll(job, handle)
             if job.cancel_requested or self._is_terminal(xid):
                 self._land_partial(job, res)
@@ -446,9 +529,8 @@ class AssistantRuntime:
             if res.model_label:
                 last_label = res.model_label
             core.record_request(xid, {
-                "n": n, "kind": ("adopted" if adopted else
-                                 "tool" if n > 1 else
-                                 "resume" if not fresh else "fresh"),
+                "n": n, "kind": ("adopted" if adopted else prompt_kind),
+                "transport": transport,
                 "readonly": bool(snap.get("readonly", True)),
                 "pid": handle.pid, "session_id": sid,
                 "request_id": f"{sid or 'nosession'}#h{n}",
@@ -464,6 +546,27 @@ class AssistantRuntime:
             final_cum = cur
             hops += 1
             if res.error:
+                # hop-1 fast-transport failure that produced no answer is
+                # an init-class failure - the CLI transport answers it.
+                if (self._fallback_ok(transport) and hops == 1
+                        and not res.text):
+                    transport = "cli"
+                    provider, sid, fresh, prev_cum = self._to_cli(
+                        conv, uid, xid)
+                    job.adapter = provider
+                    job.sid = sid
+                    job.last_cum = job.base_cum = prev_cum
+                    final_cum = prev_cum
+                    fallback = {"from": "fast", "to": "cli",
+                                "reason": "the fast transport failed "
+                                          f"before answering: {res.error}"}
+                    prompt = self._prompt_initial(
+                        conv, user_msg, env, snap, resolved, attachments,
+                        fresh=fresh,
+                        session_note=("transport-fallback"
+                                      if fresh else ""))
+                    prompt_kind = "fresh" if fresh else "resume"
+                    continue
                 error = res.error
                 answer = res.text or answer
                 break
@@ -480,6 +583,7 @@ class AssistantRuntime:
             if sources:
                 core.record_sources(xid, self._merge_sources(xid, sources))
             prompt = self._prompt_tool_result(call, result)
+            prompt_kind = "tool"
 
         self._finish(job, xid, uid, resolved, answer, prev_cum,
                      final_cum, model_label=last_label, error=error,
@@ -491,9 +595,10 @@ class AssistantRuntime:
         into the exchange. Returns the terminal PollResult."""
         started = self._now()
         res = None
+        adapter = job.adapter or self.provider
         while True:
             try:
-                res = self.provider.poll(handle)
+                res = adapter.poll(handle)
             except Exception as exc:                # noqa: BLE001
                 self._log.exception("poll failed")
                 res = PollResult(done=True,
@@ -514,13 +619,13 @@ class AssistantRuntime:
                 # the user cancel may have raced send() - kill the child
                 # here too so no provider process leaks unaccounted
                 try:
-                    self.provider.cancel(handle)
+                    adapter.cancel(handle)
                 except Exception:                   # noqa: BLE001
                     pass
                 return res
             if self._now() - started > self._hop_timeout:
                 try:
-                    self.provider.cancel(handle)
+                    adapter.cancel(handle)
                 except Exception:                   # noqa: BLE001
                     pass
                 res.done = True
@@ -758,6 +863,11 @@ class AssistantRuntime:
                 parts.append("_(note: the earlier provider session is no "
                              "longer listed; this starts a fresh one - the "
                              "digest above carries the history)_")
+            elif session_note == "transport-fallback":
+                parts.append("_(note: the fast transport could not start "
+                             "this turn, so it was re-asked on the "
+                             "standard one - the digest above carries the "
+                             "history)_")
         parts.append("## User message\n" + _clip(user_msg.get("text")
                                                   or "", 32_000))
         if attachments:
@@ -842,21 +952,132 @@ class AssistantRuntime:
         return self._resolve(dict(snap),
                              attachments_present=bool(attachments))
 
-    def _session_for(self, conv: dict, uid: str) -> str | None:
+    def _session_for(self, conv: dict, uid: str,
+                     transport: str = "cli") -> str | None:
         """The conversation's provider session iff it ran the SAME
-        resolved uid - `--model` is ignored on resume, so a settings
-        change forces a fresh session (documented provider behavior)."""
+        resolved uid AND the same transport - `--model` is ignored on
+        resume, and a session id minted under one transport means
+        nothing to another provider."""
         sid = conv.get("provider_session_id")
         if not sid:
             return None
         rows = self.core.store.query(
-            "SELECT model_uid FROM exchanges WHERE provider_session_id=?"
-            " AND model_uid IS NOT NULL ORDER BY seq DESC LIMIT 1",
+            "SELECT model_uid, transport FROM exchanges WHERE"
+            " provider_session_id=? AND model_uid IS NOT NULL"
+            " ORDER BY seq DESC LIMIT 1",
             (sid,))
-        if rows and rows[0].get("model_uid") and \
-                rows[0]["model_uid"] != uid:
-            return None                            # settings changed
+        if rows:
+            if rows[0].get("model_uid") and \
+                    rows[0]["model_uid"] != uid:
+                return None                        # settings changed
+            if (rows[0].get("transport") or "cli") != transport:
+                return None                        # foreign transport
         return sid
+
+    def _select_transport(self, snap: dict, attachments):
+        """(transport_id, adapter, fallback_note|None) for one exchange's
+        FROZEN settings snapshot.
+
+        - 'cli' = the `devin --print` baseline; also what a snapshot or
+          row without a transport field resolves to.
+        - 'fast' = the read-only fast transport. It serves a conversation
+          only when the adapter is wired AND the conversation is
+          read-only (a mutation-capable conversation needs the CLI's
+          action flow) AND any attachments can be carried.
+
+        When 'fast' can't serve the exchange the CLI answers instead and
+        the reroute lands on `exchanges.fallback` so the client can show
+        WHY cli answered a fast conversation - the user's question never
+        fails for a transport reason.
+        """
+        cli = self._providers.get("cli") or self.provider
+        want = str(snap.get("transport") or "cli").strip().lower() \
+            or "cli"
+        if want != "fast":
+            return "cli", cli, None
+        fast = self._providers.get("fast")
+        if fast is None:
+            return "cli", cli, {
+                "from": "fast", "to": "cli",
+                "reason": "the fast transport is not wired on this "
+                          "server"}
+        avail = getattr(fast, "available", None)
+        if avail is not None and \
+                (avail() if callable(avail) else avail) is False:
+            return "cli", cli, {
+                "from": "fast", "to": "cli",
+                "reason": "the fast transport reports itself "
+                          "unavailable"}
+        if not snap.get("readonly", True):
+            return "cli", cli, {
+                "from": "fast", "to": "cli",
+                "reason": "read-only is off - a mutation-capable "
+                          "conversation uses the CLI transport so "
+                          "actions stay inside the whitelist flow"}
+        if attachments and \
+                getattr(fast, "supports_images", True) is False:
+            return "cli", cli, {
+                "from": "fast", "to": "cli",
+                "reason": "the fast transport cannot carry image "
+                          "attachments"}
+        return "fast", fast, None
+
+    def _send(self, provider, prompt_path: str, *, sid, uid, epath,
+              attachments, readonly=True):
+        """Dispatch one turn on `provider`. Adapters whose send()
+        accepts an `attachments` kwarg (e.g. the ACP lane's native image
+        blocks) get the message's attachment rows with `mime_type`
+        normalized from the row's `ctype`; adapters declaring the
+        contract's `readonly` flag get the conversation's capability
+        bit (a structurally read-only transport never sees it); adapters
+        without either get the same send() call as before."""
+        kw = {}
+        try:
+            params = inspect.signature(provider.send).parameters
+            var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD
+                         for p in params.values())
+            if "attachments" in params or var_kw:
+                kw["attachments"] = [
+                    {**a, "mime_type": a.get("mime_type")
+                     or a.get("ctype")}
+                    for a in attachments]
+            if "readonly" in params or var_kw:
+                kw["readonly"] = readonly
+        except (TypeError, ValueError):
+            pass
+        return provider.send(prompt_path, session_id=sid,
+                             model_uid=uid, export_path=epath,
+                             workspace=self.workspace, **kw)
+
+    def _fallback_ok(self, transport: str) -> bool:
+        """True when the current hop may be re-routed to the CLI lane -
+        any non-cli transport failing to start or to answer counts."""
+        return transport != "cli" and \
+            self._providers.get("cli") is not None
+
+    def _to_cli(self, conv: dict, uid: str, xid: str):
+        """(adapter, sid, fresh, prev_cum) for a fallback dispatch on the
+        CLI transport: the newest CLI session on this conversation+model
+        resumes when one exists, else a fresh CLI dispatch carries the
+        history digest."""
+        provider = self._providers["cli"]
+        sid = self._session_for(conv, uid, "cli")
+        fresh = sid is None
+        if not fresh:
+            known = provider.sessions(self.workspace)
+            if isinstance(known, set) and sid not in known:
+                sid, fresh = None, True
+        prev_cum = (self.core.session_totals(sid, exclude_xid=xid)
+                    if sid else None)
+        return provider, sid, fresh, prev_cum
+
+    def transport_status(self) -> list[dict]:
+        """The transport vocabulary for the settings surface, with live
+        adapter availability."""
+        return [{"id": "cli", "label": "CLI (devin --print)",
+                 "available": self._providers.get("cli") is not None},
+                {"id": "fast", "label": "Fast",
+                 "available": self._providers.get("fast") is not None}]
 
     def _requests_so_far(self, xid: str) -> list:
         x = self.core.store.get_exchange(xid) or {}

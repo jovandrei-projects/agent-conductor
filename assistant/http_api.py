@@ -171,7 +171,10 @@ def _h_upload(core, g, body, raw, q):
 
 
 def _h_get_settings(core, g, body, raw, q):
-    return 200, {"defaults": core.defaults()}
+    # `transports` is the client-facing vocabulary + live availability;
+    # exchange rows carry `transport`/`fallback` fields already
+    return 200, {"defaults": core.defaults(),
+                 "transports": core.transport_options()}
 
 
 def _h_put_settings(core, g, body, raw, q):
