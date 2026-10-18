@@ -2093,12 +2093,14 @@ def run_events(run_dir: Path, limit: int = 2000) -> list[dict]:
     return out[-limit:]
 
 
-def tail_status(stdout_log: Path) -> str | None:
+def tail_status(stdout_log: Path | None) -> str | None:
     """The worker's terminal STATUS: line. Reads the WHOLE log, not a
     tail: an agent that prints 'STATUS: done' then a long closing report
     (>8KB of prose) must not flip to 'failed - no STATUS line' - that
     exact false negative was hit on the live apartment run. Logs are
     small and this runs once per step end, not per poll."""
+    if not stdout_log:                       # no log recorded yet
+        return None
     try:
         data = stdout_log.read_bytes().decode("utf-8", "replace")
     except OSError:
