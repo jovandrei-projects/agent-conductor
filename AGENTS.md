@@ -123,8 +123,16 @@ best-effort cmdlines (`_proc_cmd_table`, cached by pid+start) and its
 full run_dir, so a holder no served run claims - a `run_tests.py` shard
 is the usual case; run dirs under %TEMP% are the tell - shows
 `untracked` instead of a live status instead of being a bare name.
-Note `slot_wait` stays stamped on a record after the lease lands - only
-`status='queued'` means still waiting.
+A second modal table, `other devin sessions`, lists devin.exe roots no
+conductor spawn (`--prompt-file`, a lease's worker_pid, or a
+conductor.py parent) accounts for - Devin Desktop `acp` sessions, a
+manual `devin` picker/run - folded to their session root and labeled
+desktop/cli (`_devin_sessions`, 10s-cached probe). They hold no slot
+and NEVER count toward in_use/cap - they're shown because they still
+use the box. The topbar count and an open modal also repaint on the
+render sig's early return, since lease changes alone don't move the
+sig. Note `slot_wait` stays stamped on a record after the lease lands -
+only `status='queued'` means still waiting.
 Parallel sessions get a PARALLEL_NOTE prompt block: share the box, own
 your checkout/leases/ports, never fight a peer or the user over a shared
 resource - if a genuinely exclusive resource is held, end `STATUS:
