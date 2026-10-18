@@ -1314,7 +1314,12 @@ prompt = "first"
 ''')
             rc = run_manifest(m, runs)
             self.assertEqual(rc, 0)
-            d = conductor.collect_dashboard(runs)
+            # the run's recorded session_id would make the session-listing
+            # daemon spawn a real `devin list` child on proj that can
+            # outlive this collect and collide with tempdir teardown
+            with mock.patch.object(conductor, "live_sessions_by_dir",
+                                   return_value={}):
+                d = conductor.collect_dashboard(runs)
             self.assertEqual(len(d["runs"]), 1)
             self.assertEqual(d["runs"][0]["run"], "t")
             self.assertTrue(d["runs"][0]["ended_at"])
@@ -1353,7 +1358,11 @@ prompt = "y"
                 txt = m.read_text().replace('name = "t"', f'name = "{name}"')
                 m.write_text(txt)
                 run_manifest(m, runs)
-            d = conductor.collect_dashboard(runs)
+            # same live_sessions_by_dir child-on-tempdir flake guard as
+            # test_collect_dashboard
+            with mock.patch.object(conductor, "live_sessions_by_dir",
+                                   return_value={}):
+                d = conductor.collect_dashboard(runs)
             self.assertEqual(len(d["runs"]), 2)
             self.assertEqual({r["run"] for r in d["runs"]}, {"ra", "rb"})
             self.assertEqual(len({r["dir"] for r in d["runs"]}), 2)
@@ -1372,7 +1381,11 @@ prompt = "  tidy   the  catalog "
 effort = "min"
 ''')
             run_manifest(m, runs)
-            d = conductor.collect_dashboard(runs)
+            # same live_sessions_by_dir child-on-tempdir flake guard as
+            # test_collect_dashboard
+            with mock.patch.object(conductor, "live_sessions_by_dir",
+                                   return_value={}):
+                d = conductor.collect_dashboard(runs)
             a = d["agents"][0]
             self.assertEqual(a["task"], "tidy the catalog")
             self.assertEqual(a["effort"], "min")
@@ -10623,6 +10636,19 @@ prompt = "first"
                           (rd / "run.summary.md").read_text(
                               encoding="utf-8"))
             self.assertFalse((rd / ".summarizing").exists())
+            # the detached summarize child's inherited stdout handle on
+            # launch.log can lag run.summary.md's appearance by a beat -
+            # wait for the child to actually exit so tempdir teardown
+            # doesn't hit WinError 32 (a recurring shared-box flake)
+            for _ in range(200):
+                try:
+                    alive = any(p.poll() is None
+                                for p in conductor._DETACHED_PROCS)
+                except Exception:
+                    break      # test-mocked Popen entries keep nothing
+                if not alive:
+                    break
+                time.sleep(0.05)
 
     def test_summarize_endpoint_guards(self):
         with tempfile.TemporaryDirectory() as td:
@@ -11103,7 +11129,14 @@ project = "{proj.as_posix()}"
 prompt = "first"
 ''')
             self.assertEqual(run_manifest(m, runs), 0)
-            d = conductor.collect_dashboard(runs)
+            # patch like SessionGoneGraceTests._collect: the finished
+            # run's recorded session_id would make the session-listing
+            # daemon spawn a real `devin list` child on proj - it can
+            # outlive the collect and collide with tempdir teardown
+            # (WinError 32, a recurring shared-box flake)
+            with mock.patch.object(conductor, "live_sessions_by_dir",
+                                   return_value={}):
+                d = conductor.collect_dashboard(runs)
             a = d["agents"][0]
             self.assertTrue(a["log_mtime"])
             self.assertIn("T", a["log_mtime"])
