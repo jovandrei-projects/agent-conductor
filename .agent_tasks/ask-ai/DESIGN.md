@@ -948,3 +948,103 @@ conversations. The doc carries the full ProviderAdapter mapping
 blocks + path fallback, `session/cancel` notification semantics,
 `set_mode ask` read-only gate, warm-pool lifecycle, fallback-to-CLI
 story, risk table).
+
+## 12. Transports: selection, fallback, client contract
+
+*Added by the `chat-ui-and-verification` step of run
+20261017-164321-assistant-fast-transport. The fast-transport run shipped
+as one parallel pool: this section records the wire contract the chat
+client implements, so the provider-adapter and runtime-and-settings
+branches can be reconciled against it at merge.*
+
+### 12.1 What a "transport" is
+
+One ProviderAdapter implementation answering one assistant turn:
+
+- `cli` - the verified baseline: one `devin --print [-r]` spawn per
+  dispatch (`assistant/providers/devin_print.py`). Slower per reply
+  (full CLI init + ATIF export per turn) but it is the only transport
+  allowed to propose actions, because it carries the tool channel the
+  contract gates.
+- `fast` - `assistant/providers/devin_acp.py`: a warm interactive
+  `devin acp` session kept per conversation (decision record:
+  `assistant/TRANSPORT.md`; the `V17__subagent_heads` session-db
+  blocker proved non-fatal in practice on devin 3000.6.2). Read-only
+  BY CONSTRUCTION: `session/set_mode ask` gives the session no
+  mutation tool channel at all - read tools still run.
+
+### 12.2 Selection (settings surface)
+
+`settings.transport` joins the existing model/effort/fast/readonly
+snapshot set (schema v5) - a settings-level default
+(`defaults.transport`, default `'fast'` - the feature's point), a
+per-conversation override (`conversations.transport`; NULL rows read
+as `'cli'` - they keep behaving exactly as before), and a frozen copy
+on each message's `settings_json`. Values are exactly `'cli'` and
+`'fast'` (`core.TRANSPORTS`) - there is no `auto`: the runtime's own
+routing covers it.
+
+The settings dialog lists `cli` + `fast` (+ any extras the server
+advertises through `core.transport_options` - `{id,label,available}`
+rows surfaced on the `/models` catalog or `/settings` payload, with
+`available:false` entries shown "(unavailable)"). The client
+feature-detects (`transport` key on defaults/conversation, or a
+`transports` list): a pre-transport server gets a disabled select and
+never receives a settings key it would reject.
+
+### 12.3 Fallback rules + exchange payload
+
+- A fast-transport init/credential/spawn failure NEVER fails the
+  user's question: the exchange retries on the CLI transport and the
+  reroute is recorded on the exchange row.
+- A read-write conversation on `transport=fast` routes its exchanges
+  through CLI - the action-proposal flow is unchanged (the fast
+  transport structurally cannot propose actions).
+- `exchange_view`/`list_exchanges` rows carry `transport` = the id of
+  the transport that actually answered (NULL on rows that predate the
+  feature) and `fallback` = JSON `{from,to,reason}` - the reroute
+  audit (unavailable adapter, read-write routing, or init failure).
+  Each `requests[]` hop carries its own `transport` so a mid-exchange
+  reroute shows the failed fast hop then the CLI re-ask.
+
+Client tolerance (parallel-run seam): the chat client thaws
+`x.fallback` (string or dict), tolerates `transport_used`/
+`transport_fallback`/`fell_back` spellings, and derives a fallback
+when the audit is absent (`transport=fast` answered by `cli`, or a
+concrete requested id whose label differs from the answerer's) - the
+recorded `reason` is preferred verbatim on the tooltip.
+
+### 12.4 Rendering contract (chat.js)
+
+- Every reply whose exchange names a transport shows a small
+  `.aim-tp` chip next to the model badge: the answering transport's
+  short label (`cli`, `fast`, `warm`, `direct`, `acp`), tooltip
+  "answered via the X transport".
+- Fallback is never hidden: the chip goes amber (`.aim-tp.fb`) and
+  reads `requested->answered` (`fast->cli`), with the tooltip naming
+  the cause - init fallback vs the read-only routing rule
+  ("the fast transport is read-only by construction, so this
+  read-write turn ran on cli instead"). Fallback is DERIVED when the
+  server does not flag it: `transport=fast` answered by `cli`, or a
+  concrete requested id whose label differs from the answerer's,
+  marks the chip without the server having to say so.
+- Rows predating the field carry no chip (legacy = cli anyway).
+- The usage `<details>` line gains `· transport <id>` (`(fell back)`
+  when flagged) and each `requests[]` hop shows `via <transport>`.
+- Partial text: any transport that surfaces progressive reply text
+  through `exchange_view.text` repaints through the existing 1.1s
+  `pollX` loop - the thinking dots, `ai-caret` cursor, queued/
+  answering badges, stop button, failed-send removal of the
+  optimistic bubble and client_msg_id dedupe are all
+  transport-agnostic and identical on both transports.
+
+### 12.5 Capability boundary (restated for operators)
+
+- CLI transport: read tools under `--permission-mode auto` +
+  action PROPOSALS gated by the conversation's `readonly` flag +
+  human confirmation + whitelist validation at execute.
+- Fast transport: NO tool channel - it can read what the prompt
+  gives it (frozen context envelope + bounded history digest + any
+  tool_result evidence the runtime feeds it on cli hops) but can
+  never propose or run a mutation. Read-only is structural, not a
+  flag that can be toggled off.

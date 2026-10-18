@@ -1327,6 +1327,337 @@ setRoute((url,opt)=>{
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+@unittest.skipUnless(shutil.which("node"), "Node unavailable")
+class ChatTransportTests(unittest.TestCase):
+    """Fast-transport UI surface: the per-reply transport chip (with its
+    honest fallback form), the settings select (feature-detected so an
+    old server never gets a field it would reject), transport on the
+    usage breakdown, and the unchanged send/poll behavior on either
+    transport."""
+
+    def test_transport_indicator_chips(self):
+        """Every reply that names its answering transport carries the
+        chip; a requested transport that could not handle the turn
+        renders as a fallback (requested->answered, amber), the
+        read-only routing explains itself, and legacy rows with no
+        transport field render no chip at all."""
+        p = run_node(
+            r'''
+const TH=window.AskAI._transportHtml;
+// a reply the fast transport answered
+let h=TH({transport:'fast'},{model:'m'});
+assert.match(h,/aim-tp/);
+assert.match(h,/>fast<\/span>/);
+assert.match(h,/answered via the fast transport/);
+assert.doesNotMatch(h,/aim-tp fb/);
+// a reply the CLI transport answered
+h=TH({transport:'cli'},{});
+assert.match(h,/>cli<\/span>/);
+assert.doesNotMatch(h,/fb/);
+// the runtime's fallback record ({from,to,reason} - raw JSON string
+// as exchange_view ships it) renders the requested->answered chip and
+// its own recorded reason on the tooltip
+h=TH({transport:'cli',
+  fallback:'{"from":"fast","to":"cli","reason":"the fast transport '+
+    'failed to start: auth"}'},
+ {transport:'fast'});
+assert.match(h,/aim-tp fb/);
+assert.match(h,/fast\u2192cli/);
+assert.match(h,/the fast transport failed to start: auth/);
+// fast was requested but cli answered with no fallback record ->
+// derived fallback chip with the generic explanation
+h=TH({transport:'cli'},{transport:'fast'});
+assert.match(h,/aim-tp fb/);
+assert.match(h,/fast\u2192cli/);
+assert.match(h,/could not handle this turn/);
+// a pre-thawed fallback dict works the same
+h=TH({transport:'cli',fallback:{from:'fast',to:'cli',
+  reason:'routed'}},{});
+assert.match(h,/aim-tp fb/);
+assert.match(h,/fast\u2192cli/);
+// read-only routing explains WHY cli answered a 'fast' request
+h=TH({transport:'cli'},{transport:'fast',readonly:false});
+assert.match(h,/read-only by construction/);
+// concrete id mismatch is a fallback; a matching id is not
+h=TH({transport:'acp'},{transport:'warm'});
+assert.match(h,/aim-tp fb/);
+h=TH({transport:'warm'},{transport:'warm'});
+assert.doesNotMatch(h,/aim-tp fb/);
+// cli requested + cli answered is never a fallback
+h=TH({transport:'cli'},{transport:'cli'});
+assert.doesNotMatch(h,/aim-tp fb/);
+// legacy rows (no transport anywhere) render no chip
+assert.equal(TH({status:'done'},{}),'');
+assert.equal(TH(null,{}),'');
+// an empty/corrupt fallback string is not a fallback
+assert.doesNotMatch(TH({transport:'cli',fallback:'{'},{}),/fb/);
+// alternate wire spellings tolerated
+h=TH({transport_used:'cli',fell_back:true},{});
+assert.match(h,/aim-tp fb/);
+// and msgHtml places the chip next to the model badge
+const S=window.AskAI._s;
+S.exchByAid={a1:{id:'x1',status:'done',transport:'fast'}};
+h=window.AskAI._msgHtml({id:'a1',role:'assistant',text:'ok',
+  status:'complete',ctx_ref:'',
+  settings_json:'{"model":"gpt-6-luna","transport":"fast"}'});
+assert.match(h,/aim-modelb/);
+assert.match(h,/aim-tp/);
+assert.match(h,/>fast<\/span>/);
+process.exitCode=0;
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_settings_transport_select_posts_override(self):
+        """The Transport select seeds from the conversation's stored
+        override, lists auto + cli + the server-advertised fast
+        transport, the note explains routing, and Save posts the new
+        transport key alongside the existing settings."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const S=window.AskAI._s;
+  S.conv={id:'conv-1',model:'gpt-6-luna',effort:'low',fast:1,
+    readonly:1,transport:'cli'};
+  window.AskAI.openSettings();
+  await flush();
+  const ts=nodes.get('ais-transport');
+  assert(ts,'transport select exists');
+  assert.equal(ts.disabled,false);
+  assert.match(ts.innerHTML,/value="cli"/);
+  assert.match(ts.innerHTML,/value="fast"/);
+  assert.equal(ts.value,'cli','seeded from the conversation');
+  assert.match(nodes.get('ais-transport-note').textContent,
+    /CLI transport only/);
+  const setw=nodes.get('aisetwrap');
+  // the fast transport explains the read-only fast path
+  setw._h.change({target:{id:'ais-transport',value:'fast'}});
+  assert.match(nodes.get('ais-transport-note').textContent,
+    /fast answers read-only questions/);
+  // read-write + non-cli explains the routing rule
+  setw._h.change({target:{id:'ais-ro',checked:false}});
+  assert.match(nodes.get('ais-transport-note').textContent,
+    /read-write conversations still run on the CLI transport/);
+  // save posts the new transport with the rest of the settings
+  const saveBtn=nodes.get('ais-save');
+  setw._h.click({target:{closest:s=>s==='#ais-save'?saveBtn:null}});
+  await flush();
+  const posted=fetches.find(f=>f.url.includes('/settings')&&
+    f.opt&&f.opt.method==='POST');
+  const body=JSON.parse(posted.opt.body);
+  assert.equal(body.transport,'fast');
+  assert.equal(body.model,'gpt-6-luna');
+  assert.equal(body.readonly,false);
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js=r'''
+setRoute((url,opt)=>{
+  if(url.endsWith('/models'))return{models:[
+    {uid:'gpt-6-luna-low',family:'gpt-6-luna',label:'G6L',
+     in:0.2,out:1.0,vision:true,fast_variant:false}],
+   transports:[{id:'cli',label:'CLI (devin --print)',available:true},
+     {id:'fast',label:'Fast (acp warm session)',available:true}],
+   default_resolution:{ok:true,uid:'gpt-6-luna-low'}};
+  if(url.endsWith('/settings')&&opt&&opt.method==='POST')
+    return{id:'conv-1',model:'gpt-6-luna',effort:'low',fast:1,
+      readonly:0,transport:'fast'};
+  if(url.endsWith('/settings'))return{defaults:{model:'gpt-6-luna',
+    effort:'low',fast:true,readonly:true,transport:'fast'}};
+  return{items:[]};
+});
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_settings_transport_unsupported_server(self):
+        """Against a pre-transport server (no transport key on
+        defaults/conversation, no transports list): the select renders
+        disabled with the honest note, and Save omits the field - an
+        older core rejects unknown settings keys, so a phantom control
+        must never break saving model/effort/fast/readonly."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const S=window.AskAI._s;
+  S.conv={id:'conv-1',model:'gpt-6-luna',effort:'low',fast:1,
+    readonly:1};   // no transport key
+  window.AskAI.openSettings();
+  await flush();
+  const ts=nodes.get('ais-transport');
+  assert.equal(ts.disabled,true,'unsupported server disables select');
+  assert.match(nodes.get('ais-transport-note').textContent,
+    /does not advertise a transport choice/);
+  const saveBtn=nodes.get('ais-save');
+  const setw=nodes.get('aisetwrap');
+  setw._h.click({target:{closest:s=>s==='#ais-save'?saveBtn:null}});
+  await flush();
+  const posted=fetches.find(f=>f.url.includes('/settings')&&
+    f.opt&&f.opt.method==='POST');
+  const body=JSON.parse(posted.opt.body);
+  assert(!('transport' in body),'transport not posted to old server');
+  assert.equal(body.model,'gpt-6-luna');
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js=r'''
+setRoute((url,opt)=>{
+  if(url.endsWith('/models'))return{models:[
+    {uid:'gpt-6-luna-low',family:'gpt-6-luna',label:'G6L',
+     in:0.2,out:1.0,vision:true,fast_variant:false}],
+   default_resolution:{ok:true,uid:'gpt-6-luna-low'}};
+  if(url.endsWith('/settings')&&opt&&opt.method==='POST')
+    return{id:'conv-1',model:'gpt-6-luna',effort:'low',fast:1,
+      readonly:1};
+  if(url.endsWith('/settings'))return{defaults:{model:'gpt-6-luna',
+    effort:'low',fast:true,readonly:true}};
+  return{items:[]};
+});
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_transport_in_usage_details(self):
+        """The expandable usage block names the answering transport (and
+        a fell-back marker), and each internal-request hop that carries
+        its own transport shows it inline."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const S=window.AskAI._s;
+  S.conv={id:'conv-1',model:'m',effort:'',fast:0,readonly:1};
+  S.msgs=[
+    {id:'u1',role:'user',text:'q',ctx_ref:'',settings_json:'{}'},
+    {id:'a1',role:'assistant',text:'ok',status:'complete',ctx_ref:'',
+     settings_json:'{"transport":"fast"}'},
+    {id:'u2',role:'user',text:'q2',ctx_ref:'',settings_json:'{}'},
+    {id:'a2',role:'assistant',text:'ok2',status:'complete',ctx_ref:'',
+     settings_json:'{"transport":"fast"}'}];
+  S.exchByAid['a1']={id:'x1',status:'done',user_msg_id:'u1',
+    transport:'fast',prompt_t:10,completion_t:5,
+    requests:[{n:1,kind:'fresh',transport:'fast',
+      request_id:'sess-9#h1',started_at:1,ended_at:2,exit_code:0,
+      usage:{prompt_t:10,completion_t:5}}]};
+  S.exchByAid['a2']={id:'x2',status:'done',user_msg_id:'u2',
+    transport:'cli',
+    fallback:'{"from":"fast","to":"cli","reason":"init"}',
+    prompt_t:20,completion_t:9};
+  window.AskAI._paint();
+  const html=nodes.get('ai-list').innerHTML;
+  assert.match(html,/transport fast/);
+  assert.match(html,/via fast/);          // per-hop transport
+  assert.match(html,/transport cli \(fell back\)/);
+  // and the meta chips read 'fast' / 'fast→cli' respectively
+  assert.match(html,/aim-tp/);
+  assert.match(html,/fast\u2192cli/);
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js="setRoute(()=>({items:[]}));")
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_progressive_reply_repaints_mid_run(self):
+        """A transport that streams partial text repaints through the
+        existing poll loop: the mid-run tick shows the partial reply
+        with the typing caret, the terminal tick lands the full text -
+        no new code path, pollX already repaints on exchange updates."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  nodes.get('ai-text').value='stream me';
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='#ai-send'?nodes.get('ai-send'):null}});
+  await flush();
+  assert(timers.length>0,'poll scheduled');
+  // first tick: running, partial text -> bubble shows it + caret
+  timers.shift()();
+  await flush();
+  let html=nodes.get('ai-list').innerHTML;
+  assert.match(html,/thinking out/);
+  assert.match(html,/ai-caret/);
+  assert.match(html,/aim-tp/);          // transport chip mid-flight
+  // second tick: done -> full text, no caret
+  timers.shift()();
+  await flush();
+  html=nodes.get('ai-list').innerHTML;
+  assert.match(html,/thinking out loud/);
+  assert.doesNotMatch(html,/ai-caret/);
+  assert.match(html,/done/);
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js=r'''
+let polls=0;
+setRoute((url,opt)=>{
+  if(url.endsWith('/conversations')&&opt&&opt.method==='POST')
+    return{id:'conv-9',client_ref:'w',title:'',model:'gpt-6-luna',
+      effort:'low',fast:1,readonly:1,origin_view:{}};
+  if(url.endsWith('/messages')&&opt&&opt.method==='POST')
+    return{message:{id:'mu',conversation_id:'conv-9',
+        client_msg_id:'m-x',role:'user',text:'stream me',
+        ctx_ref:'{}',settings_json:'{}',status:'complete'},
+      assistant_message:{id:'ma',conversation_id:'conv-9',
+        role:'assistant',text:'',ctx_ref:'{}',settings_json:'{}',
+        status:'pending'},
+      exchange:{id:'xch-1',conversation_id:'conv-9',user_msg_id:'mu',
+        assistant_msg_id:'ma',status:'queued',transport:'fast'}};
+  if(url.includes('/exchanges/xch-1')){
+    polls++;
+    return polls===1
+      ? {id:'xch-1',user_msg_id:'mu',assistant_msg_id:'ma',
+        status:'running',text:'thinking out',transport:'fast',
+        sources:[],requests:[]}
+      : {id:'xch-1',user_msg_id:'mu',assistant_msg_id:'ma',
+        status:'done',text:'thinking out loud',transport:'fast',
+        sources:[],requests:[],prompt_t:9,completion_t:4};
+  }
+  if(url.endsWith('/conversations/conv-9/exchanges'))
+    return{items:[{id:'xch-1',user_msg_id:'mu',assistant_msg_id:'ma',
+      status:'done',transport:'fast',sources:[]}]};
+  return{items:[]};
+});
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_failed_send_clears_optimistic_bubble(self):
+        """Send failure is transport-independent: the optimistic user
+        bubble appears before the POST lands and is removed when it
+        fails, with the honest 'Send failed' note - identical behavior
+        whichever transport the conversation would have used."""
+        p = run_node(
+            r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  nodes.get('ai-text').value='this will fail';
+  nodes.get('aichat')._h.click({target:{closest:s=>
+    s==='#ai-send'?nodes.get('ai-send'):null}});
+  // optimistic bubble renders immediately (before the failed POST)
+  assert.match(nodes.get('ai-list').innerHTML,/this will fail/);
+  await flush();
+  assert.match(nodes.get('ai-note').innerHTML,/Send failed/);
+  assert.doesNotMatch(nodes.get('ai-list').innerHTML,/this will fail/);
+  assert.equal(window.AskAI._s.sending,false);
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''',
+            route_js=r'''
+setRoute((url,opt)=>{
+  if(url.endsWith('/conversations')&&opt&&opt.method==='POST')
+    return{id:'conv-9',client_ref:'w',title:'',model:'gpt-6-luna',
+      effort:'low',fast:1,readonly:1,transport:'fast',origin_view:{}};
+  if(url.endsWith('/messages'))throw new Error('server exploded');
+  return{items:[]};
+});
+''')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
 class ChatHistoryRailTests(unittest.TestCase):
     """The history panel is a floating sibling docked to the chat's
     LEFT edge - not a column inside the card - and its rows carry

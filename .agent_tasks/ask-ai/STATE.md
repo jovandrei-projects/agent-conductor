@@ -99,7 +99,16 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
 - [x] integration-and-design-review
 - [ ] follow-up-plan
 
-### Fast transport (run 20261017-164321-assistant-fast-transport)
+### Phase 3 - fast transport (run 20261017-164321-assistant-fast-transport)
+
+Second manifest on this feature (`manifests/20261017-164112-692a99ef-
+assistant-fast-transport.toml`, `parallel = true`): a second provider
+transport alongside `devin --print` so simple questions answer in
+seconds; CLI stays the fallback and the only action-capable transport.
+All four steps ran CONCURRENTLY in their own worktrees off the same
+checkpoint - each step's contract was designed blind to its siblings'
+output; DESIGN.md section 12 records the wire contract the chat client
+implements so the merge can reconcile field names.
 
 - [x] transport-investigation - DESIGN step, no code. Decision record:
       `assistant/TRANSPORT.md` - CHOSEN warm ACP session pool
@@ -136,10 +145,30 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
       text, snapshot chunks, cum fallback, cancel paths, crash +
       respawn, adopt re-issue, lock skip, auth/spawn/hang failures,
       e2e runtime). See 'Implemented contracts (devin-acp)' below.
-- [ ] runtime-and-settings - per-conversation transport field,
-      fallback recording, read-only routing, back-compat
-- [ ] chat-ui-and-verification - settings control + transport
-      indicator, end-to-end verify
+- [x] runtime-and-settings - per-conversation `transport` setting,
+      fallback recording, read-only routing, back-compat; landed via
+      merge 4a08d9c (contract in QUEUE.md's DONE bullet; 'Verified
+      (runtime-and-settings)' below)
+- [x] chat-ui-and-verification - settings control + transport
+      indicator, end-to-end verify (landed via this merge):
+      Transport select in the settings dialog (feature-detected:
+      `transport` key on defaults/conversation or a `transports`
+      list on /models or /settings; seeds from the conversation
+      override, saves with the settings POST only when advertised so
+      a pre-transport server never 400s; `available:false` options
+      show "(unavailable)"), `.aim-tp` chip per reply naming the
+      answering transport (amber `requested->answered` on a fallback
+      with the recorded `fallback.reason` on the tooltip; derived
+      when the audit is absent; read-only routing explains itself),
+      `· transport` on the usage details line + `via <t>` per request
+      hop, progressive replies repaint through the existing pollX
+      loop unchanged. Wire contract reconciled against the siblings
+      mid-run: settings `transport` = 'cli'|'fast' (schema v5 +
+      `core.TRANSPORTS`, default 'fast'; NULL conv rows read 'cli'),
+      exchange rows `transport` + `fallback` JSON {from,to,reason},
+      `requests[].transport` per hop - client additionally tolerates
+      `transport_used`/`transport_fallback`/`fell_back` spellings.
+      6 new ChatTransportTests; DESIGN.md 12 + AGENTS.md ops notes.
 
 ## Implemented contracts (devin-acp)
 
@@ -769,14 +798,36 @@ See `DESIGN.md` for full reasoning, verified facts, and sources. Headlines:
 
 ## Where it stopped
 
+`chat-ui-and-verification` (fast-transport run, parallel step 4)
+landed on master via merge resolution: the chat client's transport
+surface + docs + 6 tests came in on branch
+conductor/20261017-164321-assistant-fast-transport/
+chat-ui-and-verification. The sibling contracts emerged mid-run and
+were reconciled directly: transport = 'cli'|'fast' (schema v5,
+`core.TRANSPORTS`, default 'fast', NULL conv rows read 'cli'),
+exchanges carry `transport` + `fallback` JSON {from,to,reason},
+request hops carry `transport`; the ACP warm-session adapter
+(assistant/TRANSPORT.md decision) streams via the same
+exchange_view.text the poll loop repaints. DESIGN.md section 12
+records the contract; the UI additionally tolerates the alternate
+spellings in case merge order shifts. All four fast-transport steps
+are now on master (runtime-and-settings via merge 4a08d9c);
+`follow-up-plan` is the remaining step. Merge-resolution note:
+QUEUE.md row 14 unioned both progress tails; DESIGN.md kept the
+sibling-merged decision record as s11 and renumbered the wire
+contract to s12 (AGENTS.md pointer updated); STATE.md merged both
+checklists; chat.js `reqLine` kept both the `rw` and `via
+<transport>` bits. Post-merge verification here: `node --check`
+clean + focused unittest run below; the full `run_tests.py` gate
+was still pending on the branch at write time.
+
 `transport-investigation` (step 1 of the assistant-fast-transport
 follow-up run) is done: the transport is DECIDED - warm ACP session
 pool (`devin acp`), with `devin -p` kept as fallback. The full
-adapter contract + risk table is `assistant/TRANSPORT.md`; the next
-manifest step (`provider-adapter`) implements it exactly. Earlier
+adapter contract + risk table is `assistant/TRANSPORT.md`. Earlier
 phase summary kept below.
 
-`integration-and-design-review` was done: the assembled branch was
+`integration-and-design-review` is done: the assembled branch was
 audited end-to-end, a dozen real defects fixed, verified against a
 live provider on isolated fixture data, browser-exercised
 (46 deterministic checks), and security-reviewed. Findings below;
