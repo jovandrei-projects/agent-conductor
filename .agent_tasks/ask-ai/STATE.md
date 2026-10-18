@@ -939,7 +939,13 @@ NOTE: the assistant-fast-transport driver's merge of
 the stale merge was aborted (`resolve-runtime-and-settings` still shows
 `running` in state.json with pid None; a `sweep`/`--resume` re-marks it
 'lost' and can re-finalize the `conductor/.../runtime-and-settings`
-branch).
+branch). UPDATE ~20:2x - the abort had actually killed a LIVE merge:
+the `conductor.py merge` driver (pid 42848) had re-opened it 58s
+earlier and spawned this resolver. The resolver re-ran the merge from
+unchanged HEAD, resolved QUEUE.md (union of both DONE bullets) +
+assistant/runtime.py (`_send` now threads `readonly` through to
+adapters that declare it, alongside `attachments`), and committed it
+as merge 4a08d9c - the branch landed; 69+67 assistant tests green.
 
 `provider-adapter` (step 2 of the assistant-fast-transport run) is
 done: `assistant/providers/devin_acp.py` implements the TRANSPORT.md
