@@ -20245,7 +20245,13 @@ function applySel(){
 // walkthrough; feed.history is the viewed section that reopens cards the
 // watermark already passed. All state is `tourSt` - null means closed.
 let tourSt = null;
-const TOUR_TAG_STYLE = {new:'#bc8cff',improved:'#58a6ff',fixed:'#3fb950'};
+// change-style labels on tool-update cards; record-event words on work
+// cards (a proposal's 'ready', a run's terminal outcome) render through
+// the same chip - the tag text is the feed's own word either way
+const TOUR_TAG_STYLE = {new:'#bc8cff',improved:'#58a6ff',fixed:'#3fb950',
+  ready:'#39c5cf',done:'#3fb950',failed:'#f85149',partial:'#d29922',
+  stopped:'#8b949e',paused:'#d29922',drained:'#8b949e',ended:'#8b949e',
+  auth:'#f85149',auth_midrun:'#f85149'};
 // The badge is a pure function of /api/state's tour_unseen field: null
 // means the server hasn't computed a count yet - an honest unknown, not
 // a fake 0 - so the pill stays hidden rather than lying. Tour transition
