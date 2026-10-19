@@ -654,7 +654,8 @@ def _resolve_curated(records: list[dict], commits: list[dict],
 def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
                     requests_dir: Path, manifests_dir: Path,
                     warnings: list[str], polish=None,
-                    flags_dir: Path = DEFAULT_FLAGS_DIR) -> list[dict]:
+                    flags_dir: Path = DEFAULT_FLAGS_DIR,
+                    progress=None) -> list[dict]:
     """Raw feed entries for one {base,tip} window - no state annotation.
     Reused by build_feed (live window) and history (stored windows).
 
@@ -662,14 +663,24 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
     (tour_polish.Polisher.cards_for): when it returns cards for this
     range, its commit groupings replace the deterministic area grouping
     for the commits they claim; everything else - run/request/follow-up/
-    curated cards, leftover commits - stays deterministic."""
+    curated cards, leftover commits - stays deterministic.
+
+    ``progress`` is an optional ``(stage: str) -> None`` hook called at
+    phase boundaries - the dashboard's loading screen narrates it."""
+    def _stage(s: str) -> None:
+        if progress:
+            progress(s)
+
     base, tip = rng.get("base") or {}, rng.get("tip") or {}
+    _stage("reading commit log")
     commits, warn = collect_commits(repo_dir, base.get("commit"),
                                     tip.get("commit"))
     if warn:
         warnings.append(warn)
 
+    _stage("loading run records")
     runs_all = _iter_runs(runs_dir)
+    _stage("loading requests")
     reqs_all = _iter_requests(requests_dir)
     # association maps over ALL records, not just the window's
     key_by_dir = {d: _run_key(d, st, p) for d, p, st in runs_all}
@@ -698,6 +709,7 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
 
     # ---- curated records (claims resolve before cards form so a change
     # never appears both curated and raw)
+    _stage("resolving curated updates")
     curated, warns = load_curated(manifests_dir)
     warnings.extend(warns)
     cards, claimed, augments, aug_shas = _resolve_curated(
@@ -904,6 +916,7 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
     # re-resolve identically; curated fold-ins still win over generated
     # text, and record links are re-filtered against this window's real
     # records.
+    _stage("assembling cards")
     grouped: set[str] = set()
     aug_used: set[str] = set()
     try:
@@ -1047,7 +1060,8 @@ def build_feed(state: dict | None = None, boundary: dict | None = None,
                requests_dir: Path = DEFAULT_REQUESTS_DIR,
                manifests_dir: Path = DEFAULT_MANIFESTS_DIR,
                flags_dir: Path | None = None,
-               now: float | None = None, polish=None) -> dict:
+               now: float | None = None, polish=None,
+               progress=None) -> dict:
     """The full tour feed for the current watermark + boundary.
 
     ``entries`` = window cards still needing eyes (state 'new' or
@@ -1060,14 +1074,22 @@ def build_feed(state: dict | None = None, boundary: dict | None = None,
     ``polish`` is an optional ``(rng) -> cards|None`` hook (the tour
     enrichment cache, tour_polish.Polisher.cards_for): it is consulted
     per window - including the stored ranges history re-materializes -
-    so polished cards reproduce the same ids a descriptor recorded."""
+    so polished cards reproduce the same ids a descriptor recorded.
+
+    ``progress`` is an optional ``(stage: str) -> None`` hook the
+    dashboard's loading screen narrates while the build runs."""
+    def _stage(s: str) -> None:
+        if progress:
+            progress(s)
+
+    _stage("capturing change boundary")
     state = state or {"watermark": None, "viewed": [], "snoozed": []}
     boundary = boundary or tour_state.capture_boundary(repo_dir, now=now)
     rng = tour_state.feed_range(state, boundary)
     warnings: list[str] = []
     kw = dict(repo_dir=repo_dir, runs_dir=runs_dir,
               requests_dir=requests_dir, manifests_dir=manifests_dir,
-              polish=polish,
+              polish=polish, progress=progress,
               flags_dir=Path(flags_dir) if flags_dir is not None
               else DEFAULT_FLAGS_DIR)
 
@@ -1095,6 +1117,7 @@ def build_feed(state: dict | None = None, boundary: dict | None = None,
 
     entries = [dict(e) for e in collect(rng)]
     seen_ids = {e["id"] for e in entries}
+    _stage("rebuilding viewed history")
     hist: dict[str, dict] = {}
     for desc in tour_state.entries(state):
         if desc["state"] == "viewed":
@@ -1138,6 +1161,7 @@ def build_feed(state: dict | None = None, boundary: dict | None = None,
     # Viewed history stays reachable via `history` for explicit
     # reopening.
     entries = [e for e in entries if e["state"] != "viewed"]
+    _stage("sorting the deck")
     entries.sort(key=lambda e: (_iso_ts(e.get("at")) or 0, e["id"]))
     history.sort(key=lambda e: (_iso_ts(e.get("viewed_at")) or 0,
                                 e["id"]), reverse=True)

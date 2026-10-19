@@ -3220,13 +3220,24 @@ def _safe_name(s: str) -> str:
     return re.sub(r"[^\w.-]", "_", s)
 
 
+_FLAG_KEY_MEMO: dict[str, str] = {}
+
+
 def _flag_key(run_dir: Path) -> str:
     """Sentinel names pin the run's resolved path, not just its dir name -
     the flag dir is machine-global, and the same `<ts>-<name>` can live in
-    two checkouts' data/runs (or two test sandboxes) at once."""
-    h = hashlib.sha256(
-        os.path.normcase(str(run_dir.resolve())).encode()).hexdigest()[:8]
-    return f"{_safe_name(run_dir.name)}-{h}"
+    two checkouts' data/runs (or two test sandboxes) at once. The
+    resolve() is memoized per path string - collect_dashboard asks once
+    per step otherwise, and a moved/renamed dir arrives under a new
+    string, so entries never mislabel a reused name."""
+    k = _FLAG_KEY_MEMO.get(str(run_dir))
+    if k is None:
+        h = hashlib.sha256(
+            os.path.normcase(
+                str(run_dir.resolve())).encode()).hexdigest()[:8]
+        k = f"{_safe_name(run_dir.name)}-{h}"
+        _FLAG_KEY_MEMO[str(run_dir)] = k
+    return k
 
 
 def stop_flag(run_dir: Path, step: str | None = None) -> Path:
@@ -8877,6 +8888,37 @@ def _publish_proposal(rec: dict, text: str, requests_dir: Path,
     return dict(rec)
 
 
+def plan_supersede(request_id: str, attempt: int,
+                   requests_dir: Path = REQUESTS_DIR) -> dict:
+    """Hand-mark one recorded planner attempt superseded: the human says
+    a different attempt is the one that counts. The auto rule already
+    supersedes failed attempts BEFORE the producing one; this covers a
+    failed regen after it, or any recorded attempt the user retires.
+    The record keeps its real status/note - the dashboard row maps to
+    'superseded' only at render, so history stays honest."""
+    with REQUEST_LOCK:
+        rec = _read_request_file(request_id, requests_dir)
+        if (_spool_dir(request_id) / "request.json").is_file():
+            raise RequestError(
+                "a generation pass is parked on this request - retry "
+                "when it finishes", 409)
+        entries = rec.get("plan_sessions") or []
+        i = attempt - 1
+        if not (0 <= i < len(entries)):
+            raise RequestError(
+                f"no planner attempt #{attempt} on record", 404)
+        e = entries[i]
+        if e.get("gen_id") and e.get("gen_id") == rec.get("plan_gen_id"):
+            raise RequestError(
+                "that attempt produced the current plan - nothing to "
+                "supersede", 409)
+        if not e.get("superseded"):
+            e["superseded"] = True
+            e["superseded_at"] = now_iso()
+            _save_request(rec, requests_dir)
+    return {"ok": True, "request": request_id, "attempt": attempt}
+
+
 def save_request(request_id: str, payload: dict,
                  requests_dir: Path = REQUESTS_DIR,
                  manifests_dir: Path = MANIFESTS_DIR,
@@ -13692,8 +13734,12 @@ def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
         # outstanding failure - 'superseded' (same treatment resolve-*
         # rows get) keeps it out of the failed filter instead of
         # leaving it red forever. An attempt AFTER the producer keeps
-        # its real status: a regen that failed is still actionable.
-        if (status not in ("done", "superseded")
+        # its real status: a regen that failed is still actionable -
+        # unless the human marked it superseded by hand (the recorded
+        # outcome stays on the record; only the rendered status moves).
+        if e.get("superseded") and not produced:
+            status = "superseded"
+        elif (status not in ("done", "superseded")
                 and producer_idx is not None and i < producer_idx):
             status = "superseded"
         if produced:
@@ -13705,6 +13751,9 @@ def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
             note = e["note"]
         elif status == "failed":
             note = "preparation attempt failed"
+        elif e.get("superseded"):
+            note = ("marked superseded - the recorded outcome stays in "
+                    "history")
         else:
             note = "superseded by a later preparation"
         out.append({
@@ -14229,6 +14278,10 @@ def tour_ctx(runs_dir: Path, requests_dir: Path | None = None,
             "gen": 0,         # mutation epoch - a build that started
                               # before a transition can't overwrite the
                               # post-mutation cache it races
+            "progress": {"busy": False, "stage": "", "at": 0.0},
+                              # the loading screen's live narration -
+                              # GET /api/tour/progress serves it while
+                              # a build walks its phases
             "lock": threading.Lock()}
 
 
@@ -14271,13 +14324,31 @@ def _tour_build(ctx: dict, *, now: float | None = None) -> dict:
     polish_on = polisher is not None and polisher.enabled()
     with ctx["lock"]:
         gen0 = ctx["gen"]
+
+    def prog(s: str) -> None:
+        # the What's-new loading screen polls /api/tour/progress so a
+        # long build narrates which source it's on instead of sitting
+        # on a bare spinner - advisory only, never raises
+        try:
+            with ctx["lock"]:
+                ctx["progress"].update(busy=True, stage=s,
+                                       at=time.time())
+        except Exception:                                # noqa: BLE001
+            pass
+    prog("loading tour state")
     state = tour_state.load(ctx["state_path"])
-    boundary = tour_state.capture_boundary(ctx["repo_dir"], now=now)
-    feed = tour_feeds.build_feed(
-        state, boundary, repo_dir=ctx["repo_dir"],
-        runs_dir=ctx["runs_dir"], requests_dir=ctx["requests_dir"],
-        manifests_dir=ctx["manifests_dir"],
-        polish=polisher.cards_for if polish_on else None)
+    try:
+        feed = tour_feeds.build_feed(
+            state, repo_dir=ctx["repo_dir"],
+            runs_dir=ctx["runs_dir"], requests_dir=ctx["requests_dir"],
+            manifests_dir=ctx["manifests_dir"],
+            polish=polisher.cards_for if polish_on else None,
+            progress=prog,
+            now=now)
+    finally:
+        with ctx["lock"]:
+            ctx["progress"].update(busy=False, stage="",
+                                   at=time.time())
     payload = {"generated_at": (_iso_from(now) if now is not None
                                 else now_iso()),
                "boundary": feed["boundary"], "range": feed["range"],
@@ -14493,6 +14564,84 @@ def tour_transition(ctx: dict, entry_id: str, action: str,
     return result
 
 
+# Per-run row cache for the ARCHIVED view: an ended+archived run's rows
+# change only when a sentinel file, its state.json, the linked request,
+# or liveness moves - all cheap to check. With the archived view on, the
+# 2s poll re-pays the full per-step rebuild otherwise (reviews, skip
+# flags, prompt/log/export reads, arc parses), which made toggling the
+# chip feel like the server hung.
+_ARCH_RUN_CACHE: dict[str, dict] = {}
+
+
+def _arch_run_sig(sj: Path, st: dict, requests_dir: Path,
+                  projects: dict) -> tuple:
+    """Everything an archived run's dashboard rows can still read, as one
+    cheap signature: the state file + run dir itself, the linked request
+    file + a parked spool overlay, the manifest, this run's flag-dir
+    sentinels, each step's prompt/stdout/export/STATE.md and the run's
+    summarize/events files, the session-map generation, and every
+    liveness verdict the rows derive (pid, driver, merge, summarizer).
+    A matching sig means the per-run builder would emit identical rows,
+    so collect_dashboard may serve the cached slice."""
+    run_dir = sj.parent
+
+    def fsig(p) -> tuple | None:
+        try:
+            s = Path(p).stat()
+            return (s.st_mtime_ns, s.st_size)
+        except (OSError, TypeError, ValueError):
+            return None
+
+    rid = st.get("request_id")
+    fkey = _flag_key(run_dir)
+    try:
+        flags = tuple(sorted(
+            (f.name, f.stat().st_mtime_ns, f.stat().st_size)
+            for f in _flag_dir().glob(f"*{fkey}*")))
+    except OSError:
+        flags = ()
+    steps = st.get("steps") or {}
+    files = []
+    for n, rec in steps.items():
+        for k in ("prompt", "stdout_log", "export"):
+            files.append(fsig(rec.get(k)))
+        slug = rec.get("slug")
+        wd = rec.get("work_dir") or rec.get("project") or str(
+            projects.get(slug, {}).get("path") or "")
+        pdir = str(projects.get(slug, {}).get("path") or "")
+        for base in (wd, pdir):
+            files.append(fsig(
+                str(Path(base) / ".agent_tasks" / n / "STATE.md")
+                if base else None))
+    files += [fsig(run_dir / "summarize.stdout.log"),
+              fsig(run_dir / "summarize.export.json"),
+              fsig(run_dir / "events.jsonl"),
+              fsig(run_dir / "run.summary.md"),
+              fsig(run_dir / "resume.launch.log")]
+    if rid:
+        files += [fsig(requests_dir / f"{rid}.json"),
+                  fsig(_spool_dir(rid) / "request.json"),
+                  fsig(requests_dir / f"{rid}.gen.log"),
+                  fsig(requests_dir / f"{rid}.gen.export.json")]
+    drv = driver_alive(st)
+    live_sig = tuple(
+        (n, bool(step_live(r, drv)),
+         bool(pid_alive(r.get("pid"), r.get("started_at"))))
+        for n, r in sorted(steps.items()))
+    claim = _merge_claim_held(run_dir)
+    return (
+        fsig(sj), fsig(run_dir), fsig(st.get("manifest")),
+        flags, tuple(files), live_sig, drv,
+        _SESS_CACHE[0], _PRICE_CACHE["fetched"],
+        tuple(sorted((k, str(v.get("path") or ""))
+                     for k, v in projects.items())),
+        bool(pid_alive(_RESUME_PIDS.get(run_dir.name))),
+        run_dir.name in _MERGE_BUSY,
+        bool(pid_alive(_MERGE_PIDS.get(run_dir.name))),
+        claim and claim.get("by"),
+        _summarizing(run_dir))
+
+
 def collect_dashboard(runs_dir: Path,
                       devin_argv: list[str] | None = None,
                       requests_dir: Path | None = None,
@@ -14555,6 +14704,24 @@ def collect_dashboard(runs_dir: Path,
             archived_runs += 1
             if not include_archived:
                 continue
+        # Archived rows are historical - the poll's per-step rebuild is
+        # wasted work on them. Serve the cached slice when every input
+        # it read still matches (_arch_run_sig), else fall through and
+        # re-store below.
+        arch_sig = None
+        if st.get("archived"):
+            arch_sig = _arch_run_sig(sj, st, requests_dir, projects)
+            hit = _ARCH_RUN_CACHE.get(str(sj.parent))
+            if hit and hit["sig"] == arch_sig:
+                agents.extend(hit["main"])
+                prid = hit["prep_rid"]
+                if prid and hit["prep"] and prid not in emitted_prep:
+                    emitted_prep.add(prid)
+                    agents.extend(hit["prep"])
+                agents.extend(hit["post"])
+                runs.append(hit["row"])
+                continue
+        a0 = len(agents)
         key = (f"request:{st['request_id']}" if st.get("request_id")
                else str(sj.parent))
         counts: dict[str, int] = {}
@@ -14805,12 +14972,14 @@ def collect_dashboard(runs_dir: Path,
         # plan, kept as step 0. Deliberately NOT in counts: it is not a
         # run step, and a 'stopped' planner row must never read as
         # resumable work.
+        a1 = len(agents)
         if request and request["id"] not in emitted_prep:
             emitted_prep.add(request["id"])
             agents.extend(plan_attempt_agents(
                 request, key, generating=False,
                 log_path=requests_dir / f"{request['id']}.gen.log",
                 prices=prices))
+        a2 = len(agents)
         # The detached summarizer session rides the same task list as an
         # aux row - bookkeeping, not a pipeline step (seq=None keeps it
         # out of prev/next; the client hides it until the run is
@@ -14888,6 +15057,18 @@ def collect_dashboard(runs_dir: Path,
                                          st.get("steps", {}).values()
                                          if r.get("slug")} |
                                         {s["slug"] for s in proposed.values()})})
+        if arch_sig is not None:
+            # main+pend rows / prep attempt rows (emitted once per
+            # request - replay honors emitted_prep) / summarizer rows /
+            # the run row - the next collect reuses them while the sig
+            # still matches
+            _ARCH_RUN_CACHE[str(sj.parent)] = {
+                "sig": arch_sig, "main": agents[a0:a1],
+                "prep_rid": request["id"] if request else None,
+                "prep": agents[a1:a2], "post": agents[a2:],
+                "row": runs[-1]}
+            if len(_ARCH_RUN_CACHE) > 400:
+                _ARCH_RUN_CACHE.clear()
     for rid, rec in requests.items():
         if rid in launched:
             continue
@@ -15376,6 +15557,24 @@ a { color:#58a6ff; text-decoration:none; }
   font:inherit; font-size:12px; padding:5px 2px; cursor:pointer; }
 #tourcard .thist:hover { color:#58a6ff; }
 #tourcard .thist .sub { float:right; font-size:11px; }
+/* the deck picker: one row per section, its count right-aligned in the
+   section's accent color; an empty deck reads 'all caught up' and is
+   inert rather than opening a blank card */
+#tourcard .tmenulist { display:flex; flex-direction:column; gap:8px;
+  margin:6px 0 4px; }
+#tourcard .tmenu { display:block; width:100%; text-align:left;
+  background:#1c2129; border:1px solid #30363d; border-radius:8px;
+  color:#e6edf3; font:inherit; padding:10px 12px; cursor:pointer; }
+#tourcard .tmenu:hover:not(:disabled) { border-color:#58a6ff;
+  background:#21262e; }
+#tourcard .tmenu:focus-visible { outline:2px solid #58a6ff;
+  outline-offset:1px; }
+#tourcard .tmenu:disabled { opacity:.55; cursor:default; }
+#tourcard .tmenu .tmh { display:flex; justify-content:space-between;
+  align-items:baseline; gap:10px; }
+#tourcard .tmenu .tmsub { color:#8b949e; font-size:11px;
+  margin-top:3px; }
+#tourcard .tstage { margin-top:4px; }
 /* the split walkthrough: a colored top edge plus the colored section
    name in the header mark which half a card belongs to - blue for Tool
    updates, cyan for the Work digest */
@@ -17296,9 +17495,22 @@ function showDetail(i, keepStack){
       `title="cancel this planning pass - the request stays editable ` +
       `and any previous proposal is kept">Stop proposal</button></div>`
     : '');
-  const actHtml = (actBits || genBit)
+  // a recorded non-producing attempt (failed regen, superseded pass)
+  // can be retired by hand - the record keeps its real status, the row
+  // just stops counting as an outstanding failure
+  const supBit = (a.mode==='planner' && a.request_id &&
+      /^plan-proposal-\d+$/.test(a.step||'') &&
+      a.status!=='running' && a.status!=='superseded'
+    ? `<div class="actions"><button type="button" ` +
+      `class="btn secondary" ` +
+      `data-plan-supersede="${esc(a.request_id)}" ` +
+      `data-plan-attempt="${esc(a.step.split('-').pop())}">` +
+      `Mark attempt superseded</button>` +
+      `<span class="sub">a different attempt is the one that counts - ` +
+      `the recorded outcome stays in history.</span></div>` : '');
+  const actHtml = (actBits || genBit || supBit)
     ? `<div class="actzone"><div class="acth">Actions</div>` +
-      actBits + genBit + `</div>` : '';
+      actBits + genBit + supBit + `</div>` : '';
   const html =
     navBar +
     `<h3 id="modal-title">${esc(a.slug)} / ${esc(a.step)}` +
@@ -17939,6 +18151,19 @@ function ctxAgentItems(a){
   if (a.step==='plan-proposal' && a.status==='running' && a.request_id)
     act.push({label:'Stop proposal', danger:true,
       attrs:ctxAttrs({'stop-gen':a.request_id})});
+  // a non-producing planner attempt keeps its real recorded status -
+  // including 'failed' - until the human says a different attempt is
+  // the one that counts. Numbered rows are the non-producers; the bare
+  // 'plan-proposal' name is the producer at rest.
+  if (a.mode==='planner' && a.request_id &&
+      /^plan-proposal-\d+$/.test(a.step||'') &&
+      a.status!=='running' && a.status!=='superseded')
+    act.push({label:'Mark attempt superseded',
+      attrs:ctxAttrs({'plan-supersede':a.request_id,
+                      'plan-attempt':a.step.split('-').pop()}),
+      title:'a different attempt is the one that counts - the recorded ' +
+            'outcome stays honest in history but stops reading as an ' +
+            'outstanding failure'});
   if (a.run_dir)
     act.push({label:a.needs_review?'Mark as reviewed':'Mark as needing review',
       attrs:ctxAttrs({'review-step':base(a.run_dir),'step':a.step,
@@ -21109,6 +21334,24 @@ document.addEventListener('click', async e=>{
     }
     actEnd(actKey);
     return; }
+  // Retire one planner attempt row: the request record keeps the real
+  // outcome, the row just renders 'superseded' and leaves the failed
+  // filter. Confirmed because it rewrites the persisted request file.
+  if (t.dataset && t.dataset.planSupersede){
+    const rid = t.dataset.planSupersede,
+          att = +(t.dataset.planAttempt || 0);
+    if(!await askConfirm(`Mark planner attempt ${att} as superseded? ` +
+      `Its recorded status stays in history - the row stops counting ` +
+      `as an outstanding failure.`)) return;
+    t.disabled = true;
+    try {
+      await api('POST',
+        `/api/requests/${encodeURIComponent(rid)}/plan-supersede`,
+        {attempt:att});
+      await refresh();
+    } catch(err){ await showAlert('Supersede failed: ' + err.message);
+      t.disabled = false; }
+    return; }
   if (t.dataset && t.dataset.deleteRun){
     const dir=t.dataset.deleteRun;
     const r=(lastData?.runs||[]).find(x=>base(x.dir)===dir);
@@ -21697,10 +21940,18 @@ function tourBadge(n){
 }
 const tourReduced = () => typeof matchMedia==='function' &&
   matchMedia('(prefers-reduced-motion: reduce)').matches;
-const tourDeck = () => (tourSt && tourSt.feed && tourSt.feed.entries) || [];
+// the deck the user is walking: when tourSt.sec names a section it is
+// that section's cards only (one deck at a time); null walks all of
+// them, still in the feed's Tool-then-Work order
+const tourDeck = () => {
+  const es = (tourSt && tourSt.feed && tourSt.feed.entries) || [];
+  const s = tourSt && tourSt.sec;
+  return s ? es.filter(e=>tourSec(e)===s) : es;
+};
 const tourHist = () => (tourSt && tourSt.feed && tourSt.feed.history) || [];
 const tourCur = () => tourSt && (tourSt.mode==='hist'
-  ? tourHist()[tourSt.hi] : tourDeck()[tourSt.idx]);
+  ? tourHist()[tourSt.hi]
+  : tourSt.mode==='menu' ? null : tourDeck()[tourSt.idx]);
 // The walkthrough's two sections, in deck order: Tool updates (change/
 // curated cards) first, then the Work digest (record cards). `section`
 // is the feed's own stamp; the id-prefix fallback mirrors tour_feeds'
@@ -21864,7 +22115,9 @@ function tourActionsHtml(){
       `<button type="button" class="btn secondary" data-tour="skip">` +
       `Close</button>`;
   const e = tourCur(), deck = tourDeck();
-  return `<button type="button" class="btn secondary" data-tour="prev"` +
+  return `<button type="button" class="btn secondary" data-tour="menu"` +
+    ` title="back to the deck picker">decks</button>` +
+    `<button type="button" class="btn secondary" data-tour="prev"` +
     `${tourSt.idx<=0?' disabled':''}>&larr;</button>` +
     `<button type="button" class="btn secondary" data-tour="next"` +
     `${tourSt.idx>=deck.length-1?' disabled':''}>&rarr;</button>` +
@@ -21918,7 +22171,41 @@ function tourShow(){
       `</div>`;
   } else if (!tourSt.feed){
     inner = `<h3 id="tourcard-title">What's new</h3>` +
-      `<div class="notice">loading the change feed&hellip;</div>`;
+      `<div class="notice">loading the change feed&hellip;` +
+      `<div class="sub tstage" id="tourstage">` +
+      `${esc(tourSt.stage||'asking the server')}</div></div>` +
+      `<div class="sub">assembled automatically from this repo's git ` +
+      `log and run/request records - deterministic reads, not an ` +
+      `agent task</div>`;
+  } else if (tourSt.mode==='menu'){
+    // the deck picker: one row per section with its unviewed count -
+    // a section with nothing left reads 'all caught up' in place
+    const es = tourSt.feed.entries || [];
+    const secs = [['tool','Tool updates',
+                   'changes to this dashboard and conductor'],
+                  ['work','Work digest',
+                   'finished runs, proposals and things to review']];
+    inner = `<h3 id="tourcard-title">What's new</h3>` +
+      `<div class="sub">assembled automatically from this repo's git ` +
+      `log and run/request records` +
+      ((tourSt.feed.enrichment||{}).enabled
+        ? `; card text may be enriched by a bounded background pass` : ``) +
+      `</div>` +
+      `<div class="tmenulist">` +
+      secs.map(([k,t,d])=>{
+        const n = es.filter(e=>tourSec(e)===k).length;
+        return `<button type="button" class="tmenu" data-tour="sec" ` +
+          `data-sec="${k}"${n?'':' disabled'}><span class="tmh"><b>` +
+          `${t}</b><span class="tsecname ${k}">` +
+          (n ? `${n} card${n>1?'s':''}` : `all caught up`) +
+          `</span></span><span class="tmsub">${d}</span></button>`;
+      }).join('') + `</div>` +
+      `<div class="tactions">` +
+      `<button type="button" class="linkbtn" data-tour="sec" data-sec=""` +
+      `${es.length?'':' disabled'}>walk everything</button>` +
+      `<span class="tgap"></span>` +
+      `<button type="button" class="btn secondary" data-tour="skip">` +
+      `Close</button></div>` + tourHistHtml();
   } else if (tourSt.mode==='hist'){
     const h = tourHist()[tourSt.hi];
     inner = h
@@ -21936,9 +22223,15 @@ function tourShow(){
         `<div class="tactions">${tourActionsHtml()}</div>` +
         tourHistHtml()
       : `<h3 id="tourcard-title">All caught up</h3>` +
-        `<div class="notice ok">nothing new since the last ` +
-        `walkthrough</div>` +
-        `<div class="tactions"><span class="tgap"></span>` +
+        `<div class="notice ok">` +
+        (tourSt.sec
+          ? `nothing left in ${esc(TOUR_SEC_TITLE[tourSt.sec]||'this deck')}`
+          : `nothing new since the last walkthrough`) + `</div>` +
+        `<div class="tactions">` +
+        ((tourSt.sec || (tourSt.feed.entries||[]).length)
+          ? `<button type="button" class="btn secondary" ` +
+            `data-tour="menu">&larr; Decks</button>` : '') +
+        `<span class="tgap"></span>` +
         `<button type="button" class="btn secondary" data-tour="skip">` +
         `Close</button></div>` + tourHistHtml();
   }
@@ -21954,16 +22247,39 @@ function tourShow(){
   tourPlace(true);
 }
 function tourAnchorEl(e){
-  const sel = e && e.anchor;
-  if (!sel || !document.querySelector) return null;
-  let el = null;
-  try { el = document.querySelector(sel); } catch(_){ el = null; }
-  if (!el || !el.getBoundingClientRect) return null;
-  const r = el.getBoundingClientRect();
-  // a usable anchor has real layout - a hidden/zero-sized element gets
-  // the centered fallback like a missing selector
-  if (!r || r.width<=0 || r.height<=0) return null;
-  return {el, rect:r};
+  if (!document.querySelector) return null;
+  // a Work digest card's most honest spotlight is the table row it
+  // describes: the launched run row first, a staged proposal row by
+  // its request:<id> key next, and only then the generic stop anchor.
+  // Rows are matched on data-run-key rather than a selector so no id
+  // ever needs attribute escaping.
+  const want = [];
+  if (e && tourSec(e)==='work'){
+    for (const k of (e.runs||[])) want.push(k);
+    for (const r of (e.requests||[])) want.push('request:'+r);
+  }
+  const sels = [null].concat([e && e.anchor]);
+  if (want.length && document.querySelectorAll){
+    for (const tr of document.querySelectorAll('tr[data-run-key]')){
+      if (tr.dataset && want.includes(tr.dataset.runKey)){
+        const r = tr.getBoundingClientRect &&
+          tr.getBoundingClientRect();
+        if (r && r.width>0 && r.height>0) return {el:tr, rect:r};
+      }
+    }
+  }
+  for (const sel of sels){
+    if (!sel) continue;
+    let el = null;
+    try { el = document.querySelector(sel); } catch(_){ el = null; }
+    if (!el || !el.getBoundingClientRect) continue;
+    const r = el.getBoundingClientRect();
+    // a usable anchor has real layout - a hidden/zero-sized element
+    // falls through to the next candidate like a missing selector
+    if (!r || r.width<=0 || r.height<=0) continue;
+    return {el, rect:r};
+  }
+  return null;
 }
 function tourPlace(reveal){
   const wrap = document.getElementById('tourwrap');
@@ -22006,9 +22322,24 @@ function tourPlace(reveal){
   let top = rb + pad + gap;
   if (top + ch > vh - margin) top = r.top - pad - gap - ch;
   top = Math.max(margin, Math.min(top, Math.max(margin, vh-ch-margin)));
+  let left = Math.max(margin, Math.min(r.left, vw-cw-margin));
+  // ...but the card must never sit ON the thing it describes: when the
+  // clamped vertical slot still overlaps the anchor (a tall row parked
+  // mid-viewport, or a card taller than the space above and below),
+  // park it beside the ring instead - right first, then left. A card
+  // too big for every side keeps the clamped spot - staying on-screen
+  // wins over perfect clearance.
+  if (top < rb + pad && top + ch > r.top - pad){
+    if (r.right + gap + cw + margin <= vw){
+      left = r.right + gap;
+      top = Math.max(margin, Math.min(r.top, vh-ch-margin));
+    } else if (r.left - gap - cw - margin >= margin){
+      left = r.left - gap - cw;
+      top = Math.max(margin, Math.min(r.top, vh-ch-margin));
+    }
+  }
   card.style.top = top+'px';
-  card.style.left = Math.max(margin,
-    Math.min(r.left, vw-cw-margin))+'px';
+  card.style.left = left+'px';
   card.classList.add('anchored');
 }
 // scroll/resize listeners live only while the tour is open - closing
@@ -22029,7 +22360,27 @@ function tourBind(on){
 }
 async function tourLoad(){
   if (!tourSt) return;
-  tourSt.feed = null; tourSt.err = null; tourShow();
+  tourSt.feed = null; tourSt.err = null;
+  tourSt.stage = 'asking the server'; tourShow();
+  // /api/tour builds inline when its cache is stale - while that GET is
+  // in flight, /api/tour/progress names the phase the build is on, so a
+  // slow load narrates ('reading commit log', 'loading run records'...)
+  // instead of sitting on a bare spinner. The poll is advisory: a 404 on
+  // an older server or a failed probe just leaves the last stage up.
+  let pt = null;
+  if (typeof setInterval==='function')
+    pt = setInterval(()=>{
+      api('GET','/api/tour/progress', null, 5000).then(p=>{
+        if (tourSt && !tourSt.feed && !tourSt.err && p && p.busy &&
+            p.stage && tourSt.stage!==p.stage){
+          tourSt.stage = p.stage;
+          const el = document.getElementById('tourstage');
+          if (el && el.textContent!==undefined)
+            el.textContent = p.stage + '\u2026';
+          else tourShow();
+        }
+      }).catch(()=>{});
+    }, 400);
   try { const f = await api('GET', '/api/tour');
     if (tourSt){
       // the unread deck walks as two separated sections - Tool updates
@@ -22052,13 +22403,22 @@ async function tourLoad(){
       for (const [id, c] of tourAcked)
         if (!known.has(id)) f.history.push(c);
       tourSt.feed = f;
+      // entry point: exactly one non-empty deck walks straight in
+      // (the picker would be one click for nothing); two or zero land
+      // on the menu so each deck is chosen on its own
+      const secs = new Set((f.entries||[]).map(tourSec));
+      tourSt.sec = secs.size===1 ? [...secs][0] : null;
+      tourSt.mode = secs.size===1 ? 'deck' : 'menu';
+      tourSt.idx = 0;
     }
   } catch(e){ if (tourSt) tourSt.err = e.message || String(e); }
-  if (tourSt) tourShow();
+  if (pt!==null && typeof clearInterval==='function') clearInterval(pt);
+  if (tourSt){ tourSt.stage = null; tourShow(); }
 }
 function openTour(){
   if (tourSt) return;
   tourSt = {feed:null, err:null, notice:null, idx:0, hi:0, mode:'deck',
+    sec:null, stage:null,
     pending:false, returnEl:document.activeElement||null, _sc:null};
   tourBind(true);
   applySel();           // Ask AI's about-chip follows into the tour
@@ -22099,8 +22459,12 @@ async function tourMark(){
     // deck was pulled (a new commit re-grouped it): a retry can never
     // land, so resync the deck to the server's current feed instead
     if (/unknown tour entry/i.test(String(err && err.message || err))){
+      const prevSec = tourSt.sec;
       await tourLoad();
       if (!tourSt) return;
+      // stay in the deck the user was walking - tourLoad's auto-pick
+      // doesn't know which section this resync came from
+      tourSt.sec = prevSec; tourSt.mode = 'deck';
       const deck = tourDeck();
       const ni = deck.findIndex(x=>x.state!=='viewed');
       tourSt.idx = ni<0 ? deck.length : ni;
@@ -22119,12 +22483,14 @@ async function tourMark(){
   // /api/state poll, which converges once the refresh lands
   if (r && typeof r.unseen_count==='number') tourBadge(r.unseen_count);
   // a viewed card leaves the deck for good (the server's feed filters
-  // it out of entries too - it lives on in 'viewed earlier') - the
-  // splice puts the next unviewed card at this index, or runs the deck
-  // out into the caught-up view
-  const deck = tourDeck();
-  deck.splice(tourSt.idx, 1);
-  if (tourSt.idx > deck.length) tourSt.idx = deck.length;
+  // it out of entries too - it lives on in 'viewed earlier'). Splice
+  // the SOURCE array - tourDeck() returns a filtered copy when a
+  // section is selected - and the index then points at the deck's next
+  // card, or runs it out into the caught-up view
+  const es = tourSt.feed.entries;
+  const j = es.findIndex(x=>x.id===e.id);
+  if (j>=0) es.splice(j,1);
+  if (tourSt.idx > tourDeck().length) tourSt.idx = tourDeck().length;
   tourSt.mode = 'deck';
   tourShow();
 }
@@ -22145,6 +22511,11 @@ async function tourUnview(){
     // than trusting local position guesses
     await tourLoad();
     if (!tourSt) return;
+    // open the deck the card actually landed in - tourLoad's
+    // auto-pick doesn't know which section it re-entered
+    const hit = ((tourSt.feed && tourSt.feed.entries) || [])
+      .find(x=>x.id===h.id);
+    if (hit){ tourSt.sec = tourSec(hit); tourSt.mode = 'deck'; }
     const j = tourDeck().findIndex(x=>x.id===h.id);
     if (j>=0) tourSt.idx = j;
     tourShow();
@@ -22164,14 +22535,30 @@ function tourAct(act, el){
   if (tourSt.pending) return;
   if (act==='mark'){ tourMark(); return; }
   if (act==='unview'){ tourUnview(); return; }
+  if (act==='menu'){ tourSt.sec=null; tourSt.mode='menu'; tourShow();
+    return; }
+  if (act==='sec'){
+    // open one deck: data-sec '' = 'walk everything' (the whole feed,
+    // Tool updates then Work digest); a named deck walks only its
+    // section
+    tourSt.sec = (el && el.dataset && el.dataset.sec) || null;
+    tourSt.mode = 'deck';
+    const d = tourDeck();
+    const ni = d.findIndex(x=>x.state!=='viewed');
+    tourSt.idx = ni<0 ? 0 : ni;
+    tourShow(); return; }
   if (act==='prev' && tourSt.idx>0){ tourSt.idx--; tourShow(); return; }
   if (act==='next' && tourSt.idx<tourDeck().length-1){
     tourSt.idx++; tourShow(); return; }
   if (act==='hist'){
     const i = +(el && el.dataset && el.dataset.hi || 0);
-    if (tourHist()[i]){ tourSt.mode='hist'; tourSt.hi=i; tourShow(); }
+    if (tourHist()[i]){ tourSt._hm = tourSt.mode;
+      tourSt.mode='hist'; tourSt.hi=i; tourShow(); }
     return; }
-  if (act==='back'){ tourSt.mode='deck'; tourShow(); return; }
+  // back returns to wherever history was opened from - the deck picker
+  // included (walking a combined deck with sec null keeps 'deck')
+  if (act==='back'){ tourSt.mode = tourSt._hm || 'deck'; tourShow();
+    return; }
 }
 // --- assistant surface bridge ----------------------------------------
 // The chat client (assistant/static/chat.js) reads which view is on
@@ -22437,6 +22824,12 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     self._json(payload)
                 elif path == "/api/tour":
                     self._json(tour_feed(tour))
+                elif path == "/api/tour/progress":
+                    # the What's-new loading screen polls this while
+                    # /api/tour builds - stage names the source the
+                    # build is on (git log, run records, ...)
+                    with tour["lock"]:
+                        self._json(dict(tour["progress"]))
                 elif path == "/api/repos":
                     # the repos modal's light list: watched repo names +
                     # paths only - the heavy worktree scan goes per-repo
@@ -22601,7 +22994,8 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                         runs_dir, run_dir=body.get("run")), 201)
                 elif (m := re.fullmatch(r"/api/requests/([^/]+)/"
                                          r"(save|generate|run|discard|apply"
-                                         r"|answer|stop|regen-followup)",
+                                         r"|answer|stop|regen-followup"
+                                         r"|plan-supersede)",
                                         path)):
                     request_id, action = m.groups()
                     if action == "save":
@@ -22618,6 +23012,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     elif action == "stop":
                         self._json(stop_generation(request_id, requests_dir,
                                                    runs_dir), 202)
+                    elif action == "plan-supersede":
+                        self._json(plan_supersede(
+                            request_id, int(body.get("attempt") or 0),
+                            requests_dir))
                     elif action == "run":
                         self._json(launch_request(request_id, requests_dir,
                                                   manifests_dir, runs_dir,

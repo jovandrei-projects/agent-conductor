@@ -1365,6 +1365,40 @@ class SplitFeedTests(unittest.TestCase):
             self.assertEqual(area["section"], "tool")
 
 
+class ProgressTests(unittest.TestCase):
+    """build_feed's optional progress hook narrates the phases in
+    collection order - the dashboard's loading card polls
+    /api/tour/progress and relays these while the inline build runs."""
+
+    def test_stages_fire_in_collection_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            stages = []
+            tour_feeds.build_feed(
+                wm(), boundary(repo),
+                repo_dir=repo, runs_dir=base / "runs",
+                requests_dir=base / "requests",
+                manifests_dir=base / "manifests",
+                progress=stages.append)
+        order = ["capturing change boundary", "reading commit log",
+                 "loading run records", "loading requests",
+                 "resolving curated updates", "assembling cards",
+                 "rebuilding viewed history", "sorting the deck"]
+        idx = [stages.index(s) for s in order]
+        self.assertEqual(idx, sorted(idx))      # every phase, in order
+        # no hook -> no crash, same feed
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            f = tour_feeds.build_feed(
+                wm(), boundary(repo),
+                repo_dir=repo, runs_dir=base / "runs",
+                requests_dir=base / "requests",
+                manifests_dir=base / "manifests")
+            self.assertIn("entries", f)
+
+
 class RegistryTests(unittest.TestCase):
     """TOUR_STOPS must map to anchors that actually exist in _DASH_HTML."""
 
