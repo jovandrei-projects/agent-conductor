@@ -14971,6 +14971,10 @@ def collect_dashboard(runs_dir: Path,
                          # steps merge back cleanly and conflicts resolve
                          # themselves; unchecking is the deliberate choice
                          "worktrees": True, "merge_resolver": True,
+                         # one detached prose-only session at run end is
+                         # cheap insurance for the morning review -
+                         # failure just leaves the deterministic roll-up
+                         "summarize": True,
                          "parallel": False},
             "model_options": model_options(devin_argv or ["devin"]),
             "auth": auth_status(devin_argv or ["devin"])}
@@ -18154,7 +18158,7 @@ function syncMergeTiming(){
 function openNew(){
   if (!closeThen(closeDetail(), openNew)) return;
   const defaults=lastData?.defaults||{model:'swe-2',effort:'max',
-    worktrees:true,merge_resolver:true};
+    worktrees:true,merge_resolver:true,summarize:true};
   modalRequest={id:null,status:'new',dirty:false,originalManifest:''};
   showRequestForm({status:'new',raw:'',label:'',project:'',...defaults});
 }

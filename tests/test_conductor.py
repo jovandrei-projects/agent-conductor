@@ -7656,10 +7656,11 @@ assert.match(elem('dbody').innerHTML,
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_request_form_isolation_defaults_and_interlocks(self):
-        """New proposals default worktrees + merge_resolver ON and parallel
-        OFF; merge_resolver only resolves worktree merges, so unchecking
-        worktrees greys + clears it (and re-checking restores it); ticking
-        parallel forces + greys worktrees like held merges do."""
+        """New proposals default worktrees + merge_resolver + summarize ON
+        and parallel OFF; merge_resolver only resolves worktree merges, so
+        unchecking worktrees greys + clears it (and re-checking restores
+        it); ticking parallel forces + greys worktrees like held merges
+        do."""
         js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
             "</script>", 1)[0]
         harness = r'''
@@ -7680,14 +7681,15 @@ vm.runInContext(src,ctx);
 const d={serve_boot:'b',generated_at:'x',agents:[],runs:[],
   project_options:[{slug:'p',cloud_ok:false}],
   defaults:{model:'swe-2',effort:'max',worktrees:true,
-    merge_resolver:true,parallel:false}};
+    merge_resolver:true,parallel:false,summarize:true}};
 vm.runInContext('render('+JSON.stringify(d)+')',ctx);
 vm.runInContext('openNew()',ctx);
-// defaults land in the rendered form: isolation + resolver ticked,
-// parallel unticked
+// defaults land in the rendered form: isolation + resolver + summarize
+// ticked, parallel unticked
 const html=elem('dbody').innerHTML;
 assert.match(html,/id="rq-worktrees" checked/);
 assert.match(html,/id="rq-merge_resolver" checked/);
+assert.match(html,/id="rq-summarize" checked/);
 assert.match(html,/id="rq-parallel"(?! checked)/);
 assert.match(html,/Run the steps in \s*parallel/);
 // stub DOM: set the browser-truth control state, then fire the handler
