@@ -842,6 +842,10 @@ def build_feed(state: dict | None = None, boundary: dict | None = None,
             e["state"] = tour_state.entry_state(state, e["id"])
         e["anchor"] = _anchor(e.get("stop"))
         e["stop_title"] = _stop_title(e.get("stop"))
+    # the deck is what you haven't seen: a card marked viewed leaves the
+    # walkthrough immediately (it already re-materialized into history),
+    # even while newer unmarked cards keep the watermark from advancing.
+    entries = [e for e in entries if e["state"] != "viewed"]
     entries.sort(key=lambda e: (_iso_ts(e.get("at")) or 0, e["id"]))
     history.sort(key=lambda e: (_iso_ts(e.get("viewed_at")) or 0,
                                 e["id"]), reverse=True)

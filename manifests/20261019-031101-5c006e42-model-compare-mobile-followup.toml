@@ -1,0 +1,96 @@
+# Follow-up manifest for run 20261016-013639-model-compare-mobile.
+#
+# That run built the mobile/ Expo mirror of the model-compare webapp; all four
+# implementation steps landed (the "failed" middle step only lacked a STATUS
+# line - its commits were merged via f03b2ce). Everything still open is a
+# residual or hardening item below.
+#
+# Deliberately NOT included: ROADMAP Phase 2 optionals (served dashboard,
+# user-supplied eval numbers, per-token ACU math) are gated on the user's
+# choice/data, not on this run's leftovers. EXPO_PUBLIC_DATA_URL remote fetch
+# stays deferred - no host exists.
+
+[run]
+name = "model-compare-mobile-followup"
+description = "Residuals from the mobile mirror run: dep/asset hygiene, on-device gesture verification, dataset freshness guard."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 90
+max_attempts = 2
+
+# ---------------------------------------------------------------------------
+
+[[step]]
+worktree = true
+name = "deps-cleanup-and-assets"
+project = "model-compare"
+verify = "python run_tests.py --quick"
+prompt = """
+Work in the model-compare repository, inside the mobile/ Expo app (see mobile/NOTES.md and .agent_tasks/mobile/STATE.md). Dependency + asset hygiene pass:
+
+1. Remove the unused `victory-native` dependency. The scatter is custom-drawn with @shopify/react-native-skia and victory-native has zero imports under mobile/src - confirm that first, then uninstall it.
+2. `npm ls react-native-worklets` flags v0.13.0 as invalid against a nested expo-modules-core peer range (it shipped with the SDK 58 template). Run `npx expo-doctor` and `npx expo install --fix` to resolve it; if the mismatch is template-inherent and the bundle still builds, document that finding in mobile/NOTES.md instead of forcing an upgrade.
+3. Replace the remaining Expo template assets with project ones: icon.png (~800KB template art), splash-icon.png, favicon.png, the android adaptive-icon foreground/background/monochrome images, and ios assets/expo.icon per app.json. A simple dark-background scatter-dots motif matching the app's theme tokens is enough - generate the PNGs programmatically (Python PIL or a small node script; nothing fancy needed). Also delete unused template images under assets/ (expo-badge*, react-logo*, tutorial-web.png, explore/home glyphs, grid.png, logo-glow.png, expo-logo.png) after grepping to confirm nothing references them.
+4. Afterwards re-run the full check suite: `node node_modules/typescript/bin/tsc --noEmit`, eslint, `npm test` (scripts/smoke-test.cjs), and `npx expo export --platform web` must all stay clean.
+
+Note: on this box use `npm.cmd`/`npx.cmd` - PowerShell blocks the bare npm/npx shims. node_modules is not installed in a fresh worktree; run `npm ci` first. Update .agent_tasks/mobile/STATE.md to reflect what changed.
+"""
+
+# ---------------------------------------------------------------------------
+
+[[step]]
+worktree = true
+name = "on-device-verification"
+project = "model-compare"
+timeout_min = 150
+verify = "python run_tests.py --quick"
+prompt = """
+Work in the model-compare repository, inside the mobile/ Expo app (see mobile/NOTES.md and .agent_tasks/mobile/STATE.md). This is the one real residual of the mobile mirror: the Skia scatter's gestures have only ever been compile-verified - the web fallback intentionally does not use Skia, so Playwright never exercised them.
+
+STATE.md says "no device on this box" but that note is stale. This machine HAS Android tooling: %LOCALAPPDATA%\\Android\\Sdk contains platform-tools + emulator; `adb devices` showed a physical device RFGL11NN0QV attached; `emulator -list-avds` lists Galaxy_S25_Ultra_API35, Galaxy_S26_Ultra_API36, Pixel_3a_API34, Pixel_8a_API35. Note npm.cmd/npx.cmd required (PowerShell blocks bare shims); run `npm ci` in mobile/ first.
+
+1. Re-check `adb devices`. Prefer the attached physical device if still present; otherwise boot an emulator (`emulator -avd Pixel_8a_API35`, then `adb wait-for-device` and wait for sys.boot_completed=1).
+2. Get the app onto it: `cd mobile && npx expo start` + Expo Go on the device (Skia ships in Expo Go for recent SDKs - check Expo's SDK 58 docs if it errors), or `npx expo run:android` to build+install a debug dev-client via adb if a JDK is available.
+3. On-device walkthrough with `adb exec-out screencap -p > shot.png` screenshots that you actually VIEW: all four tabs render (Chart, Models, Compare, Calc), the native tab bar is visible, the scatter draws per-company colors, est dashed rings, hollow-copilot / diamond-devin-personal markers, collision-placed pile labels, dashed frontier paths, sweet-spot quadrant.
+4. Gesture checks on the chart screen, screenshot-verifying the before/after state of each:
+   - `input tap` on a dot -> inspect tooltip appears with Pin/Details actions
+   - pinch-to-zoom (see below), then `input swipe` pans the viewport while zoomed; at 1x the screen scroll is unaffected
+   - double-tap resets the zoom
+   - Pinch is the hard one to script: `adb shell input` has no multitouch. Try `sendevent` MT-slot sequences on the emulator (record/replay a two-finger gesture), or the emulator's extended controls; if it genuinely cannot be driven from the command line, verify every other gesture and record pinch as the remaining manual-check item in STATE.md - do NOT claim it passed.
+5. Fix anything found, re-verify, and update .agent_tasks/mobile/STATE.md (residual resolved or precisely narrowed), ROADMAP.md Phase 4, and mobile/README.md if the verified surface changed. Kill every spawned server/emulator process before finishing - a live child keeps the session from exiting.
+"""
+
+# ---------------------------------------------------------------------------
+
+[[step]]
+worktree = true
+name = "dataset-drift-guard"
+project = "model-compare"
+timeout_min = 60
+verify = "python run_tests.py --quick"
+prompt = """
+Work in the model-compare repository. mobile/scripts/export-dataset.mjs extracts the dataset consts (VERSIONS/COLORS/MW/ED/MSHORT/MNAMES/MIXW/MINOTE) straight out of index.html into mobile/assets/dataset.json (`npm run export-data`), keeping index.html the single source of truth. But nothing verifies the bundle is fresh: whenever `python generate_report.py` rewrites index.html, the mobile copy silently goes stale.
+
+Add a freshness guard:
+- Give export-dataset.mjs a `--check` mode (or a tiny sibling script) that regenerates the dataset to a temp location and diffs it against mobile/assets/dataset.json, exiting non-zero on drift with a clear "cd mobile && npm run export-data" hint.
+- Wire that check into `python run_tests.py` so the repo suite catches drift - follow the suite's existing test style and keep it fast enough for --quick.
+- Do NOT make generate_report.py emit JSON - extraction stays the mechanism, index.html stays the source of truth.
+- Verify: `python run_tests.py --quick` green; then prove the check fires by copying dataset.json, corrupting the copy's regeneration source path expectation (e.g. temporarily edit one value in dataset.json, run the check, confirm non-zero + the hint, restore).
+
+node is available; use `npm.cmd`/`npx.cmd` shims under PowerShell if needed, but the check itself should be runnable via node/python so run_tests.py needs no npm install.
+"""
+
+# ---------------------------------------------------------------------------
+
+[[step]]
+worktree = true
+name = "follow-up-plan"
+project = "model-compare"
+timeout_min = 30
+prompt = "This run just ended. Review what it accomplished against the request it ran from: per-step logs, STATUS/NEXT lines and notes are under C:/Projects/agent-conductor/data/runs (the newest dir ending in -model-compare-mobile-followup), and progress files live under this project .agent_tasks/. Then write a NEW conductor TOML manifest proposing ONLY the still-unfinished or newly discovered work, saved as C:/Projects/agent-conductor/manifests/model-compare-mobile-followup2.toml. Do not implement or launch that manifest - a human reviews it first. If nothing remains, write the manifest file with a comment saying so - an empty proposal is a valid signal for the reviewer."

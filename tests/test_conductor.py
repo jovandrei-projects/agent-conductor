@@ -1636,6 +1636,320 @@ assert.doesNotMatch(html,/st-other">leased</);
         self.assertEqual({s["pid"]: s["kind"] for s in out},
                          {400: "cli", 300: "desktop"})
 
+    def test_external_session_names_resolve_from_logs_and_db(self):
+        """The pool modal's session names come from the process's own
+        devin_<startts>_<pid>.log (exact pid+start match, so a recycled
+        pid can't adopt a dead process's log) resolved to titles through
+        the CLI's sessions.db - and a bare REPL labels 'interactive'
+        with no session instead of inventing one."""
+        import sqlite3
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "logs").mkdir()
+            (root / "logs" / "devin_20261017-120000_111.log").write_bytes(
+                b"noise\nCreated new session: cool-id\n"
+                b"Saved 3 nodes for session cool-id\n")
+            # a stale log for the same pid at a different start time -
+            # must NOT be picked up
+            (root / "logs" / "devin_20261016-120000_111.log").write_bytes(
+                b"for session stale-id\n")
+            (root / "logs" / "devin_20261017-120100_222.log").write_bytes(
+                b"Saved 2 nodes for session second-id\n")
+            con = sqlite3.connect(root / "sessions.db")
+            con.execute("create table sessions (id text primary key,"
+                        " title text, working_directory text,"
+                        " last_activity_at text)")
+            con.executemany(
+                "insert into sessions values (?,?,?,?)",
+                [("cool-id", "Fix the thing", "C:/repo", "t1"),
+                 ("second-id", "Second chat", "C:/r2", "t2")])
+            con.commit()
+            con.close()
+            procs = [
+                {"pid": 111, "ppid": 9, "name": "devin.exe",
+                 "started_at": "2026-10-17T12:00:00",
+                 "cmd": "devin --permission-mode auto"},
+                {"pid": 222, "ppid": 9, "name": "devin.exe",
+                 "started_at": "2026-10-17T12:01:00",
+                 "cmd": "devin.exe acp"},
+                {"pid": 333, "ppid": 9, "name": "devin.exe",
+                 "started_at": "2026-10-17T12:02:00", "cmd": "devin"},
+            ]
+            saved_ext = dict(conductor._EXT_SESS_CACHE)
+            saved_db = list(conductor._SESS_DB_CACHE)
+            conductor._EXT_SESS_CACHE.update(stamp=None, rows={})
+            conductor._SESS_DB_CACHE[0] = 0.0
+            try:
+                with mock.patch.dict(os.environ,
+                                     {"CONDUCTOR_DEVIN_CLI": str(root)}), \
+                        mock.patch.object(conductor, "_devin_procs",
+                                          return_value=procs), \
+                        mock.patch.object(conductor, "_proc_cmd_table",
+                                          return_value={}):
+                    out = {s["pid"]: s
+                           for s in conductor._devin_sessions([])}
+            finally:
+                conductor._EXT_SESS_CACHE.update(saved_ext)
+                conductor._SESS_DB_CACHE[:] = saved_db
+        r111 = out[111]
+        self.assertEqual(r111["role"], "interactive")
+        self.assertEqual(r111["sessions_seen"], 1)
+        self.assertEqual([s["title"] for s in r111["sessions"]],
+                         ["Fix the thing"])
+        self.assertEqual(r111["sessions"][0]["id"], "cool-id")
+        r222 = out[222]
+        self.assertEqual(r222["role"], "agent host")
+        self.assertEqual(r222["sessions"][0]["title"], "Second chat")
+        # no log file, no sessions - but the role still labels it
+        self.assertEqual(out[333]["role"], "interactive")
+        self.assertEqual(out[333]["sessions_seen"], 0)
+        self.assertEqual(out[333]["sessions"], [])
+
+    def test_repo_status_reports_base_and_worktrees(self):
+        """Fictional worktrees exercising every state the repos modal
+        renders: an unmerged branch with its commits listed, a merged
+        one that only fell behind, an up-to-date one, a detached one, a
+        dirty one, a missing (prunable) one - plus a conductor step
+        worktree whose state.json records 'merged' while git still sees
+        unmerged commits, the bookkeeping-lie case the view exists to
+        surface."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+
+            def commit(repo, fname, content, msg):
+                (repo / fname).write_text(content, encoding="utf-8")
+                git(repo, "add", "-A")
+                git(repo, "commit", "-m", msg)
+                return git(repo, "rev-parse", "HEAD").stdout.strip()
+
+            repo = base / "proj"
+            repo.mkdir()
+            git(repo, "init")
+            commit(repo, "f.txt", "0\n", "init")
+            dflt = conductor.current_branch(repo)
+
+            # unmerged: two commits only on the branch, plus a dirty file
+            git(repo, "worktree", "add", str(base / "wt-feat"), "-b",
+                "feat")
+            commit(base / "wt-feat", "a.txt", "a\n", "feature work A")
+            commit(base / "wt-feat", "b.txt", "b\n", "feature work B")
+            (base / "wt-feat" / "scratch.txt").write_text(
+                "dirty", encoding="utf-8")
+
+            # stale: created at init, base moves past it -> 0 ahead,
+            # 1 behind ('all its commits are already in base')
+            git(repo, "worktree", "add", str(base / "wt-stale"), "-b",
+                "stale")
+
+            # base advances one - gives the earlier worktrees a behind
+            commit(repo, "g.txt", "g\n", "base moves on")
+
+            # up to date: created at the new tip -> 0 ahead, 0 behind
+            git(repo, "worktree", "add", str(base / "wt-same"), "-b",
+                "same")
+
+            # detached
+            git(repo, "worktree", "add", "--detach",
+                str(base / "wt-detach"), "HEAD")
+
+            # prunable: registered, then the directory vanished
+            git(repo, "worktree", "add", str(base / "wt-gone"), "-b",
+                "gone")
+            shutil.rmtree(base / "wt-gone")
+
+            # a conductor step worktree under data/worktrees whose
+            # state.json lies: recorded merged, but one commit is still
+            # only on the branch
+            runs = base / "data" / "runs"
+            wtdir = (base / "data" / "worktrees"
+                     / "20261019-010000-fakerun" / "fix-bug")
+            git(repo, "worktree", "add", str(wtdir), "-b",
+                "conductor/20261019-010000-fakerun/fix-bug")
+            commit(wtdir, "c.txt", "c\n", "the fix")
+            (runs / "20261019-010000-fakerun").mkdir(parents=True)
+            (runs / "20261019-010000-fakerun" / "state.json").write_text(
+                json.dumps({"steps": {"fix-bug": {
+                    "merged": True,
+                    "merged_at": "2026-10-19T02:00:00",
+                    "merge_target": dflt}}}), encoding="utf-8")
+
+            # and a quiet repo with no linked worktrees at all
+            repo2 = base / "quietproj"
+            repo2.mkdir()
+            git(repo2, "init")
+            commit(repo2, "q.txt", "q\n", "init")
+
+            d = conductor._repo_status(
+                {"proj": {"path": repo}, "quietproj": {"path": repo2}},
+                runs)
+
+        repos = {r["name"]: r for r in d["repos"]}
+        self.assertIn("proj", repos)
+        self.assertIn("quietproj", d["quiet"])
+
+        r = repos["proj"]
+        self.assertEqual(r["base"], dflt)
+        self.assertGreaterEqual(len(r["base_log"]), 1)
+        self.assertEqual(r["base_log"][0]["subject"], "base moves on")
+        self.assertTrue(r["base_log"][0]["sha"])
+        self.assertTrue(r["base_log"][0]["at"])
+
+        ws = {Path(w["path"]).name: w for w in r["worktrees"]}
+        self.assertEqual(set(ws), {"wt-feat", "wt-stale", "wt-same",
+                                   "wt-detach", "wt-gone", "fix-bug"})
+
+        w = ws["wt-feat"]
+        self.assertEqual(w["ahead"], 2)
+        self.assertEqual(w["behind"], 1)
+        self.assertTrue(w["dirty"])
+        self.assertEqual([c["subject"] for c in w["commits"]],
+                         ["feature work B", "feature work A"])
+
+        w = ws["wt-stale"]
+        self.assertEqual(w["ahead"], 0)
+        self.assertEqual(w["behind"], 1)
+
+        w = ws["wt-same"]
+        self.assertEqual(w["ahead"], 0)
+        self.assertEqual(w["behind"], 0)
+
+        self.assertTrue(ws["wt-detach"]["detached"])
+        self.assertTrue(ws["wt-gone"]["prunable"])
+
+        w = ws["fix-bug"]
+        self.assertEqual(w["ahead"], 1)
+        self.assertEqual(w["behind"], 0)   # created at the newest tip
+        c = w["conductor"]
+        self.assertEqual(c["run"], "20261019-010000-fakerun")
+        self.assertEqual(c["step"], "fix-bug")
+        self.assertFalse(c["merge_staging"])
+        self.assertTrue(c["merged_recorded"])   # and ahead=1 makes the
+        # row a visible bookkeeping-lie in the modal
+
+    def test_wt_conductor_link_reads_merge_staging(self):
+        """A '<step>.merge' worktree dir resolves to its step's record
+        with merge_staging set - that's the deferred-merge staging wt."""
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td) / "runs"
+            (runs / "r1").mkdir(parents=True)
+            (runs / "r1" / "state.json").write_text(json.dumps(
+                {"steps": {"s1": {"merged": True,
+                                  "merge_target": "dev"}}}),
+                encoding="utf-8")
+            c = conductor._wt_conductor_link(runs, "r1", "s1.merge")
+            self.assertEqual(c["step"], "s1")
+            self.assertTrue(c["merge_staging"])
+            self.assertTrue(c["merged_recorded"])
+            self.assertEqual(c["merge_target"], "dev")
+            # a directory no state.json explains still links by name
+            c = conductor._wt_conductor_link(runs, "r2", "s2")
+            self.assertEqual(c["run"], "r2")
+            self.assertFalse(c["merged_recorded"])
+
+    def test_plan_attempts_before_producer_render_superseded(self):
+        """Iterations that failed/were stopped BEFORE the attempt that
+        produced the live plan are history - 'superseded', not 'failed',
+        so the Failed view stops flagging work that needs nothing. A
+        failed regen AFTER the producer keeps its real status: that one
+        still means something went wrong on the latest try."""
+        with tempfile.TemporaryDirectory() as td:
+            rec = {"id": "req1", "raw": "do things", "run": "req1",
+                   "project": "agent-conductor", "plan_gen_id": "g3",
+                   "plan_sessions": [
+                       {"gen_id": "g1", "status": "failed",
+                        "session_id": "s1"},
+                       {"gen_id": "g2", "status": "stopped",
+                        "session_id": "s2"},
+                       {"gen_id": "g3", "status": "done",
+                        "session_id": "s3"},
+                       {"gen_id": "g4", "status": "failed",
+                        "session_id": "s4"}]}
+            rows = conductor.plan_attempt_agents(
+                rec, "request:req1", generating=False,
+                log_path=Path(td) / "x.gen.log", prices={})
+        st = {r["step"]: r["status"] for r in rows}
+        self.assertEqual(st["plan-proposal"], "done")
+        self.assertEqual(st["plan-proposal-1"], "superseded")
+        self.assertEqual(st["plan-proposal-2"], "superseded")
+        self.assertEqual(st["plan-proposal-4"], "failed")
+        # and without a producer nothing is superseded - a failed plan
+        # with no later success is still outstanding
+        with tempfile.TemporaryDirectory() as td:
+            rec2 = dict(rec, plan_gen_id=None)
+            rows2 = conductor.plan_attempt_agents(
+                rec2, "request:req1", generating=False,
+                log_path=Path(td) / "x.gen.log", prices={})
+        st2 = {r["step"]: r["status"] for r in rows2}
+        self.assertEqual(st2["plan-proposal-1"], "failed")
+        self.assertEqual(st2["plan-proposal-4"], "failed")
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_repos_modal_renders_merge_states(self):
+        """The repos modal paints each watched repo's base HEAD plus
+        per-worktree merge chips: unmerged commits listed by name, stale
+        behinds, the bookkeeping-lie warning when a recorded merge
+        disagrees with git, and the quiet-repo footnote."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map();
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',parentElement:{classList:{toggle(){}}}}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  activeElement:null,addEventListener:()=>{}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const d={generated_at:'2026-10-19T03:00:00',repos:[
+ {name:'proj',path:'C:/p',base:'master',
+  base_log:[{sha:'e102e30',subject:'landed fix',at:'2026-10-19T02:00:00'},
+            {sha:'a1b2c3d',subject:'prev one',at:'2026-10-18T01:00:00'}],
+  worktrees:[
+   {path:'/w/feat',branch:'feat',ahead:2,behind:1,base:'master',
+    dirty:true,detached:false,prunable:false,merging:false,
+    commits:[{sha:'c0001',subject:'feature work A',at:'2026-10-19T01:00:00'},
+             {sha:'c0002',subject:'feature work B',at:'2026-10-19T01:30:00'}]},
+   {path:'/w/stale',branch:'stale',ahead:0,behind:1,base:'master',
+    dirty:false,detached:false,prunable:false,merging:false,commits:[]},
+   {path:'/w/ok',branch:'ok',ahead:0,behind:0,base:'master',
+    dirty:false,detached:false,prunable:false,merging:false,commits:[]},
+   {path:'/data/worktrees/r1/s1',branch:'conductor/r1/s1',ahead:1,
+    behind:0,base:'master',dirty:false,detached:false,prunable:false,
+    merging:false,
+    commits:[{sha:'d0001',subject:'step work',at:'2026-10-19T01:40:00'}],
+    conductor:{run:'20261019-010000-fakerun',step:'s1',
+     merged_recorded:true,merged_at:'2026-10-19T02:00:00',
+     merge_staging:false,merge_target:'master'}},
+   {path:'/w/mrg',branch:'mrg',ahead:1,behind:0,base:'master',
+    dirty:false,detached:false,prunable:false,merging:true,
+    commits:[{sha:'e0001',subject:'m',at:'2026-10-19T01:50:00'}]}
+  ]}],
+ quiet:['quietproj','money-plan']};
+vm.runInContext('repoView=true;repoData='+JSON.stringify(d)+';renderRepos()',ctx);
+const html=elem('dbody').innerHTML;
+assert.match(html,/repositories/);
+assert.match(html,/<h4>proj <span/);
+assert.match(html,/>master</);
+assert.match(html,/e102e30<\/code> landed fix/);
+assert.match(html,/latest 2 commits/);          // base log details
+assert.match(html,/2 unmerged/);
+assert.match(html,/feature work A/);
+assert.match(html,/1 behind/);
+assert.match(html,/all in master/);             // stale, nothing unique
+assert.match(html,/up to date/);
+assert.match(html,/dirty/);
+assert.match(html,/record says merged/);        // the bookkeeping lie
+assert.match(html,/data-run-details="20261019-010000-fakerun"/);
+assert.match(html,/merge in progress/);
+assert.match(html,/no linked worktrees: quietproj, money-plan/);
+assert.match(html,/data-repo-refresh/);
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_pool_ui_tracks_leases_between_identical_payloads(self):
         """Regression: slot_pool is NOT part of the render signature, so
@@ -1694,8 +2008,12 @@ const d={serve_boot:'b',generated_at:'2026-10-17T19:00:00',cpu_count:16,
   free_ram_gb:4.9,agents:[],runs:[],
   slot_pool:{cap:8,in_use:0,holders:[],external:[
     {pid:29632,kind:'desktop',started_at:'2026-10-17T17:33:26',
-     cmd:'devin.exe acp'},
-    {pid:3224,kind:'cli',started_at:'2026-10-17T13:41:00',cmd:'devin'}]}};
+     cmd:'devin.exe acp',role:'agent host',sessions_seen:2,
+     sessions:[{id:'warm-bubble',title:'Understanding agent pools',
+                dir:'C:/proj'},
+               {id:'x2'}]},
+    {pid:3224,kind:'cli',started_at:'2026-10-17T13:41:00',cmd:'devin',
+     role:'interactive',sessions_seen:0,sessions:[]}]}};
 vm.runInContext('render('+JSON.stringify(d)+')',ctx);
 vm.runInContext('poolView=true;renderPool()',ctx);
 const html=elem('dbody').innerHTML;
@@ -1705,6 +2023,11 @@ assert.match(html,/>desktop</);
 assert.match(html,/>cli</);
 assert.match(html,/devin\.exe acp/);
 assert.match(html,/never count toward the cap/);
+// enrichment: role chip + resolved session title (untitled ids hide),
+// and a REPL with no sessions shows the honest idle label
+assert.match(html,/agent host/);
+assert.match(html,/Understanding agent pools/);
+assert.match(html,/idle - no session yet/);
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
                            capture_output=True, text=True, encoding="utf-8",
@@ -3760,7 +4083,11 @@ prompt = "Organize the catalog and verify results."
         # 'plan-proposal' is THIS plan's producer - never attempt 1
         self.assertEqual(by_step["plan-proposal"]["session_id"], "sess-2")
         self.assertEqual(by_step["plan-proposal"]["seq"], -1)
-        self.assertEqual(by_step["plan-proposal-1"]["status"], "stopped")
+        # a pre-producer attempt is superseded bookkeeping - the raw
+        # plan_sessions record keeps 'stopped', the dashboard row does
+        # not stay under a work-needed status
+        self.assertEqual(by_step["plan-proposal-1"]["status"],
+                         "superseded")
         self.assertEqual(by_step["plan-proposal-1"]["session_id"],
                          "sess-1")
         self.assertIsNone(by_step["plan-proposal-1"]["seq"])
@@ -4078,7 +4405,8 @@ prompt = "Organize the catalog and verify results."
         self.assertEqual(by_step["plan-proposal"]["session_id"],
                          "sess-plan-2")
         self.assertEqual(by_step["plan-proposal"]["seq"], -1)
-        self.assertEqual(by_step["plan-proposal-1"]["status"], "stopped")
+        self.assertEqual(by_step["plan-proposal-1"]["status"],
+                         "superseded")
         self.assertEqual(by_step["plan-proposal-1"]["session_id"],
                          "sess-plan-1")
         self.assertIsNone(by_step["plan-proposal"]["run_dir"])
@@ -4102,7 +4430,8 @@ prompt = "Organize the catalog and verify results."
         self.assertEqual(by_step["organize"]["status"], "done")
         self.assertEqual(by_step["plan-proposal"]["session_id"],
                          "sess-plan-2")
-        self.assertEqual(by_step["plan-proposal-1"]["status"], "stopped")
+        self.assertEqual(by_step["plan-proposal-1"]["status"],
+                         "superseded")
 
     def test_same_second_stop_cannot_publish_late_toml(self):
         """Regression: _disk_untouched compared only updated_at, a
@@ -15057,7 +15386,12 @@ wave = 1
                          "end": "2026-10-16T01:04:10"},
                         {"start": "2026-10-16T01:06:00",
                          "end": "2026-10-16T01:10:00"}]}}}))
-            d = conductor.collect_dashboard(runs, ["no-such-devin"])
+            # include_archived: the fixture's fixed 2026-10-16 stamps age
+            # past ARCHIVE_AFTER_S on the wall clock, and _auto_archive
+            # would drop the run from the default view - this test's
+            # contract is the elapsed fields, not the archive filter
+            d = conductor.collect_dashboard(runs, ["no-such-devin"],
+                                            include_archived=True)
             a = next(a for a in d["agents"] if a["step"] == "s1")
             self.assertEqual(a["elapsed_s"], 330.0)
             self.assertEqual(a["first_started_at"],

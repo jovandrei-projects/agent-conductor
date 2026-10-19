@@ -249,7 +249,9 @@ assert.ok(!fetches.some(u=>u.includes('/api/tour')));   // badge never GETs the 
   await click(act('mark'));
   assert.deepEqual(posts[1].url,'/api/tour/area%3Apower%3Aaaa111bbb222/viewed');
   assert.equal(elem('tour-badge').textContent,'1');
-  assert.match(card(),/Update 2 of 2/);
+  // the marked card leaves the deck - '1 of 1' counts what is left,
+  // never a card already seen
+  assert.match(card(),/Update 1 of 1/);
   assert.match(card(),/Mixed bag/);
   // the viewed card joined the viewed section
   assert.match(card(),/viewed earlier \(2\)/);

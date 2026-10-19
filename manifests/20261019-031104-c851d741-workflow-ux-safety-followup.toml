@@ -1,0 +1,220 @@
+# Follow-up proposal drafted by the workflow-ux-safety run's closing
+# follow-up-plan step (run dir: data/runs/20261016-013719-workflow-ux-safety,
+# request 20261016-004433-fca7265b). Reviewed but NOT launched - a human
+# reviews this file, then `python conductor.py run` or dashboard Start run.
+#
+# Reviewed evidence: the run's state.json + events.jsonl, every step's
+# stdout/verify log tail, per-step STATUS/NEXT/OUTCOME lines, the three
+# parked worktrees' .agent_tasks/<step>/STATE.md, the original request
+# record 20261016-004433-fca7265b.json, and merged git state on master
+# (c9939ae at review time).
+#
+# Outcome vs the request - 14 of 17 items landed on master AND verified
+# during the run:
+#   summary-purpose-parsing (purpose marker no longer leaks as Task text),
+#   modal-detail-navigation (in-app summary + modalHist Back stack),
+#   full-trajectory-view (lazy full-text arc entries), row-context-menus,
+#   proposal-action-state (computed pending diff, neutral Regenerate),
+#   request-image-picker, model-choice-lists, interrupt-with-instructions,
+#   recoverable-trash, followup-run-discovery (Ready-to-run registration),
+#   isolate-proposal-planning (planner spool through open merges),
+#   deferred-merge-engine, emulator-resource-ownership (serial leases),
+#   mobile-relaunch-handling + apartment-mobile-relaunch (the
+#   Confirm-Navigation stall closed on BOTH sides: mobile_device.py
+#   relaunch/consent-gated confirm-navigation + app-side __save.flushNow,
+#   proven on a live emulator dialog, device-persist 19/19).
+#   integration-regressions verified the landed wave together: 423/423
+#   tests + demo + 60/60 live Playwright probe + deferred-merge e2e 22/22 +
+#   gen-during-merge e2e 10/10 (one real regression found and fixed).
+#
+#   PARKED with completed, verified work - all recorded `failed` without a
+#   real work failure, branches + worktrees retained:
+#     isolate-worktree-services  f071b48  per-worker loopback port leases
+#                    (8806-8859), CONDUCTOR_* env propagation, leased serve
+#                    port, service row in task modal; 241/241 in-worktree;
+#                    recorded failed only on the 600s verify cap.
+#     project-merge-targets      00ec1fd  merge_target end-to-end (Step/
+#                    [defaults]/[run] scope, recorded at dispatch, non-main
+#                    merge worktrees, branches endpoint + form default);
+#                    247/247; recorded failed on a missing STATUS line.
+#     deferred-merge-controls    32b44b7  merge-timing proposal option +
+#                    run-modal pending-merge panel + selective confirmed
+#                    merge; 258/258; same STATUS-less failure.
+#   Worktrees: data/worktrees/20261016-013719-workflow-ux-safety/<step>/.
+#
+# What remains (the only scope below):
+#   1. Land the three parked branches - the work is done and verified;
+#      missing are the merges, the state.json merge bookkeeping, and one
+#      combined verification.
+#   2. Checkpoints are NOT merge-aware: this run recorded a foreign
+#      driver's post-step `git add -A` checkpoint sweeping a mid-merge
+#      tree into a stray 'checkpoint' commit. deferred-merge-engine gave
+#      merge-vs-merge the _RepoMergeLock; the checkpoint side is open.
+#   3. mobile_device.py confirm-navigation: post-tap cleared-verify flakes
+#      on slow/stale uiautomator dumps (rc=4 false-negative after a
+#      successful tap - observed live by both mobile steps; the app-side
+#      check retries once as a workaround, the helper itself is unhardened).
+#   4. The device lease ships dark: no projects.toml entry sets `device`,
+#      so no mobile run ever leases. Opt in the mobile-capable projects.
+#   5. The three parked features (port leases, merge_target, deferred
+#      controls) are mock/e2e verified but never exercised live.
+#
+# Deliberately excluded - owned by still-unlaunched sibling proposals:
+#   - manifests/run-review-ux-followup.toml: the 600s verify cap fix
+#     (verify-timeout-config), the five parked run-review-ux branches, that
+#     run's flake pair + live smoke. Its merge step and this manifest's both
+#     write master - they must not run concurrently (the merge lock
+#     serializes; launch them one at a time).
+#   - manifests/proposal-flow-fixes-followup.toml: transitively-merged
+#     record accuracy + live planner smoke. This run has no transitive
+#     merges - its three parkers are genuinely unmerged.
+#   - manifests/proposal-ui-fixes-followup.toml: _flag_soon wall-clock
+#     flake family. manifests/ux-controls-followup.toml: the older
+#     verify-timeout draft (superseded by run-review-ux's copy).
+#
+# Data observation for the reviewer (no step - likely needs human eyes):
+# the five follow-up manifests registered ~16:04 (owned copies
+# manifests/20261016-1604*-*.toml, swept into commit a8fae9e) have NO
+# surviving request records in data/requests/ and followups.index is
+# absent - if nobody discarded them, the registry lost rows somewhere.
+# The smoke step re-checks durable listing; investigate separately if the
+# disappearance was not deliberate.
+#
+# Reviewer note on the pending flag: the registered proposal reads
+# 'worktrees' pending because the form checkbox cannot express mixed
+# isolation - land-parked-branches deliberately runs in the main checkout
+# (it merges branches into the checked-out master), the rest are
+# worktree-isolated. Do NOT reconcile by clicking Apply options with the
+# box ticked - that would force worktree = true onto the merge step and
+# break it. The clean launch is `python conductor.py run` on this manifest
+# (or its owned copy) after review; the dashboard Start gate is designed to
+# refuse exactly this state.
+#
+#   python conductor.py plan manifests\workflow-ux-safety-followup.toml
+#   python conductor.py run  manifests\workflow-ux-safety-followup.toml
+
+[run]
+name = "workflow-ux-safety-followup"
+description = "Land the three parked workflow-ux-safety branches (service-port leases, merge_target, deferred-merge controls), make step checkpoints merge-aware, harden mobile post-tap verify + opt mobile projects into device leases, live-smoke the landed set."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 60
+max_attempts = 3
+verify = "python run_tests.py"
+
+# Every step sets verify = "" on purpose: the driving conductor's post-step
+# gate is hard-capped at 600s (run_step's timeout=600; the deferred-staging
+# verify likewise) while this suite already needs ~580s BEFORE the ~46
+# parked-branch tests land. Each prompt requires running `python
+# run_tests.py` manually to green - same gate, uncapped. The configurable
+# timeout is owned by run-review-ux-followup.toml's verify-timeout-config.
+
+# ---------------------------------------------------------------------------
+# Step 1 runs in the MAIN checkout on purpose: merging parked branches into
+# the checked-out master is checkout-level work (established convention).
+[[step]]
+name = "land-parked-branches"
+project = "agent-conductor"
+timeout_min = 120
+verify = ""
+prompt = '''
+Land the three parked worktree branches of run 20261016-013719-workflow-ux-safety onto master in THIS (main) checkout. All feature work on them is complete and was verified by the workers in-worktree - your job is the merges, the run-record bookkeeping, and the combined verification, not re-doing features.
+
+Parked state (confirm with `git branch --list "conductor/20261016-013719-workflow-ux-safety/*"` and `git worktree list`):
+- isolate-worktree-services tip f071b48 - worker port leases (8806-8859) + CONDUCTOR_* env + leased serve port; in-worktree 241/241 green.
+- project-merge-targets tip 00ec1fd - merge_target end-to-end; removes worktree_merge in favor of merge_step_branch and rewires _merge_run; in-worktree 247/247.
+- deferred-merge-controls tip 32b44b7 (base a649a85) - merge-timing option + pending-merge panel; in-worktree 258/258.
+
+Preflight - do NOT skip:
+- Confirm the parent run ended: data/runs/20261016-013719-workflow-ux-safety/state.json has no step still `running` and its driver_pid is dead.
+- Check every OTHER data/runs/*/state.json: if any has a live driver_pid or a step whose work_dir is inside this repo, finish `blocked` and name it - a foreign driver's `git add -A` checkpoint can sweep your mid-merge tree into a stray "checkpoint" commit (documented incident from this very run), and a same-repo merge lock may already be held.
+- Checkout must be on master with no staged or tracked-modified files. Untracked manifests/*-followup*.toml intake files are EXPECTED - leave them alone (git status is "clean enough" with them present; do not delete or commit them yourself).
+
+Then:
+1. Run `python conductor.py merge 20261016-013719-workflow-ux-safety` (bare run-dir NAME - a path fails RUN_DIR_RE validation) first - the supported pending-branch path merges in manifest order and stamps merged/merged_at + step_merged events (flipping the failed statuses off). The run had merge_resolver = true, so conflicts may spawn resolve-* sessions - let them work.
+2. For any branch left conflicted, merge by hand: `git merge --no-edit conductor/20261016-013719-workflow-ux-safety/<step>` in manifest order (isolate-worktree-services, then project-merge-targets, then deferred-merge-controls). Expected conflicts: .agent_tasks/QUEUE.md + .agent_tasks/efficiency_stats.md (both-append bookkeeping - union them, keep every line from both sides, chronological order) and REAL semantic overlaps in conductor.py + tests: project-merge-targets replaced worktree_merge with merge_step_branch/_merge_loc/merge_wt_for and rewired _merge_run, while master gained deferred-merge-engine's pending_merges loop + _RepoMergeLock + _merge_deferred_group staging AFTER that branch forked - the merged _merge_run must keep BOTH: recorded-target-aware legacy merges AND the serialized deferred pipeline. Likewise deferred-merge-controls' collect_dashboard/JS hunks sit next to later master work (followup stamps, watcher identity, service rows) - keep both sides' features. Never resolve by dropping a side. Afterwards `git grep -n "^<<<<<<<"` must be empty.
+3. Re-run the merge verb so it observes now-up-to-date branches and stamps the remaining records (`merged`/`merged_at`/status flip + step_merged events). If a branch already landed it is a no-op merge - that is fine.
+4. Verify: `git merge-base --is-ancestor <tip> master` succeeds for all three; state.json shows the three records merged=true; `git worktree list` shows none of the run's worktrees left (remove any survivors once their branch is provably merged); `python run_tests.py` run BY YOU to green (expect ~700s+ once the ~46 parked tests join - the driving gate's 600s cap is a KNOWN false-fail, that fix lives in the sibling run-review-ux-followup manifest); `python conductor.py demo` green.
+5. If the combined tree genuinely fails, investigate and fix on master as separate commits - never finish with a merge in progress: each attempt ends committed or `git merge --abort`ed.
+
+Update .agent_tasks (the merged branches carry most ledger entries - add what is missing, incl. a QUEUE.md line for this landing) and commit bookkeeping separately from fixes.
+'''
+
+# ---------------------------------------------------------------------------
+[[step]]
+name = "merge-aware-checkpoints"
+project = "agent-conductor"
+worktree = true
+timeout_min = 75
+verify = ""
+prompt = '''
+This run produced a documented incident: a foreign driver's post-step checkpoint ran `git add -A && git commit` in a checkout that had a merge in progress, sweeping the mid-merge tree into a stray "conductor: checkpoint" commit (see QUEUE.md's isolate-proposal-planning UPDATE). deferred-merge-engine added _RepoMergeLock for merge-vs-merge, but the checkpoint side is still open: git_commit (conductor.py ~line 1000) is a bare add-A+commit with no merge awareness, reached from the pre-step checkpoint (~3534), the post-attempt commit (~3733), and the wave checkpoint (~4278).
+
+Make checkpoints merge-aware:
+- A checkpoint landing where `merge_in_progress(work_dir)` or `_repo_merge_busy(work_dir)` must NOT `git add -A` - it would capture someone else's conflicted tree. Decide the right semantics per call site and document them: pre-step in such a checkout should probably fail the step with a clear note (committing there is corruption-prone anyway); post-step/wave sites should skip the commit and record why on the step record rather than silently absorbing a merge - but never leave the driver believing work was checkpointed when it was not.
+- Keep the change small and consistent with existing helpers (merge_in_progress, _repo_merge_busy, git_dirty_tracked). A merge a HUMAN started is protected the same way - never abort, never adopt.
+- Cover it with tests in the existing style (tempdir repos): pre-step checkpoint refuses on an open merge, post-step checkpoint skips with a recorded note, live foreign lock-file blocks, a dead holder's lock does not, and normal checkpoints still work.
+- Check for other `git add -A`/`git_commit` callers that can hit a checkout with foreign merge state (resolve-* dispatch paths, resume, sweep-adjacent paths) and give them the same guard or document why they are safe.
+
+Run `python run_tests.py` manually to green (~12+ min; the conductor gate cap is known-broken, see the header comment). Update .agent_tasks and commit code separately from bookkeeping.
+'''
+
+# ---------------------------------------------------------------------------
+[[step]]
+name = "mobile-device-hardening"
+project = "agent-conductor"
+worktree = true
+timeout_min = 75
+verify = ""
+prompt = '''
+Two leftovers from the mobile half of run 20261016-013719-workflow-ux-safety (see its state.json outcomes and QUEUE.md entries for emulator-resource-ownership, mobile-relaunch-handling, apartment-mobile-relaunch, integration-regressions):
+
+1. mobile_device.py confirm-navigation: the post-tap cleared-verify can false-fail - the Leave/Stay tap lands and the dialog is gone (verified by screencap), but a slow or stale uiautomator dump during modal dismissal still produces rc=4 (observed live by the apartment-mobile-relaunch step; integration-regressions recorded the same as a documented limitation). Harden it: a bounded post-tap confirmation that tolerates transient dump failures - e.g. retry/backoff with a fresh dump required to prove the dialog is GONE, optionally cross-checked via `dumpsys window` focus/`mCurrentFocus` before declaring timeout. Keep every guarantee: never auto-accept, --leave/--stay consent unchanged, foreign/ unexpected dialogs still refuse with diagnostics, all waits stay bounded, the serial lease enforcement is untouched.
+   Tests: extend the MobileDeviceTests family - stale/empty dump then cleared = success, persistent dialog = still rc=4-equivalent failure, foreign signature still refused, per-call timeouts still honored.
+
+2. The device lease ships dark: no projects.toml entry carries `device`, so the machinery built this run is never exercised. Add `device = "emulator"` to the projects that demonstrably run Android work - apartment-3d (proven device harnesses + this run's live validation) and mobile-apps at minimum; check data/runs evidence for model-compare before deciding (the model-compare-mobile run name suggests device use - verify rather than assume). Comment the choice in projects.toml and make sure AGENTS.md's device paragraph already documents project-level inheritance (it should - verify the claim, fix if stale). Do NOT touch cloud_ok gates.
+
+Run `python run_tests.py` manually to green. Update .agent_tasks; commit code separately from bookkeeping.
+'''
+
+# ---------------------------------------------------------------------------
+[[step]]
+name = "landed-features-live-smoke"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+verify = ""
+prompt = '''
+The three branches landed by step 1 (service-port leases, merge_target, deferred-merge controls) plus this run's follow-up registration are mock/e2e-verified but were never exercised live end-to-end. Do that pass now against the LANDED master state.
+
+TRAP-5-safe setup (proven pattern): copy the repo to a scratch dir nobody watches - robocopy/xcopy C:\Projects\agent-conductor -> %TEMP%\ac-wfus-smoke-<ts> EXCLUDING .git, data, worktrees, caches; run `python examples/make_demo_projects.py` + `python examples/make_lab_projects.py` in the copy so data/demo*/lab-* exist; serve FROM THE COPY on a free 87xx port so every write lands in the copy's data/. First confirm no run driver is live in the real checkout (data/runs/*/state.json driver_pid liveness) - do not disturb a live run.
+
+Exercise and report each item honestly (real Chromium via Playwright preferred; node-harness otherwise - say which):
+- Service ports: a small 2-step manifest in the scratch copy with worktree steps shows each step leasing a distinct service_port/service_url on its agent row + task modal 'service' row, released at step end, no :8773 collision.
+- merge_target: the request form's branch field lists real local branches for a selected project (GET /api/projects/<slug>/branches); a demo/lab project given a non-main branch receives a worktree step's merge on THAT branch, not the default - recorded target_branch visible in the run modal.
+- Deferred merging: a scratch manifest with merge = "deferred" leaves branches pending after the wave; the run modal's Pending merges panel lists them grouped by project with verify chips; the confirmed Merge selected lands them, alternatives stay uncombined, and a busy/dirty stage keeps things pending with an honest state.
+- Follow-up registration: a produced <scratchrun>-followup.toml in the copy's manifests/ becomes a Ready-to-run request row on refresh/restart (durable listing - the run that built this feature just had five registered follow-ups vanish from data/requests under unclear circumstances; prove the guarantee holds in the copy).
+
+Verify, do not fix: record precisely what works live vs what is broken, in .agent_tasks; finish `partial` rather than patching here. COMMIT the probe script(s) under tests/ or a probes dir (past probes died in scratch/). Kill EVERY spawned process - serve, browser drivers, demo runs - BEFORE printing STATUS (trap 12). Commit bookkeeping only.
+'''
+
+# ---------------------------------------------------------------------------
+[[step]]
+name = "follow-up-plan"
+project = "agent-conductor"
+worktree = true
+timeout_min = 30
+verify = ""
+prompt = '''
+Review what this run accomplished against the residuals it targeted: the three parked workflow-ux-safety branches landed on master (or not) with truthful records, checkpoint merge-awareness, the mobile post-tap hardening + device-lease opt-in, and the live smoke results.
+
+Per-step logs, STATUS/NEXT/OUTCOME lines and notes are under C:/Projects/agent-conductor/data/runs in the newest dir ending in 'workflow-ux-safety-followup', alongside this project's .agent_tasks files and the merged git state. Check the still-unlaunched sibling proposals too (manifests/ux-controls-followup.toml, proposal-ui-fixes-followup.toml, proposal-flow-fixes-followup.toml, run-review-ux-followup.toml) so overlapping items are never proposed twice - and note whether any were launched meanwhile.
+
+Then write a NEW conductor TOML manifest proposing only still-unfinished or newly discovered work, saved as 'C:/Projects/agent-conductor/manifests/workflow-ux-safety-followup-2.toml' using forward slashes, and register it as Ready to run via `python conductor.py import manifests/workflow-ux-safety-followup-2.toml --run <this run's dir>` (explicit import is the supported flow - the -2 name is outside the *-followup.toml discovery glob by design). Follow this manifest's conventions: registered project slugs, worktree = true for code steps, the registered verification command in [defaults], max_attempts = 3, merge_resolver = true, a closing follow-up-plan step, verify = "" per step while the driving conductor's 600s gate cap remains unshipped. Do NOT launch or implement the follow-up - a human reviews it. If nothing remains, say so explicitly in the manifest header comment without inventing work.
+'''
