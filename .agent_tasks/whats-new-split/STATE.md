@@ -117,7 +117,11 @@ Closing review + next manifest only.
 
 ## Where it stopped
 
-feed-build landed + verified in this worktree. Next: `walkthrough-ui`
+feed-build merged to master via merge dd1df59 (conflict resolution:
+5 files, all semantic-equivalent both-changed regions - kept the
+branch's section stamping plus HEAD's stronger viewed->history
+assertions and `include_archived` archive-sweep isolation; 74 tour
+tests + the cumulative-elapsed test green). Next: `walkthrough-ui`
 step of run 20261019-031845-whats-new-split - split `_DASH_HTML`'s
 walkthrough into 'Tool updates' vs 'Work digest' sections using the
 feed contract above (cards carry `section`; render `unreviewed`,
