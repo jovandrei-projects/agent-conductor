@@ -6032,6 +6032,121 @@ const rclick=t=>handlers.contextmenu({target:t,clientX:60,clientY:70,
         self.assertEqual(p.returncode, 0, p.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_resume_hidden_when_only_parked_branches_remain(self):
+        """runCtl.parkedOnly: a run whose every unfinished record is a
+        conflict-parked worktree branch offers no Resume - it could only
+        re-attempt the same merges the pending-merges panel already
+        handles, so its presence promises a re-run that cannot happen.
+        A run mixing a parked branch with a genuinely re-runnable step
+        keeps the offer, a run whose agent rows aren't in the payload
+        stays resumable, and an interrupted parked-only run's notice
+        points at the merge panel rather than Resume."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',scrollTop:0,style:{},querySelector:()=>null,
+  querySelectorAll:()=>[]}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const sel={isCollapsed:true,toString:()=>''};
+const window={innerWidth:1200,innerHeight:800,addEventListener:()=>{},
+  getSelection:()=>sel};
+// 'parked': a done step plus two conflict-parked branches - nothing a
+// fresh session could re-run. 'mixed': one parked branch + one
+// branchless failure - a real re-run exists, Resume stays. 'sparse':
+// a failed count but no agent rows - the payload cannot prove
+// parked-only, so Resume stays too.
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',agents:[
+  {step:'pd',run:'parked',run_dir:'/runs/p',run_key:'/runs/p',slug:'prj',
+   status:'done',task:'t'},
+  {step:'p1',run:'parked',run_dir:'/runs/p',run_key:'/runs/p',slug:'prj',
+   status:'failed',branch:'conductor/p/p1',merged:false,task:'t'},
+  {step:'p2',run:'parked',run_dir:'/runs/p',run_key:'/runs/p',slug:'prj',
+   status:'failed',branch:'conductor/p/p2',merged:false,task:'t'},
+  {step:'m1',run:'mixed',run_dir:'/runs/m',run_key:'/runs/m',slug:'prj',
+   status:'failed',branch:'conductor/m/m1',merged:false,task:'t'},
+  {step:'m2',run:'mixed',run_dir:'/runs/m',run_key:'/runs/m',slug:'prj',
+   status:'failed',task:'t'}],
+ runs:[{run:'parked',dir:'/runs/p',key:'/runs/p',counts:{done:1,failed:2},
+        ended_at:'2026-10-16T01:00:00',
+        pending_branches:[{step:'p1',status:'failed',slug:'prj',
+          branch:'conductor/p/p1',verify_ok:false},
+         {step:'p2',status:'failed',slug:'prj',
+          branch:'conductor/p/p2',verify_ok:false}]},
+       {run:'mixed',dir:'/runs/m',key:'/runs/m',counts:{failed:2},
+        ended_at:'2026-10-16T01:00:00',
+        pending_branches:[{step:'m1',status:'failed',slug:'prj',
+          branch:'conductor/m/m1',verify_ok:false}]},
+       {run:'sparse',dir:'/runs/s',key:'/runs/s',counts:{failed:1},
+        ended_at:'2026-10-16T01:00:00'}]};
+const fetch=async(url,opt)=>{
+  if(url.startsWith('/api/state')) return {ok:true,json:async()=>data};
+  return {ok:true,json:async()=>({}),text:async()=>''};};
+const ctx=vm.createContext({document,window,fetch,confirm:()=>true,
+  alert:()=>{},location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const cls=c=>({contains:x=>c.split(' ').includes(x),add(){},remove(){}});
+const runRow=key=>({cls:'runrow',dataset:{runKey:key},
+  classList:cls('runrow'),isConnected:true,
+  focus(){},matches:s=>s==='tr.runrow'||s==='tr.runrow,tr.agen',
+  getBoundingClientRect:()=>({left:10,top:20,bottom:30})});
+const onRow=row=>({isContentEditable:false,dataset:{},
+  closest:sel=>{
+    if(sel==='#ctxmenu')return null;
+    if(sel.indexOf('input')===0)return null;
+    if(sel==='tr.runrow')return row.cls==='runrow'?row:null;
+    if(sel==='tr.runrow,tr.agen')return row;
+    return null;}});
+const rclick=t=>handlers.contextmenu({target:t,clientX:60,clientY:70,
+  preventDefault:()=>{}});
+(async()=>{
+  // parked-only: merge is offered, Resume is not - in the context menu
+  // AND in the modal (the whole Run control panel drops out)
+  rclick(onRow(runRow('/runs/p')));
+  const m=elem('ctxmenu');
+  assert.match(m.innerHTML,
+    /data-run-details="\/runs\/p"[^>]*>Merge pending branches/);
+  assert.doesNotMatch(m.innerHTML,/Resume unfinished steps/);
+  vm.runInContext('showRunDetails("/runs/p")',ctx);
+  const pb=elem('dbody').innerHTML;
+  assert.match(pb,/Merge selected pending work/);
+  assert.doesNotMatch(pb,/data-resume-run/);
+  assert.doesNotMatch(pb,/>Run control</);
+  // mixed: the branchless failed step is real re-runnable work
+  rclick(onRow(runRow('/runs/m')));
+  assert.match(m.innerHTML,
+    /data-resume-run="m"[^>]*>Resume unfinished steps/);
+  assert.match(m.innerHTML,/>Merge pending branches/);
+  vm.runInContext('showRunDetails("/runs/m")',ctx);
+  assert.match(elem('dbody').innerHTML,/data-resume-run="m"/);
+  // sparse payload cannot prove parked-only -> stays resumable
+  rclick(onRow(runRow('/runs/s')));
+  assert.match(m.innerHTML,
+    /data-resume-run="s"[^>]*>Resume unfinished steps/);
+  // interrupted + parked-only: the notice points at merging, not Resume
+  const d2=JSON.parse(JSON.stringify(data));
+  delete d2.runs[0].ended_at;
+  vm.runInContext('render('+JSON.stringify(d2)+')',ctx);
+  vm.runInContext('showRunDetails("/runs/p")',ctx);
+  const ib=elem('dbody').innerHTML;
+  assert.match(ib,/Interrupted/);
+  assert.match(ib,/merge them below/);
+  assert.doesNotMatch(ib,/Resume picks up/);
+  assert.doesNotMatch(ib,/data-resume-run/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_task_menu_state_actions_and_dispatch(self):
         js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
             "</script>", 1)[0]

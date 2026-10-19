@@ -6204,6 +6204,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 if _git(project_dir, "rev-parse", "-q", "--verify",
                         prior["branch"]).returncode == 0:
                     via_resolver = False
+                    resolver_tried = False
                     merr = None
                     try:
                         with _RepoMergeLock(
@@ -6221,6 +6222,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                             # session would just fail again.
                             if not ok and step.merge_resolver \
                                     and loc is not None and merr is None:
+                                resolver_tried = True
                                 ok = resolve_merge_conflict(
                                     step, slug, project_dir, wt,
                                     prior["branch"], cfg, run_dir,
@@ -6258,11 +6260,16 @@ def cmd_run(args: argparse.Namespace) -> int:
                             break
                     else:
                         prior["merged"] = False
+                        # The "enable merge_resolver" hint only helps when
+                        # no resolver was attempted - a refused or failed
+                        # resolve-* session already said why in the note.
                         _append_note(prior, merr or
                                      "merge still conflicts; resolve the "
-                                     "kept worktree by hand or enable "
-                                     "merge_resolver - re-running the same "
-                                     "branch cannot fix a conflict")
+                                     "kept worktree by hand" +
+                                     ("" if resolver_tried else
+                                      " or enable merge_resolver") +
+                                     " - re-running the same branch "
+                                     "cannot fix a conflict")
                         _bump_completion(prior)
                         save_state(run_dir, state)
                         log_event(run_dir, event="step_merge_conflict",
@@ -16496,10 +16503,21 @@ function runCtl(r){
   // aux resolve-* record whose parent's merge already landed, so it must
   // never keep Resume/interrupted offers alive on its own
   const unfinished = cks.some(s=>s!=='done' && s!=='superseded');
+  // parkedOnly: every unfinished record is a worktree branch that never
+  // landed. Resume could only re-attempt the exact merges the Pending
+  // merges panel already offers - a slower path to the same outcome -
+  // so the button is hidden rather than promising a re-run it cannot
+  // do. The mine.length guard keeps a run whose agent rows are not in
+  // this payload (trimmed/legacy data) resumable instead of stranded.
+  const mine = AGENTS.filter(a=>(a.run_key||a.run_dir)===key);
+  const parkedOnly = unfinished && !!mine.length &&
+    !mine.some(a=>!['done','superseded','running','queued']
+        .includes(a.status) && !(a.branch && a.merged!==true));
   return {key, liveSteps, executing,
     canResume: !!(cks.length &&
       !cks.some(s=>['running','queued'].includes(s)) &&
-      unfinished),
+      unfinished && !parkedOnly),
+    parkedOnly,
     // worktree branches that never landed (conflict parked the worktree, or
     // the conductor died between the wave and the merge) - mergeable once
     // the run has actually stopped or finished
@@ -16574,6 +16592,7 @@ function showRunDetails(key, keepStack){
   const liveSteps = ctl.liveSteps;
   const interrupted = ctl.interrupted;
   const executing = ctl.executing;
+  const parkedOnly = ctl.parkedOnly;
   // the run's task list as links into each task's modal - pipeline seq
   // order, aux bookkeeping rows last and marked
   const tasks = AGENTS.filter(a=>(a.run_key||a.run_dir)===key)
@@ -16737,14 +16756,22 @@ function showRunDetails(key, keepStack){
         `paused, stopped and interrupted runs">` +
         `Resume unfinished steps</button>` : '') +
       `</div></div>` : '';
-  const notice = (r.aborted==='paused' && canResume)
+  const notice = (r.aborted==='paused' && (canResume || parkedOnly))
     ? `<div class="notice warn">Paused - in-flight steps finished and ` +
-      `nothing new launched. Resume continues where it left off ` +
-      `(safe across a restart).</div>`
+      `nothing new launched. ` +
+      (parkedOnly
+        ? `what remains is parked branches - merge them below; there ` +
+          `is nothing left to resume.`
+        : `Resume continues where it left off (safe across a restart).`) +
+      `</div>`
     : interrupted
     ? `<div class="notice warn">Interrupted - the conductor process is ` +
-      `gone (crash or machine restart). Resume picks up unfinished ` +
-      `steps from committed state.</div>` : '';
+      `gone (crash or machine restart). ` +
+      (parkedOnly
+        ? `what remains is parked branches - merge them below; there ` +
+          `is nothing left to resume.`
+        : `Resume picks up unfinished steps from committed state.`) +
+      `</div>` : '';
   // prev/next walks the visible RUNS table (runSibs), sibling-style:
   // buttons name their target run, the counter gives position, and the
   // walk never stacks history entries (Back still works once)
