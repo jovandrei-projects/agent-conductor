@@ -497,6 +497,194 @@ class TourApiTests(unittest.TestCase):
             lambda: self.tour["count"] is not None
             and self.tour["count"]["value"] == 2))   # both cards 'new'
 
+    def test_concurrent_transitions_coalesce_refresh(self):
+        """Two marks landing while the deferred rebuild is gated: both
+        persist (serialized updates lose nothing), the in-flight
+        pre-mutation build can never store over the post-mutation
+        state, and exactly ONE wanted re-run follows - never a build
+        per transition."""
+        e1 = f"area:power:{self.c_power[:12]}"
+        e2 = f"area:assistant:{self.c_chat[:12]}"
+        self.get()                          # the deck both acks see
+        gate, entered = threading.Event(), threading.Event()
+        real = tour_feeds.build_feed
+        first = [True]
+
+        def slow(*a, **kw):
+            if first[0]:
+                first[0] = False
+                entered.set()
+                gate.wait(10)
+            return real(*a, **kw)
+
+        self.addCleanup(gate.set)   # a failed assert never parks a daemon
+        with mock.patch.object(tour_feeds, "build_feed",
+                               side_effect=slow) as spy:
+            results = {}
+
+            def mark(eid):
+                results[eid] = self.post(eid, "viewed")
+
+            threads = [threading.Thread(target=mark, args=(e,))
+                       for e in (e1, e2)]
+            for t in threads:
+                t.start()
+            self.assertTrue(entered.wait(5))        # daemon mid-build
+            for t in threads:
+                t.join(10)
+            for eid in (e1, e2):
+                s, d = results[eid]
+                self.assertEqual(s, 200, d)
+                self.assertEqual(d["state"], "viewed")
+            st = self.state_file()
+            self.assertEqual({v["id"] for v in st["viewed"]}, {e1, e2})
+            gate.set()
+            # the gated pre-mutation build + exactly one coalesced
+            # rerun - then busy and wanted both clear
+            self.assertTrue(_poll(lambda: not self.tour["busy"]))
+            self.assertEqual(spy.call_count, 2)
+            self.assertFalse(self.tour["wanted"])
+            # converged caches reflect BOTH marks - the stale build's
+            # payload never overwrote the post-mutation state
+            self.assertEqual(self.tour["count"]["value"], 0)
+            s, d = self.call("GET", "/api/state")
+            self.assertEqual(d["tour_unseen"], 0)
+            self.assertEqual(self.get()["unseen_count"], 0)
+            # the last 'new' mark moved the watermark to the payload's
+            # captured boundary
+            self.assertEqual(self.state_file()["watermark"]["commit"],
+                             rev(self.repo))
+
+    def test_daemon_refresh_failure_recovers(self):
+        """A raised build inside the daemon refresh only logs: the
+        persisted mark stands, busy clears instead of wedging, the
+        response still answers from last-known state, and the next
+        poll's re-armed build converges the caches."""
+        self.get()                                # warm feed + count = 2
+        calls = [0]
+        failed = threading.Event()
+        real = tour_feeds.build_feed
+
+        def flaky(*a, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                failed.set()
+                raise RuntimeError("simulated feed failure")
+            return real(*a, **kw)
+
+        eid = f"area:power:{self.c_power[:12]}"
+        with mock.patch.object(tour_feeds, "build_feed",
+                               side_effect=flaky):
+            s, d = self.post(eid, "viewed")
+            self.assertEqual(s, 200, d)
+            self.assertEqual(d["state"], "viewed")
+            # last-known count under the just-saved mark + the deferred
+            # marker - not a fresh collection
+            self.assertEqual(d["unseen_count"], 1)
+            self.assertTrue(d["count_pending"])
+            self.assertTrue(failed.wait(5))        # the daemon ran+failed
+            self.assertTrue(_poll(lambda: not self.tour["busy"]))
+            # the mark stands - a refresh failure never un-saves it
+            self.assertEqual(self.state_file()["viewed"][0]["id"], eid)
+            s, d = self.call("GET", "/api/state")
+            # still the count the warm build computed - honest
+            # last-known, not a fake 0
+            self.assertEqual(d["tour_unseen"], 2)
+            # the same call re-armed a build; it recovers and converges
+            self.assertTrue(_poll(
+                lambda: self.tour["count"] is not None
+                and self.tour["count"]["value"] == 1))
+            self.assertEqual(calls[0], 2)
+            feed = self.get()                       # served from cache
+            self.assertNotIn(eid, self.ids(feed))
+            self.assertEqual({h["id"] for h in feed["history"]}, {eid})
+            self.assertEqual(feed["unseen_count"], 1)
+            self.assertEqual(calls[0], 2)
+
+    def test_mark_viewed_never_touches_task_review(self):
+        """Acknowledging a run's work card is notification-only: the
+        run's state.json is byte-identical after the POST (no folded
+        review mark) and no review-* sentinel lands for the run."""
+        rd = self.runs / "20261017-020000-rev"
+        rd.mkdir(parents=True)
+        (rd / "state.json").write_text(json.dumps(
+            {"run": "rev", "ended_at": "2026-10-17T02:00:00",
+             "steps": {"s1": {"status": "done", "completion_seq": 1},
+                       "s2": {"status": "done", "completion_seq": 1}}}),
+            encoding="utf-8")
+        feed = self.get()
+        eid = "run:20261017-020000-rev:2026-10-17T02:00:00"
+        card = self.ids(feed)[eid]
+        self.assertEqual(card["kind"], "run")
+        self.assertEqual(card["section"], "work")
+        self.assertEqual(card["unreviewed"], 2)      # counted, read-only
+        before = (rd / "state.json").read_bytes()
+        s, d = self.post(eid, "viewed")
+        self.assertEqual(s, 200, d)
+        self.assertEqual(d["state"], "viewed")
+        self.assertEqual(d["unseen_count"], 2)   # the two tool cards
+        # notification state changed; task review state did not
+        self.assertEqual(self.state_file()["viewed"][0]["id"], eid)
+        self.assertEqual((rd / "state.json").read_bytes(), before)
+        key = tour_feeds._flag_key(rd)
+        flag_dir = tour_feeds.DEFAULT_FLAGS_DIR
+        hits = list(flag_dir.glob(f"review-{key}*")) \
+            if flag_dir.exists() else []
+        self.assertEqual(hits, [])
+
+    def test_state_file_stays_single_shape(self):
+        """The persisted contract is one file with exactly
+        {watermark, viewed[], snoozed[]} - descriptors carry only
+        id/range/stamp fields; no per-section state ever appears."""
+        self.get()
+        self.post(f"area:power:{self.c_power[:12]}", "viewed")
+        self.post(f"area:assistant:{self.c_chat[:12]}", "snooze")
+        st = self.state_file()
+        self.assertEqual(set(st), {"watermark", "viewed", "snoozed"})
+        self.assertEqual(set(st["watermark"]), {"commit", "at",
+                                               "origin"})
+        allowed = {"id", "range", "viewed_at", "snoozed_at",
+                   "unviewed_at"}
+        for d in st["viewed"] + st["snoozed"]:
+            self.assertLessEqual(set(d), allowed)
+            self.assertEqual(set(d["range"]), {"base", "tip"})
+            self.assertEqual(set(d["range"]["base"]), {"commit", "at"})
+            self.assertEqual(set(d["range"]["tip"]), {"commit", "at"})
+
+    def test_legacy_viewed_descriptor_still_binds(self):
+        """Descriptors recorded before ranges existed (id + stamp only)
+        still bind: the live card leaves the unread deck, history
+        re-materializes what the empty window can, and unview puts the
+        card back in the deck as new."""
+        rid = "20261017-010000-aaaabbbb"
+        (self.requests / f"{rid}.json").write_text(json.dumps(
+            {"id": rid, "status": "ready", "label": "legacy",
+             "created_at": "2026-10-17T01:00:00"}), encoding="utf-8")
+        eid_area = f"area:power:{self.c_power[:12]}"
+        self.seed_state(viewed=[
+            {"id": f"request:{rid}",
+             "viewed_at": "2026-10-17T05:00:00"},        # no range key
+            {"id": eid_area,
+             "viewed_at": "2026-10-17T05:00:00"}])
+        feed = self.get()
+        # both live cards are already acknowledged - only the chat card
+        # stays in the unread deck, even though the watermark is pinned
+        self.assertEqual([e["id"] for e in feed["entries"]],
+                         [f"area:assistant:{self.c_chat[:12]}"])
+        hist = {h["id"]: h for h in feed["history"]}
+        self.assertEqual(hist[f"request:{rid}"]["state"], "viewed")
+        self.assertFalse(hist[f"request:{rid}"].get("unavailable",
+                                                  False))
+        self.assertEqual(hist[eid_area]["state"], "viewed")
+        self.assertTrue(hist[eid_area]["unavailable"])  # honest stub
+        # and the descriptor still transitions - unview resurfaces the
+        # card into the deck
+        s, d = self.post(f"request:{rid}", "unview")
+        self.assertEqual(s, 200, d)
+        self.assertEqual(d["state"], "new")
+        self.assertEqual(d["unseen_count"], 2)
+        self.assertIn(f"request:{rid}", self.ids())
+
 
 if __name__ == "__main__":
     unittest.main()

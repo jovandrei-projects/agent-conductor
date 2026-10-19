@@ -575,6 +575,261 @@ const FEED2={generated_at:'g1',boundary:{commit:'b',at:'t'},range:{},
 })().catch(e=>{console.error(e);process.exitCode=1;});
 ''')
 
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_tool_only_feed_walks_single_section(self):
+        """A feed with only Tool updates walks cleanly: no Work digest
+        header, no blank card, and 'next' can't leave the section."""
+        self._node(r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  const toolOnly={generated_at:'g',boundary:{},range:{},
+    unseen_count:2,warnings:[],history:[],entries:[
+    {id:'area:power:aaa111bbb222',kind:'change',section:'tool',
+     section_title:'Tool updates',stop:'power',stop_title:'Dashboard power',
+     title:'Power <img>',blurb:'b',tag:'improved',anchor:'#power-btn',
+     commits:[],runs:[],requests:[],at:'2026-10-17T01:00:00',range:{},
+     state:'new'},
+    {id:'area:mixed:ddd444eee555',kind:'change',section:'tool',
+     section_title:'Tool updates',stop:'mixed',
+     stop_title:'Cross-cutting changes',title:'Mixed',blurb:'b',
+     tag:'fixed',anchor:null,commits:[],runs:[],requests:[],
+     at:'2026-10-17T02:00:00',range:{},state:'new'}]};
+  queue.push({ok:true,json:async()=>toolOnly});
+  await open();
+  assert.match(card(),/Tool updates<\/span> · card 1 of 2/);
+  assert.doesNotMatch(card(),/Work digest/);
+  await click(act('next'));
+  assert.match(card(),/Tool updates<\/span> · card 2 of 2/);
+  await click(act('next'));          // at the end - stays put
+  assert.match(card(),/card 2 of 2/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_section_fallback_from_id_prefix(self):
+        """Cards served without a section stamp (a feed predating the
+        split) still partition by id prefix - record ids into the Work
+        digest, the rest into Tool updates - and viewed-history rows
+        label their section the same way."""
+        self._node(r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  const f={generated_at:'g',boundary:{},range:{},unseen_count:2,
+    warnings:[],entries:[
+    {id:'run:2026-r1:2026-10-18T01:00:00',kind:'run',stop:'runs',
+     stop_title:'Runs',title:'Run finished: x',blurb:'b',tag:'done',
+     outcome:'done',anchor:'#runs',commits:[],runs:['request:req1'],
+     requests:['req1'],completed_at:'2026-10-18T01:00:00',
+     steps_done:3,steps_total:3,unreviewed:0,
+     at:'2026-10-18T01:00:00',range:{},state:'new'},
+    {id:'area:power:aaa111bbb222',kind:'change',stop:'power',
+     stop_title:'Dashboard power',title:'Power',blurb:'b',
+     tag:'improved',anchor:'#power-btn',commits:[],runs:[],requests:[],
+     at:'2026-10-17T01:00:00',range:{},state:'new'}],
+    history:[{id:'followup:fu1',kind:'followup',stop:'requests',
+     stop_title:'Proposals & requests',title:'Follow-up proposal: old',
+     blurb:'b',tag:'ready',anchor:null,commits:[],requests:['fu1'],
+     runs:[],at:'2026-10-16T00:00:00',range:{},state:'viewed',
+     viewed_at:'2026-10-16T01:00:00'}]};
+  queue.push({ok:true,json:async()=>f});
+  await open();
+  // no section fields at all: the run card still lands in Work digest
+  // AFTER the tool card even though its stamp is newer
+  assert.match(card(),/Tool updates<\/span> · card 1 of 1/);
+  await click(act('next'));
+  assert.match(card(),/Work digest<\/span> · card 1 of 1 · Runs/);
+  // the viewed-history row labels its section the same way
+  assert.match(card(),/viewed earlier \(1\)/);
+  assert.match(card(),/<b class="tsecname work">Work digest<\/b>/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_reopen_after_partial_review_shows_only_unread(self):
+        """Marking one card and reopening the tour deals only the
+        unread remainder: the re-pulled feed moved the acknowledged
+        card to 'viewed earlier', the section counters count only the
+        deck, and the viewed card still reopens from history."""
+        self._node(self._SPLIT + r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  queue.push({ok:true,json:async()=>FEED2});
+  await open();
+  // mark the Tool-updates card; the deck becomes work-only
+  queue.push({ok:true,json:async()=>({id:'x',state:'viewed',
+    changed:true,unseen_count:2})});
+  await click(act('mark'));
+  assert.match(card(),/Work digest<\/span> · card 1 of 2/);
+  await click(act('skip'));
+  assert.equal(elem('tourwrap').hidden,true);
+  // reopen: the post-mark feed serves the two unread cards and the
+  // acknowledged one as viewed history - FEED2 itself was mutated by
+  // the mark (the deck splice + history unshift write back through
+  // tourSt.feed), so a clone of it IS the post-mark feed shape
+  const f2=JSON.parse(JSON.stringify(FEED2));
+  f2.unseen_count=2;
+  queue.push({ok:true,json:async()=>f2});
+  await open();
+  const h=card();
+  assert.match(h,/Work digest<\/span> · card 1 of 2/);
+  assert.doesNotMatch(h,/card 1 of 3/);              // unread-only deck
+  assert.match(h,/viewed earlier \(1\)/);
+  assert.match(h,/Power polish/);                    // listed, not dealt
+  await click(act('hist',{hi:'0'}));
+  assert.match(card(),/viewed 1 of 1/);
+  assert.match(card(),/Power polish/);
+  await click(act('back'));
+  assert.match(card(),/Work digest<\/span> · card 1 of 2/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_unknown_outcome_and_zero_unreviewed(self):
+        """An outcome word the palette doesn't list still prints
+        verbatim (color defaults grey) - the chip never lies about the
+        event; unreviewed:0 renders the muted 'all reviewed' chip still
+        wired to the run modal."""
+        self._node(r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  const f={generated_at:'g',boundary:{},range:{},unseen_count:2,
+    warnings:[],history:[],entries:[
+    {id:'run:2026-r1:t',kind:'run',section:'work',
+     section_title:'Work digest',stop:'runs',stop_title:'Runs',
+     title:'Run finished: x',blurb:'b',tag:'melted',outcome:'melted',
+     anchor:'#runs',commits:[],runs:['request:req1'],requests:['req1'],
+     completed_at:'2026-10-18T01:00:00',steps_done:3,steps_total:3,
+     unreviewed:0,at:'2026-10-18T01:00:00',range:{},state:'new'},
+    {id:'run:2026-r2:t',kind:'run',section:'work',
+     section_title:'Work digest',stop:'runs',stop_title:'Runs',
+     title:'Run finished: y',blurb:'b',tag:'failed',outcome:'failed',
+     anchor:'#runs',commits:[],runs:['request:req1'],requests:[],
+     completed_at:'2026-10-18T02:00:00',steps_done:1,steps_total:2,
+     unreviewed:1,at:'2026-10-18T02:00:00',range:{},state:'new'}]};
+  queue.push({ok:true,json:async()=>f});
+  await open();
+  const h=card();
+  assert.match(h,/class="ttag ev"[^>]*>melted</);       // verbatim word
+  assert.match(h,/style="color:#8b949e;border-color:#8b949e/); // default
+  assert.match(h,/class="chip trev ok" data-run-details="request:req1"/);
+  assert.match(h,/>all reviewed</);
+  assert.match(h,/every finished task in this run has been reviewed/);
+  await click(act('next'));
+  const h2=card();
+  assert.match(h2,/class="chip trev" data-run-details/);
+  assert.match(h2,/>1 unreviewed</);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_unlaunched_request_shows_no_run_chip(self):
+        """A proposal no run ever launched links ONLY its own request
+        chip - no fabricated run chip, and (being the only chip) no
+        Request/Run prefix labels."""
+        self._node(self._SPLIT + r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  const f=JSON.parse(JSON.stringify(FEED2));
+  f.entries=[Object.assign({},FEED2.entries[2],
+    {id:'request:req8',requests:['req8'],runs:[],
+     title:'New proposal: eight'})];
+  f.unseen_count=1;
+  queue.push({ok:true,json:async()=>f});
+  await open();
+  const h=card();
+  assert.match(h,/data-open-request="req8"/);
+  assert.doesNotMatch(h,/data-run-details/);
+  assert.doesNotMatch(h,/relk/);                     // single chip: plain
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_chip_identities_request_vs_run(self):
+        """When a launched run shares the request's dashboard key, the
+        Request chip still shows the REQUEST's own name (the staged
+        proposal row's label) while the Run chip prefers the real run
+        row - two records, two identities, two modal targets."""
+        self._node(self._SPLIT + r'''
+(async()=>{
+  const d2=Object.assign({},DATA,{runs:[
+    {run:'proposal label',key:'request:req9',request_id:'req9',
+     stage:'ready'},
+    {run:'the finished run',key:'request:req9',request_id:'req9',
+     counts:{done:1}}]});
+  vm.runInContext('render('+JSON.stringify(d2)+')',ctx);
+  const f=JSON.parse(JSON.stringify(FEED2));
+  f.entries=[Object.assign({},FEED2.entries[2],
+    {runs:['request:req9']})];          // the launch shares the key
+  f.unseen_count=1;
+  queue.push({ok:true,json:async()=>f});
+  await open();
+  const h=card();
+  // Request chip: the proposal's own identity, never the run's name
+  assert.match(h,/<b class="relk">Request<\/b> proposal label</);
+  assert.doesNotMatch(h,/Request<\/b> the finished run/);
+  // Run chip: prefers the non-stage row sharing the key
+  assert.match(h,/<b class="relk">Run<\/b> the finished run</);
+  assert.match(h,/data-open-request="req9"/);
+  assert.match(h,/data-run-details="request:req9"/);
+  // the request chip opens the REQUEST modal (GETs the record)
+  queue.push({ok:true,json:async()=>({id:'req9',status:'ready',
+    label:'nine',manifest_text:'[run]',proposed_steps:[]})});
+  const reqChip=ds=>({id:'',dataset:{},closest:s=>
+    s==='[data-open-request]'?{dataset:{openRequest:ds}}:null});
+  await click(reqChip('req9'));
+  assert.ok(fetches.some(u=>u==='/api/requests/req9'));
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_pipeline_card_followups_anchor_and_modal(self):
+        """A pipeline card renders the run chip only (its covered
+        request never gets a duplicate chip), the folded follow-up's
+        own .tfu row (request chip + run link + stamp), the runs-table
+        spotlight anchor, and the run modal via its unreviewed chip."""
+        self._node(r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  anchor('#runs',mkRect({left:8,top:300,width:900,height:200,
+    right:908,bottom:500}));
+  const f={generated_at:'g',boundary:{},range:{},unseen_count:1,
+    warnings:[],history:[],entries:[
+    {id:'run:2026-r1:t',kind:'pipeline',section:'work',
+     section_title:'Work digest',stop:'runs',stop_title:'Runs',
+     title:'Run finished: pipe',blurb:'b',tag:'done',outcome:'done',
+     anchor:'#runs',commits:[],runs:['request:req1'],requests:['req1'],
+     covers:['request:req1'],proposed_at:'2026-10-17T20:00:00',
+     completed_at:'2026-10-18T01:00:00',steps_done:3,steps_total:3,
+     unreviewed:1,
+     followups:[{id:'followup:fu9',label:'fu label nine',
+       at:'2026-10-18T02:00:00',requests:['fu9'],
+       runs:['request:req1']}],
+     at:'2026-10-18T01:00:00',range:{},state:'new'}]};
+  queue.push({ok:true,json:async()=>f});
+  await open();
+  const h=card();
+  assert.match(h,/Work digest<\/span> · card 1 of 1 · Runs/);
+  // the covered proposal earns no duplicate request chip on the card
+  assert.doesNotMatch(h,/data-open-request="req1"/);
+  assert.match(h,/data-run-details="request:req1"/);
+  // the folded follow-up renders its own row + identity
+  assert.match(h,/follow-ups/);
+  assert.match(h,/class="tfu"/);
+  assert.match(h,/data-open-request="fu9"/);
+  assert.match(h,/fu label nine/);
+  assert.match(h,/Run<\/b> req one/);
+  // anchored to the runs table, not centered
+  assert.equal(elem('tourring').hidden,false);
+  assert.equal(elem('tourcard').classList.contains('anchored'),true);
+  // the unreviewed chip opens the run modal, suspending the tour
+  const runChip=ds=>({id:'',dataset:{},closest:s=>
+    s==='[data-run-details]'?{dataset:{runDetails:ds}}:null});
+  await click(runChip('request:req1'));
+  assert.equal(elem('backdrop').hidden,false);
+  assert.equal(elem('tourwrap').classList.contains('suspended'),true);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
 
 if __name__ == "__main__":
     unittest.main()

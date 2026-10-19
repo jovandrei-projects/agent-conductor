@@ -17,6 +17,7 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
 import tour_feeds  # noqa: E402
+import tour_state  # noqa: E402
 
 
 def git(path: Path, *args: str) -> subprocess.CompletedProcess:
@@ -942,6 +943,426 @@ class SplitFeedTests(unittest.TestCase):
             f = feed(repo, r, q, base/"m", st, bnd)
             self.assertEqual(len(f["entries"]), 1)
             self.assertEqual(f["entries"][0]["kind"], "pipeline")
+
+    def test_all_card_kinds_carry_section(self):
+        """Every emitted card kind declares its feed section + title:
+        change/curated are "Tool updates", run/request/followup/pipeline
+        are the "Work digest"."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            c0 = rev(repo)
+            r, q, m = base/"r", base/"q", base/"m"
+            c1 = commit(repo, "assistant/a.py", "x", "chat internals")
+            commit(repo, "conductor.py", "x", "Improve power dialog")
+            m.mkdir(parents=True)
+            # a curated record claiming the assistant commit under a
+            # DIFFERENT stop -> a dedicated curated card (its commits
+            # leave the area grouping)
+            (m / "whatsnew.jsonl").write_text(json.dumps({
+                "stop": "modal", "blurb": "Human take on chat",
+                "commits": [c1[:10]]}) + "\n", encoding="utf-8")
+            write_request(q, "20261017-010000-1111aaaa",
+                          "2026-10-17T01:00:00")          # request
+            write_request(q, "20261017-040000-2222bbbb",
+                          "2026-10-17T04:00:00")          # -> pipeline
+            write_run(r, "20261017-050000-runx",
+                      "2026-10-17T06:00:00",
+                      request_id="20261017-040000-2222bbbb",
+                      steps={"s1": {"status": "done"}})
+            write_run(r, "20261017-070000-lonerun",
+                      "2026-10-17T08:00:00")              # run
+            write_request(q, "20261017-090000-3333cccc",
+                          "2026-10-17T09:00:00",
+                          source_run="20261017-070000-lonerun",
+                          imported="followup")            # followup
+            st = wm(c0, "2026-10-17T00:00:00")
+            f = feed(repo, r, q, m, st,
+                     boundary(repo, "2026-10-17T12:00:00"))
+            secs = {e["kind"]: (e["section"], e["section_title"])
+                    for e in f["entries"]}
+            self.assertEqual(secs, {
+                "change": ("tool", "Tool updates"),
+                "curated": ("tool", "Tool updates"),
+                "run": ("work", "Work digest"),
+                "request": ("work", "Work digest"),
+                "followup": ("work", "Work digest"),
+                "pipeline": ("work", "Work digest")})
+
+    def test_stub_cards_classify_by_id_prefix(self):
+        """A descriptor whose window can no longer rebuild returns the
+        honest 'unknown' stub; it still lands in the right section of
+        the viewed history by id prefix (record ids = work, the rest
+        = tool)."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            c0 = rev(repo)
+            # a dead window: base==tip commits resolve nothing and the
+            # record bound predates every stamp
+            dead = rng(c0, "2020-01-01T00:00:00", c0, "2020-01-02T00:00:00")
+            st = wm(rev(repo), "2026-10-17T02:00:00")
+            st["viewed"] = [
+                {"id": "request:20261016-000000-deadbeef",
+                 "range": dead, "viewed_at": "2020-01-02T00:00:00"},
+                {"id": "run:20261016-000000-gone:2026-10-16T00:00:00",
+                 "range": dead, "viewed_at": "2020-01-02T00:00:00"},
+                {"id": "followup:20261016-000000-cafebabe",
+                 "range": dead, "viewed_at": "2020-01-02T00:00:00"},
+                {"id": "area:power:deadbeefdead",
+                 "range": dead, "viewed_at": "2020-01-02T00:00:00"},
+                {"id": "curated:modal:deadbeefdead",
+                 "range": dead, "viewed_at": "2020-01-02T00:00:00"}]
+            f = feed(repo, base/"r", base/"q", base/"m", st)
+            self.assertEqual(f["entries"], [])
+            hist = {h["id"]: h for h in f["history"]}
+            self.assertEqual(len(hist), 5)
+            for eid in ("request:20261016-000000-deadbeef",
+                        "run:20261016-000000-gone:2026-10-16T00:00:00",
+                        "followup:20261016-000000-cafebabe"):
+                self.assertEqual(hist[eid]["kind"], "unknown")
+                self.assertEqual(hist[eid]["section"], "work")
+                self.assertEqual(hist[eid]["section_title"],
+                                 "Work digest")
+                self.assertTrue(hist[eid]["unavailable"])
+            for eid in ("area:power:deadbeefdead",
+                        "curated:modal:deadbeefdead"):
+                self.assertEqual(hist[eid]["kind"], "unknown")
+                self.assertEqual(hist[eid]["section"], "tool")
+                self.assertEqual(hist[eid]["section_title"],
+                                 "Tool updates")
+                self.assertTrue(hist[eid]["unavailable"])
+
+    def test_unrelated_records_stay_separate(self):
+        """Records sharing a window but no recorded link never fold:
+        two independent request+run pairs yield two pipeline cards, an
+        unlinked run and an unlaunched request keep their own cards -
+        nothing is matched on display-name coincidence."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            write_request(q, "20261017-010000-aaaa0001",
+                          "2026-10-17T01:00:00", label="alpha")
+            write_run(r, "20261017-020000-run-a", "2026-10-17T02:00:00",
+                      request_id="20261017-010000-aaaa0001")
+            write_request(q, "20261017-030000-bbbb0002",
+                          "2026-10-17T03:00:00", label="beta")
+            write_run(r, "20261017-040000-run-b", "2026-10-17T04:00:00",
+                      request_id="20261017-030000-bbbb0002",
+                      steps={"s1": {"status": "done"}})
+            write_run(r, "20261017-050000-solo", "2026-10-17T05:00:00")
+            write_request(q, "20261017-060000-cccc0003",
+                          "2026-10-17T06:00:00", label="lone proposal")
+            st = wm(rev(repo), "2026-10-17T00:00:00")
+            f = feed(repo, r, q, base/"m", st,
+                     boundary(repo, "2026-10-17T12:00:00"))
+            ids = by_id(f)
+            self.assertEqual(len(f["entries"]), 4)
+            pa = ids["run:20261017-020000-run-a:2026-10-17T02:00:00"]
+            pb = ids["run:20261017-040000-run-b:2026-10-17T04:00:00"]
+            self.assertEqual(pa["kind"], "pipeline")
+            self.assertEqual(pb["kind"], "pipeline")
+            # each pipeline covers ONLY its own proposal
+            self.assertEqual(pa["covers"],
+                             ["request:20261017-010000-aaaa0001"])
+            self.assertEqual(pb["covers"],
+                             ["request:20261017-030000-bbbb0002"])
+            self.assertEqual(pa["requests"],
+                             ["20261017-010000-aaaa0001"])
+            self.assertEqual(pb["requests"],
+                             ["20261017-030000-bbbb0002"])
+            self.assertEqual(pa["proposed_at"], "2026-10-17T01:00:00")
+            self.assertEqual(pb["steps_done"], 1)
+            # the unlinked pair stays standalone and unlinked
+            solo = ids["run:20261017-050000-solo:2026-10-17T05:00:00"]
+            self.assertEqual(solo["kind"], "run")
+            self.assertEqual(solo["requests"], [])
+            self.assertNotIn("covers", solo)
+            lone = ids["request:20261017-060000-cccc0003"]
+            self.assertEqual(lone["kind"], "request")
+            self.assertEqual(lone["runs"], [])       # no fabricated link
+            self.assertNotIn("covers", lone)
+
+    def test_request_in_window_run_in_prior_window_links_only(self):
+        """The proposal event is in the window but its run finished in
+        an earlier (acknowledged) one: the request keeps its own card -
+        still naming the recorded launch - and no pipeline forms."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            write_request(q, "20261017-040000-9999aaaa",
+                          "2026-10-17T04:00:00")
+            write_run(r, "20261017-050000-x", "2026-10-16T06:00:00",
+                      request_id="20261017-040000-9999aaaa")
+            st = wm(rev(repo), "2026-10-17T00:00:00")
+            f = feed(repo, r, q, base/"m", st,
+                     boundary(repo, "2026-10-17T12:00:00"))
+            ids = by_id(f)
+            e = ids["request:20261017-040000-9999aaaa"]
+            self.assertEqual(e["kind"], "request")
+            self.assertNotIn("covers", e)
+            # the recorded launch still links from the card
+            self.assertEqual(e["runs"],
+                             ["request:20261017-040000-9999aaaa"])
+            # and the out-of-window run emitted no card of its own
+            self.assertEqual(len(f["entries"]), 1)
+
+    def test_followup_folds_via_source_run_link(self):
+        """A follow-up without an explicit source_request still folds:
+        its recorded source_run resolves to that run's request link,
+        landing on the associated request's card."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            # the source run finished in an EARLIER window - its
+            # request's card stays standalone this window
+            write_run(r, "20261016-050000-src", "2026-10-16T06:00:00",
+                      request_id="20261017-010000-11112222")
+            write_request(q, "20261017-010000-11112222",
+                          "2026-10-17T01:00:00", label="the request")
+            write_request(q, "20261017-090000-abcd1234",
+                          "2026-10-17T09:00:00", label="more work",
+                          source_run="20261016-050000-src",
+                          imported="followup")
+            st = wm(rev(repo), "2026-10-17T00:00:00")
+            f = feed(repo, r, q, base/"m", st,
+                     boundary(repo, "2026-10-17T12:00:00"))
+            ids = by_id(f)
+            self.assertEqual(len(ids), 1)
+            e = ids["request:20261017-010000-11112222"]
+            self.assertEqual(e["kind"], "request")
+            self.assertEqual(e["covers"],
+                             ["followup:20261017-090000-abcd1234"])
+            fu = e["followups"][0]
+            self.assertEqual(fu["id"],
+                             "followup:20261017-090000-abcd1234")
+            self.assertEqual(fu["runs"],
+                             ["request:20261017-010000-11112222"])
+
+    def test_followup_chain_resolves_to_root_card(self):
+        """A follow-up of a follow-up still lands on the root card -
+        fold chains walk to the bottom and covers collects them all."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            write_request(q, "20261017-010000-11112222",
+                          "2026-10-17T01:00:00", label="the request")
+            write_run(r, "20261017-050000-src", "2026-10-17T06:00:00",
+                      request_id="20261017-010000-11112222")
+            write_request(q, "20261017-090000-aaaa0001",
+                          "2026-10-17T09:00:00",
+                          source_request="20261017-010000-11112222",
+                          imported="followup")
+            write_request(q, "20261017-110000-bbbb0002",
+                          "2026-10-17T11:00:00",
+                          source_request="20261017-090000-aaaa0001",
+                          imported="followup")
+            st = wm(rev(repo), "2026-10-17T00:00:00")
+            f = feed(repo, r, q, base/"m", st,
+                     boundary(repo, "2026-10-17T12:00:00"))
+            ids = by_id(f)
+            self.assertEqual(len(ids), 1)
+            e = ids["run:20261017-050000-src:2026-10-17T06:00:00"]
+            self.assertEqual(e["kind"], "pipeline")
+            self.assertEqual(
+                set(e["covers"]),
+                {"request:20261017-010000-11112222",
+                 "followup:20261017-090000-aaaa0001",
+                 "followup:20261017-110000-bbbb0002"})
+            self.assertEqual(
+                [x["id"] for x in e["followups"]],
+                ["followup:20261017-090000-aaaa0001",
+                 "followup:20261017-110000-bbbb0002"])
+
+    def test_event_tags_never_read_as_change_tags(self):
+        """Record cards tag the EVENT: 'ready' on proposals/follow-ups
+        and the terminal outcome on runs - even when a record's own
+        name reads like a change subject."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            write_request(q, "20261017-010000-11112222",
+                          "2026-10-17T01:00:00",
+                          label="Fix the login crash")   # fix-y name
+            write_request(q, "20261017-020000-abcd1234",
+                          "2026-10-17T02:00:00",
+                          source_run="gone", imported="followup",
+                          label="Improve everything")    # improve-y
+            write_run(r, "20261017-050000-fixrun",
+                      "2026-10-17T06:00:00",
+                      run="Improve the world",           # improve-y name
+                      steps={"s1": {"status": "done"},
+                             "s2": {"status": "superseded"}})
+            write_run(r, "20261017-070000-mixed", "2026-10-17T08:00:00",
+                      steps={"s1": {"status": "done"},
+                             "s2": {"status": "lost"}})
+            write_run(r, "20261017-080000-part", "2026-10-17T09:00:00",
+                      steps={"s1": {"status": "done"},
+                             "s2": {"status": "running"}})
+            write_run(r, "20261017-090000-nosteps",
+                      "2026-10-17T10:00:00")
+            write_run(r, "20261017-110000-halt", "2026-10-17T12:00:00",
+                      aborted="paused",
+                      steps={"s1": {"status": "failed"}})
+            st = wm(rev(repo), "2026-10-17T00:00:00")
+            f = feed(repo, r, q, base/"m", st,
+                     boundary(repo, "2026-10-17T13:00:00"))
+            ids = by_id(f)
+            self.assertEqual(
+                ids["request:20261017-010000-11112222"]["tag"], "ready")
+            self.assertEqual(
+                ids["followup:20261017-020000-abcd1234"]["tag"], "ready")
+            # 'Improve the world' finished clean -> 'done', NOT improved
+            self.assertEqual(
+                ids["run:20261017-050000-fixrun:2026-10-17T06:00:00"]
+                ["tag"], "done")
+            self.assertEqual(
+                ids["run:20261017-070000-mixed:2026-10-17T08:00:00"]
+                ["tag"], "failed")
+            self.assertEqual(
+                ids["run:20261017-080000-part:2026-10-17T09:00:00"]
+                ["tag"], "partial")
+            self.assertEqual(
+                ids["run:20261017-090000-nosteps:2026-10-17T10:00:00"]
+                ["tag"], "ended")
+            # a recorded halt reason wins over the step verdicts
+            self.assertEqual(
+                ids["run:20261017-110000-halt:2026-10-17T12:00:00"]
+                ["tag"], "paused")
+            for e in f["entries"]:
+                self.assertNotIn(e["tag"], tour_feeds.TAGS)
+
+    def test_build_never_writes_review_state(self):
+        """Counting unreviewed tasks is read-only end to end: no
+        review-* sentinel appears in the flags dir and the run's
+        state.json gains no folded mark."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, flags = base/"r", base/"flags"
+            flags.mkdir()
+            write_run(r, "20261017-050000-x", "2026-10-17T06:00:00",
+                      steps={"s1": {"status": "done",
+                                    "completion_seq": 1},
+                             "s2": {"status": "done",
+                                    "completion_seq": 2}})
+            st = wm(rev(repo), "2026-10-17T00:00:00")
+            f = tour_feeds.build_feed(
+                st, boundary(repo, "2026-10-17T12:00:00"),
+                repo_dir=repo, runs_dir=r, requests_dir=base/"q",
+                manifests_dir=base/"m", flags_dir=flags)
+            self.assertEqual(f["entries"][0]["unreviewed"], 2)
+            self.assertEqual(list(flags.iterdir()), [])
+            on_disk = json.loads(
+                (r / "20261017-050000-x" / "state.json").read_text(
+                    encoding="utf-8"))
+            for srec in on_disk["steps"].values():
+                self.assertNotIn("review", srec)
+
+    def test_viewed_covered_id_leaves_folded_card_new(self):
+        """Marking the standalone request id a live pipeline card
+        covers records THAT mark only: the folded card is the run
+        event, which stays 'new' in the deck, while the covered
+        descriptor re-materializes a viewed copy into history."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            write_run(r, "20261017-050000-x", "2026-10-17T06:00:00",
+                      request_id="20261017-040000-9999aaaa")
+            write_request(q, "20261017-040000-9999aaaa",
+                          "2026-10-17T04:00:00")
+            st = wm(rev(repo), "2026-10-17T00:00:00")
+            bnd = boundary(repo, "2026-10-17T12:00:00")
+            f1 = feed(repo, r, q, base/"m", st, bnd)
+            pid = "run:20261017-050000-x:2026-10-17T06:00:00"
+            st["viewed"] = [{
+                "id": "request:20261017-040000-9999aaaa",
+                "range": f1["range"],
+                "viewed_at": "2026-10-17T10:00:00"}]
+            f2 = feed(repo, r, q, base/"m", st, bnd)
+            live = by_id(f2)
+            self.assertEqual(live[pid]["state"], "new")   # run event new
+            hist = {h["id"]: h for h in f2["history"]}
+            self.assertEqual(hist[pid]["state"], "viewed")
+            self.assertEqual(hist[pid]["kind"], "pipeline")
+
+    def test_live_range_descriptor_reuses_one_collection(self):
+        """A viewed descriptor whose stored window IS the live range
+        costs no second collection - the per-build memo keys on the
+        exact (base, tip) pair."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            c0 = rev(repo)
+            commit(repo, "assistant/a.py", "x", "chat")
+            st = wm(c0, "2026-10-16T00:00:00")
+            kw = dict(repo_dir=repo, runs_dir=base/"r",
+                      requests_dir=base/"q", manifests_dir=base/"m")
+            b1 = boundary(repo)
+            f1 = tour_feeds.build_feed(st, b1, **kw)
+            eid = f1["entries"][0]["id"]
+            st["viewed"] = [{"id": eid, "range": f1["range"],
+                             "viewed_at": "2026-10-17T01:00:00"}]
+            calls = []
+            real = tour_feeds._collect_window
+
+            def spy(rng_arg, **k):
+                calls.append(tour_feeds._range_key(rng_arg))
+                return real(rng_arg, **k)
+
+            try:
+                tour_feeds._collect_window = spy
+                tour_feeds.build_feed(st, b1, **kw)
+            finally:
+                tour_feeds._collect_window = real
+            self.assertEqual(len(calls), 1)     # descriptor shared it
+
+    def test_legacy_viewed_descriptor_still_binds(self):
+        """Descriptors written before ranges existed (id + stamp only)
+        still bind: normalized to an empty window, the live card leaves
+        the unread deck while history re-materializes what the empty
+        range can - the real card for records (record scans bound on
+        stamps, unbounded here), an honest stub for commit cards."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            c0 = rev(repo)
+            c1 = commit(repo, "assistant/a.py", "x", "chat")
+            q = base/"q"
+            write_request(q, "20261017-010000-aaaabbbb",
+                          "2026-10-17T01:00:00")
+            p = base / "tour-state.json"
+            # pre-redesign shape: no 'range' key at all
+            p.write_text(json.dumps({
+                "watermark": {"commit": c0, "at": "2026-10-16T00:00:00",
+                              "origin": "advance"},
+                "viewed": [
+                    {"id": "request:20261017-010000-aaaabbbb",
+                     "viewed_at": "2026-10-17T02:00:00"},
+                    {"id": f"area:assistant:{c1[:12]}",
+                     "viewed_at": "2026-10-17T02:00:00"}],
+                "snoozed": []}), encoding="utf-8")
+            st = tour_state.load(p)
+            f = feed(repo, base/"r", q, base/"m", st,
+                     boundary(repo, "2026-10-17T12:00:00"))
+            # both live cards are already acknowledged: the deck is
+            # empty even though the watermark never advanced
+            self.assertEqual(f["entries"], [])
+            hist = {h["id"]: h for h in f["history"]}
+            req = hist["request:20261017-010000-aaaabbbb"]
+            self.assertEqual(req["state"], "viewed")
+            self.assertEqual(req["kind"], "request")
+            self.assertFalse(req.get("unavailable", False))
+            area = hist[f"area:assistant:{c1[:12]}"]
+            self.assertEqual(area["state"], "viewed")
+            self.assertTrue(area["unavailable"])       # honest stub
+            self.assertEqual(area["section"], "tool")
 
 
 class RegistryTests(unittest.TestCase):
