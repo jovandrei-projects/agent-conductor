@@ -1,0 +1,113 @@
+[run]
+name = "whats-new-split"
+description = "Separate tool updates from work activity in What's new, fold related events, clarify review and navigation chips, and make notification acknowledgments fast."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 60
+max_attempts = 3
+verify = "python run_tests.py --jobs 8"
+
+[[step]]
+name = "feed-build"
+project = "agent-conductor"
+worktree = true
+prompt = '''
+Implement only the feed/build foundation for the What's new redesign. Inspect tour_feeds.py, tour_state.py, their callers, and tests/test_tour_*.py before changing behavior. Use stdlib only. Preserve tour_state's machinery, its single watermark, and its single viewed-state file; do not introduce a state migration or independent section acknowledgment state.
+
+Classify change and curated cards as Tool updates, preserving their spotlight anchors, and run/request/follow-up cards as Work digest. Supply the minimal feed metadata needed by the later renderer while keeping the current renderer functional.
+
+Fold a request and its finished run into one work card only when both events fall inside the same feed window. Include proposal and completion dates, the actual terminal outcome, and completed-step count. Fold follow-up proposals into their associated request's work card when that request is also in the window. Preserve standalone registration, completion, and follow-up events when their counterparts fall in different windows. Match existing relationships, not display-name coincidences, and retain compatible card identities and viewed-history reconstruction.
+
+Replace change-style record tags with event-appropriate values, such as ready for proposals and done/failed for runs. Preserve existing tool-update tags. Expose the associated run's unreviewed-task count from existing review data, without changing task review state.
+
+Memoize _collect_window by the exact (base, tip) range within each build_feed invocation, including live-window and viewed-descriptor collection. Each distinct range should scan once per build; do not introduce a persistent cross-build cache or mutate shared cached results during card assembly.
+
+Exclude state='viewed' entries from the live walkthrough deck on feed load even before the watermark advances. Retain re-materialized history for explicit reopening.
+
+Run affected unittest coverage and the configured verification command. Make only necessary accompanying test adjustments to keep this step green; leave comprehensive regression expansion to tour-tests. Update AGENTS.md's What's-new section and existing .agent_tasks/ tracking with feed contracts, identity decisions, verification results, and STATUS/NEXT notes for the renderer.
+'''
+
+[[step]]
+name = "walkthrough-ui"
+project = "agent-conductor"
+worktree = true
+depends_on = ["feed-build"]
+prompt = '''
+Implement the card-rendering and section-split portion of What's new using the landed feed-build contract and its .agent_tasks/ notes. Locate the tour block in conductor.py's _DASH_HTML, approximately lines 20240-20600, and follow the existing tourSt/tourCardHtml patterns. Use vanilla JavaScript and existing styling conventions, with no new dependencies. Report missing predecessor output as a blocker rather than inventing a different feed contract.
+
+Present two clearly separated sections within one walkthrough: Tool updates for change/curated cards, and Work digest for run/request/follow-up cards. Show the section context in each card header, preserve tool-update spotlight anchors, and handle an empty section without broken navigation or blank cards. Continue using the shared watermark and viewed state. Reopening after partial review must use the unread deck while retaining explicit access to viewed history.
+
+Render record-event labels such as ready, done, and failed distinctly from feature-change labels new, improved, and fixed, preserving actual outcomes.
+
+Run cards and folded request/run pipeline cards must display the associated run's unreviewed-task count as a chip opening the existing run modal. Mark viewed remains notification acknowledgment only and must never invoke task-review actions.
+
+For related-record chips, run cards show only the run chip; request cards show their request chip plus a run chip only when a launched run exists; folded pipeline cards show their run chip. Do not fabricate run links. Whenever request and run chips coexist, distinguish them with explicit Request/Run labeling and styling, use each record's own identity rather than resolving the request label to the run name, and open the correct existing modal.
+
+Keep acknowledgment and polling behavior compatible with a last-known or deferred unseen_count from the subsequent endpoint change. Do not reinsert acknowledged cards because a count response is stale.
+
+Run affected tests and configured verification, updating only necessary assertions for this step. Update AGENTS.md's What's-new section and .agent_tasks/ tracking with rendering contracts, verification results, and STATUS/NEXT notes.
+'''
+
+[[step]]
+name = "deferred-transition"
+project = "agent-conductor"
+worktree = true
+depends_on = ["walkthrough-ui"]
+prompt = '''
+Implement only the deferred-rebuild transition for What's new, using the feed and renderer contracts delivered by the preceding steps. Inspect tour_transition, the tour endpoints in conductor.py around lines 13480-13690, and existing feed/count cache and polling behavior. Check predecessor .agent_tasks/ notes and report missing prerequisites explicitly.
+
+Persist the requested transition through the existing tour_state machinery before responding. Remove synchronous full-feed rebuilding and expensive collection from the POST path. Schedule feed and unseen-count cache refresh on a daemon thread using stdlib and established project patterns, then return promptly with a compatible last-known or explicitly deferred unseen_count.
+
+Ensure the normal dashboard poll observes the refreshed count and the badge converges after background refresh. Preserve unread-deck filtering and viewed-history access. Do not change the single watermark/viewed-state machinery, and never mark run tasks reviewed when a work notification is acknowledged.
+
+Handle concurrent transitions so persisted acknowledgments are not lost and an older background rebuild cannot permanently replace newer cache state. Reuse existing synchronization or refresh-coalescing patterns where available. A background refresh failure must not undo the saved transition or leave caches permanently unrefreshable; keep failures diagnosable without exposing private data.
+
+Run affected endpoint/cache tests and configured verification. Make narrowly necessary test adjustments so this step lands green, leaving comprehensive deterministic concurrency coverage to tour-tests. Update AGENTS.md's What's-new section and .agent_tasks/ tracking with response semantics, refresh behavior, verification results, and STATUS/NEXT notes.
+'''
+
+[[step]]
+name = "tour-tests"
+project = "agent-conductor"
+worktree = true
+depends_on = ["feed-build", "walkthrough-ui", "deferred-transition"]
+prompt = '''
+Add comprehensive regression coverage for the completed What's new redesign in tests/test_tour_*.py, following existing unittest fixtures and conventions. Inspect predecessor .agent_tasks/ notes and actual landed changes first. Use stdlib only; do not add a browser framework or other dependency.
+
+Cover:
+- Tool updates versus Work digest classification and header context, with tool spotlight anchors preserved and empty sections handled.
+- Same-window request/run folding with dates, terminal outcome, and completed-step count; same-window follow-up folding; separate events across different windows; unrelated records remaining separate.
+- Event-appropriate proposal/follow-up/run tags, including failed runs, without conflating them with new/improved/fixed change tags.
+- Run and folded-card unreviewed counts and run-modal actions; request/run chip combinations, distinct identities, and correct modal targets; no run chip for an unlaunched request.
+- Mark viewed changing notification state without changing task review state, the single watermark/viewed-state contract, and compatibility with existing viewed descriptors.
+- Viewed live-window entries disappearing from the unread deck before watermark advancement, partial-review reopening showing only unread cards, and viewed history remaining reopenable.
+- One underlying window collection per distinct (base, tip) range within a build, including shared viewed-descriptor ranges, and fresh collection in a later build.
+- POST persistence and return without waiting for a blocked feed rebuild; daemon refresh behavior, feed/count cache convergence through polling, concurrent transitions, stale refresh completion, and refresh failures.
+
+Use deterministic mocks or synchronization primitives rather than timing-sensitive sleeps for background-work tests, and ensure test workers are cleaned up. Follow the existing test strategy for embedded JavaScript rather than introducing new infrastructure.
+
+Fix only in-scope regressions exposed by these tests. Run focused tour tests and python run_tests.py --jobs 8; record actual outcomes and any verification limitations. Update AGENTS.md's What's-new section to match verified behavior and update .agent_tasks/ tracking with coverage, unresolved issues, and clear STATUS/NEXT notes.
+'''
+
+[[step]]
+name = "follow-up-plan"
+project = "agent-conductor"
+worktree = true
+timeout_min = 15
+depends_on = ["feed-build", "walkthrough-ui", "deferred-transition", "tour-tests"]
+prompt = '''
+Perform a closing review and propose follow-up work only; do not implement product changes or launch another run.
+
+Review actual merged changes, verification results, and any failed or parked steps against the requested redesign: separate Tool updates and Work digest sections with shared tour state; window-aware pipeline/follow-up folding; unreviewed-count chips without task-review side effects; distinct event tags and related-record chips; build-local window memoization; deferred transition rebuilds with converging counts; and unread-only deck loading with reopenable history. Also check stdlib/vanilla-JS constraints, unittest coverage, AGENTS.md updates, and .agent_tasks/ completion tracking.
+
+Find this run's per-step logs, STATUS/NEXT lines, and notes under C:/Projects/agent-conductor/data/runs in the newest directory whose name ends with whats-new-split. Read those alongside the project's .agent_tasks files. Distinguish landed, verified work from unsuccessful, blocked, or parked work; do not assume a terminal step succeeded.
+
+Write a NEW conductor TOML manifest to C:/Projects/agent-conductor/manifests/whats-new-split-followup.toml proposing only still-unfinished or newly discovered in-scope work. Use the registered project slug agent-conductor, concrete sequential steps and appropriate dependencies, the same required defaults and verification command, worktree isolation, and automatic merge resolution. Do not guess a merge target, add cloud execution, repeat completed work, or copy credentials/private data into the manifest. If nothing remains, explicitly record that outcome rather than inventing implementation tasks.
+
+Update .agent_tasks/ review tracking with the evidence and follow-up proposal location. The manifest is for human review only: do not launch it or implement any proposed follow-up.
+'''
