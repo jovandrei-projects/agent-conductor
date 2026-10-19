@@ -171,8 +171,9 @@ class TourApiTests(unittest.TestCase):
         self.assertEqual(chat["tag"], "new")
 
     def test_records_and_ride_alongs(self):
-        """A windowed request + finished run land as cards keyed by
-        request id / dashboard run key."""
+        """A windowed request + finished run fold into one pipeline work
+        card keyed on the run event (the proposal is covered, not a
+        second card)."""
         rid = "20261017-010000-aaaabbbb"
         (self.requests / f"{rid}.json").write_text(json.dumps(
             {"id": rid, "status": "ready", "label": "new stuff",
@@ -184,10 +185,14 @@ class TourApiTests(unittest.TestCase):
              "ended_at": "2026-10-17T02:00:00", "steps": {}}),
             encoding="utf-8")
         ids = self.ids()
-        self.assertEqual(ids[f"request:{rid}"]["requests"], [rid])
+        self.assertNotIn(f"request:{rid}", ids)      # folded away
         run = ids["run:20261017-020000-somename:2026-10-17T02:00:00"]
+        self.assertEqual(run["kind"], "pipeline")
+        self.assertEqual(run["section"], "work")
         self.assertEqual(run["runs"], [f"request:{rid}"])
         self.assertEqual(run["requests"], [rid])
+        self.assertIn(f"request:{rid}", run["covers"])
+        self.assertEqual(run["outcome"], "ended")     # no steps recorded
 
     # ---------------------------------------------------- transitions
 
@@ -199,8 +204,12 @@ class TourApiTests(unittest.TestCase):
         self.assertEqual(d["state"], "viewed")
         self.assertEqual(d["unseen_count"], 1)
         self.assertFalse(d["advanced"])          # one still 'new'
-        # immediately consistent - no TTL wait
-        self.assertEqual(self.ids()[eid]["state"], "viewed")
+        # immediately consistent - no TTL wait; the acknowledged card
+        # left the deck and sits in the viewed section
+        feed = self.get()
+        self.assertNotIn(eid, {e["id"] for e in feed["entries"]})
+        hist = {h["id"]: h for h in feed["history"]}
+        self.assertEqual(hist[eid]["state"], "viewed")
         st = self.state_file()
         self.assertEqual([v["id"] for v in st["viewed"]], [eid])
         s, d = self.post(eid, "unview")
@@ -350,7 +359,9 @@ class TourApiTests(unittest.TestCase):
         self.get()                                # warm the cache
         self.post(eid, "viewed")
         d = self.get()                            # still inside the TTL
-        self.assertEqual(self.ids(d)[eid]["state"], "viewed")
+        # the acknowledged card is out of the live deck, in history
+        self.assertNotIn(eid, {e["id"] for e in d["entries"]})
+        self.assertEqual({h["id"] for h in d["history"]}, {eid})
         self.assertEqual(d["unseen_count"], 1)
 
     def test_transition_refreshes_cached_count(self):
