@@ -15172,7 +15172,13 @@ wave = 1
                          "end": "2026-10-16T01:04:10"},
                         {"start": "2026-10-16T01:06:00",
                          "end": "2026-10-16T01:10:00"}]}}}))
-            d = conductor.collect_dashboard(runs, ["no-such-devin"])
+            # the fixture's stamps are intentionally old (multi-interval
+            # resume bookkeeping) - don't let the auto-archive sweep,
+            # which legitimately hides runs ended over 48h ago, swallow
+            # the row this payload-contract test is about
+            with mock.patch.object(conductor, "_auto_archive",
+                                   lambda *a, **k: None):
+                d = conductor.collect_dashboard(runs, ["no-such-devin"])
             a = next(a for a in d["agents"] if a["step"] == "s1")
             self.assertEqual(a["elapsed_s"], 330.0)
             self.assertEqual(a["first_started_at"],
