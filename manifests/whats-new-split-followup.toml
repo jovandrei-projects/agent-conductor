@@ -1,0 +1,92 @@
+# Follow-up proposal drafted by the whats-new-split run's closing
+# follow-up-plan step (run dir: data/runs/20261019-031845-whats-new-split,
+# request 20261019-031223-58671699, source manifest
+# manifests/20261019-031223-58671699-whats-new-split.toml).
+# Reviewed but NOT launched - this file intentionally declares NO [[step]]
+# entries: nothing remains. It registers as "empty"/"no work remains" in
+# the follow-up intake, never as a runnable job.
+#
+# Reviewed evidence: the run's state.json + events.jsonl, all four feature
+# steps' stdout/verify logs + STATUS/NEXT/OUTCOME lines, the merged code in
+# this repo (tour_feeds.py, tour_state.py, conductor.py tour_ctx/_DASH_HTML
+# blocks, tests/test_tour_*.py), AGENTS.md's What's-new section,
+# .agent_tasks/whats-new-split/STATE.md + QUEUE.md, the original request
+# record's full raw text, and a re-run of the tour suite on the merged tree
+# (152/152 green: feeds 50, api 25, dash 19, state 26, polish 24, e2e 8).
+#
+# Per-item verdict against the request (all LANDED + MERGED on master):
+#   1. Two sections, one watermark - PASS. Every card carries
+#      section/section_title; change+curated -> "Tool updates", records ->
+#      "Work digest"; tour_state's {watermark, viewed, snoozed} file is
+#      byte-shape-pinned unchanged. tourLoad partitions the deck;
+#      per-section 'card i of n' + sec-tool/sec-work chrome; empty section
+#      contributes no cards.
+#   2. Same-window pipeline folding - PASS. request+finished-run in one
+#      window -> kind 'pipeline' (id run:<dir>:<ended>) with covers,
+#      proposed_at/completed_at, outcome, steps_done/steps_total,
+#      unreviewed; follow-ups fold into their associated in-window request;
+#      cross-window counterparts stay standalone; matching on recorded
+#      request_id/source_request/source_run links only, never names.
+#   3. Unreviewed-count chip, no review side effects - PASS. .trev chip on
+#      run/pipeline cards opens the run modal; count derives read-only from
+#      sentinels + srec.review; test pins run state.json byte-identical and
+#      no review-* sentinel on mark-viewed.
+#   4. Event tags distinct from change tags - PASS. 'ready' for proposals,
+#      verbatim terminal outcome for run/pipeline; filled .ttag.ev styling
+#      vs outline change tags; unknown outcome words still print.
+#   5. Related-record chips - PASS. run/pipeline -> run chip only;
+#      request/followup -> request chip + recorded runs; Request/Run .relk
+#      prefixes + rel tints when coexisting; request chip keeps the
+#      request's own identity; no fabricated run links.
+#   6. Speed - PASS. _collect_window memoized per exact {base,tip} inside
+#      each build_feed (live + descriptor windows share one collection;
+#      entries copied before annotation; no cross-build cache). POST
+#      persists through tour_state first, drops feed cache + bumps gen,
+#      returns _tour_count_now's last-known/deferred unseen_count with
+#      count_pending, and arms a coalesced daemon rebuild (busy + wanted
+#      rerun; failures only log and re-arm).
+#   7. Unread-only deck - PASS. state=='viewed' excluded from entries on
+#      feed load pre-advancement; history re-materializes viewed cards;
+#      tourAcked filters stale re-pulled feeds and reattaches marked cards.
+#   Constraints - PASS. stdlib-only (no new imports anywhere), vanilla JS
+#   inside _DASH_HTML, unittest coverage per conventions (23 new
+#   deterministic tests, threading.Event gates, no added sleeps), AGENTS.md
+#   + .agent_tasks updated, every step landed green.
+#
+# Per-step truth (from run state, not assumption):
+#   feed-build         done -> merged (resolver resolve-feed-build fixed a
+#                      5-file/7-hunk equivalent-edits conflict; dd1df59);
+#                      verify 992 tests 8/8.
+#   walkthrough-ui     done -> merged cleanly; verify 999 tests 8/8.
+#   deferred-transition done -> merged cleanly; verify 1001 tests 8/8.
+#   tour-tests         done -> merged cleanly; verify 1024 tests 8/8;
+#                      +23 tests, zero regressions found.
+#
+# Deliberately not proposed (and why):
+#   - A headed-browser render pass of the split deck: the request scoped
+#     verification to "unittest coverage matching tests/test_tour_*.py
+#     conventions" - the project's JS strategy is the node-vm stub DOM, and
+#     test_tour_e2e covers the real HTTP lifecycle. Nothing in scope is
+#     unverified by that standard; a human eyeball of the live deck is a
+#     human task, not a conductor step.
+#   - Any product change: no defects, parked branches, blocked or failed
+#     steps exist from this run to carry forward.
+#
+# Observations for the human (not steps):
+#   - Checkpoint c3fc7c5's `git add -A` swept the unrelated intake file
+#     manifests/20261019-034417-b712823e-space-plan-core.toml into a tracked
+#     commit - the known commit-swallow trap; the file is harmless there
+#     but is now tracked on master.
+#   - efficiency_stats.md missed rows for feed-build and tour-tests;
+#     backfilled by this step.
+#   - Re-check this proposal with `python conductor.py regen-followup`
+#     only if it goes stale; today there is nothing to launch.
+
+[run]
+name = "whats-new-split-followup"
+description = "Closing review of run 20261019-031845-whats-new-split: all 7 requested items landed merged and verified (152/152 tour + 1024-suite green); no unfinished, blocked, or newly discovered in-scope work remains."
+checkpoint = true
+merge_resolver = true
+on_failure = "continue"
+
+# Intentionally no [[step]] entries - nothing remains to do.
