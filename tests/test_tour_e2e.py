@@ -88,14 +88,16 @@ class TourE2ETests(unittest.TestCase):
       branch conductor/<run>/s1 merged back              -> attributed to
                the finished-run card below, not a separate change card
     Records: one request (rid1), one run that launched it and finished
-    in-window (its card absorbs the merge chain), one follow-up request
-    (rid2) registered from that run. Seven new cards total.
+    in-window (its card absorbs the merge chain AND the request +
+    follow-up events - same-window work folds into one pipeline card),
+    one follow-up request (rid2) registered from that run. Five new
+    cards total.
     """
 
     RUN_DIR = "20261017-020000-somename"
     RID1 = "20261017-010000-aaaabbbb"
     RID2 = "20261017-030000-ccccdddd"
-    N_CARDS = 7
+    N_CARDS = 5
 
     def setUp(self):
         # the shipped default: no env opt-in -> enrichment stays off;
@@ -283,11 +285,22 @@ class TourE2ETests(unittest.TestCase):
         # ...so the merge produces no separate change card
         self.assertFalse(any(self.c_merge[:12] in k for k in ids))
 
-        req = ids[f"request:{self.RID1}"]
-        self.assertEqual(req["requests"], [self.RID1])
-        fup = ids[f"followup:{self.RID2}"]
-        self.assertEqual(fup["requests"], [self.RID2])
-        self.assertEqual(fup["runs"], [f"request:{self.RID1}"])
+        # the request + follow-up folded into the run's work card (all
+        # three events share the window)
+        self.assertEqual(run["kind"], "pipeline")
+        self.assertEqual(run["section"], "work")
+        self.assertEqual(run["tag"], "failed")      # s2 failed
+        self.assertEqual(run["outcome"], "failed")
+        self.assertEqual(run["proposed_at"], "2026-10-17T01:00:00")
+        self.assertEqual(run["steps_done"], 1)
+        self.assertEqual(run["steps_total"], 2)
+        self.assertEqual({c for c in run["covers"]},
+                         {f"request:{self.RID1}", f"followup:{self.RID2}"})
+        fu = run["followups"][0]
+        self.assertEqual(fu["id"], f"followup:{self.RID2}")
+        self.assertEqual(fu["requests"], [self.RID2])
+        self.assertNotIn(f"request:{self.RID1}", ids)
+        self.assertNotIn(f"followup:{self.RID2}", ids)
 
         # open/dismiss is read-only - the state file's bytes are
         # identical after any number of GETs
@@ -477,6 +490,7 @@ class TourE2ETests(unittest.TestCase):
             self.assertEqual(d["tour_unseen"], self.N_CARDS - 1)
             feed = self.get()
             self.assertNotIn(eid, self.ids(feed))  # viewed -> history
+            self.assertEqual({h["id"] for h in feed["history"]}, {eid})
             self.assertEqual(feed["unseen_count"], self.N_CARDS - 1)
 
     def test_mutations_are_immediately_consistent(self):

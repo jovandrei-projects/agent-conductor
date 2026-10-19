@@ -460,8 +460,18 @@ class AssociationTests(unittest.TestCase):
             bnd = {"commit": rev(repo), "at": "2026-10-17T12:00:00"}
             f = feed(repo, r, q, base/"m", state, bnd)
             ids = by_id(f)
-            self.assertEqual(ids["request:20261017-040000-9999aaaa"]["runs"],
+            # same window: the proposal folds into its run's card - the
+            # standalone request card is gone, the link survives as the
+            # pipeline card's run chip + covers entry
+            self.assertNotIn("request:20261017-040000-9999aaaa", ids)
+            e = ids["run:20261017-050000-x:2026-10-17T06:00:00"]
+            self.assertEqual(e["kind"], "pipeline")
+            self.assertEqual(e["runs"],
                              ["request:20261017-040000-9999aaaa"])
+            self.assertEqual(e["requests"],
+                             ["20261017-040000-9999aaaa"])
+            self.assertIn("request:20261017-040000-9999aaaa",
+                          e["covers"])
 
     def test_merge_commits_attribute_to_run_card(self):
         """A conductor merge + its branch chain belong to the finished
@@ -522,8 +532,8 @@ class IdentityTests(unittest.TestCase):
                              "viewed_at": "2026-10-17T01:00:00"}]
             f2 = feed(repo, base/"r", base/"q", base/"m", st)
             # a viewed card leaves the deck immediately - it lives on
-            # in 'viewed earlier', even while the watermark is pinned
-            # by other still-new cards
+            # in history, even while the watermark is pinned by other
+            # still-new cards
             self.assertEqual(f2["entries"], [])
             self.assertEqual([h["id"] for h in f2["history"]], [eid])
             self.assertEqual(f2["history"][0]["state"], "viewed")
@@ -619,6 +629,319 @@ class IdentityTests(unittest.TestCase):
             self.assertEqual(f["history"][0]["id"],
                              "request:20261016-000000-deadbeef")
             self.assertTrue(f["history"][0]["unavailable"])
+
+
+class SplitFeedTests(unittest.TestCase):
+    """The 'Tool updates' / 'Work digest' split feed contract: section
+    classification, same-window request+run folding, follow-up folding,
+    record-event tags, the run's unreviewed-task count, 'viewed' leaving
+    the live deck, and per-build exact-range collection memoization."""
+
+    def test_sections_classify_cards(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            commit(repo, "assistant/a.py", "x", "chat")
+            write_request(q, "20261017-010000-aaaabbbb",
+                          "2026-10-17T01:00:00")
+            st = wm(None, "2026-10-17T00:00:00")
+            f = feed(repo, r, q, base/"m", st,
+                     boundary(repo, "2026-10-17T12:00:00"))
+            secs = {e["kind"]: (e["section"], e["section_title"])
+                    for e in f["entries"]}
+            self.assertEqual(secs["change"], ("tool", "Tool updates"))
+            self.assertEqual(secs["request"], ("work", "Work digest"))
+
+    def test_pipeline_fold_fields(self):
+        """A request + its in-window run = one work card carrying both
+        event dates, the terminal outcome, and step tallies."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            write_run(r, "20261017-050000-x", "2026-10-17T06:00:00",
+                      request_id="20261017-040000-9999aaaa",
+                      steps={"s1": {"status": "done"},
+                             "s2": {"status": "done"}})
+            write_request(q, "20261017-040000-9999aaaa",
+                          "2026-10-17T04:00:00", label="ship it")
+            st = wm(rev(repo), "2026-10-17T00:00:00")
+            f = feed(repo, r, q, base/"m", st,
+                     boundary(repo, "2026-10-17T12:00:00"))
+            self.assertEqual(len(f["entries"]), 1)      # one work card
+            e = f["entries"][0]
+            self.assertEqual(e["id"],
+                             "run:20261017-050000-x:2026-10-17T06:00:00")
+            self.assertEqual(e["kind"], "pipeline")
+            self.assertEqual(e["section"], "work")
+            self.assertEqual(e["tag"], "done")          # not a change tag
+            self.assertEqual(e["outcome"], "done")
+            self.assertEqual(e["proposed_at"], "2026-10-17T04:00:00")
+            self.assertEqual(e["completed_at"], "2026-10-17T06:00:00")
+            self.assertEqual(e["steps_done"], 2)
+            self.assertEqual(e["steps_total"], 2)
+            self.assertEqual(e["unreviewed"], 0)
+            self.assertEqual(e["covers"],
+                             ["request:20261017-040000-9999aaaa"])
+
+    def test_failed_and_aborted_outcomes_tag_honestly(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r = base/"r"
+            write_run(r, "20261017-050000-f", "2026-10-17T06:00:00",
+                      steps={"s1": {"status": "done"},
+                             "s2": {"status": "failed"}})
+            write_run(r, "20261017-070000-s", "2026-10-17T08:00:00",
+                      aborted="stopped",
+                      steps={"s1": {"status": "done"}})
+            st = wm(None, "2026-10-17T00:00:00")
+            f = feed(repo, r, base/"q", base/"m", st,
+                     boundary(repo, "2026-10-17T12:00:00"))
+            by = by_id(f)
+            self.assertEqual(by["run:20261017-050000-f:"
+                                "2026-10-17T06:00:00"]["outcome"],
+                             "failed")
+            self.assertEqual(by["run:20261017-050000-f:"
+                                "2026-10-17T06:00:00"]["tag"], "failed")
+            # a recorded halt reason is the outcome - step verdicts
+            # never overrule it
+            self.assertEqual(by["run:20261017-070000-s:"
+                                "2026-10-17T08:00:00"]["outcome"],
+                             "stopped")
+
+    def test_cross_window_events_keep_standalone_cards(self):
+        """A run in the window whose request was created in an earlier
+        (acknowledged) window stays a standalone 'run' card - and vice
+        versa."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            write_run(r, "20261017-050000-x", "2026-10-17T06:00:00",
+                      request_id="20261016-040000-9999aaaa")
+            write_request(q, "20261016-040000-9999aaaa",
+                          "2026-10-16T04:00:00")     # before base.at
+            st = wm(None, "2026-10-17T00:00:00")
+            f = feed(repo, r, q, base/"m", st,
+                     boundary(repo, "2026-10-17T12:00:00"))
+            ids = by_id(f)
+            e = ids["run:20261017-050000-x:2026-10-17T06:00:00"]
+            self.assertEqual(e["kind"], "run")          # not folded
+            self.assertNotIn("covers", e)
+            self.assertEqual(e["requests"],
+                             ["20261016-040000-9999aaaa"])
+            # ...but the proposal date still resolves for the card
+            self.assertEqual(e["proposed_at"], "2026-10-16T04:00:00")
+
+    def test_followup_folds_into_associated_request_card(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            write_run(r, "20261017-050000-src", "2026-10-17T06:00:00",
+                      request_id="20261017-010000-11112222")
+            write_request(q, "20261017-010000-11112222",
+                          "2026-10-17T01:00:00", label="the request")
+            write_request(q, "20261017-090000-abcd1234",
+                          "2026-10-17T09:00:00", label="more work",
+                          source_run="20261017-050000-src",
+                          source_request="20261017-010000-11112222",
+                          imported="followup")
+            st = wm(rev(repo), "2026-10-17T00:00:00")
+            f = feed(repo, r, q, base/"m", st,
+                     boundary(repo, "2026-10-17T12:00:00"))
+            ids = by_id(f)
+            self.assertEqual(len(ids), 1)               # all folded
+            e = ids["run:20261017-050000-src:2026-10-17T06:00:00"]
+            self.assertEqual(e["kind"], "pipeline")
+            self.assertEqual({c for c in e["covers"]},
+                             {"request:20261017-010000-11112222",
+                              "followup:20261017-090000-abcd1234"})
+            fu = e["followups"][0]
+            self.assertEqual(fu["id"],
+                             "followup:20261017-090000-abcd1234")
+            self.assertEqual(fu["requests"],
+                             ["20261017-090000-abcd1234"])
+            self.assertEqual(fu["at"], "2026-10-17T09:00:00")
+
+    def test_followup_stays_standalone_across_windows(self):
+        """A follow-up whose associated request sits in another window
+        keeps its own card - matching the recorded link, not names."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            write_run(r, "20261017-050000-src", "2026-10-17T06:00:00",
+                      request_id="20261016-010000-11112222")
+            write_request(q, "20261016-010000-11112222",
+                          "2026-10-16T01:00:00")     # before base.at
+            write_request(q, "20261017-090000-abcd1234",
+                          "2026-10-17T09:00:00",
+                          source_run="20261017-050000-src",
+                          source_request="20261016-010000-11112222",
+                          imported="followup")
+            st = wm(None, "2026-10-17T00:00:00")
+            f = feed(repo, r, q, base/"m", st,
+                     boundary(repo, "2026-10-17T12:00:00"))
+            ids = by_id(f)
+            # three standalone events: run, follow-up (source request
+            # acknowledged in an earlier window)
+            self.assertIn("run:20261017-050000-src:2026-10-17T06:00:00",
+                          ids)
+            self.assertIn("followup:20261017-090000-abcd1234", ids)
+
+    def test_folded_descriptor_rematerializes_through_covers(self):
+        """A 'viewed' request descriptor from before the run finished
+        still resolves - through the pipeline card's covers list."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            write_run(r, "20261017-050000-x", "2026-10-17T06:00:00",
+                      request_id="20261017-040000-9999aaaa")
+            write_request(q, "20261017-040000-9999aaaa",
+                          "2026-10-17T04:00:00")
+            st = wm(None, "2026-10-17T00:00:00")
+            bnd = boundary(repo, "2026-10-17T12:00:00")
+            f1 = feed(repo, r, q, base/"m", st, bnd)
+            st["viewed"] = [{
+                "id": "request:20261017-040000-9999aaaa",
+                "range": f1["range"],
+                "viewed_at": "2026-10-17T10:00:00"}]
+            f2 = feed(repo, r, q, base/"m", st, bnd)
+            hist = {h["id"]: h for h in f2["history"]}
+            eid = "run:20261017-050000-x:2026-10-17T06:00:00"
+            self.assertIn(eid, hist)                    # resolved via covers
+            self.assertEqual(hist[eid]["kind"], "pipeline")
+            self.assertFalse(hist[eid].get("unavailable"))
+
+    def test_unreviewed_count_comes_from_marks(self):
+        """The run card exposes its unreviewed-task count from existing
+        review data - folded marks AND a live sentinel - never written."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            flags = base/"flags"
+            flags.mkdir()
+            write_run(r, "20261017-050000-x", "2026-10-17T06:00:00",
+                      steps={
+                          "s1": {"status": "done", "completion_seq": 1,
+                                 "review": {"reviewed": True, "seq": 1,
+                                            "at": "2026-10-17T06:01:00"}},
+                          "s2": {"status": "done", "completion_seq": 2,
+                                 "review": {"reviewed": True, "seq": 1,
+                                            "at": "2026-10-17T06:01:00"}},
+                          "s3": {"status": "failed",
+                                 "completion_seq": 1},
+                          "s4": {"status": "done"}})
+            st = wm(None, "2026-10-17T00:00:00")
+            bnd = boundary(repo, "2026-10-17T12:00:00")
+            kw = dict(repo_dir=repo, runs_dir=r, requests_dir=q,
+                      manifests_dir=base/"m", flags_dir=flags)
+            f = tour_feeds.build_feed(st, bnd, **kw)
+            e = f["entries"][0]
+            # s2's mark is stale (seq 1 < completion 2) and s3 has no
+            # mark at all; s4 never completed; s1 is current
+            self.assertEqual(e["unreviewed"], 2)
+            # a live sentinel overrides the folded mark on `at` ties
+            d = r / "20261017-050000-x"
+            (flags / ("review-" + tour_feeds._flag_key(d) + "-s1")
+             ).write_text(json.dumps(
+                 {"reviewed": False, "seq": 1,
+                  "at": "2026-10-17T07:00:00"}), encoding="utf-8")
+            f2 = tour_feeds.build_feed(st, bnd, **kw)
+            self.assertEqual(f2["entries"][0]["unreviewed"], 3)
+
+    def test_viewed_card_leaves_live_deck_before_advance(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            c0 = rev(repo)
+            commit(repo, "assistant/a.py", "x", "chat")
+            commit(repo, "mobile_device.py", "x", "mobile")
+            st = wm(c0, "2026-10-16T00:00:00")
+            f1 = feed(repo, base/"r", base/"q", base/"m", st)
+            eid = f1["entries"][0]["id"]
+            st["viewed"] = [{"id": eid, "range": f1["range"],
+                             "viewed_at": "2026-10-17T01:00:00"}]
+            f2 = feed(repo, base/"r", base/"q", base/"m", st)
+            live = {e["id"]: e for e in f2["entries"]}
+            self.assertNotIn(eid, live)             # not in the deck
+            self.assertEqual({h["id"] for h in f2["history"]}, {eid})
+            self.assertEqual(f2["history"][0]["state"], "viewed")
+            self.assertEqual(f2["unseen_count"], 1) # the other card
+
+    def test_each_distinct_range_collects_once(self):
+        """Two viewed descriptors storing the same window share ONE
+        collection - the live window is another; a second build_feed
+        collects fresh (no cross-build cache)."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            c0 = rev(repo)
+            c1 = commit(repo, "assistant/a.py", "x", "chat")
+            c2 = commit(repo, "mobile_device.py", "x", "mobile")
+            st = wm(c0, "2026-10-16T00:00:00")
+            kw = dict(repo_dir=repo, runs_dir=base/"r",
+                      requests_dir=base/"q", manifests_dir=base/"m")
+            b1 = boundary(repo)
+            # an older window than the live one - distinct range key,
+            # still containing both cards
+            shared = rng(c0, "2026-10-16T00:00:00", c2,
+                         "2026-10-17T01:00:00")
+            st["viewed"] = [
+                {"id": f"area:assistant:{c1[:12]}", "range": shared,
+                 "viewed_at": "2026-10-17T01:00:00"},
+                {"id": f"area:mobile:{c2[:12]}", "range": shared,
+                 "viewed_at": "2026-10-17T01:05:00"}]
+            calls = []
+            real = tour_feeds._collect_window
+
+            def spy(rng_arg, **k):
+                calls.append(tour_feeds._range_key(rng_arg))
+                return real(rng_arg, **k)
+
+            try:
+                tour_feeds._collect_window = spy
+                tour_feeds.build_feed(st, b1, **kw)
+            finally:
+                tour_feeds._collect_window = real
+            self.assertEqual(len(calls), len(set(calls)))  # no re-scans
+            # live window + the one shared stored range
+            self.assertEqual(len(calls), 2)
+            # a later build collects fresh - nothing persists across it
+            try:
+                tour_feeds._collect_window = spy
+                calls.clear()
+                tour_feeds.build_feed(st, b1, **kw)
+            finally:
+                tour_feeds._collect_window = real
+            self.assertEqual(len(calls), 2)
+
+    def test_snoozed_covered_descriptor_stays_one_card(self):
+        """A snoozed request id whose event folded into a live pipeline
+        card must not produce a duplicate entry."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r, q = base/"r", base/"q"
+            write_run(r, "20261017-050000-x", "2026-10-17T06:00:00",
+                      request_id="20261017-040000-9999aaaa")
+            write_request(q, "20261017-040000-9999aaaa",
+                          "2026-10-17T04:00:00")
+            st = wm(rev(repo), "2026-10-17T00:00:00")
+            bnd = boundary(repo, "2026-10-17T12:00:00")
+            st["snoozed"] = [{
+                "id": "request:20261017-040000-9999aaaa",
+                "range": rng(None, "2026-10-17T00:00:00",
+                             rev(repo), "2026-10-17T12:00:00"),
+                "snoozed_at": "2026-10-17T10:00:00"}]
+            f = feed(repo, r, q, base/"m", st, bnd)
+            self.assertEqual(len(f["entries"]), 1)
+            self.assertEqual(f["entries"][0]["kind"], "pipeline")
 
 
 class RegistryTests(unittest.TestCase):
