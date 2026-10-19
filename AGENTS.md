@@ -131,10 +131,40 @@ conductor.py parent) accounts for - Devin Desktop `acp` sessions, a
 manual `devin` picker/run - folded to their session root and labeled
 desktop/cli (`_devin_sessions`, 10s-cached probe). They hold no slot
 and NEVER count toward in_use/cap - they're shown because they still
-use the box. The topbar count and an open modal also repaint on the
-render sig's early return, since lease changes alone don't move the
-sig. Note `slot_wait` stays stamped on a record after the lease lands -
-only `status='queued'` means still waiting.
+use the box. Each row also gets a role (`_ext_role`: agent host /
+summarizer helper / print worker / cli utility / interactive) and the
+session titles it touched (`_ext_enrich`): the pid+start-matched
+`devin_<ts>_<pid>.log` under the CLI data root (`CONDUCTOR_DEVIN_CLI`
+override, else %APPDATA%\devin\cli) names session ids, and
+`sessions.db` resolves them to titles via a read-only 1s-timeout
+sqlite open - a locked/absent db or log just leaves the row unnamed.
+The Desktop `acp` host multiplexes every open conversation, so it
+lists its most-recent sessions, never "the" session; a REPL that
+never sent a prompt labels 'idle - no session yet'. The topbar count
+and an open modal also repaint on the render sig's early return, since
+lease changes alone don't move the sig. Note `slot_wait` stays stamped
+on a record after the lease lands - only `status='queued'` means still
+waiting.
+
+The topbar `repos` button opens the repositories modal (`/api/repos`,
+10s-cached scan, `repo_status`/`_repo_status`): one section per watched
+repo - every configured project plus this repo, dedup'd by path - with
+the MAIN checkout's branch as 'the base' (the served dir itself may be
+a worktree, so `current_branch` on it would lie; a detached main falls
+back to master/main), the base's latest 3 commits under a fold, and a
+row per linked worktree: branch or detached sha, ahead/behind counts
+vs the base (`rev-list --left-right --count`), dirty/MERGE_HEAD/
+prunable flags, and its unmerged commits listed newest-first (8 max).
+A worktree under `data/worktrees/<run>/<step>` (or `<step>.merge`,
+the deferred-merge staging dir) is cross-checked against the run's
+state.json via `_wt_conductor_link` - `merged`/`merge_target` from the
+record are shown next to what git actually sees, so a recorded-but-not-
+really-merged step is a visible lie, not silent bookkeeping; an
+explicit `merge_target` overrides the default base for that row's
+counts. Rows link through to the run modal. Repos with no linked
+worktrees collapse to a `no linked worktrees:` footnote line; an open
+modal refetches on a ~15s cadence and each section's base-log fold
+survives repaints.
 Parallel sessions get a PARALLEL_NOTE prompt block: share the box, own
 your checkout/leases/ports, never fight a peer or the user over a shared
 resource - if a genuinely exclusive resource is held, end `STATUS:

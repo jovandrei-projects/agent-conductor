@@ -4966,7 +4966,198 @@ def _devin_sessions(holders: list[dict]) -> list[dict]:
             anc, hops = by_pid.get(anc["ppid"]), hops + 1
         out.append({"pid": p["pid"], "kind": kind,
                     "started_at": p["started_at"], "cmd": p["cmd"]})
+    _ext_enrich(out, procs)
     return sorted(out, key=lambda s: s["started_at"] or "")
+
+
+_EXT_SESS_CACHE: dict = {"stamp": None, "rows": {}}
+_SESS_DB_CACHE: list = [0.0, {}]   # [mono, id -> title row] - titles
+                                 # change rarely, the db is multi-GB
+_SESS_ID_RE = re.compile(
+    rb"(?:Created new session: |for session )"
+    rb"([A-Za-z0-9][A-Za-z0-9_\-]{1,80})")
+
+
+def _devin_log_root() -> Path | None:
+    """The CLI's data root - per-process logs/ and the sessions.db sit
+    side by side under it (Windows: %APPDATA%\\devin\\cli).
+    CONDUCTOR_DEVIN_CLI overrides for tests/odd installs; a missing
+    layout simply means no session names, never an error."""
+    env = os.environ.get("CONDUCTOR_DEVIN_CLI")
+    cands = [Path(env)] if env else []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        cands.append(Path(appdata) / "devin" / "cli")
+    cands += [Path.home() / ".local" / "share" / "devin" / "cli",
+              Path.home() / ".devin" / "cli"]
+    for c in cands:
+        if (c / "logs").is_dir():
+            return c
+    return None
+
+
+def _proc_log_path(root: Path, pid: int,
+                   started_at: str | None) -> Path | None:
+    """devin_<yyyymmdd-HHMMSS>_<pid>.log for THIS process instance - the
+    filename stamps local create time, so a recycled pid can't adopt a
+    dead process's log. A few seconds of skew covers spawn->init."""
+    if not started_at:
+        return None
+    try:
+        want = dt.datetime.fromisoformat(
+            str(started_at)).replace(tzinfo=None)
+    except ValueError:
+        return None
+    best, best_d = None, 10.0
+    try:
+        for f in (root / "logs").glob(f"*_{pid}.log"):
+            m = re.match(r"devin_(\d{8}-\d{6})_", f.name)
+            if not m:
+                continue
+            try:
+                fts = dt.datetime.strptime(
+                    m.group(1), "%Y%m%d-%H%M%S")
+            except ValueError:
+                continue
+            d = abs((fts - want).total_seconds())
+            if d <= best_d:
+                best, best_d = f, d
+    except OSError:
+        return None
+    return best
+
+
+def _log_sessions(path: Path, tail: int = 262144) -> list[str]:
+    """Session ids a devin process's live log names - 'Created new
+    session: <id>' and the session-db save lines - ordered by LAST
+    mention (most recent first). The embedded acp child writes these,
+    so callers pass descendant logs too."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > tail:
+                f.seek(-tail, os.SEEK_END)
+            blob = f.read()
+    except OSError:
+        return []
+    hits = [m.group(1).decode("ascii", "replace")
+            for m in _SESS_ID_RE.finditer(blob)]
+    return list(dict.fromkeys(reversed(hits)))
+
+
+def _session_titles(root: Path, ids: list[str]) -> dict:
+    """session id -> {title, dir, last_activity_at} out of the CLI's
+    sessions.db. Read-only URI + 1s timeout: the file is a live WAL
+    (multi-GB) owned by the desktop app - a missed read just leaves the
+    row unnamed, never blocks it."""
+    db = root / "sessions.db"
+    if not ids or not db.is_file():
+        return {}
+    at, cached = _SESS_DB_CACHE
+    if at and time.time() - at < 30.0:
+        return {i: cached[i] for i in ids if i in cached}
+    out: dict = {}
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{db}?mode=ro",
+                              uri=True, timeout=1)
+        try:
+            marks = ",".join("?" * len(ids))
+            for sid, title, wdir, lat in con.execute(
+                    "select id, title, working_directory,"
+                    "last_activity_at from sessions where id in"
+                    f" ({marks})", ids):
+                out[sid] = {"title": title, "dir": wdir,
+                            "last_activity_at": lat}
+        finally:
+            con.close()
+    except Exception:                                  # noqa: BLE001
+        return {}
+    merged = dict(cached)
+    merged.update(out)
+    _SESS_DB_CACHE[0] = time.time()
+    _SESS_DB_CACHE[1] = merged
+    return out
+
+
+def _ext_role(cmd: str) -> str:
+    """What an external devin.exe actually is. The desktop `acp`
+    process is the app's shared agent host - it multiplexes every open
+    conversation, so 'one session name' never applies; its --agent-type
+    children are helpers, not chats. A bare REPL is interactive."""
+    if re.search(r"(?:^|\s)acp(?:\s|$)", cmd):
+        m = re.search(r"--agent-type[=\s]+(\S+)", cmd)
+        return f"{m.group(1)} helper" if m else "agent host"
+    if "--print" in cmd or re.search(r"(?:^|\s)-p(?:\s|$)", cmd):
+        return "print worker"
+    if re.search(r"(?:^|\s)(list|rm|auth|doctor|update|version)"
+                 r"(?:\s|$)", cmd):
+        return "cli utility"
+    return "interactive"
+
+
+def _ext_enrich(rows: list[dict], procs: list[dict]) -> None:
+    """Attach role + session names to each 'other devin sessions' row.
+
+    The names come from the process's own CLI log
+    (devin_<startts>_<pid>.log - exact pid+start match, pid reuse
+    disambiguated) plus the logs of its devin.exe children, since a
+    REPL/--print root does its session-db writes in the embedded acp
+    child. Ids resolve to titles via sessions.db. Enrichment is cached
+    against the process snapshot stamp - _devin_procs already refreshes
+    on a 10s cadence, and the log tails + sqlite read don't need to run
+    on every /api/state poll."""
+    stamp = _DEVIN_PROCS_CACHE[0]
+    cache = _EXT_SESS_CACHE
+    if cache.get("stamp") != stamp:
+        cache["rows"] = {}
+        root = _devin_log_root()
+        cli = [p for p in procs
+               if p["name"] in ("devin.exe", "devin")
+               and not any(m in p["cmd"] for m in _ELECTRON_MARKERS)]
+        info_by_pid: dict[int, dict] = {}
+        need: set[str] = set()
+        live_rows = [r for r in rows]
+        for r in live_rows:
+            info = {"role": _ext_role(r.get("cmd") or ""),
+                    "session_ids": []}
+            if root is not None:
+                logs = []
+                own = _proc_log_path(root, r["pid"],
+                                     r.get("started_at"))
+                if own is not None:
+                    logs.append(own)
+                for k in cli:
+                    if k["ppid"] == r["pid"]:
+                        lp = _proc_log_path(root, k["pid"],
+                                            k.get("started_at"))
+                        if lp is not None:
+                            logs.append(lp)
+                sids: list[str] = []
+                for lp in logs:
+                    for sid in _log_sessions(lp):
+                        if sid not in sids:
+                            sids.append(sid)
+                info["session_ids"] = sids
+                need.update(sids)
+            info_by_pid[r["pid"]] = info
+        titles = _session_titles(root, sorted(need)) if root else {}
+        for r in live_rows:
+            info = info_by_pid[r["pid"]]
+            sids = info["session_ids"]
+            cache["rows"][r["pid"]] = {
+                "role": info["role"],
+                "sessions_seen": len(sids),
+                "sessions": [{"id": sid,
+                              **titles.get(sid, {})}
+                             for sid in sids[:4]]}
+        cache["stamp"] = stamp
+    for r in rows:
+        # the cache covers this snapshot's rows; a row that appeared
+        # after it (holder set changed the root list) still gets its
+        # cmdline role - only the log/db lookup is cache-gated
+        r.update(cache["rows"].get(r["pid"])
+                 or {"role": _ext_role(r.get("cmd") or "")})
 
 
 def _slots_view(slot_dir: Path | None = None) -> dict:
@@ -5010,6 +5201,201 @@ def _slots_view(slot_dir: Path | None = None) -> dict:
             "worker_cmd": w.get("cmd") or None})
     return {"cap": agent_slot_cap(), "in_use": len(holders),
             "holders": out, "external": _devin_sessions(holders)}
+
+
+# --- the repos view: 'is my work in master yet?' -------------------------
+# GET /api/repos answers what a user otherwise asks the agent: every
+# watched repo's default branch HEAD plus each linked worktree's
+# ahead/behind vs it and the unmerged commits by name. Conductor step
+# worktrees under data/worktrees get a live cross-check against their
+# state.json merge record so a bookkeeping lie shows as a mismatch, not
+# as 'merged'. 10s-cached: the scan is several git subprocesses per repo.
+
+
+def _worktree_rows(repo_dir: Path) -> list[dict]:
+    """`git worktree list --porcelain` fully parsed - {path, head,
+    branch, detached, prunable, bare}, main checkout first. Richer than
+    worktree_list (which callers use for (path, branch) pairs only)."""
+    r = _git(repo_dir, "worktree", "list", "--porcelain")
+    if r.returncode != 0:
+        return []
+    out, cur = [], None
+    for ln in r.stdout.splitlines() + [""]:
+        if ln.startswith("worktree "):
+            if cur is not None:
+                out.append(cur)
+            cur = {"path": ln[9:], "head": None, "branch": None,
+                   "detached": False, "prunable": False, "bare": False}
+        elif cur is not None:
+            if ln.startswith("HEAD "):
+                cur["head"] = ln[5:]
+            elif ln.startswith("branch "):
+                ref = ln[7:]
+                cur["branch"] = (ref[len("refs/heads/"):]
+                                 if ref.startswith("refs/heads/")
+                                 else ref)
+            elif ln == "detached":
+                cur["detached"] = True
+            elif ln.startswith("prunable"):
+                cur["prunable"] = True
+            elif ln == "bare":
+                cur["bare"] = True
+    if cur is not None:
+        out.append(cur)
+    return out
+
+
+def _git_commit_rows(repo_dir: Path, rev: str,
+                     n: int = 8) -> list[dict]:
+    """[{sha, subject, at}] newest-first for `git log -n <n> <rev>`."""
+    r = _git(repo_dir, "log", f"-{n}", "--format=%h%x09%s%x09%cI",
+             rev, "--")
+    if r.returncode != 0:
+        return []
+    out = []
+    for ln in r.stdout.splitlines():
+        sha, _t1, rest = ln.partition("\t")
+        subj, _t2, at = rest.rpartition("\t")
+        out.append({"sha": sha, "subject": subj, "at": at})
+    return out
+
+
+def _wt_conductor_link(runs_dir: Path, run_name: str,
+                       step_part: str) -> dict | None:
+    """state.json cross-check for a data/worktrees/<run>/<step> path
+    (a trailing .merge is the step's merge-staging worktree): the run +
+    step it belongs to and the recorded merge bookkeeping - None when no
+    state.json matches, so a hand-made dir never pretends provenance."""
+    staging = step_part.endswith(".merge")
+    step = step_part[:-len(".merge")] if staging else step_part
+    rec: dict = {}
+    try:
+        st = json.loads((runs_dir / run_name / "state.json")
+                        .read_text(encoding="utf-8"))
+        rec = (st.get("steps") or {}).get(step) or {}
+    except (OSError, ValueError):
+        pass
+    return {"run": run_name, "step": step, "merge_staging": staging,
+            "merged_recorded": rec.get("merged") is True,
+            "merged_at": rec.get("merged_at"),
+            "merge_target": rec.get("merge_target")}
+
+
+def _repo_status(projects: dict[str, dict],
+                 runs_dir: Path) -> dict:
+    """One section per watched repo - every configured project plus this
+    repo - dedup'd by resolved path. Repos with no linked worktrees land
+    in `quiet` so the modal keeps them to a footnote line."""
+    try:
+        wt_root = (runs_dir.parent / "worktrees").resolve()
+    except OSError:
+        wt_root = runs_dir.parent / "worktrees"
+    seen: set[str] = set()
+    repos, quiet = [], []
+    cands = [("this repo (agent-conductor)", ROOT)] + [
+        (slug, ent["path"]) for slug, ent in projects.items()]
+    for name, pdir in cands:
+        try:
+            pdir = pdir.resolve()
+        except (OSError, TypeError):
+            continue
+        key = os.path.normcase(str(pdir))
+        if key in seen or not is_git_repo(pdir):
+            continue
+        seen.add(key)
+        rows = _worktree_rows(pdir)
+        if not rows:
+            continue
+        # 'the base' is what conductor merges into by default: the
+        # branch the MAIN checkout (worktree rows[0]) sits on. The
+        # served path itself may be a linked worktree (conductor often
+        # runs inside one), so current_branch(pdir) would report the
+        # session's own branch - the main checkout is the trunk the
+        # user means by 'merged into master'. A detached main falls
+        # back to master/main, then to comparing against HEAD sha.
+        base = rows[0]["branch"]
+        if base is None:
+            base = ("master" if local_branch_exists(pdir, "master")
+                    else "main" if local_branch_exists(pdir, "main")
+                    else None)
+        base_ref = base or "HEAD"
+        wts = []
+        for w in rows[1:]:                # rows[0] is the main checkout
+            wpath = Path(w["path"])
+            row = {"path": str(wpath), "branch": w["branch"],
+                   "detached": w["detached"],
+                   "prunable": w["prunable"], "dirty": False,
+                   "merging": False, "ahead": None, "behind": None,
+                   "commits": [], "conductor": None, "base": base}
+            rel_parts: tuple = ()
+            try:
+                rel = os.path.relpath(str(wpath.resolve()),
+                                      str(wt_root))
+                parts = Path(rel).parts
+                if parts and parts[0] != "..":
+                    rel_parts = parts
+            except (OSError, ValueError):
+                pass
+            if len(rel_parts) >= 2:
+                row["conductor"] = _wt_conductor_link(
+                    runs_dir, rel_parts[0], rel_parts[1])
+                tgt = row["conductor"].get("merge_target")
+                if tgt and local_branch_exists(pdir, tgt):
+                    # an explicit merge_target beats the default base -
+                    # 'is it merged' means into THIS branch
+                    row["base"] = tgt
+            head = w["branch"] or w["head"]
+            bref = row["base"]
+            if head and bref and not w["prunable"]:
+                r2 = _git(pdir, "rev-list", "--left-right", "--count",
+                          f"{bref}...{head}")
+                if r2.returncode == 0:
+                    parts = r2.stdout.split()
+                    if len(parts) == 2:
+                        row["behind"], row["ahead"] = (int(parts[0]),
+                                                     int(parts[1]))
+                if row["ahead"]:
+                    row["commits"] = _git_commit_rows(
+                        pdir, f"{bref}..{head}", 8)
+            if wpath.is_dir():
+                row["dirty"] = bool(
+                    _git(wpath, "status", "--porcelain",
+                         "--untracked-files=normal").stdout.strip())
+                row["merging"] = _git(
+                    wpath, "rev-parse", "-q", "--verify",
+                    "MERGE_HEAD").returncode == 0
+            wts.append(row)
+        repo = {"name": name, "path": str(pdir), "base": base,
+                "base_log": _git_commit_rows(pdir, base_ref, 3),
+                "worktrees": wts}
+        (repos if wts else quiet).append(
+            repo if wts else name)
+    repos.sort(key=lambda r: (
+        -sum(1 for w in r["worktrees"] if w.get("ahead")),
+        -len(r["worktrees"]), r["name"]))
+    return {"generated_at": now_iso(), "repos": repos,
+            "quiet": quiet}
+
+
+_REPO_STATUS_TTL_S = 10.0
+_REPO_STATUS_CACHE = {"at": 0.0, "payload": None}
+_REPO_STATUS_LOCK = threading.Lock()
+
+
+def repo_status(runs_dir: Path, projects: dict | None = None,
+                fresh: bool = False) -> dict:
+    """GET /api/repos payload - the cached scan, or a fresh one."""
+    now = time.time()
+    with _REPO_STATUS_LOCK:
+        if (not fresh and _REPO_STATUS_CACHE["payload"] is not None
+                and now - _REPO_STATUS_CACHE["at"]
+                < _REPO_STATUS_TTL_S):
+            return _REPO_STATUS_CACHE["payload"]
+        payload = _repo_status(projects if projects is not None
+                               else load_projects(), runs_dir)
+        _REPO_STATUS_CACHE["at"] = now
+        _REPO_STATUS_CACHE["payload"] = payload
+        return payload
 
 
 def _agent_slot_acquire(step: Step, run_dir: Path, state: dict,
@@ -12976,6 +13362,9 @@ def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
     if not entries:
         return []
     producer = rec.get("plan_gen_id")
+    producer_idx = next(
+        (i for i, e in enumerate(entries)
+         if e.get("gen_id") and e.get("gen_id") == producer), None)
     export_path = log_path.with_suffix(".export.json")
     task = "Propose a TOML runbook for: " + " ".join(
         (rec.get("raw") or "").split())[:120]
@@ -12990,6 +13379,15 @@ def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
         log = str(log_path) if files and log_path.is_file() else None
         exp = str(export_path) if files and export_path.is_file() else None
         status = e.get("status") or "done"
+        # an attempt that failed (or stopped/timed out) but was then
+        # answered by a LATER producing attempt is bookkeeping, not
+        # outstanding failure - 'superseded' (same treatment resolve-*
+        # rows get) keeps it out of the failed filter instead of
+        # leaving it red forever. An attempt AFTER the producer keeps
+        # its real status: a regen that failed is still actionable.
+        if (status not in ("done", "superseded")
+                and producer_idx is not None and i < producer_idx):
+            status = "superseded"
         if produced:
             note = ("prepared this plan - preparation history, not a "
                     "run step")
@@ -14322,6 +14720,21 @@ h3.proj .sub { margin-bottom:0; font-weight:400; }
 #detail .poolstat .warn { color:#d29922; }
 #detail table.pooltab { table-layout:auto; }
 #detail table.pooltab td, #detail table.pooltab th { padding-right:18px; }
+/* the repos modal: one block per watched repo, base HEAD on its own
+   line, worktree table under it */
+#detail .repoblk { margin-top:14px; }
+#detail .repoblk h4 { margin:0 0 6px; font-size:13px; }
+#detail .repoblk h4 .sub { font-weight:400; }
+.repoline { margin:2px 0 4px; }
+.repoline code, .cmt code { color:#58a6ff; font-size:11px;
+  font-family:Consolas,monospace; }
+.repolog { margin:2px 0 6px 14px; font-size:12px; color:#8b949e; }
+.repolog summary { cursor:pointer; }
+.cmt { padding:1px 0 1px 14px; font-size:12px; }
+.cmt .sub { margin-left:6px; }
+#detail table.repotab { table-layout:auto; }
+#detail table.repotab td, #detail table.repotab th {
+  padding-right:18px; }
 /* task/run history feed (driver events.jsonl + dashboard action log) */
 .evlog { margin:6px 0 10px; max-height:220px; overflow:auto;
   border:1px solid #21262d; border-radius:7px; }
@@ -14343,6 +14756,11 @@ th { position:sticky; top:var(--topbar-h,110px); z-index:7;
   background:#0d1117; text-align:left; font-weight:600; color:#8b949e;
   font-size:11px; text-transform:uppercase; padding:4px 10px 4px 0;
   border-bottom:1px solid #21262d; }
+/* inside the modal the page topbar doesn't exist - the sticky header
+   pins to the dialog's own scroll top, or flush under the .dnav bar
+   (42px, fixed below) when a Back trail is showing */
+#detail th { top:0; }
+#dbody:has(> .dnav) th { top:42px; }
 td { padding:6px 10px 6px 0; border-bottom:1px solid #161b22; vertical-align:top; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 /* a left gutter inside every first cell: the left-edge state markers
    (unreviewed cyan, selected/dsel blue) paint an inset stripe there, so
@@ -14453,6 +14871,13 @@ body.compact td .genline { display:inline-block; max-width:100%;
 a { color:#58a6ff; text-decoration:none; }
 [hidden] { display:none !important; }
 #backdrop { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:50; }
+/* pendingActs' in-flight action bar: bottom-center pills that survive
+   modal navigation; the x stops the client-side wait only */
+#actbar { position:fixed; left:50%; transform:translateX(-50%); bottom:16px; z-index:55; display:flex; gap:8px; flex-wrap:wrap; justify-content:center; max-width:80vw; }
+#actbar .act-item { display:inline-flex; align-items:center; gap:8px; background:#161b22; border:1px solid #30363d; border-radius:16px; padding:4px 8px 4px 12px; font-size:12px; color:#c9d1d9; box-shadow:0 6px 18px rgba(0,0,0,.45); }
+#actbar .act-spin { width:10px; height:10px; border:2px solid #58a6ff; border-top-color:transparent; border-radius:50%; animation:chipspin .7s linear infinite; flex:none; }
+#actbar .act-x { background:none; border:0; color:#8b949e; font-size:14px; cursor:pointer; padding:0 2px; }
+#actbar .act-x:hover { color:#f85149; }
 /* themed confirm/alert + power dialogs - native confirm()/alert()
    chrome replaced so every prompt matches the dashboard palette */
 #askwrap, #powerwrap { position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:70; display:flex; align-items:center; justify-content:center; }
@@ -14547,9 +14972,8 @@ a { color:#58a6ff; text-decoration:none; }
 /* margin-bottom buys real clearance: a sticky first-child with the
    -18px top pull leaves the next line tucked ~6px under the bar's
    bottom edge in Chrome, so the nominal gap must exceed that drift */
-#detail .dnav { position:sticky; top:0; z-index:6; display:flex; align-items:center; gap:10px; margin:-18px -22px 26px; padding:7px 170px 7px 22px; background:#161b22; border-bottom:1px solid #30363d; border-radius:9px 9px 0 0; }
+#detail .dnav { position:sticky; top:0; z-index:6; display:flex; align-items:center; gap:10px; margin:-18px -22px 26px; height:42px; box-sizing:border-box; padding:0 22px; background:#161b22; border-bottom:1px solid #30363d; border-radius:9px 9px 0 0; }
 #detail .dnav-btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; min-width:38px; max-width:40%; background:#21262d; border:1px solid #30363d; color:#e6edf3; border-radius:6px; padding:4px 10px; font:inherit; font-size:12px; cursor:pointer; }
-#detail .dnav-btn.nav { min-width:130px; }
 #detail .dnav-btn span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #detail .dnav-btn:hover:not(:disabled) { border-color:#58a6ff; }
 #detail .dnav-btn:disabled { opacity:.4; cursor:default; }
@@ -14849,6 +15273,8 @@ tr.ctxanchor td { background:#1c3041; }
       title="machine-wide agent pool: slots in use / cap, shared by every run on this box. Click for the live breakdown - who holds each slot, who is queued - and the cap control">
       <span id="pool-val">agents &hellip;</span>
     </button>
+    <button type="button" class="btn secondary" id="repos-btn"
+      title="repo status - each watched repo's default-branch HEAD, its linked worktrees (conductor steps and devin sessions alike), and which commits are still unmerged">Repos</button>
     <button type="button" class="btn secondary" id="tour-btn"
       title="what's new - a guided tour of changes, finished runs and proposals since your last look">What's new<span id="tour-badge" class="tbadge" hidden></span></button>
     <button type="button" class="btn secondary" id="power-btn"
@@ -14903,6 +15329,22 @@ const loc = iso => { if(!iso) return '-';
 const fmtS = s => { if(s==null) return '-';
   s=Math.round(s); const h=Math.floor(s/3600), m=Math.floor(s%3600/60);
   return (h? h+'h':'') + (m? m+'m':'') + (s%60)+'s'; };
+// compact age for commit timestamps in the repos modal - 'just now' /
+// '5m ago' / '3d ago', falling back to loc() past two months
+const ago = iso => { if(!iso) return '-';
+  const s=(Date.now()-new Date(iso))/1000;
+  if (!(s>90)) return 'just now';
+  const m=s/60; if (m<90) return Math.round(m)+'m ago';
+  const h=m/60; if (h<36) return Math.round(h)+'h ago';
+  const dd=h/24; if (dd<60) return Math.round(dd)+'d ago';
+  return loc(iso); };
+const cmtLine = c => `<div class="cmt"><code>${esc(c.sha)}</code> ` +
+  `${esc(c.subject)} <span class="sub">${ago(c.at)}</span></div>`;
+// a worktree path's last few components for the repos table (the full
+// path stays on the tooltip)
+const tailPath = p => { const s=String(p||'').replace(/[\\\\/]+$/,'');
+  const parts=s.replace(/\\\\/g,'/').split('/').filter(Boolean);
+  return parts.length<=3 ? s : '\u2026/'+parts.slice(-3).join('/'); };
 const kfmt = n => n==null?'-':(n>=1000
   ? (n/1000).toFixed(n>=100000?0:1).replace(/\.0$/,'')+'k' : String(n));
 // tokens render as labeled fields so every counter names itself:
@@ -15065,6 +15507,12 @@ let modalQA = null;         // {id, rec, sel:Set, free:''} while the planner
 let runModalKey = null;     // runKey while the run-details modal shows
 let summaryView = null;     // {key: agentKey} while the summary modal shows
 let poolView = false;       // the agent-pool modal is open
+let repoView = false;       // the repositories modal is open
+let repoData = null;        // last /api/repos payload
+let repoFetched = 0;        // Date.now() when it landed
+let repoBusy = false;       // a /api/repos fetch is in flight
+const repologOpen = new Set();  // repo names whose base-log details
+                                // stays expanded across repaints
 let poolCapDraft = null;    // unapplied cap value in that modal (null = none)
 let modalScroll = null;     // scrollTop a Back navigation restores on render
 const modalHist = [];       // Back stack: {kind, key|id, scroll} entries of
@@ -15544,6 +15992,7 @@ function _closeDetailNow(keepStack){
   detailIdx = null; detailKey = null; modalRequest = null; modalQA = null;
   runModalKey = null; summaryView = null; detailHTML = '';
   modalRunKey = null; poolView = false; poolCapDraft = null;
+  repoView = false;
   if (!keepStack){ modalHist.length = 0; modalScroll = null; }
   document.getElementById('backdrop').hidden = true;
   applySel();        // every row mark clears with the dialog it belongs to
@@ -15640,6 +16089,7 @@ function snapshotModal(){
   if (detailKey!=null) return {kind:'agent',key:detailKey,scroll};
   if (runModalKey) return {kind:'run',key:runModalKey,scroll};
   if (poolView) return {kind:'pool',scroll};
+  if (repoView) return {kind:'repo',scroll};
   return null;
 }
 function pushHist(snap){
@@ -15665,6 +16115,7 @@ function histLabel(snap){
     return 'run '+(r?r.run:snap.key);
   }
   if (snap.kind==='pool') return 'agent pool';
+  if (snap.kind==='repo') return 'repositories';
   return 'request';
 }
 function backBtnHTML(){
@@ -15694,7 +16145,7 @@ function modalBack(){
     // the open*() calls below run their own closeDetail(keepStack) -
     // clear this view's markers first so its dirty flag can't re-prompt
     detailIdx=null; detailKey=null; modalRequest=null; modalQA=null;
-    runModalKey=null; summaryView=null; poolView=false;
+    runModalKey=null; summaryView=null; poolView=false; repoView=false;
     modalScroll=top.scroll;
     if (top.kind==='agent'){
       const j=AGENTS.findIndex(x=>agentKey(x)===top.key);
@@ -15708,6 +16159,7 @@ function modalBack(){
     if (top.kind==='request'){ openRequest(top.id,true); return; }
     if (top.kind==='summary'){ openSummary(top.key,false); return; }
     if (top.kind==='pool'){ openPool(false); return; }
+    if (top.kind==='repo'){ openRepos(); return; }
   }
   modalScroll=null;
   closeDetail(true);                   // history exhausted - nothing to show
@@ -16230,11 +16682,13 @@ function showDetail(i, keepStack){
   // target, the counter gives position. Hidden for a lone/seq-less row.
   const sibs = pipeSibs(a);
   const pos = sibs.findIndex(x=>agentKey(x)===detailKey);
+  // arrows only (step names stay on the tooltips, like the summary
+  // modal's nav) - named buttons crowded into the centered 'task N of
+  // M' counter on anything but a wide modal
   const navBtn = (b,dir)=> b
     ? `<button type="button" class="dnav-btn nav" ` +
       `data-nav="${esc(agentKey(b))}" title="${esc(b.step)}">` +
-      (dir<0 ? `&larr; <span>${esc(b.step)}</span>`
-             : `<span>${esc(b.step)}</span> &rarr;`) + `</button>`
+      (dir<0 ? '&larr;' : '&rarr;') + `</button>`
     : `<button type="button" class="dnav-btn nav" disabled>` +
       (dir<0 ? '&larr;' : '&rarr;') + `</button>`;
   const navBar = (pos>=0 && sibs.length>1)
@@ -16777,11 +17231,12 @@ function showRunDetails(key, keepStack){
   // walk never stacks history entries (Back still works once)
   const rsibs = runSibs();
   const rpos = rsibs.findIndex(x=>runKey(x)===key);
+  // arrows only like the task/summary nav - named run buttons crowded
+  // into the centered 'run N of M' counter the same way
   const rnavBtn = (b,dir)=> b
     ? `<button type="button" class="dnav-btn nav" ` +
       `data-nav-run="${esc(runKey(b))}" title="${esc(b.run)}">` +
-      (dir<0 ? `&larr; <span>${esc(b.run)}</span>`
-             : `<span>${esc(b.run)}</span> &rarr;`) + `</button>`
+      (dir<0 ? '&larr;' : '&rarr;') + `</button>`
     : `<button type="button" class="dnav-btn nav" disabled>` +
       (dir<0 ? '&larr;' : '&rarr;') + `</button>`;
   const navBar = (rpos>=0 && rsibs.length>1)
@@ -17081,12 +17536,14 @@ function ctxMoveFocus(key){
   ctxState.idx = i;
   if (bs[i].focus) bs[i].focus();
 }
-async function api(method,path,body,timeoutMs){
+async function api(method,path,body,timeoutMs,signal){
   const opt = method==='GET' ? {} : {method,
     headers:{'Content-Type':'application/json'}, body:JSON.stringify(body||{})};
   // a never-settling fetch would park callers forever - chipBusy never
   // clears, its view chip spins and stays inert until a page reload
-  if (timeoutMs && typeof AbortSignal!=='undefined' && AbortSignal.timeout)
+  if (signal) opt.signal = signal;
+  else if (timeoutMs && typeof AbortSignal!=='undefined' &&
+           AbortSignal.timeout)
     opt.signal = AbortSignal.timeout(timeoutMs);
   const res=await fetch(path,opt);
   const out=await res.json();
@@ -17117,6 +17574,32 @@ async function refresh(){
 // re-stamps 'busy' from the set and its click guard keeps holding - a
 // repeat click mid-flight must never re-toggle the view flag back off).
 const chipBusy = new Set();
+// In-flight mutating actions (review marks today): navigating the modal
+// while one saves never cancelled the write - the POST already left -
+// but nothing showed it, so the pill flipping on a later poll read as a
+// dropped click. pendingActs paints a bottom bar of what's still
+// saving; each entry's x aborts the client-side wait (the server may
+// already have applied the write - the next refresh shows the truth,
+// so an abort refetches anyway). The bar removes itself when empty.
+const pendingActs = new Map();    // key -> {label, cancel}
+function pendingUI(){
+  let bar = document.getElementById('actbar');
+  if (!bar){ bar = document.createElement('div'); bar.id = 'actbar';
+    document.body.appendChild(bar); }
+  if (!pendingActs.size){ bar.hidden = true; return; }
+  bar.hidden = false;
+  bar.innerHTML = [...pendingActs.entries()].map(([k,a]) =>
+    `<span class="act-item"><span class="act-spin"></span>` +
+    `<span>${esc(a.label)}</span>` +
+    `<button type="button" class="act-x" ` +
+    `data-act-cancel="${esc(k)}" title="stop waiting on this - the ` +
+    `write may already have landed; the next refresh shows the ` +
+    `truth">&times;</button></span>`).join('');
+}
+function actBegin(key, label, cancel){
+  pendingActs.set(key, {label, cancel}); pendingUI(); }
+function actEnd(key){
+  if (pendingActs.delete(key)) pendingUI(); }
 let viewloadN = 0;
 async function busyRefresh(el, key){
   if (key){ if (chipBusy.has(key)) return; chipBusy.add(key); }
@@ -18249,6 +18732,27 @@ function poolHtml(d){
   // column's owner/parent/worker pids + cmdlines identify the process.
   const trunc = (s,n) => (s||'').length>n
     ? esc(s.slice(0,n))+'&hellip;' : esc(s||'');
+  // what an 'other devin sessions' row IS: the cmdline's role plus the
+  // session names the server's log/db lookup resolved. A REPL that
+  // never sent a prompt owns no session - 'idle' is the honest label.
+  const extSessCell = s => {
+    const ss = s.sessions||[];
+    const titled = ss.filter(x=>x.title);
+    const bits = [];
+    if (s.role) bits.push(`<span class="stc st-other">${esc(s.role)}</span>`);
+    if (titled.length)
+      bits.push(titled.map(x=>
+        `<div title="${esc(x.id)}${x.dir?' - '+esc(x.dir):''}">` +
+        `${trunc(x.title,64)}</div>`).join(''));
+    if ((s.sessions_seen||0) > ss.length)
+      bits.push(`<span class="sub">+${s.sessions_seen-ss.length}` +
+        ` more</span>`);
+    if (!ss.length)
+      bits.push(s.role==='interactive'
+        ? '<span class="sub">idle - no session yet</span>'
+        : '<span class="sub">&mdash;</span>');
+    return bits.join(' ');
+  };
   const holdCell = h => {
     if (!h.owner_pid && !h.worker_pid) return '&hellip;';
     const ln = (lbl,pid,cmd) => `<div title="${esc(cmd||'')}">` +
@@ -18379,11 +18883,17 @@ function poolHtml(d){
     ((sp.external||[]).length
       ? `<h3 style="margin-top:16px">other devin sessions</h3>` +
         `<div class="wrapw"><table class="pooltab"><tr><th>pid</th>` +
-        `<th>source</th><th>command</th><th>started</th></tr>` +
+        `<th>source</th><th title="what the process is + the session(s) ` +
+        `it touches - ids come from its own CLI log ` +
+        `(devin_&lt;start&gt;_&lt;pid&gt;.log), titles from the CLI's ` +
+        `sessions.db; a desktop agent host multiplexes every open ` +
+        `conversation, so it lists the ones touched most recently">` +
+        `session</th><th>command</th><th>started</th></tr>` +
         sp.external.map(s=>
           `<tr><td>${s.pid}</td>` +
           `<td><span class="stc st-other">${esc(s.kind||'cli')}</span>` +
-          `</td><td class="wrap"><div title="${esc(s.cmd||'')}">` +
+          `</td><td class="wrap">${extSessCell(s)}</td>` +
+          `<td class="wrap"><div title="${esc(s.cmd||'')}">` +
           `${trunc(s.cmd,90)||'&mdash;'}</div></td>` +
           `<td title="${esc(s.started_at||'')}">` +
           `${s.started_at?loc(s.started_at):'-'}</td></tr>`).join('') +
@@ -18394,6 +18904,151 @@ function poolHtml(d){
         `no slot and never count toward the cap, but they do use this ` +
         `box's cpu/ram.</div>`
       : '');
+}
+// --- repositories modal --------------------------------------------------
+// 'is my work in master yet' without asking an agent: /api/repos gives
+// each watched repo's base HEAD and every linked worktree's merge state.
+// The fetch is its own endpoint (git work doesn't ride the 2s state
+// poll); while the modal is open it re-pulls every ~15s so merges that
+// land mid-look show up on their own.
+function openRepos(){
+  // same dirty-request guard every other modal opener takes
+  if (!closeThen(closeDetail(false, true), openRepos)) return;
+  repoView = true;
+  renderRepos();
+  applySel();
+  if (modalScroll==null){
+    const d = document.getElementById('detail');
+    if (d) d.scrollTop = 0;
+  }
+  applyModalScroll();
+  document.getElementById('backdrop').hidden = false;
+  fetchRepos();
+}
+async function fetchRepos(fresh){
+  if (repoBusy) return;
+  repoBusy = true;
+  try {
+    repoData = await api('GET',
+      '/api/repos'+(fresh?'?fresh=1':''), null, 30000);
+    repoFetched = Date.now();
+    if (repoView) renderRepos();
+  } catch(err){
+    if (repoView){
+      repoData = {generated_at:null, repos:[], quiet:[],
+                  error:err.message||String(err)};
+      renderRepos();
+    }
+  } finally { repoBusy = false; }
+}
+function renderRepos(){
+  if (!repoView) return;
+  const html = repoData ? reposHtml(repoData)
+    : `<h3 id="modal-title">repositories</h3>` +
+      `<div class="notice">scanning watched repos&hellip;</div>`;
+  if (html===detailHTML) return;
+  const fcap = captureModalFocus();
+  const scap = captureModalScroll();
+  document.getElementById('dbody').innerHTML = html;
+  detailHTML = html;
+  restoreModalFocus(fcap);
+  restoreModalScroll(scap);
+}
+function reposHtml(d){
+  let h = `<h3 id="modal-title">repositories</h3>` +
+    `<div class="sub">each watched repo's base-branch HEAD plus every ` +
+    `linked worktree's merge state - conductor step worktrees and devin ` +
+    `session worktrees alike. checked ${loc(d.generated_at)} ` +
+    `<button type="button" class="linkbtn" data-repo-refresh` +
+    `${repoBusy?' disabled':''}>refresh</button></div>`;
+  if (d.error)
+    h += `<div class="notice error">${esc(d.error)}</div>`;
+  for (const r of d.repos||[]){
+    const head = (r.base_log||[])[0];
+    h += `<div class="repoblk"><h4>${esc(r.name)}` +
+      ` <span class="sub">${esc(r.path)}</span></h4>` +
+      `<div class="repoline"><span class="stc st-ok">` +
+      `${esc(r.base||'HEAD')}</span> ` +
+      (head ? `HEAD <code>${esc(head.sha)}</code> ` +
+        `${esc(head.subject)} <span class="sub">${ago(head.at)}` +
+        `</span>`
+        : `<span class="sub">no commits</span>`) +
+      `</div>`;
+    if ((r.base_log||[]).length>1)
+      h += `<details class="repolog" data-repolog="${esc(r.name)}"` +
+        `${repologOpen.has(r.name)?' open':''}>` +
+        `<summary>latest ${r.base_log.length} commits</summary>` +
+        r.base_log.map(cmtLine).join('') + `</details>`;
+    h += `<div class="wrapw"><table class="repotab"><tr>` +
+      `<th>worktree</th><th>vs ${esc(r.base||'base')}</th>` +
+      `<th>conductor</th><th>path</th></tr>` +
+      (r.worktrees||[]).map(wtRow).join('') + `</table></div></div>`;
+  }
+  if ((d.quiet||[]).length)
+    h += `<div class="sub" style="margin-top:14px">no linked ` +
+      `worktrees: ${d.quiet.map(esc).join(', ')}</div>`;
+  if (!(d.repos||[]).length && !(d.quiet||[]).length && !d.error)
+    h += `<div class="notice">no watched git repos.</div>`;
+  return h;
+}
+// one worktree row: branch + unmerged commits, the merge-state chips,
+// the conductor run it belongs to (when it's a step worktree under
+// data/worktrees - a bookkeeping 'merged' that git disagrees with shows
+// red, not green), and its path tail.
+function wtRow(w){
+  const c = w.conductor, ws = [];
+  if (w.prunable)
+    ws.push('<span class="stc st-bad" title="registered with git but ' +
+      'its directory is gone - `git worktree prune` clears it">' +
+      'missing dir</span>');
+  if (w.merging)
+    ws.push('<span class="stc st-bad">merge in progress</span>');
+  if (w.detached)
+    ws.push('<span class="stc st-other">detached</span>');
+  else if (!w.prunable){
+    if (w.ahead==null)
+      ws.push('<span class="stc st-other">?</span>');
+    else if (w.ahead>0)
+      ws.push(`<span class="stc st-warn">${w.ahead} unmerged</span>`);
+    else if (w.behind>0)
+      ws.push(`<span class="stc st-ok" title="every commit on this ` +
+        `worktree is already in ${esc(w.base||'the base')}">all in ` +
+        `${esc(w.base||'base')}</span>`);
+    else
+      ws.push('<span class="stc st-ok">up to date</span>');
+    if (w.behind>0)
+      ws.push(`<span class="sub">${w.behind} behind</span>`);
+  }
+  if (w.dirty)
+    ws.push('<span class="stc st-warn" title="uncommitted changes in ' +
+      'the worktree">dirty</span>');
+  let rec = '';
+  if (c && c.merged_recorded)
+    rec = w.ahead>0
+      ? ` <span class="stc st-bad" title="state.json records this ` +
+        `step merged${c.merged_at?' at '+esc(loc(c.merged_at)):''} - ` +
+        `but ${w.ahead} commit(s) are not in ` +
+        `${esc(w.base||'the base')}">record says merged?!</span>`
+      : ` <span class="stc st-ok" title="state.json records merged` +
+        `${c.merged_at?' at '+esc(loc(c.merged_at)):''}">` +
+        `merged &#10003;</span>`;
+  const staging = c && c.merge_staging
+    ? `<div class="sub">merge staging for ${esc(c.step)}</div>` : '';
+  const link = c
+    ? `<button type="button" class="linkbtn" ` +
+      `data-run-details="${esc(c.run)}" title="open this run's ` +
+      `details">${esc(c.run)}</button>` +
+      `<div class="sub">${esc(c.step)}</div>` : '';
+  const cmts = (w.commits||[]).map(cmtLine).join('') +
+    ((w.ahead||0) > (w.commits||[]).length
+      ? `<div class="cmt sub">+${w.ahead-w.commits.length} more</div>`
+      : '');
+  return `<tr><td class="wrap"><code>${esc(w.branch||'(detached)')}` +
+    `</code>${staging}${cmts}</td>` +
+    `<td>${ws.join(' ')}${rec}</td>` +
+    `<td class="wrap">${link}</td>` +
+    `<td class="wrap"><span class="sub" title="${esc(w.path)}">` +
+    `${esc(tailPath(w.path))}</span></td></tr>`;
 }
 function poolStep(dlt){
   const sp = lastData && lastData.slot_pool;
@@ -18523,6 +19178,10 @@ function render(d){
     // modal still track it here (both are no-ops when nothing changed)
     syncPoolBox();
     renderPool();
+    // same for the open repos modal - its own endpoint, own cadence:
+    // a merge landing mid-look is exactly when the main payload sits still
+    if (repoView && !document.getElementById('backdrop').hidden &&
+        Date.now()-repoFetched > 15000) fetchRepos();
     return;
   }
   lastSig = sig;
@@ -19097,6 +19756,11 @@ function render(d){
   // the pool modal is fully live: holder rows appear/leave as leases
   // land and the queued table fills - repaint it on every payload
   if (poolView && !document.getElementById('backdrop').hidden) renderPool();
+  // the repos modal pulls its own endpoint - every ~15s while open, so
+  // a merge landing mid-look repaints without a manual refresh (the
+  // server's 10s cache keeps the git calls cheap)
+  if (repoView && !document.getElementById('backdrop').hidden &&
+      Date.now()-repoFetched > 15000) fetchRepos();
   // the open summary view isn't repainted on refresh - its document is
   // static - but the review marks it surfaces are live; re-decorate in
   // place so a click flips pill/link/strikethrough without a reopen
@@ -19154,6 +19818,14 @@ document.addEventListener('contextmenu', e=>{
 // the menu dies with the view it belongs to (scrolled off / resized away)
 document.addEventListener('scroll', ()=>{ if (ctxState) hideCtxMenu(); },
   true);
+// a repolog <details> keeps its open state across the modal's repaints
+// (toggle doesn't bubble - capture phase sees it at document level)
+document.addEventListener('toggle', e=>{
+  const el = e.target;
+  if (el && el.dataset && el.dataset.repolog)
+    el.open ? repologOpen.add(el.dataset.repolog)
+            : repologOpen.delete(el.dataset.repolog);
+}, true);
 document.addEventListener('click', async e=>{
   const t = e.target;
   // context menu: an item click closes it and falls through to the normal
@@ -19211,11 +19883,21 @@ document.addEventListener('click', async e=>{
   // drafts, Apply commits
   if (t.id==='poolbox' || (t.closest && t.closest('#poolbox'))){
     openPool(); return; }
+  if (t.id==='repos-btn'){ openRepos(); return; }
+  if (t.closest && t.closest('[data-repo-refresh]')){
+    fetchRepos(true); return; }
   if (t.id==='cap-dec'){ poolStep(-1); return; }
   if (t.id==='cap-inc'){ poolStep(1); return; }
   if (t.id==='cap-apply'){ poolApply(t); return; }
   if (t.id==='new-request'){
     openNew(); return; }
+  // an actbar x stops the client-side wait on an in-flight action
+  const actEl = t.closest && t.closest('[data-act-cancel]');
+  if (actEl){
+    const p = pendingActs.get(actEl.dataset.actCancel);
+    if (p){ pendingActs.delete(actEl.dataset.actCancel);
+      if (p.cancel) p.cancel(); pendingUI(); }
+    return; }
   if (t.dataset && t.dataset.density){
     setDensity(t.dataset.density); return; }
   if (t.dataset && t.dataset.action){
@@ -19673,17 +20355,38 @@ document.addEventListener('click', async e=>{
     const dir=t.dataset.reviewRun||t.dataset.reviewStep;
     const reviewed=t.dataset.reviewSet==='1';
     const rawSeq=t.dataset.reviewSeq;
+    const actKey='review|'+(t.dataset.reviewStep
+      ? dir+'/'+t.dataset.step : dir);
+    if (pendingActs.has(actKey)) return;    // this mark is already
+                                           // saving - a second click
+                                           // would double-post
     t.disabled=true;
+    const ctl = typeof AbortController!=='undefined'
+      ? new AbortController() : null;
+    actBegin(actKey,
+      'saving review mark' +
+        (t.dataset.reviewStep ? ` - ${t.dataset.step}` : ' - run'),
+      ()=>{ if (ctl) ctl.abort(); });
     try {
       await api('POST',
         `/api/runs/${encodeURIComponent(dir)}` +
         (t.dataset.reviewStep
           ? `/steps/${encodeURIComponent(t.dataset.step)}` : '') +
         `/review`,
-        {reviewed, seq: (rawSeq===''||rawSeq==null) ? null : +rawSeq});
+        {reviewed, seq: (rawSeq===''||rawSeq==null) ? null : +rawSeq},
+        null, ctl && ctl.signal);
       await refresh();
-    } catch(err){ await showAlert('Review update failed: '+err.message);
-      t.disabled=false; }
+    } catch(err){
+      if (ctl && ctl.signal.aborted){
+        // stopped waiting by user - the write may still have landed;
+        // a background refresh reconciles either way
+        refresh().catch(()=>{});
+      } else {
+        await showAlert('Review update failed: '+err.message);
+        t.disabled=false;
+      }
+    }
+    actEnd(actKey);
     return; }
   if (t.dataset && t.dataset.deleteRun){
     const dir=t.dataset.deleteRun;
@@ -20530,10 +21233,13 @@ async function tourMark(){
   const hs = tourSt.feed.history || (tourSt.feed.history = []);
   if (!hs.some(h=>h.id===e.id)) hs.unshift(e);
   tourBadge(r.unseen_count);                    // fresh count, no poll wait
+  // a viewed card leaves the deck for good (the server's feed filters
+  // it out of entries too - it lives on in 'viewed earlier') - the
+  // splice puts the next unviewed card at this index, or runs the deck
+  // out into the caught-up view
   const deck = tourDeck();
-  let ni = deck.findIndex((x,j)=>j>tourSt.idx && x.state!=='viewed');
-  if (ni<0) ni = deck.findIndex(x=>x.state!=='viewed');
-  tourSt.idx = ni<0 ? deck.length : ni;         // past end -> caught up
+  deck.splice(tourSt.idx, 1);
+  if (tourSt.idx > deck.length) tourSt.idx = deck.length;
   tourSt.mode = 'deck';
   tourShow();
 }
@@ -20595,6 +21301,7 @@ globalThis.aiView = () => ({
     status: modalRequest.status},
   modalQA: modalQA && {id: modalQA.id},
   pool: poolView,
+  repo: repoView,
   trash: showTrash,
   power: !document.getElementById('powerwrap').hidden,
   only: [...only], facets: [...facets], projs: [...projs],
@@ -20841,6 +21548,15 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     self._json(payload)
                 elif path == "/api/tour":
                     self._json(tour_feed(tour))
+                elif path == "/api/repos":
+                    # the repos modal: watched repos' base HEAD +
+                    # worktree merge state, 10s-cached server-side
+                    q = urllib.parse.parse_qs(
+                        urllib.parse.urlsplit(self.path).query)
+                    self._json(repo_status(
+                        runs_dir,
+                        fresh=q.get("fresh", [""])[0]
+                        in ("1", "true", "yes")))
                 elif (m := re.fullmatch(
                         r"/api/projects/([^/]+)/branches", path)):
                     # Merge-target selector data: eligible local branches of

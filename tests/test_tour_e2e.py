@@ -392,13 +392,16 @@ class TourE2ETests(unittest.TestCase):
         feed = self.get()
         self.assertEqual(feed["unseen_count"], self.N_CARDS - 2)
         e = self.ids(feed)
-        self.assertEqual(e[f"area:power:{self.c_power[:12]}"]["state"],
-                         "viewed")
+        # the viewed card stays viewed across the restart - it lives in
+        # history now, not the deck
+        self.assertNotIn(f"area:power:{self.c_power[:12]}", e)
         self.assertEqual(e[f"area:mobile:{self.c_mobile[:12]}"]["state"],
                          "snoozed")
+        hist = {h["id"]: h for h in feed["history"]}
         self.assertEqual(
-            {h["id"] for h in feed["history"]},
-            {f"area:power:{self.c_power[:12]}"})
+            set(hist), {f"area:power:{self.c_power[:12]}"})
+        self.assertEqual(
+            hist[f"area:power:{self.c_power[:12]}"]["state"], "viewed")
         # a restart never moved the watermark
         self.assertEqual(self.state_file()["watermark"]["commit"],
                          self.c0)
@@ -473,7 +476,7 @@ class TourE2ETests(unittest.TestCase):
             s, d = self.call("GET", "/api/state")
             self.assertEqual(d["tour_unseen"], self.N_CARDS - 1)
             feed = self.get()
-            self.assertEqual(self.ids(feed)[eid]["state"], "viewed")
+            self.assertNotIn(eid, self.ids(feed))  # viewed -> history
             self.assertEqual(feed["unseen_count"], self.N_CARDS - 1)
 
     def test_mutations_are_immediately_consistent(self):

@@ -521,7 +521,12 @@ class IdentityTests(unittest.TestCase):
             st["viewed"] = [{"id": eid, "range": f1["range"],
                              "viewed_at": "2026-10-17T01:00:00"}]
             f2 = feed(repo, base/"r", base/"q", base/"m", st)
-            self.assertEqual(f2["entries"][0]["state"], "viewed")
+            # a viewed card leaves the deck immediately - it lives on
+            # in 'viewed earlier', even while the watermark is pinned
+            # by other still-new cards
+            self.assertEqual(f2["entries"], [])
+            self.assertEqual([h["id"] for h in f2["history"]], [eid])
+            self.assertEqual(f2["history"][0]["state"], "viewed")
             # a new commit lands in the same area
             c2 = commit(repo, "assistant/b.py", "y", "chat two")
             f3 = feed(repo, base/"r", base/"q", base/"m", st)

@@ -199,8 +199,14 @@ class TourApiTests(unittest.TestCase):
         self.assertEqual(d["state"], "viewed")
         self.assertEqual(d["unseen_count"], 1)
         self.assertFalse(d["advanced"])          # one still 'new'
-        # immediately consistent - no TTL wait
-        self.assertEqual(self.ids()[eid]["state"], "viewed")
+        # immediately consistent - no TTL wait; a viewed card leaves
+        # the deck (only unviewed cards ride entries) and shows up in
+        # the history section instead
+        feed = self.get()
+        self.assertNotIn(eid, self.ids(feed))
+        self.assertEqual(
+            {h["id"]: h["state"] for h in feed["history"]}[eid],
+            "viewed")
         st = self.state_file()
         self.assertEqual([v["id"] for v in st["viewed"]], [eid])
         s, d = self.post(eid, "unview")
@@ -350,7 +356,7 @@ class TourApiTests(unittest.TestCase):
         self.get()                                # warm the cache
         self.post(eid, "viewed")
         d = self.get()                            # still inside the TTL
-        self.assertEqual(self.ids(d)[eid]["state"], "viewed")
+        self.assertNotIn(eid, self.ids(d))        # viewed -> history
         self.assertEqual(d["unseen_count"], 1)
 
     def test_transition_refreshes_cached_count(self):
