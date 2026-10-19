@@ -13883,6 +13883,10 @@ def _respawn_serve(args: argparse.Namespace) -> None:
 # watermark + entry descriptors) and tour_feeds (the deterministic card
 # list). All caches live in a per-server `tour_ctx` so a second
 # dashboard (tests, a worktree serve) never shares another's feed.
+# Feed builds are EXPENSIVE (git log + record scans), so only GET
+# /api/tour ever builds inline; the state poll and the POST transitions
+# answer from the retained feed/count and re-arm coalesced daemon
+# rebuilds (_tour_refresh) instead.
 TOUR_FEED_TTL_S = 60.0      # ~60s feed cache: the badge polls /api/state
                             # far more often than repo changes arrive
 
@@ -13905,8 +13909,15 @@ def tour_ctx(runs_dir: Path, requests_dir: Path | None = None,
             "state_path": runs_dir.parent / "tour-state.json",
             "devin_argv": list(devin_argv or ["devin"]),
             "feed": None,     # {"at": epoch, "payload": GET /api/tour body}
+            "last": None,     # the newest payload ever stored - kept for
+                              # transition validation even after `feed`
+                              # drops; a once-seen card stays ackable
             "count": None,    # {"at": epoch, "value": int}
             "busy": False,    # a background build owns the refresh
+            "wanted": False,  # a refresh was requested mid-build: the
+                              # worker runs once more before clearing
+                              # busy, so a transition's post-mutation
+                              # rebuild is never lost to coalescing
             "gen": 0,         # mutation epoch - a build that started
                               # before a transition can't overwrite the
                               # post-mutation cache it races
@@ -13977,6 +13988,7 @@ def _tour_build(ctx: dict, *, now: float | None = None) -> dict:
     with ctx["lock"]:
         if ctx["gen"] == gen0:
             ctx["feed"] = {"at": ts, "payload": payload}
+            ctx["last"] = payload
             ctx["count"] = {"at": ts, "value": feed["unseen_count"]}
     return payload
 
@@ -13987,6 +13999,47 @@ def _tour_invalidate(ctx: dict) -> None:
     waiting out the TTL."""
     with ctx["lock"]:
         ctx["feed"] = None
+
+
+def _tour_refresh(ctx: dict, *, rerun: bool = False) -> None:
+    """Arm ONE daemon feed build when none is running - the _SESS_BUSY
+    pattern, so the dashboard paint and transition responses never wait
+    on git log or record scans. When a build IS in flight, ``rerun``
+    marks a follow-on build wanted so a request issued against newer
+    state (a persisted transition) is never lost to a coalesced
+    pre-change build: the worker runs once more, then exits. A failed
+    build only logs - the mark on disk stands, ``busy`` clears, and the
+    next poll or transition re-arms, so a refresh failure can never
+    wedge the caches."""
+    with ctx["lock"]:
+        if ctx["busy"]:
+            if rerun:
+                ctx["wanted"] = True
+            return
+        ctx["busy"] = True
+
+    def work() -> None:
+        try:
+            while True:
+                try:
+                    _tour_build(ctx)
+                except Exception:                        # noqa: BLE001
+                    LOG.exception("tour feed refresh failed")
+                with ctx["lock"]:
+                    if not ctx["wanted"]:
+                        ctx["busy"] = False
+                        return
+                    ctx["wanted"] = False    # asked-for mid-build: run
+                                             # once more, then exit
+        finally:
+            with ctx["lock"]:
+                ctx["busy"] = False
+
+    try:
+        threading.Thread(target=work, daemon=True).start()
+    except Exception:                                    # noqa: BLE001
+        with ctx["lock"]:
+            ctx["busy"] = False
 
 
 def tour_feed(ctx: dict, *, now: float | None = None,
@@ -14010,67 +14063,108 @@ def tour_unseen(ctx: dict, *, now: float | None = None) -> int | None:
     response never wait on git log or record scans; the next poll picks
     the count up."""
     ts = time.time() if now is None else now
-    spawn = False
     with ctx["lock"]:
         stale = ctx["feed"] is None \
             or ts - ctx["feed"]["at"] >= TOUR_FEED_TTL_S
-        if stale and not ctx["busy"]:
-            ctx["busy"] = spawn = True
         count = ctx["count"]
-    if spawn:
-        def work() -> None:
-            try:
-                _tour_build(ctx)
-            except Exception:                            # noqa: BLE001
-                LOG.exception("tour feed refresh failed")
-            finally:
-                with ctx["lock"]:
-                    ctx["busy"] = False
-        try:
-            threading.Thread(target=work, daemon=True).start()
-        except Exception:                                # noqa: BLE001
-            with ctx["lock"]:
-                ctx["busy"] = False
+    if stale:
+        _tour_refresh(ctx)
     return count["value"] if count is not None else None
 
 
 def _tour_find(payload: dict, entry_id: str) -> dict | None:
     """Entry lookup across live entries AND the re-materialized viewed
     history - every recorded descriptor lands in exactly one of them,
-    so this covers every id the persisted transitions accept."""
+    so this covers every id the persisted transitions accept. An id a
+    folded work card absorbed resolves to that card (``covers``): the
+    mark then records the standalone id while the fold-target stays
+    unacknowledged on its own."""
     for e in payload["entries"] + payload["history"]:
-        if e.get("id") == entry_id:
+        if e.get("id") == entry_id \
+                or entry_id in (e.get("covers") or ()):
             return e
     return None
 
 
+def _tour_count_now(payload: dict | None, state: dict) -> int | None:
+    """The unseen_count the LAST-built feed implies under the CURRENT
+    persisted states - the 'last-known' figure a deferred transition
+    answers with instead of rebuilding inline. The card list comes from
+    the retained payload; each card's 'new'-ness is re-derived from
+    tour_state, so the just-saved mark (and any concurrent transition)
+    is already reflected. An unviewed descriptor whose card the
+    retained feed lacks still counts - it re-enters the deck unless a
+    folded card already covers its event. None when no feed has ever
+    built - the /api/state poll converges on the real count once the
+    scheduled refresh lands."""
+    if payload is None:
+        return None
+    tour_state, _tour_feeds = _tour_mods()
+    descs = tour_state.entries(state)
+    dstates = {d["id"]: d["state"] for d in descs}
+    live, covered, count = set(), set(), 0
+    for e in payload.get("entries") or []:
+        live.add(e["id"])
+        covered.update(e.get("covers") or ())
+        if dstates.get(e["id"], "new") == "new":
+            count += 1
+    for h in payload.get("history") or []:
+        covered.update(h.get("covers") or ())
+    count += sum(1 for d in descs
+                 if d["state"] == "new"
+                 and d["id"] not in live and d["id"] not in covered)
+    return count
+
+
 def tour_transition(ctx: dict, entry_id: str, action: str,
                     *, now: float | None = None) -> dict:
-    """POST /api/tour/<id>/<action>: validate the entry against the feed
-    (a cached miss retries once on a fresh build - a change that landed
-    inside the TTL is still acknowledgeable), run the persisted
-    transition, then rebuild so neither the feed cache nor the unseen
-    count can serve pre-mutation state."""
+    """POST /api/tour/<id>/<action>: validate the entry against the
+    last-built feed, persist the transition through tour_state, then
+    schedule the feed/count refresh on a daemon (_tour_refresh) - the
+    POST path never runs a feed build.
+
+    The response's ``unseen_count`` is the count the retained feed
+    implies under the just-saved state (a last-known figure, not a
+    fresh collection; None when no feed has ever built), and
+    ``count_pending`` marks the scheduled refresh the /api/state poll
+    converges on. Validation never collects either: the id is looked
+    up in the newest built payload - entries + history + folded
+    ``covers``, TTL-agnostic, so a once-seen card stays acknowledgeable
+    after the live feed moved on - and falls back to the persisted
+    descriptors when nothing has been built this serve (a restart
+    clears caches, not the file). Only an id neither built nor recorded
+    is 'unknown'; a persisted descriptor ack with no live feed lands
+    the mark but cannot judge the remaining deck, so the watermark
+    simply does not advance that round."""
     if action not in ("viewed", "snooze", "unview"):
         raise RequestError(f"unknown tour action: {action}", 404)
     entry_id = str(entry_id or "").strip()
     if not entry_id or len(entry_id) > 512:
         raise RequestError("invalid tour entry id")
     tour_state, _tour_feeds = _tour_mods()
-    payload = tour_feed(ctx, now=now)
-    entry = _tour_find(payload, entry_id)
+    with ctx["lock"]:
+        payload = ctx["last"]
+    entry = _tour_find(payload, entry_id) if payload is not None else None
     if entry is None:
-        payload = tour_feed(ctx, now=now, fresh=True)
-        entry = _tour_find(payload, entry_id)
-    if entry is None:
-        raise RequestError(f"unknown tour entry: {entry_id}", 404)
+        desc = tour_state.descriptor(tour_state.load(ctx["state_path"]),
+                                     entry_id)
+        if desc is None:
+            _tour_refresh(ctx)      # a retry after the rebuild can land
+            raise RequestError(f"unknown tour entry: {entry_id}", 404)
+        entry = {"id": entry_id, "range": desc.get("range")}
     if action == "viewed":
         # ids still 'new' after this mark - only an empty list lets the
-        # watermark advance, and only to THIS feed's captured boundary
-        still_new = [e["id"] for e in payload["entries"]
-                     if e.get("state") == "new" and e["id"] != entry_id]
+        # watermark advance, and only to the payload's captured boundary
+        # (never a fresh HEAD); mark_viewed re-checks each id against
+        # the persisted file, so concurrent marks can't over-acknowledge
+        still_new = boundary = None
+        if payload is not None:
+            still_new = [e["id"] for e in payload["entries"]
+                         if e.get("state") == "new"
+                         and e["id"] != entry_id]
+            boundary = payload["boundary"]
         result = tour_state.mark_viewed(
-            entry_id, entry.get("range"), payload["boundary"],
+            entry_id, entry.get("range"), boundary,
             remaining_new=still_new, path=ctx["state_path"],
             repo_dir=ctx["repo_dir"], now=now)
     elif action == "snooze":
@@ -14079,12 +14173,15 @@ def tour_transition(ctx: dict, entry_id: str, action: str,
     else:
         result = tour_state.unview(entry_id, path=ctx["state_path"],
                                    now=now)
-    with ctx["lock"]:
-        ctx["feed"] = ctx["count"] = None    # drop pre-mutation copies
-        ctx["gen"] += 1            # any build started before this
-                                   # transition now fails its store
-    refreshed = _tour_build(ctx, now=now)
-    result["unseen_count"] = refreshed["unseen_count"]
+    if result.get("changed"):
+        with ctx["lock"]:
+            ctx["feed"] = None      # a GET must never serve pre-mutation
+            ctx["gen"] += 1         # any build started before this
+                                    # transition now fails its store
+        _tour_refresh(ctx, rerun=True)
+        result["count_pending"] = True
+    result["unseen_count"] = _tour_count_now(
+        payload, tour_state.load(ctx["state_path"]))
     return result
 
 
@@ -20998,8 +21095,10 @@ const TOUR_TAG_STYLE = {new:'#bc8cff',improved:'#58a6ff',fixed:'#3fb950',
 // The badge is a pure function of /api/state's tour_unseen field: null
 // means the server hasn't computed a count yet - an honest unknown, not
 // a fake 0 - so the pill stays hidden rather than lying. Tour transition
-// POSTs carry the fresh count too, so marking a card repaints it
-// without waiting for the next poll.
+// POSTs carry the count the last-built feed implies under the saved
+// state (or a deferred null when nothing has ever built) - a real
+// number repaints immediately, anything else leaves the pill to the
+// poll, which converges once the scheduled refresh lands.
 function tourBadge(n){
   const b = document.getElementById('tour-badge');
   if (!b) return;
@@ -21452,8 +21551,9 @@ async function tourUnview(){
     tourAcked.delete(h.id);        // unread again - may re-enter the deck
     if (r && typeof r.unseen_count==='number') tourBadge(r.unseen_count);
     tourSt.mode = 'deck';
-    // the card returns to the live deck - the server already rebuilt
-    // the feed, so re-pull it instead of guessing positions locally
+    // the card returns to the live deck - the transition dropped the
+    // feed cache, so the re-pull rebuilds post-mutation state rather
+    // than trusting local position guesses
     await tourLoad();
     if (!tourSt) return;
     const j = tourDeck().findIndex(x=>x.id===h.id);
