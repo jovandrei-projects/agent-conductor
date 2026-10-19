@@ -4860,13 +4860,125 @@ def sweep_agent_slots(slot_dir: Path | None = None) -> list[str]:
     return out
 
 
+_DEVIN_PROCS_CACHE: list = [0.0, []]   # [mono, rows] - the process probe
+_DEVIN_PROCS_TTL_S = 10.0              # costs a powershell; /api/state polls
+                                       # faster than sessions come and go
+_ELECTRON_MARKERS = ("--type=", "--user-data-dir", "--node-ipc")
+
+
+def _cim_dt(v) -> str | None:
+    """Win32_Process CreationDate -> a now_iso()-shaped local stamp.
+    ConvertTo-Json emits ISO on PS7 but the PS5.1 /Date(ms+offset)/ form
+    on stock Windows PowerShell - take whichever shows up."""
+    s = str(v or "")
+    m = re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", s)
+    if m:
+        return m.group(0)
+    m = re.search(r"/Date\((\d+)", s)
+    if m:
+        return dt.datetime.fromtimestamp(
+            int(m.group(1)) / 1000).isoformat(timespec="seconds")
+    return None
+
+
+def _devin_procs_query() -> list[dict]:
+    """Every process on this box whose image name is devin*/Devin*:
+    {pid, ppid, name, started_at, cmd}. One subprocess for the whole
+    table, like _query_proc_table. Windows keeps the on-disk case in
+    Name, which is what tells the CLI binary (devin.exe) apart from the
+    desktop app and its helpers (Devin.exe)."""
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process -Filter \"Name like "
+                 "'devin%'\" | Select-Object Name,ProcessId,"
+                 "ParentProcessId,CreationDate,CommandLine | "
+                 "ConvertTo-Json -Compress"],
+                capture_output=True, text=True, timeout=15,
+                **hidden_subprocess_kwargs())
+            if out.returncode != 0 or not (out.stdout or "").strip():
+                return []
+            data = json.loads(out.stdout)
+            rows = data if isinstance(data, list) else [data]
+            return [{"pid": int(r["ProcessId"]),
+                     "ppid": r.get("ParentProcessId"),
+                     "name": r.get("Name") or "",
+                     "started_at": _cim_dt(r.get("CreationDate")),
+                     "cmd": r.get("CommandLine") or ""}
+                    for r in rows if r.get("ProcessId")]
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,comm=,args="],
+            capture_output=True, text=True, timeout=15)
+        rows = []
+        for ln in (out.stdout or "").splitlines():
+            f = ln.strip().split(None, 3)
+            if len(f) >= 4 and f[0].isdigit() \
+                    and "devin" in f[2].lower():
+                rows.append({"pid": int(f[0]),
+                             "ppid": int(f[1]) if f[1].isdigit() else None,
+                             "name": f[2], "started_at": None,
+                             "cmd": f[3]})
+        return rows
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+
+
+def _devin_procs() -> list[dict]:
+    t, rows = _DEVIN_PROCS_CACHE
+    if t and time.time() - t < _DEVIN_PROCS_TTL_S:
+        return rows
+    _DEVIN_PROCS_CACHE[0] = time.time()
+    _DEVIN_PROCS_CACHE[1] = _devin_procs_query()
+    return _DEVIN_PROCS_CACHE[1]
+
+
+def _devin_sessions(holders: list[dict]) -> list[dict]:
+    """Devin sessions on this box that hold NO agent slot - a Devin
+    Desktop session, a manual `devin` picker/run, another tool's CLI.
+    They don't count toward the cap (the pool leases conductor work
+    only); they're listed so a loaded box isn't mistaken for pool
+    occupancy. Conductor-spawned sessions are excluded: every one writes
+    a --prompt-file, and each holder's recorded worker pid covers the
+    gap before that cmdline check. A session's children (its `acp`
+    subprocess, a driver's `devin list`/auth probes) fold into the
+    root."""
+    procs = _devin_procs()
+    by_pid = {p["pid"]: p for p in procs}
+    cli = [p for p in procs if p["name"] in ("devin.exe", "devin")
+           and not any(m in p["cmd"] for m in _ELECTRON_MARKERS)]
+    cli_pids = {p["pid"] for p in cli}
+    worker_pids = {h.get("worker_pid") for h in holders}
+    roots = [p for p in cli if p["ppid"] not in cli_pids
+             and p["pid"] not in worker_pids
+             and "--prompt-file" not in p["cmd"]]
+    pproc = _proc_cmd_table([(p["ppid"], None) for p in roots])
+    out = []
+    for p in roots:
+        pcmd = (pproc.get((p["ppid"], None)) or {}).get("cmd") or ""
+        if "conductor.py" in pcmd:
+            continue           # a driver's devin list/auth probe - ours
+        anc, kind, hops = by_pid.get(p["ppid"]), "cli", 0
+        while anc and hops < 4:
+            if anc["name"] == "Devin.exe":
+                kind = "desktop"
+                break
+            anc, hops = by_pid.get(anc["ppid"]), hops + 1
+        out.append({"pid": p["pid"], "kind": kind,
+                    "started_at": p["started_at"], "cmd": p["cmd"]})
+    return sorted(out, key=lambda s: s["started_at"] or "")
+
+
 def _slots_view(slot_dir: Path | None = None) -> dict:
     """The /api/state pool summary: how many machine-wide agent slots are
     held right now and by whom. Beyond run:step names (never task text)
     each holder carries the lease's full run_dir plus owner/worker pids
     with best-effort cmdlines - and the owner's parent - so the pool
     modal can identify a holder no served run claims (test/demo runs
-    under a temp runs-dir, deleted run dirs, orphaned workers)."""
+    under a temp runs-dir, deleted run dirs, orphaned workers).
+    `external` lists devin sessions no conductor spawn/lease accounts
+    for (desktop sessions, manual CLIs) - informational only, they never
+    count toward in_use."""
     holders = _slot_holders(slot_dir)
     proc = _proc_cmd_table(
         [(h.get("owner_pid"), h.get("owner_started_at"))
@@ -4897,7 +5009,7 @@ def _slots_view(slot_dir: Path | None = None) -> dict:
             "worker_pid": h.get("worker_pid"),
             "worker_cmd": w.get("cmd") or None})
     return {"cap": agent_slot_cap(), "in_use": len(holders),
-            "holders": out}
+            "holders": out, "external": _devin_sessions(holders)}
 
 
 def _agent_slot_acquire(step: Step, run_dir: Path, state: dict,
@@ -18188,6 +18300,9 @@ function poolHtml(d){
       `<span>queued for a slot ` +
         `<b${waiters.length?' class="warn"':''}>${waiters.length}</b>` +
       `</span>` +
+      `<span title="devin sessions on this box that hold no slot - ` +
+        `they never count toward the cap">other sessions ` +
+        `<b>${(sp.external||[]).length}</b></span>` +
       `<span>cpu <b>${d.cpu_count||'?'}</b> cores</span>` +
       `<span>free ram <b>${d.free_ram_gb||'?'}</b> GB</span>` +
     `</div>` +
@@ -18233,6 +18348,24 @@ function poolHtml(d){
       ? `<div class="sub" style="margin-top:12px">${otherQ.length} ` +
         `other queued step(s) wait on a device lease, a merge lock or ` +
         `their wave - they don't hold pool slots.</div>`
+      : '') +
+    ((sp.external||[]).length
+      ? `<h3 style="margin-top:16px">other devin sessions</h3>` +
+        `<div class="wrapw"><table class="pooltab"><tr><th>pid</th>` +
+        `<th>source</th><th>command</th><th>started</th></tr>` +
+        sp.external.map(s=>
+          `<tr><td>${s.pid}</td>` +
+          `<td><span class="stc st-other">${esc(s.kind||'cli')}</span>` +
+          `</td><td class="wrap"><div title="${esc(s.cmd||'')}">` +
+          `${trunc(s.cmd,90)||'&mdash;'}</div></td>` +
+          `<td title="${esc(s.started_at||'')}">` +
+          `${s.started_at?loc(s.started_at):'-'}</td></tr>`).join('') +
+        `</table></div>` +
+        `<div class="sub" style="margin-top:6px">devin sessions no ` +
+        `conductor spawn or slot lease accounts for - a Devin Desktop ` +
+        `session, a manual <b>devin</b> run, another tool. They hold ` +
+        `no slot and never count toward the cap, but they do use this ` +
+        `box's cpu/ram.</div>`
       : '');
 }
 function poolStep(dlt){
@@ -18358,6 +18491,11 @@ function render(d){
         && tailEl.textContent !== AGENTS[detailIdx].tail)
       tailEl.textContent = AGENTS[detailIdx].tail;   // live stdout stream
     streamGenTail();
+    // the pool lives outside the sig: a lease opens/closes with no run
+    // or agent change at all, so the topbar count and an open pool
+    // modal still track it here (both are no-ops when nothing changed)
+    syncPoolBox();
+    renderPool();
     return;
   }
   lastSig = sig;

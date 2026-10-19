@@ -1597,6 +1597,120 @@ assert.doesNotMatch(html,/st-other">leased</);
                            timeout=10)
         self.assertEqual(p.returncode, 0, p.stderr)
 
+    def test_devin_sessions_external_classification(self):
+        """_devin_sessions: conductor's own sessions stay out (a lease's
+        worker pid, any --prompt-file cmdline, a driver's devin list
+        probe via its conductor.py parent); a session's acp child folds
+        into it; survivors are labeled desktop vs cli by ancestry."""
+        procs = [
+            {"pid": 10, "ppid": 1, "name": "Devin.exe",
+             "started_at": None, "cmd": "C:/Programs/Devin/Devin.exe"},
+            {"pid": 11, "ppid": 10, "name": "Devin.exe",
+             "started_at": None,
+             "cmd": "Devin.exe --type=renderer --user-data-dir=x"},
+            {"pid": 300, "ppid": 11, "name": "devin.exe",
+             "started_at": "2026-10-17T18:00:00", "cmd": "devin.exe acp"},
+            {"pid": 200, "ppid": 500, "name": "devin.exe",
+             "started_at": "2026-10-17T17:00:00",
+             "cmd": "devin --print -p x"},
+            {"pid": 201, "ppid": 200, "name": "devin.exe",
+             "started_at": "2026-10-17T17:00:01", "cmd": "devin acp"},
+            {"pid": 210, "ppid": 500, "name": "devin.exe",
+             "started_at": "2026-10-17T17:05:00",
+             "cmd": "devin --print --prompt-file r/prompts/s.md"},
+            {"pid": 220, "ppid": 500, "name": "devin.exe",
+             "started_at": "2026-10-17T17:06:00",
+             "cmd": "devin list --format json"},
+            {"pid": 400, "ppid": 777, "name": "devin.exe",
+             "started_at": "2026-10-17T16:00:00", "cmd": "devin"},
+        ]
+        pcmds = {(500, None): {"cmd": "pythonw conductor.py run m.toml"},
+                 (777, None): {"cmd": "pwsh"},
+                 (11, None): {"cmd": "Devin.exe --type=renderer"}}
+        with mock.patch.object(conductor, "_devin_procs",
+                               return_value=procs), \
+                mock.patch.object(conductor, "_proc_cmd_table",
+                                  return_value=pcmds):
+            out = conductor._devin_sessions([{"worker_pid": 200}])
+        self.assertEqual([s["pid"] for s in out], [400, 300])
+        self.assertEqual({s["pid"]: s["kind"] for s in out},
+                         {400: "cli", 300: "desktop"})
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_pool_ui_tracks_leases_between_identical_payloads(self):
+        """Regression: slot_pool is NOT part of the render signature, so
+        a lease landing/freeing with no other change early-returns out
+        of render() - the topbar count and an open pool modal must still
+        repaint there (a stale 'agents 4/8' next to a 1-holder modal was
+        the burn)."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map();
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',parentElement:{classList:{toggle(){}}}}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  addEventListener:()=>{}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const mk=n=>({serve_boot:'b',generated_at:'2026-10-17T19:00:0'+n,
+  cpu_count:16,free_ram_gb:4.9,agents:[],runs:[],
+  slot_pool:{cap:8,in_use:n,holders:[]}});
+vm.runInContext('render('+JSON.stringify(mk(1))+')',ctx);
+assert.equal(elem('pool-val').textContent,'agents 1/8');
+vm.runInContext('poolView=true;renderPool()',ctx);
+assert.match(elem('dbody').innerHTML,/in use <b>1\/8<\/b>/);
+// identical runs/agents - only the lease count moved: the sig matches,
+// but the pool still repaints off the early return
+vm.runInContext('render('+JSON.stringify(mk(4))+')',ctx);
+assert.equal(elem('pool-val').textContent,'agents 4/8');
+assert.match(elem('dbody').innerHTML,/in use <b>4\/8<\/b>/);
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_pool_modal_lists_external_sessions(self):
+        """The pool modal's second table lists devin sessions no
+        conductor lease claims (desktop/cli), labeled as never counting
+        toward the cap."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map();
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',parentElement:{classList:{toggle(){}}}}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,querySelectorAll:()=>[],
+  addEventListener:()=>{}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const d={serve_boot:'b',generated_at:'2026-10-17T19:00:00',cpu_count:16,
+  free_ram_gb:4.9,agents:[],runs:[],
+  slot_pool:{cap:8,in_use:0,holders:[],external:[
+    {pid:29632,kind:'desktop',started_at:'2026-10-17T17:33:26',
+     cmd:'devin.exe acp'},
+    {pid:3224,kind:'cli',started_at:'2026-10-17T13:41:00',cmd:'devin'}]}};
+vm.runInContext('render('+JSON.stringify(d)+')',ctx);
+vm.runInContext('poolView=true;renderPool()',ctx);
+const html=elem('dbody').innerHTML;
+assert.match(html,/other devin sessions/);
+assert.match(html,/>29632</);
+assert.match(html,/>desktop</);
+assert.match(html,/>cli</);
+assert.match(html,/devin\.exe acp/);
+assert.match(html,/never count toward the cap/);
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_draft_and_review_modal_never_start_implementation(self):
         js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
@@ -11046,7 +11160,9 @@ prompt = "first"
             runs, server = self._serve(td)
             env = {"CONDUCTOR_SLOT_DIR": str(Path(td) / "slots"),
                    "CONDUCTOR_MAX_AGENTS": ""}
-            with mock.patch.dict(os.environ, env):
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(conductor, "_devin_procs",
+                                      return_value=[]):
                 status, out = self._call(server.server_port, "POST",
                                          "/api/pool", {"cap": 6})
                 self.assertEqual(status, 200)
@@ -11054,6 +11170,7 @@ prompt = "first"
                 status, out = self._call(server.server_port, "GET",
                                          "/api/state")
                 self.assertEqual(out["slot_pool"]["cap"], 6)
+                self.assertEqual(out["slot_pool"]["external"], [])
                 for bad in (0, 99, "x", None):
                     status, out = self._call(server.server_port, "POST",
                                              "/api/pool", {"cap": bad})
