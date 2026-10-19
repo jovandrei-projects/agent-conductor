@@ -4,11 +4,11 @@ Redesign the dashboard "What's new" walkthrough into two sections -
 **Tool updates** (change/curated cards) and **Work digest** (record
 cards) - with folded request/run/follow-up work cards and asynchronous
 feed refresh. Manifest run `20261019-031845-whats-new-split`
-(`manifests/20261019-031223-58671699-whats-new-split.toml`), four steps;
+(`manifests/20261019-031223-58671699-whats-new-split.toml`), five steps;
 each step lands on its own `data/worktrees/20261019-031845-*/<step>`
 branch.
 
-**Status:** in progress   **Started:** 2026-10-19   **Last touched:** 2026-10-19
+**Status:** done   **Started:** 2026-10-19   **Last touched:** 2026-10-19
 
 ## Objective
 
@@ -209,16 +209,48 @@ a raise-once wrapper; every gated test registers
 on the gate. No sleeps were added for background-work assertions (the
 existing `_poll` convergence helpers only).
 
-### Step follow-up-plan - pending
+### Step follow-up-plan - DONE
 
-Closing review + next manifest only.
+Closing review completed 2026-10-19 on this step's branch. Evidence
+reviewed: run `data/runs/20261019-031845-whats-new-split` state.json +
+events.jsonl + per-step stdout/verify logs + STATUS/NEXT/OUTCOME lines,
+the merged code in this checkout (tour_feeds.py / tour_state.py /
+conductor.py tour_ctx + _DASH_HTML / tests/test_tour_*.py), AGENTS.md's
+What's-new section, the original request's full raw text (7 items +
+constraints), and a re-run of the tour suite on the merged tree
+(152/152 green).
+
+Verdict per item: ALL SEVEN requested items landed merged + verified -
+(1) two-section deck on the unchanged single watermark/state file,
+(2) same-window pipeline + follow-up folding on recorded links with
+cross-window standalone events, (3) read-only unreviewed-count `.trev`
+chip to the run modal with mark-viewed never touching task review
+(state.json byte-identical pin), (4) filled event tags (`ready`/verbatim
+outcome) distinct from change tags, (5) Request/Run chip contract with
+own-identity labels and no fabricated links, (6) per-build `{base,tip}`
+memoization + persist-first deferred POST with gen/wanted-coalesced
+daemon rebuild and converging count, (7) viewed cards leaving the deck
+pre-advancement with reopenable history. Constraints held: stdlib-only,
+vanilla JS, unittest conventions, AGENTS.md updated, every step green.
+
+Outcome recorded: `manifests/whats-new-split-followup.toml` - a
+deliberately EMPTY proposal (`[run]` table + comments, no `[[step]]`),
+which the follow-up intake registers as "no work remains". Nothing
+failed, parked, or unfinished exists to carry forward, and no newly
+discovered in-scope work was substantiated.
+
+Notes for the human: checkpoint c3fc7c5's `git add -A` swept the
+unrelated intake file `manifests/20261019-034417-b712823e-space-plan-core.toml`
+into a tracked commit (known commit-swallow trap; harmless, now tracked
+on master). efficiency_stats.md had missed the feed-build and
+tour-tests rows - backfilled by this step.
 
 ## Where it stopped
 
-tour-tests implemented + verified on branch
-`conductor/20261019-031845-whats-new-split/tour-tests`. Next:
-`follow-up-plan` step of run 20261019-031845-whats-new-split - closing
-review + follow-up manifest proposal only (no product changes).
+Task complete. All five manifest steps done + merged (feed-build via
+resolver dd1df59); closing review found nothing remaining - the empty
+follow-up proposal at `manifests/whats-new-split-followup.toml` is for
+human review only (registered as "no work remains", not a runnable job).
 
 ## Verification
 
