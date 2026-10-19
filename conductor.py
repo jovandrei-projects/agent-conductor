@@ -14949,6 +14949,43 @@ a { color:#58a6ff; text-decoration:none; }
   font:inherit; font-size:12px; padding:5px 2px; cursor:pointer; }
 #tourcard .thist:hover { color:#58a6ff; }
 #tourcard .thist .sub { float:right; font-size:11px; }
+/* the split walkthrough: a colored top edge plus the colored section
+   name in the header mark which half a card belongs to - blue for Tool
+   updates, cyan for the Work digest */
+#tourcard.sec-tool { border-top:2px solid #58a6ff; }
+#tourcard.sec-work { border-top:2px solid #39c5cf; }
+#tourcard .tsecname { font-weight:700; }
+#tourcard .tsecname.tool { color:#58a6ff; }
+#tourcard .tsecname.work { color:#39c5cf; }
+/* record-event tags (a proposal's ready, a run's outcome) get a tinted
+   fill + weight so an event word never reads as a change-style
+   new/improved/fixed label (those stay outline-only) */
+#tourcard .ttag.ev { font-weight:600; }
+#tourcard .tmeta { color:#8b949e; font-size:12px; margin:6px 0 0; }
+/* the unreviewed-task count chip on run/pipeline cards - the same cyan
+   the runs table's unreviewed pill uses; opens the run modal (reviewing
+   tasks is never what 'Mark viewed' does) */
+#tourcard .trev { color:#39c5cf; border-color:#1e6e77;
+  background:#122e33; vertical-align:1px; }
+#tourcard .trev.ok { color:#8b949e; border-color:#30363d;
+  background:none; }
+#tourcard .trev:hover { border-color:#39c5cf; }
+#tourcard .trev.ok:hover { border-color:#8b949e; }
+/* request vs run chips get an explicit kind prefix whenever both sorts
+   coexist on one card (folded pipelines, launched requests, curated
+   cards naming records) */
+#tourcard .relk { color:#8b949e; font-weight:600; font-size:10px;
+  text-transform:uppercase; letter-spacing:.04em; margin-right:5px; }
+#tourcard .chip.rel.req { border-color:#614b84; }
+#tourcard .chip.rel.run { border-color:#1f6feb; }
+#tourcard .chip.rel.req:hover { border-color:#bc8cff; }
+#tourcard .chip.rel.run:hover { border-color:#58a6ff; }
+/* folded follow-up proposals ride their request/pipeline card as one
+   row each: chips left, its registration stamp right */
+#tourcard .tfu { display:flex; align-items:baseline; flex-wrap:wrap;
+  margin:2px 0; }
+#tourcard .tfu .chip { margin:0 6px 4px 0; }
+#tourcard .tfu > .sub { margin-left:auto; font-size:11px; }
 #tour-btn .tbadge { display:inline-block; margin-left:7px; padding:0 6px;
   border-radius:9px; background:#1f6feb; color:#fff; font-size:11px;
   line-height:15px; vertical-align:1px; }
@@ -20945,12 +20982,15 @@ function applySel(){
 // oversized box-shadow IS the page dim and its transparent center pops
 // the anchor through; an entry with no usable anchor falls back to a
 // dimmed centered card. The deck (feed.entries, oldest -> newest) is the
-// walkthrough; feed.history is the viewed section that reopens cards the
-// watermark already passed. All state is `tourSt` - null means closed.
+// walkthrough - reordered on load into the feed's two sections (Tool
+// updates, then Work digest); feed.history is the viewed section that
+// reopens cards the watermark already passed. All state is `tourSt` -
+// null means closed.
 let tourSt = null;
 // change-style labels on tool-update cards; record-event words on work
 // cards (a proposal's 'ready', a run's terminal outcome) render through
-// the same chip - the tag text is the feed's own word either way
+// the same chip - the tag text is the feed's own word either way, but
+// work cards paint it FILLED so an outcome never reads as a change tag
 const TOUR_TAG_STYLE = {new:'#bc8cff',improved:'#58a6ff',fixed:'#3fb950',
   ready:'#39c5cf',done:'#3fb950',failed:'#f85149',partial:'#d29922',
   stopped:'#8b949e',paused:'#d29922',drained:'#8b949e',ended:'#8b949e',
@@ -20975,41 +21015,153 @@ const tourDeck = () => (tourSt && tourSt.feed && tourSt.feed.entries) || [];
 const tourHist = () => (tourSt && tourSt.feed && tourSt.feed.history) || [];
 const tourCur = () => tourSt && (tourSt.mode==='hist'
   ? tourHist()[tourSt.hi] : tourDeck()[tourSt.idx]);
+// The walkthrough's two sections, in deck order: Tool updates (change/
+// curated cards) first, then the Work digest (record cards). `section`
+// is the feed's own stamp; the id-prefix fallback mirrors tour_feeds'
+// _section() for cards served before the stamp existed.
+const TOUR_SEC_TITLE = {tool:'Tool updates', work:'Work digest'};
+const tourSec = e => {
+  const s = e && e.section;
+  if (s==='tool' || s==='work') return s;
+  const i = (e && e.id) || '';
+  return /^request:|run:|followup:/.test(i) ? 'work' : 'tool';
+};
+const tourSecTitle = e =>
+  (e && e.section_title) || TOUR_SEC_TITLE[tourSec(e)];
+// ids acknowledged this page-life, mapped to the marked card. A
+// re-pulled feed can briefly still list one (the post-transition
+// refresh is deferred), so the deck filters them out and 'viewed
+// earlier' reattaches any the stale copy doesn't know yet - the server
+// feed stays authoritative (an explicit unview removes the id again).
+const tourAcked = new Map();
+// the card's position inside its own section ('card 2 of 3'), counted
+// over the ordered deck
+function tourPosText(){
+  const deck = tourDeck(), cur = deck[tourSt.idx];
+  const sec = tourSec(cur);
+  let si=0, sn=0;
+  deck.forEach((x,i)=>{ if (tourSec(x)!==sec) return;
+    sn++; if (i<=tourSt.idx) si++; });
+  return `card ${si} of ${sn}`;
+}
+// work-card metadata row: proposal/finish stamps + step tallies; change
+// cards show their event stamp instead
+function tourMetaHtml(e){
+  const bits=[];
+  if (e.proposed_at) bits.push(`proposed ${esc(loc(e.proposed_at))}`);
+  if (e.completed_at && e.completed_at!==e.proposed_at)
+    bits.push(`finished ${esc(loc(e.completed_at))}`);
+  if ((e.steps_total|0)>0)
+    bits.push(`${e.steps_done|0}/${e.steps_total|0} steps done`);
+  if (!bits.length && e.at) bits.push(esc(loc(e.at)));
+  return bits.length ? `<div class="tmeta">${bits.join(' · ')}</div>`:'';
+}
 // every repository/record string below flows through esc() - curated
 // blurbs, commit subjects and request labels are never trusted markup
 function tourRelatedHtml(e){
-  const runs = (e.runs||[]).map(k=>{
-    const r = ((lastData&&lastData.runs)||[]).find(x=>runKey(x)===k);
-    return `<button type="button" class="chip" ` +
+  const kind = e && e.kind;
+  const rows = (lastData && lastData.runs) || [];
+  // chip contract per card kind: run/pipeline cards link ONLY their run;
+  // request/follow-up/tool cards link the requests the feed named plus
+  // run chips only for recorded launches - never a fabricated link.
+  const runOnly = kind==='run' || kind==='pipeline';
+  const runs = e.runs || [];
+  const reqs = runOnly ? [] : (e.requests || []);
+  const both = runs.length>0 && reqs.length>0;
+  const runChip = (k, lb) => {
+    // a run chip names the RUN (its row's name, else the bare key) -
+    // prefer a real run row over a still-staged proposal sharing the key
+    const r = rows.find(x=>runKey(x)===k && !x.stage)
+           || rows.find(x=>runKey(x)===k);
+    return `<button type="button" class="chip${lb?' rel run':''}" ` +
       `data-run-details="${esc(k)}" title="open this run's details">` +
-      `${esc(r && (r.run||k) || base(k))}</button>`;
+      (lb?`<b class="relk">Run</b> `:'') +
+      `${esc((r && r.run) || k)}</button>`;
+  };
+  const reqChip = (rid, lb, text, tip) => {
+    return `<button type="button" class="chip${lb?' rel req':''}" ` +
+      `data-open-request="${esc(rid)}" ` +
+      `title="${esc(tip||'open this request')}">` +
+      (lb?`<b class="relk">Request</b> `:'') + `${esc(text)}</button>`;
+  };
+  const reqText = rid => {
+    // the REQUEST's own identity: a still-staged proposal row's name is
+    // its label; a launched run row sharing request_id names the RUN -
+    // never resolve to that. Bare id when no proposal row survives.
+    const q = rows.find(x=>x.request_id===rid && x.stage);
+    return (q && q.run) || rid;
+  };
+  const chips = runs.map(k=>runChip(k, both)).join('') +
+    reqs.map(rid=>reqChip(rid, both, reqText(rid))).join('');
+  // follow-up proposals folded into this card: one row each - its own
+  // request chip, any recorded run links, and its registration stamp
+  const fus = (e.followups||[]).map(f=>{
+    const frid=(f.requests||[]).length===1 ? f.requests[0] : null;
+    const fruns=f.runs||[], fb = !!frid && fruns.length>0;
+    return `<div class="tfu">` +
+      (frid ? reqChip(frid, fb, f.label || reqText(frid),
+                     'open this follow-up proposal')
+            : esc(f.label || 'follow-up')) +
+      fruns.map(k=>runChip(k, fb)).join('') +
+      `<span class="sub">${esc(loc(f.at))}</span></div>`;
   }).join('');
-  const reqs = (e.requests||[]).map(rid=>{
-    const r = ((lastData&&lastData.runs)||[]).find(x=>x.request_id===rid);
-    return `<button type="button" class="chip" ` +
-      `data-open-request="${esc(rid)}" title="open this request">` +
-      `${esc(r && (r.run||rid) || rid)}</button>`;
-  }).join('');
-  return (runs || reqs)
-    ? `<div class="tsec">related</div><div class="trel">${runs}${reqs}</div>`
+  return (chips || fus)
+    ? (chips
+       ? `<div class="tsec">related</div><div class="trel">${chips}</div>`
+       : '') +
+      (fus ? `<div class="tsec">follow-ups</div>${fus}` : '')
     : '';
 }
 function tourCardHtml(e, posText){
-  const tag = TOUR_TAG_STYLE[e.tag] ? e.tag : 'new';
+  const kind = e && e.kind, sec = tourSec(e);
+  // record-event words ride a FILLED chip (tinted via 8-digit hex alpha)
+  // - the outline-only look stays reserved for the change-style
+  // new/improved/fixed labels. A run card's word is its recorded
+  // outcome verbatim; an unlisted outcome still prints, only the color
+  // defaults - the text must never lie about the event.
+  const rawTag = (kind==='run'||kind==='pipeline') && e.outcome
+    ? e.outcome : e.tag;
+  const c = TOUR_TAG_STYLE[rawTag] || '#8b949e';
+  const tag = TOUR_TAG_STYLE[rawTag] ? rawTag
+    : (sec==='work' ? String(rawTag||'event') : 'new');
+  const tagTitle = sec==='work'
+    ? (kind==='run'||kind==='pipeline' ? 'run outcome - a record event'
+                                      : 'record event')
+    : 'change type';
   const commits = (e.commits||[]).map(c=>
     `<li><code>${esc(String(c.sha||'').slice(0,10))}</code> ` +
     `${esc(c.subject)}</li>`).join('');
-  return `<div class="tpos">${esc(posText)}` +
+  // the run's unreviewed-task count rides the card as a chip into the
+  // run modal - 'Mark viewed' acknowledges the notification only and
+  // never marks a task reviewed (the chip's title says so outright)
+  const unrev = (kind==='run'||kind==='pipeline') &&
+      typeof e.unreviewed==='number'
+    ? ` <button type="button" class="chip trev${e.unreviewed>0?'':' ok'}"` +
+      ((e.runs||[]).length
+        ? ` data-run-details="${esc(e.runs[0])}"` : '') +
+      ` title="${e.unreviewed>0
+        ? esc(`${e.unreviewed} task(s) finished unreviewed - open the ` +
+              `run to review them; marking this card viewed only ` +
+              `acknowledges this notice`)
+        : 'every finished task in this run has been reviewed'}">` +
+      `${e.unreviewed>0 ? e.unreviewed+' unreviewed'
+                       : 'all reviewed'}</button>`
+    : '';
+  return `<div class="tpos"><span class="tsecname ${esc(sec)}">` +
+    `${esc(tourSecTitle(e))}</span> · ${esc(posText)}` +
     (e.stop_title ? ` · ${esc(e.stop_title)}` : '') + `</div>` +
     `<h3 id="tourcard-title">${esc(e.title||'(untitled)')}</h3>` +
-    `<span class="ttag" style="color:${TOUR_TAG_STYLE[tag]};` +
-      `border-color:${TOUR_TAG_STYLE[tag]}">${tag}</span>` +
+    `<span class="ttag${sec==='work'?' ev':''}" title="${tagTitle}" ` +
+      `style="color:${c};border-color:${c}` +
+      `${sec==='work'?`;background:${c}26`:''}">${esc(tag)}</span>` +
+    unrev +
     (e.state==='snoozed'
       ? ` <span class="sub">deferred earlier</span>` : '') +
     (e.state==='viewed'
       ? ` <span class="sub">viewed</span>` : '') +
     (e.unavailable
       ? ` <span class="sub">source window lost</span>` : '') +
+    tourMetaHtml(e) +
     `<div class="tblurb">${esc(e.blurb||'')}</div>` +
     (commits
       ? `<div class="tsec">commits</div><ul class="tlist">${commits}</ul>`
@@ -21047,7 +21199,9 @@ function tourHistHtml(){
       `<button type="button" class="thist" data-tour="hist" ` +
       `data-hi="${i}" title="reopen this card">` +
       `${esc(h.title||'(untitled)')}` +
-      `<span class="sub">${esc(h.viewed_at ? loc(h.viewed_at)
+      `<span class="sub"><b class="tsecname ${esc(tourSec(h))}">` +
+      `${esc(TOUR_SEC_TITLE[tourSec(h)])}</b> · ` +
+      `${esc(h.viewed_at ? loc(h.viewed_at)
         : (h.state||'viewed'))}</span></button>`).join('') +
     `</details>`;
 }
@@ -21055,7 +21209,11 @@ function tourShow(){
   const wrap = document.getElementById('tourwrap');
   const card = document.getElementById('tourcard');
   if (!wrap || !card) return;
-  if (!tourSt){ wrap.hidden = true; return; }
+  if (!tourSt){
+    wrap.hidden = true;
+    if (card.classList) card.classList.remove('sec-tool','sec-work');
+    return;
+  }
   wrap.hidden = false;
   // sync the suspend marker too - applySel re-derives it on every modal
   // open/close, but a tour opened while a dialog is already up must
@@ -21086,7 +21244,7 @@ function tourShow(){
   } else {
     const deck = tourDeck(), e = deck[tourSt.idx];
     inner = e
-      ? tourCardHtml(e, `Update ${tourSt.idx+1} of ${deck.length}`) +
+      ? tourCardHtml(e, tourPosText()) +
         (tourSt.notice
           ? `<div class="notice error">${esc(tourSt.notice)}</div>` : '') +
         `<div class="tactions">${tourActionsHtml()}</div>` +
@@ -21100,6 +21258,13 @@ function tourShow(){
   }
   card.innerHTML = inner;
   card.classList.toggle('busy', !!tourSt.pending);
+  // the section accent follows the CURRENT card only - error/loading/
+  // caught-up views (no card) carry neither color
+  if (card.classList){
+    const cs = tourSt.feed && tourCur() ? tourSec(tourCur()) : '';
+    card.classList.toggle('sec-tool', cs==='tool');
+    card.classList.toggle('sec-work', cs==='work');
+  }
   tourPlace(true);
 }
 function tourAnchorEl(e){
@@ -21180,7 +21345,28 @@ async function tourLoad(){
   if (!tourSt) return;
   tourSt.feed = null; tourSt.err = null; tourShow();
   try { const f = await api('GET', '/api/tour');
-    if (tourSt) tourSt.feed = f;
+    if (tourSt){
+      // the unread deck walks as two separated sections - Tool updates
+      // first, then the Work digest - each keeping the feed's own
+      // oldest->newest order (an empty section simply contributes no
+      // cards, so navigation never lands on a blank). Ids acknowledged
+      // this session are filtered out too: a re-pulled feed can briefly
+      // predate the mark (the transition's refresh is deferred), and a
+      // stale copy must never reinsert an acknowledged card.
+      const tool=[], work=[];
+      for (const e of (f.entries||[])){
+        if (tourAcked.has(e.id)) continue;
+        (tourSec(e)==='work' ? work : tool).push(e);
+      }
+      f.entries = tool.concat(work);
+      // a card acknowledged since the feed was built also reattaches to
+      // 'viewed earlier' when the stale copy doesn't carry it yet
+      f.history = f.history || [];
+      const known = new Set(f.history.map(x=>x.id));
+      for (const [id, c] of tourAcked)
+        if (!known.has(id)) f.history.push(c);
+      tourSt.feed = f;
+    }
   } catch(e){ if (tourSt) tourSt.err = e.message || String(e); }
   if (tourSt) tourShow();
 }
@@ -21236,9 +21422,14 @@ async function tourMark(){
   if (!tourSt) return;                          // closed mid-flight
   tourSt.pending = false;
   e.state = 'viewed'; e.viewed_at = new Date().toISOString();
+  tourAcked.set(e.id, e);    // never reinserted by a stale feed re-pull
   const hs = tourSt.feed.history || (tourSt.feed.history = []);
   if (!hs.some(h=>h.id===e.id)) hs.unshift(e);
-  tourBadge(r.unseen_count);                    // fresh count, no poll wait
+  // the response may carry a fresh count or a last-known/deferred one
+  // (the transition endpoint drops its synchronous feed rebuild): only
+  // a real number repaints - anything else leaves the badge to the
+  // /api/state poll, which converges once the refresh lands
+  if (r && typeof r.unseen_count==='number') tourBadge(r.unseen_count);
   // a viewed card leaves the deck for good (the server's feed filters
   // it out of entries too - it lives on in 'viewed earlier') - the
   // splice puts the next unviewed card at this index, or runs the deck
@@ -21258,7 +21449,8 @@ async function tourUnview(){
       '/api/tour/'+encodeURIComponent(h.id)+'/unview', {});
     if (!tourSt) return;
     tourSt.pending = false;
-    tourBadge(r.unseen_count);
+    tourAcked.delete(h.id);        // unread again - may re-enter the deck
+    if (r && typeof r.unseen_count==='number') tourBadge(r.unseen_count);
     tourSt.mode = 'deck';
     // the card returns to the live deck - the server already rebuilt
     // the feed, so re-pull it instead of guessing positions locally
