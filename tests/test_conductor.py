@@ -1883,6 +1883,172 @@ assert.doesNotMatch(html,/st-other">leased</);
         self.assertEqual(st2["plan-proposal-1"], "failed")
         self.assertEqual(st2["plan-proposal-4"], "failed")
 
+    def test_plan_supersede_manual_mark(self):
+        """The auto rule only supersedes attempts BEFORE the producer;
+        a failed regen after it keeps 'failed' until the human retires
+        it. plan_supersede stamps a flag the renderer honors - the
+        record itself stays honest ('failed' + superseded marker)."""
+        with tempfile.TemporaryDirectory() as td:
+            reqdir = Path(td) / "requests"
+            reqdir.mkdir()
+            rid = "20261019-000000-aaaabbbb"
+            rec = {"id": rid, "status": "ready", "plan_gen_id": "g-good",
+                   "plan_sessions": [
+                       {"gen_id": "g-old", "status": "failed",
+                        "note": "x"},
+                       {"gen_id": "g-good", "status": "done"},
+                       {"gen_id": "g-regen", "status": "failed",
+                        "note": "interrupted by server restart"}]}
+            (reqdir / f"{rid}.json").write_text(json.dumps(rec))
+            # attempt 3 is a POST-producer failure - still 'failed'
+            rows = conductor.plan_attempt_agents(
+                rec, f"request:{rid}", generating=False,
+                log_path=reqdir / f"{rid}.gen.log", prices={})
+            st = {r["step"]: r["status"] for r in rows}
+            self.assertEqual(st["plan-proposal-3"], "failed")
+            self.assertEqual(st["plan-proposal-1"], "superseded")
+            out = conductor.plan_supersede(rid, 3, reqdir)
+            self.assertTrue(out["ok"])
+            # the file keeps its real status - only a marker was added
+            rec2 = json.loads((reqdir / f"{rid}.json").read_text())
+            self.assertEqual(rec2["plan_sessions"][2]["status"], "failed")
+            self.assertEqual(rec2["plan_sessions"][2]["note"],
+                             "interrupted by server restart")
+            self.assertTrue(rec2["plan_sessions"][2]["superseded"])
+            self.assertTrue(rec2["plan_sessions"][2]["superseded_at"])
+            rows2 = conductor.plan_attempt_agents(
+                rec2, f"request:{rid}", generating=False,
+                log_path=reqdir / f"{rid}.gen.log", prices={})
+            r3 = {r["step"]: r for r in rows2}["plan-proposal-3"]
+            self.assertEqual(r3["status"], "superseded")
+            # guards: the producer and out-of-range ids are refused
+            with self.assertRaises(conductor.RequestError):
+                conductor.plan_supersede(rid, 2, reqdir)   # producer
+            with self.assertRaises(conductor.RequestError):
+                conductor.plan_supersede(rid, 9, reqdir)   # no attempt 9
+            with self.assertRaises(conductor.RequestError):
+                conductor.plan_supersede("20261019-000000-nosuch00", 1,
+                                         reqdir)
+            # idempotent: re-marking is a no-op success
+            out = conductor.plan_supersede(rid, 3, reqdir)
+            self.assertTrue(out["ok"])
+
+    def test_plan_supersede_endpoint(self):
+        """POST /api/requests/<id>/plan-supersede routes through the same
+        guards: 404 unknown request or attempt, 409 on the producing
+        attempt, 200 stamps the marker on the record."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            reqs = base / "reqs"
+            runs = base / "runs"
+            reqs.mkdir(); runs.mkdir()
+            rid = "20261019-000000-ccccdddd"
+            (reqs / f"{rid}.json").write_text(json.dumps({
+                "id": rid, "status": "ready", "plan_gen_id": "g2",
+                "plan_sessions": [
+                    {"gen_id": "g1", "status": "failed"},
+                    {"gen_id": "g2", "status": "done"},
+                    {"gen_id": "g3", "status": "failed"}]}))
+            handler = conductor.make_dashboard_handler(
+                runs, ["no-such-devin"], reqs, base / "manifests")
+            server = conductor.http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0), handler)
+            threading.Thread(target=server.serve_forever, daemon=True) \
+                .start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            port = server.server_port
+
+            def post(path, body):
+                conn = http.client.HTTPConnection("127.0.0.1", port,
+                                                  timeout=5)
+                conn.request("POST", path, json.dumps(body), headers={
+                    "Origin": f"http://127.0.0.1:{port}",
+                    "Content-Type": "application/json"})
+                res = conn.getresponse()
+                raw = res.read()
+                conn.close()
+                return res.status, json.loads(raw)
+
+            s, d = post(f"/api/requests/{rid}/plan-supersede",
+                        {"attempt": 3})
+            self.assertEqual(s, 200, d)
+            rec = json.loads((reqs / f"{rid}.json").read_text())
+            self.assertTrue(rec["plan_sessions"][2]["superseded"])
+            s, d = post(f"/api/requests/{rid}/plan-supersede",
+                        {"attempt": 2})              # the producer
+            self.assertEqual(s, 409, d)
+            s, d = post(f"/api/requests/{rid}/plan-supersede",
+                        {"attempt": 9})              # out of range
+            self.assertEqual(s, 404, d)
+            s, d = post("/api/requests/20261019-000000-eeeeffff/"
+                        "plan-supersede", {"attempt": 1})
+            self.assertEqual(s, 404, d)
+
+    def test_archived_rows_cached_by_signature(self):
+        """The archived view's per-run rebuild is the expensive part of
+        collect_dashboard - the cache serves a byte-identical slice
+        while the sig matches, and touching the run's state.json
+        rebuilds it (a stale cache must never mask a real change)."""
+        conductor._ARCH_RUN_CACHE.clear()
+        self.addCleanup(conductor._ARCH_RUN_CACHE.clear)
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "runs"
+            reqs = base / "requests"
+            rdir = runs / "r1"
+            rdir.mkdir(parents=True)
+            reqs.mkdir()
+            state = {"run": "r1", "archived": "2026-10-01T00:00:00",
+                     "started_at": "2026-10-01T00:00:00",
+                     "ended_at": "2026-10-01T01:00:00",
+                     "steps": {"s1": {"slug": "p", "status": "done",
+                                      "project": str(base / "proj"),
+                                      "pid": 1,
+                                      "started_at": "2026-10-01T00:00:00",
+                                      "ended_at": "2026-10-01T00:10:00"}}}
+            (rdir / "state.json").write_text(json.dumps(state))
+            calls = [0]
+            real = conductor._skip_flagged
+
+            def spy(p):
+                calls[0] += 1
+                return real(p)
+
+            with mock.patch.object(conductor, "live_sessions_by_dir",
+                                   return_value={}), \
+                 mock.patch.object(conductor, "_skip_flagged",
+                                   side_effect=spy):
+                d1 = conductor.collect_dashboard(
+                    runs, requests_dir=reqs, include_archived=True)
+                d2 = conductor.collect_dashboard(
+                    runs, requests_dir=reqs, include_archived=True)
+            self.assertEqual(calls[0], 1)   # second collect hit the cache
+            self.assertEqual(d1["runs"], d2["runs"])
+            self.assertEqual(d1["agents"], d2["agents"])
+            self.assertEqual(len(d1["runs"]), 1)
+            self.assertTrue(d1["runs"][0]["archived"])
+            # state.json moved -> the sig moved -> rebuild happens once
+            state["note"] = "touched"
+            (rdir / "state.json").write_text(json.dumps(state))
+            with mock.patch.object(conductor, "live_sessions_by_dir",
+                                   return_value={}), \
+                 mock.patch.object(conductor, "_skip_flagged",
+                                   side_effect=spy):
+                d3 = conductor.collect_dashboard(
+                    runs, requests_dir=reqs, include_archived=True)
+            self.assertEqual(calls[0], 2)
+            # and the non-archived poll never consults the cache at all
+            with mock.patch.object(conductor, "live_sessions_by_dir",
+                                   return_value={}), \
+                 mock.patch.object(conductor, "_skip_flagged",
+                                   side_effect=spy):
+                d4 = conductor.collect_dashboard(
+                    runs, requests_dir=reqs)
+            self.assertEqual(d4["runs"], [])        # archived stays hidden
+            self.assertEqual(d4["archived_runs"], 1)
+            self.assertEqual(calls[0], 2)           # archived run skipped
+
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_repos_modal_renders_merge_states(self):
         """The repos modal paints each watched repo's base HEAD plus
@@ -6940,6 +7106,106 @@ const menuBtn=dataset=>({id:'',dataset,disabled:false,
   assert.equal(vm.runInContext('selectedRun',ctx),'/runs/done');
   assert.doesNotMatch(elem('agents').innerHTML,/>live-step</);
   assert.match(elem('agents').innerHTML,/>held</);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_plan_supersede_menu_item_and_dispatch(self):
+        """A failed planner attempt AFTER the producer stays 'failed'
+        forever unless the human retires it - the row's context menu and
+        the task modal both offer 'Mark attempt superseded', which
+        confirms then POSTs {attempt} to the request's endpoint. The
+        producer and a live attempt never show the item."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, posts=[], alerts=[];
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',scrollTop:0,style:{},querySelector:()=>null,
+  querySelectorAll:()=>[]}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const sel={isCollapsed:true,toString:()=>''};
+const window={innerWidth:1200,innerHeight:800,addEventListener:()=>{},
+  getSelection:()=>sel};
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',agents:[
+  {step:'plan-proposal',mode:'planner',run:'req',run_key:'request:r1',
+   slug:'p',status:'done',request_id:'r1',task:'planner'},
+  {step:'plan-proposal-2',mode:'planner',run:'req',run_key:'request:r1',
+   slug:'p',status:'superseded',request_id:'r1',task:'planner'},
+  {step:'plan-proposal-5',mode:'planner',run:'req',run_key:'request:r1',
+   slug:'p',status:'failed',request_id:'r1',task:'planner',
+   note:'interrupted by server restart'},
+  {step:'plan-proposal-9',mode:'planner',run:'req',run_key:'request:r1',
+   slug:'p',status:'running',request_id:'r1',task:'planner'}],runs:[
+  {run:'req',dir:'/runs/req',key:'request:r1',request_id:'r1',
+   counts:{done:1}}]};
+const fetch=async(url,opt)=>{
+  posts.push({url,body:opt&&opt.body?JSON.parse(opt.body):null});
+  if(url.startsWith('/api/state')) return {ok:true,json:async()=>data};
+  return {ok:true,json:async()=>({}),text:async()=>''}; };
+const ctx=vm.createContext({document,window,fetch,confirm:()=>true,
+  alert:m=>alerts.push(m),location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const cls=c=>({contains:x=>c.split(' ').includes(x),add(){},remove(){}});
+const agenRow=i=>({cls:'agen',dataset:{i:String(i)},classList:cls('agen'),
+  isConnected:true,focused:0,focus(){this.focused++;},
+  matches:s=>s==='tr.agen'||s==='tr.runrow,tr.agen',
+  getBoundingClientRect:()=>({left:10,top:20,bottom:30})});
+const onRow=row=>({isContentEditable:false,dataset:{},
+  closest:sel=>{
+    if(sel==='#ctxmenu')return null;
+    if(sel.indexOf('input')===0)return null;
+    if(sel==='tr.agen')return row.cls==='agen'?row:null;
+    if(sel==='tr.runrow,tr.agen')return row;
+    return null;}});
+const rclick=t=>{let pd=0;handlers.contextmenu({target:t,clientX:60,
+  clientY:70,preventDefault:()=>{pd++;}});return pd;};
+const menuBtn=dataset=>({id:'',dataset,disabled:false,
+  closest:sel=>{
+    if(sel==='#ctxmenu')return {inMenu:1};
+    const m=sel.match(/^\[data-([a-z-]+)\]$/);
+    if(m){const k=m[1].replace(/-([a-z])/g,(s,c)=>c.toUpperCase());
+      return k in dataset?{dataset}:null;}
+    return null;}});
+const askBtn=i=>({id:'',dataset:{},closest:sel=>
+  sel==='[data-ask]'?{dataset:{ask:String(i)}}:null});
+const flush=async()=>{for(let i=0;i<10;i++)await Promise.resolve();};
+(async()=>{
+  const m=elem('ctxmenu');
+  // the producer row (bare 'plan-proposal', done) - no retire item
+  assert.equal(rclick(onRow(agenRow(0))),1);
+  assert.doesNotMatch(m.innerHTML,/data-plan-supersede/);
+  // an already-superseded row - no item either
+  assert.equal(rclick(onRow(agenRow(1))),1);
+  assert.doesNotMatch(m.innerHTML,/data-plan-supersede/);
+  // the post-producer failure - the item, naming its request + attempt
+  assert.equal(rclick(onRow(agenRow(2))),1);
+  assert.match(m.innerHTML,
+    /data-plan-supersede="r1"[^>]*data-plan-attempt="5"[^>]*>Mark attempt superseded/);
+  // a still-running attempt is never retired mid-flight
+  assert.equal(rclick(onRow(agenRow(3))),1);
+  assert.doesNotMatch(m.innerHTML,/data-plan-supersede/);
+  // dispatch: confirm -> POST {attempt:5} to the request endpoint
+  assert.equal(rclick(onRow(agenRow(2))),1);
+  posts.length=0;
+  const p=handlers.click({target:menuBtn({planSupersede:'r1',
+    planAttempt:'5'}),preventDefault:()=>{}});
+  await flush();
+  assert.equal(elem('askwrap').hidden,false);         // confirm first
+  assert.equal(posts.length,0);                       // nothing sent yet
+  await handlers.click({target:askBtn(1),preventDefault:()=>{}});
+  await p; await flush();
+  assert.equal(posts[0].url,'/api/requests/r1/plan-supersede');
+  assert.deepEqual(posts[0].body,{attempt:5});
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,

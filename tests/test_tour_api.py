@@ -383,6 +383,51 @@ class TourApiTests(unittest.TestCase):
             lambda: self.tour["count"] is not None
             and self.tour["count"]["value"] == 1))
 
+    # ------------------------------------------- /api/tour/progress
+
+    def test_progress_endpoint_narrates_the_build(self):
+        """GET /api/tour/progress answers {busy, stage}: idle at rest,
+        and while the inline feed build runs it carries the current
+        phase name - the loading card polls this instead of sitting on
+        a bare 'loading the change feed' line."""
+        s, d = self.call("GET", "/api/tour/progress")
+        self.assertEqual(s, 200, d)
+        self.assertEqual(d["busy"], False)
+        gate = threading.Event()
+        entered = threading.Event()
+        real = tour_feeds.build_feed
+
+        def slow(*a, **kw):
+            prog = kw.get("progress")
+            if prog:
+                prog("loading run records")
+            entered.set()
+            gate.wait(10)
+            return real(*a, **kw)
+
+        got = {}
+        with mock.patch.object(tour_feeds, "build_feed",
+                               side_effect=slow):
+            t = threading.Thread(
+                target=lambda: got.setdefault(
+                    "r", self.call("GET", "/api/tour")), daemon=True)
+            t.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                s, d = self.call("GET", "/api/tour/progress")
+                self.assertEqual(s, 200)
+                self.assertTrue(d["busy"])
+                self.assertEqual(d["stage"], "loading run records")
+                self.assertTrue(d["at"] > 0)
+            finally:
+                gate.set()
+            t.join(10)
+        self.assertEqual(got["r"][0], 200, got.get("r"))
+        # once the build lands the endpoint goes quiet again
+        s, d = self.call("GET", "/api/tour/progress")
+        self.assertEqual(d["busy"], False)
+        self.assertEqual(d["stage"], "")
+
     # -------------------------------------------------- /api/state
 
     def test_state_field_is_tiny_and_eventually_filled(self):
