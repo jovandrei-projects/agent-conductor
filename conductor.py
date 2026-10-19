@@ -15973,9 +15973,16 @@ let summaryView = null;     // {key: agentKey} while the summary modal shows
 let poolView = false;       // the agent-pool modal is open
 let repoView = false;       // the repositories modal is open
 let repoData = null;        // assembled {generated_at, repos, quiet}
-let repoScan = null;        // {list, i, current, fresh} while scanning
+let repoScan = null;        // {list, i, current, fresh, done} while
+                            // scanning - done = names this pass landed
 let repoFetched = 0;        // Date.now() when the scan completed
 let repoBusy = false;       // a repo list/scan pass is in flight
+// A scan pass walks every watched repo's git calls sequentially - with
+// ~15+ watched repos the walk alone takes tens of seconds, so a tight
+// poll would scan nearly continuously. 60s keeps an externally-landed
+// merge visible without paying full git cost back-to-back; opening the
+// modal, the refresh button and post-merge rescans stay immediate.
+const REPO_AUTOPOLL_MS = 60000;
 const repoSects = new Map();// repo name -> section | {quiet:true}
 const repoMsgs = new Map(); // worktree path (or 'repo|<name>') ->
                             // {cls, html} - last merge attempt's
@@ -19406,7 +19413,7 @@ async function fetchRepos(fresh){
   try {
     const lst = await api('GET', '/api/repos', null, 15000);
     repoScan = {list: lst.repos||[], i:0, current:null,
-                fresh: !!fresh, running: true};
+                fresh: !!fresh, running: true, done: new Set()};
     if (!repoData) repoData = {generated_at:null, repos:[], quiet:[]};
     if (repoView) renderRepos();
     for (const it of repoScan.list){
@@ -19423,24 +19430,41 @@ async function fetchRepos(fresh){
           error: err.message||String(err)});
       }
       repoScan.i++;
+      repoScan.done.add(it.name);
       if (repoView) renderRepos();
     }
     repoScan = null;
-    // assemble: sections in scan order, quiet names folded out, then
-    // the same -pending/-worktree-count/name sort the one-shot payload
-    // used to apply server-side
-    const repos = [], quiet = [];
+    // assemble: a rescan keeps the order already on screen - sections
+    // update in place, quieted repos drop to the footnote, newly-active
+    // ones append. Re-sorting every pass would shuffle the list under
+    // the user's cursor. Only the FIRST assemble applies the
+    // -pending/-worktree-count/name sort the one-shot payload used.
+    const prevRepos = (repoData.repos)||[], prevQuiet = repoData.quiet||[];
+    const repos = [], quiet = [], placed = new Set();
+    const putQuiet = n => { if (!quiet.includes(n)) quiet.push(n); };
+    for (const r of prevRepos){
+      const s = repoSects.get(r.name);
+      if (!s) continue;
+      if (s.quiet) putQuiet(s.name);
+      else { repos.push(s); placed.add(s.name); }
+    }
+    for (const n of prevQuiet){
+      const s = repoSects.get(n);
+      if (s && s.quiet) putQuiet(n);
+    }
     for (const it of (lst.repos||[])){
+      if (placed.has(it.name)) continue;
       const s = repoSects.get(it.name);
       if (!s) continue;
-      if (s.quiet) quiet.push(s.name);
-      else repos.push(s);
+      if (s.quiet) putQuiet(s.name);
+      else { repos.push(s); placed.add(s.name); }
     }
-    repos.sort((a,b)=>
-      ((b.worktrees||[]).filter(w=>(w.ahead||0)>0).length -
-       (a.worktrees||[]).filter(w=>(w.ahead||0)>0).length) ||
-      ((b.worktrees||[]).length - (a.worktrees||[]).length) ||
-      String(a.name).localeCompare(String(b.name)));
+    if (!prevRepos.length)
+      repos.sort((a,b)=>
+        ((b.worktrees||[]).filter(w=>(w.ahead||0)>0).length -
+         (a.worktrees||[]).filter(w=>(w.ahead||0)>0).length) ||
+        ((b.worktrees||[]).length - (a.worktrees||[]).length) ||
+        String(a.name).localeCompare(String(b.name)));
     repoData = {generated_at:new Date().toISOString(),
                 repos, quiet};
     repoFetched = Date.now();
@@ -19504,38 +19528,57 @@ function reposHtml(d){
     `${repoBusy?' disabled':''}>refresh</button></div>`;
   if (d2.error)
     h += `<div class="notice error">${esc(d2.error)}</div>`;
-  // mid-scan the footnote lists only repos confirmed quiet THIS pass -
-  // the previous pass's quiet names are stale until their rescan lands
-  const quiet = (repoScan && repoScan.running)
-    ? [] : [].concat(d2.quiet||[]);
+  // no per-repo skeleton rows: the status line narrates the walk, and
+  // every queued name as a placeholder block is 16 rows of noise for a
+  // first scan. Mid-scan quiet bookkeeping: a prior-quiet name keeps
+  // its footnote spot until its rescan lands non-quiet; a landed quiet
+  // section (first pass or a repo that just went quiet) joins it.
+  const quiet = [];
+  const putQuiet = n => { if (!quiet.includes(n)) quiet.push(n); };
   let anySect = false;
   if (repoScan && repoScan.running){
-    // mid-scan: walk the watched list in order; a repo whose section
-    // landed renders it, a quiet hit defers to the footnote, anything
-    // else is a skeleton placeholder narrating the queue
-    for (const it of repoScan.list){
-      const s = repoSects.get(it.name);
-      if (s === undefined){
-        h += `<div class="repoblk"><h4>${esc(it.name)} ` +
-          `<span class="sub">${esc(it.path)}</span></h4>` +
-          `<div class="sub reposec">${it.name===repoScan.current
-            ? 'scanning&hellip;' : 'queued&hellip;'}</div></div>`;
-        anySect = true;
-        continue;
+    for (const n of (d2.quiet||[])){
+      const s = repoScan.done.has(n) ? repoSects.get(n) : null;
+      if (!s || s.quiet) putQuiet(n);
+    }
+    if (d2.repos && d2.repos.length){
+      // rescan: sections hold their on-screen positions and swap in the
+      // fresh copy as the walk passes them - no placeholders, no
+      // reshuffling under the user's cursor
+      const shown = new Set();
+      for (const r of d2.repos){
+        const s = repoSects.get(r.name) || r;
+        if (s.quiet){ putQuiet(s.name); continue; }
+        shown.add(r.name); anySect = true;
+        h += repoSectHtml(s);
       }
-      if (s.quiet){ if (!quiet.includes(s.name)) quiet.push(s.name);
-                    continue; }
-      anySect = true;
-      h += repoSectHtml(s);
+      // a repo that had no section before (quiet then, or newly
+      // watched) materializes at the end once its scan lands
+      for (const it of repoScan.list){
+        if (shown.has(it.name) || !repoScan.done.has(it.name)) continue;
+        const s = repoSects.get(it.name);
+        if (s && !s.quiet){ anySect = true; h += repoSectHtml(s); }
+      }
+    } else {
+      // first scan: sections materialize in watch order as they land
+      for (const it of repoScan.list){
+        const s = repoSects.get(it.name);
+        if (!s) continue;
+        if (s.quiet){ putQuiet(s.name); continue; }
+        anySect = true;
+        h += repoSectHtml(s);
+      }
     }
   } else {
     for (const r of d2.repos||[]){ anySect = true;
                                    h += repoSectHtml(r); }
+    for (const n of (d2.quiet||[])) putQuiet(n);
   }
   if (quiet.length)
     h += `<div class="sub" style="margin-top:14px">no linked ` +
       `worktrees: ${quiet.map(esc).join(', ')}</div>`;
-  if (!anySect && !quiet.length && !d2.error)
+  if (!anySect && !quiet.length && !d2.error &&
+      !(repoScan && repoScan.running))
     h += `<div class="notice">no watched git repos.</div>`;
   return h;
 }
@@ -19891,7 +19934,7 @@ function render(d){
     // same for the open repos modal - its own endpoint, own cadence:
     // a merge landing mid-look is exactly when the main payload sits still
     if (repoView && !document.getElementById('backdrop').hidden &&
-        Date.now()-repoFetched > 15000) fetchRepos();
+        Date.now()-repoFetched > REPO_AUTOPOLL_MS) fetchRepos();
     return;
   }
   lastSig = sig;
@@ -20466,11 +20509,12 @@ function render(d){
   // the pool modal is fully live: holder rows appear/leave as leases
   // land and the queued table fills - repaint it on every payload
   if (poolView && !document.getElementById('backdrop').hidden) renderPool();
-  // the repos modal pulls its own endpoint - every ~15s while open, so
-  // a merge landing mid-look repaints without a manual refresh (the
-  // server's 10s cache keeps the git calls cheap)
+  // the repos modal pulls its own endpoint - every ~60s while open, so
+  // a merge landing mid-look repaints without a manual refresh. The
+  // full walk is dozens of git spawns; modal merges rescan themselves
+  // via rescanRepo, so the poll only has to catch outside merges.
   if (repoView && !document.getElementById('backdrop').hidden &&
-      Date.now()-repoFetched > 15000) fetchRepos();
+      Date.now()-repoFetched > REPO_AUTOPOLL_MS) fetchRepos();
   // the open summary view isn't repainted on refresh - its document is
   // static - but the review marks it surfaces are live; re-decorate in
   // place so a click flips pill/link/strikethrough without a reopen

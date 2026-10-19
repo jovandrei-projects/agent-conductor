@@ -151,8 +151,10 @@ split per repo so it can narrate progress instead of blocking: `GET
 /api/repos` is the light name+path list (`repo_list`/`_repo_targets`),
 then the client walks `GET /api/repos/<name>` (`repo_one`, 10s-cached
 per repo) one at a time - the status line reads `scanning <name> ·
-i of n`, not-yet-scanned repos render queued/scanning placeholders,
-and a `{quiet: true}` answer folds into the footnote. A one-shot
+i of n` and sections materialize as they land (no per-repo
+placeholders; on a rescan each keeps its on-screen position and swaps
+in its fresh copy, so the list never reshuffles mid-look), and a
+`{quiet: true}` answer folds into the footnote. A one-shot
 whole-set scan stays available as `repo_status`/`_repo_status` for the
 Ask-AI provider; a single `/api/repos` fetch used to time out under
 the 30s AbortSignal across ~14 repos ('signal timed out'), which is
@@ -178,8 +180,11 @@ overrides the default base for that row's counts. `state_found` says
 whether a state.json actually backed the link (merge routing requires
 it; the name-only display link doesn't). Rows link through to the run
 modal. Repos with no linked worktrees collapse to a `no linked
-worktrees:` footnote line; an open modal refetches on a ~15s cadence
-and each section's base-log fold survives repaints.
+worktrees:` footnote line; an open modal refetches on a ~60s cadence
+(`REPO_AUTOPOLL_MS` - a full walk is dozens of git spawns, and modal
+merges rescan themselves anyway) and each section's base-log fold
+survives repaints. The first assemble sorts sections by pending
+count; later passes preserve the displayed order.
 
 Merge from the modal: every pending row (ahead>0, real branch, not
 prunable/mid-merge) gets a `merge` link, and a repo with pending rows

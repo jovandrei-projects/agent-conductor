@@ -7886,6 +7886,79 @@ assert.equal(f.worktrees,true);
         self.assertEqual(p.returncode, 0, p.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_repos_modal_stable_order_no_skeletons(self):
+        """Repos modal: a scan narrates via the status line only - no
+        per-repo queued/scanning placeholder blocks; sections materialize
+        as they land, and a rescan updates them in place instead of
+        re-sorting under the user."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',value:'',checked:false,disabled:false,title:'',
+  dataset:{},classList:{add(){},remove(){},toggle(){}}});
+  return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,fn)=>{handlers[ev]=fn;}};
+const sect=(name,nw)=>({name,path:'/p/'+name,base:'main',
+  base_log:[{sha:'head'+name,subject:name+' head',at:'2026-01-01'}],
+  worktrees:Array.from({length:nw},(_,i)=>({path:'/p/'+name+'/w'+i,
+    branch:'feat-'+name+'-'+i,ahead:1,behind:0,detached:false,
+    prunable:false,dirty:false,merging:false,
+    commits:[{sha:'c'+name+i,subject:'wip',at:'2026-01-01'}],
+    conductor:null,base:'main'}))});
+const quiet={name:'c',path:'/p/c',quiet:true};
+let pass=0;
+const PASSES=[{a:sect('a',1),b:sect('b',2),c:quiet},
+              {a:sect('a',3),b:sect('b',1),c:quiet}];
+const snaps=[];
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},
+  fetch:async(path,opt)=>{
+    const p=String(path).split('?')[0];
+    if(p==='/api/repos') return {ok:true,json:async()=>({generated_at:'t',
+      repos:['a','b','c'].map(n=>({name:n,path:'/p/'+n}))})};
+    const m=p.match(/^\/api\/repos\/(.+)$/);
+    if(m){ snaps.push(elem('dbody').innerHTML);
+      return {ok:true,json:async()=>PASSES[pass][decodeURIComponent(m[1])]}; }
+    return {ok:true,json:async()=>({})};
+  },
+  confirm:()=>true,alert:()=>{}});
+vm.runInContext(src,ctx);
+const run=async()=>{
+  vm.runInContext('repoView=true',ctx);
+  await vm.runInContext('fetchRepos()',ctx);
+  // first pass sorts by pending-worktree count: b(2) before a(1); c quiet
+  let order=vm.runInContext('repoData.repos.map(r=>r.name).join(",")',ctx);
+  assert.equal(order,'b,a');
+  assert.equal(vm.runInContext('repoData.quiet.join(",")',ctx),'c');
+  // every mid-scan paint: the status line narrates, never skeleton rows
+  assert.equal(snaps.length,3);
+  for(const h of snaps){
+    assert.ok(!/queued&hellip;/.test(h),'queued placeholder painted');
+    assert.ok(!/class="sub reposec"/.test(h),'scanning skeleton painted');
+  }
+  // rescan with the pending counts flipped - the on-screen order must
+  // NOT re-sort, but the fresh section data still lands
+  pass=1; snaps.length=0;
+  await vm.runInContext('fetchRepos()',ctx);
+  order=vm.runInContext('repoData.repos.map(r=>r.name).join(",")',ctx);
+  assert.equal(order,'b,a','a rescan must keep the on-screen order');
+  assert.equal(vm.runInContext(
+    'repoData.repos.find(r=>r.name==="a").worktrees.length',ctx),3);
+};
+run().then(()=>process.exit(0),e=>{console.error(e);process.exit(1)});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_pending_panel_selective_merge(self):
         """Run details list pending merges per project with verify +
         alternative state; ticking alternatives is exclusive; the merge
