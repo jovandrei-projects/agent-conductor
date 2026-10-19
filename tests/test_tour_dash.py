@@ -175,7 +175,7 @@ assert.ok(!fetches.some(u=>u.includes('/api/tour')));   // badge never GETs the 
   await open();
   assert.equal(elem('tourwrap').hidden,false);
   const h=card();
-  assert.match(h,/Update 1 of 2/);
+  assert.match(h,/Tool updates<\/span> · card 1 of 2/);
   assert.match(h,/Dashboard power/);
   assert.match(h,/Power &lt;img src=x&gt;/);          // escaped, not markup
   assert.doesNotMatch(h,/<img src=x>/);
@@ -237,11 +237,11 @@ assert.ok(!fetches.some(u=>u.includes('/api/tour')));   // badge never GETs the 
   vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
   queue.push({ok:true,json:async()=>FEED});
   await open();
-  // failed persist: stay on Update 1, error shown, nothing marked
+  // failed persist: stay on the same card, error shown, nothing marked
   queue.push({ok:false,json:async()=>({error:'db locked'})});
   await click(act('mark'));
   assert.match(card(),/Mark viewed failed: db locked/);
-  assert.match(card(),/Update 1 of 2/);
+  assert.match(card(),/card 1 of 2/);
   assert.equal(posts.length,1);
   // success: badge repaints from unseen_count, deck advances
   queue.push({ok:true,json:async()=>({id:'x',state:'viewed',changed:true,
@@ -251,7 +251,7 @@ assert.ok(!fetches.some(u=>u.includes('/api/tour')));   // badge never GETs the 
   assert.equal(elem('tour-badge').textContent,'1');
   // the marked card leaves the deck - '1 of 1' counts what is left,
   // never a card already seen
-  assert.match(card(),/Update 1 of 1/);
+  assert.match(card(),/card 1 of 1/);
   assert.match(card(),/Mixed bag/);
   // the viewed card joined the viewed section
   assert.match(card(),/viewed earlier \(2\)/);
@@ -285,7 +285,7 @@ assert.ok(!fetches.some(u=>u.includes('/api/tour')));   // badge never GETs the 
   await click(act('mark'));
   assert.equal(fetches.filter(u=>u==='/api/tour').length,2); // open+resync
   assert.match(card(),/Mark viewed failed: unknown tour entry/);
-  assert.match(card(),/Update 1 of 1/);              // resynced deck
+  assert.match(card(),/card 1 of 1/);              // resynced deck
   assert.match(card(),/Mixed bag/);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 ''')
@@ -347,7 +347,7 @@ assert.ok(!fetches.some(u=>u.includes('/api/tour')));   // badge never GETs the 
   await click({id:'dx',dataset:{},closest:()=>null});  // close modal
   assert.equal(elem('backdrop').hidden,true);
   assert.equal(elem('tourwrap').classList.contains('suspended'),false);
-  assert.match(card(),/Update 1 of 2/);                // same card resumes
+  assert.match(card(),/card 1 of 2/);                // same card resumes
   // request chip -> openRequest (GETs the record, modal suspends too)
   queue.push({ok:true,json:async()=>({id:'req1',status:'ready',
     label:'req one',manifest_text:'[run]',proposed_steps:[]})});
@@ -361,7 +361,7 @@ assert.ok(!fetches.some(u=>u.includes('/api/tour')));   // badge never GETs the 
   await key('Escape');
   assert.equal(elem('backdrop').hidden,true);
   assert.equal(elem('tourwrap').hidden,false);
-  assert.match(card(),/Update 1 of 2/);
+  assert.match(card(),/card 1 of 2/);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 ''')
 
@@ -383,7 +383,7 @@ assert.ok(!fetches.some(u=>u.includes('/api/tour')));   // badge never GETs the 
   assert.match(card(),/data-tour="unview"/);
   assert.match(card(),/data-tour="back"/);
   await click(act('back'));
-  assert.match(card(),/Update 1 of 2/);
+  assert.match(card(),/card 1 of 2/);
   // unview: POST -> fresh count -> feed re-pulled -> entry in the deck
   await click(act('hist',{hi:'0'}));
   queue.push({ok:true,json:async()=>({id:'h',state:'new',changed:true,
@@ -396,7 +396,7 @@ assert.ok(!fetches.some(u=>u.includes('/api/tour')));   // badge never GETs the 
   assert.deepEqual(posts.map(p=>p.url),
     ['/api/tour/area%3Atour%3Afff000aaa111/unview']);
   assert.equal(elem('tour-badge').textContent,'3');
-  assert.match(card(),/Update 1 of 3/);
+  assert.match(card(),/card 1 of 3/);
   assert.match(card(),/Tour added/);
   assert.match(card(),/Mark viewed/);
 })().catch(e=>{console.error(e);process.exitCode=1;});
@@ -437,12 +437,141 @@ assert.ok(!fetches.some(u=>u.includes('/api/tour')));   // badge never GETs the 
   queue.push({ok:true,json:async()=>f});
   await open();
   await click(act('next'));
-  assert.match(card(),/Update 2 of 2/);
+  assert.match(card(),/card 2 of 2/);
   assert.match(card(),/deferred earlier/);
   assert.match(card(),/Mark viewed/);                 // still acknowledgeable
   await click(act('prev'));
-  assert.match(card(),/Update 1 of 2/);
+  assert.match(card(),/card 1 of 2/);
   assert.equal(posts.length,0);                        // browsing never POSTs
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    # a mixed feed: one tool-update + two work-digest cards, deliberately
+    # out of section order and with the run event NEWER than the change
+    _SPLIT = r'''
+const FEED2={generated_at:'g1',boundary:{commit:'b',at:'t'},range:{},
+  unseen_count:3,warnings:[],
+  entries:[
+    {id:'run:2026-r1:2026-10-18T01:00',kind:'run',section:'work',
+     section_title:'Work digest',stop:'runs',stop_title:'Runs',
+     title:'Run finished: job one',blurb:'desc',tag:'done',
+     outcome:'done',anchor:'#runs',
+     commits:[],runs:['request:req1'],requests:['req1'],
+     completed_at:'2026-10-18T01:00:00',proposed_at:'2026-10-17T20:00:00',
+     steps_done:2,steps_total:3,unreviewed:2,
+     at:'2026-10-18T01:00:00',range:{},state:'new'},
+    {id:'area:power:ccc333ddd444',kind:'change',section:'tool',
+     section_title:'Tool updates',stop:'power',
+     stop_title:'Dashboard power',title:'Power polish',blurb:'b',
+     tag:'improved',anchor:'#power-btn',commits:[],runs:[],requests:[],
+     at:'2026-10-17T01:00:00',range:{},state:'new'},
+    {id:'request:req9',kind:'request',section:'work',
+     section_title:'Work digest',stop:'requests',
+     stop_title:'Proposals & requests',title:'New proposal: nine',
+     blurb:'d',tag:'ready',anchor:'#runs',commits:[],requests:['req9'],
+     runs:['request:req1'],at:'2026-10-17T05:00:00',
+     proposed_at:'2026-10-17T05:00:00',range:{},state:'new'}],
+  history:[]};
+'''
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_split_sections_and_work_card_chrome(self):
+        """The deck walks Tool updates first, then the Work digest,
+        regardless of interleaved timestamps; each header names its
+        section + per-section position and the card edge takes the
+        section accent. Work cards paint the filled record-event tag
+        (the run's real outcome), the proposed/finished/steps meta, and
+        the unreviewed-count chip into the run modal; a run card shows
+        ONLY its run chip while a request card adds its own Request chip
+        beside the launched Run chip - each labelled by its own record."""
+        self._node(self._SPLIT + r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  queue.push({ok:true,json:async()=>FEED2});
+  await open();
+  // tool updates first even though the run event is newer
+  let h=card();
+  assert.match(h,/Tool updates<\/span> · card 1 of 1/);
+  assert.match(h,/Power polish/);
+  assert.equal(elem('tourcard').classList.contains('sec-tool'),true);
+  assert.match(h,/class="ttag"[^>]*>improved</);       // outline change tag
+  assert.doesNotMatch(h,/ttag ev/);
+  // -> Work digest card 1: the finished run
+  await click(act('next'));
+  h=card();
+  assert.match(h,/Work digest<\/span> · card 1 of 2/);
+  assert.match(h,/Run finished: job one/);
+  assert.equal(elem('tourcard').classList.contains('sec-work'),true);
+  assert.equal(elem('tourcard').classList.contains('sec-tool'),false);
+  // event tag: filled (.ev), the actual outcome word
+  assert.match(h,/class="ttag ev"[^>]*>done</);
+  assert.match(h,/title="run outcome - a record event"/);
+  // meta line: proposed + finished + steps
+  assert.match(h,/proposed [^<]* · finished [^<]* · 2\/3 steps done/);
+  // unreviewed chip -> run modal; never a mark-viewed substitute
+  assert.match(h,/class="chip trev" data-run-details="request:req1"/);
+  assert.match(h,/>2 unreviewed</);
+  // run card shows ONLY the run chip - no request chip link
+  assert.match(h,/data-run-details="request:req1"/);
+  assert.doesNotMatch(h,/data-open-request/);
+  // -> Work digest card 2: the request with a launched run - both chips,
+  //   explicitly labelled, each its own identity
+  await click(act('next'));
+  h=card();
+  assert.match(h,/Work digest<\/span> · card 2 of 2/);
+  assert.match(h,/class="ttag ev"[^>]*>ready</);
+  assert.match(h,/<b class="relk">Request<\/b> req9</);   // own id, not run name
+  assert.match(h,/<b class="relk">Run<\/b> req one</);    // the run's name
+  assert.match(h,/data-open-request="req9"/);
+  assert.match(h,/data-run-details="request:req1"/);
+  assert.doesNotMatch(h,/unreviewed/);                    // no count on requests
+  // a request chip opens the REQUEST modal, never the run's
+  queue.push({ok:true,json:async()=>({id:'req9',status:'ready',
+    label:'nine',manifest_text:'[run]',proposed_steps:[]})});
+  const reqChip=ds=>({id:'',dataset:{},closest:s=>
+    s==='[data-open-request]'?{dataset:{openRequest:ds}}:null});
+  await click(reqChip('req9'));
+  assert.ok(fetches.some(u=>u==='/api/requests/req9'));
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_empty_section_and_deferred_count_no_reinsert(self):
+        """A feed with only one populated section walks it cleanly - no
+        blank card, no broken nav. A mark whose response carries a
+        deferred (null) unseen_count leaves the badge on its last-known
+        value, and a re-pulled feed that still contains the acknowledged
+        card never reinserts it."""
+        self._node(self._SPLIT + r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  const onlyWork=Object.assign({},FEED2,
+    {entries:[FEED2.entries[0]],unseen_count:1});
+  queue.push({ok:true,json:async()=>onlyWork});
+  await open();
+  let h=card();
+  assert.match(h,/Work digest<\/span> · card 1 of 1/);
+  assert.doesNotMatch(h,/Tool updates/);
+  await click(act('next'));            // nav can't run off the section
+  assert.match(card(),/card 1 of 1/);
+  // mark viewed with a DEFERRED count: badge keeps the last-known '2',
+  // the card still leaves the deck (acknowledgment is local truth)
+  queue.push({ok:true,json:async()=>({id:'x',state:'viewed',changed:true,
+    unseen_count:null})});
+  await click(act('mark'));
+  assert.equal(elem('tour-badge').textContent,'2');    // no flicker-to-0
+  assert.match(card(),/All caught up/);
+  // a re-pull serves a STALE feed still listing the acked card - the
+  // session acked-set keeps it out of the deck (the card header would
+  // carry a section name; the caught-up view has none)
+  queue.push({ok:true,json:async()=>onlyWork});
+  await click(act('retry'));
+  h=card();
+  assert.match(h,/<h3 id="tourcard-title">All caught up<\/h3>/);
+  assert.doesNotMatch(h,/class="tpos"/);               // no card dealt
+  // and the acknowledged card stays reachable through viewed history
+  assert.match(h,/viewed earlier \(1\)/);
+  assert.match(h,/Run finished: job one/);             // listed, not dealt
 })().catch(e=>{console.error(e);process.exitCode=1;});
 ''')
 
