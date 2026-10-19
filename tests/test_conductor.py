@@ -1944,11 +1944,221 @@ assert.match(html,/data-run-details="20261019-010000-fakerun"/);
 assert.match(html,/merge in progress/);
 assert.match(html,/no linked worktrees: quietproj, money-plan/);
 assert.match(html,/data-repo-refresh/);
+assert.match(html,/data-merge-all/);            // repo has pending rows
+assert.match(html,/data-wtmerge/);              // per-row merge buttons
+assert.match(html,/data-branch="feat"/);
+// feat + the bookkeeping-lie conductor row are mergeable; the
+// mid-merge row and the up-to-date/stale/detached ones are not
+assert.match(html,/merge 2 pending/);
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
-                           capture_output=True, text=True, encoding="utf-8",
+                           capture_output=True, text=True, encoding='utf-8',
                            timeout=10)
         self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_repo_merge_lands_foreign_worktree(self):
+        """A worktree no run claims (a Devin-Desktop/session checkout)
+        merges mechanically into the main checkout under the repo lock -
+        the branch and the worktree are deliberately left in place."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = base / "proj"
+            repo.mkdir()
+            git(repo, "init")
+            (repo / "f.txt").write_text("0\n", encoding="utf-8")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "init")
+            wt = base / "wt-feat"
+            git(repo, "worktree", "add", str(wt), "-b", "feat")
+            (wt / "feat.txt").write_text("x\n", encoding="utf-8")
+            git(wt, "add", "-A")
+            git(wt, "commit", "-m", "feature work")
+
+            out = conductor.repo_merge(
+                {"path": str(repo), "worktree": str(wt),
+                 "branch": "feat"},
+                base / "data" / "runs", ["devin"],
+                projects={"proj": {"path": repo}})
+            self.assertTrue(out["result"]["merged"])
+            # the commit really is an ancestor of the base branch now
+            self.assertEqual(git(repo, "merge-base", "--is-ancestor",
+                                 "feat", "HEAD").returncode, 0)
+            self.assertTrue((repo / "feat.txt").is_file())
+            # nothing pruned - the session that owns the worktree may
+            # still be live
+            self.assertTrue(wt.is_dir())
+            self.assertTrue(conductor.local_branch_exists(repo, "feat"))
+            # a second merge is a clean no-op, not an error
+            out2 = conductor.repo_merge(
+                {"path": str(repo), "worktree": str(wt),
+                 "branch": "feat"},
+                base / "data" / "runs", ["devin"],
+                projects={"proj": {"path": repo}})
+            self.assertIn("nothing to merge", out2["result"]["skipped"])
+
+    def test_repo_merge_conflict_reports_and_preserves(self):
+        """A genuinely conflicting branch aborts back to a clean main
+        checkout, reports the conflicted paths, and keeps both the
+        worktree and the branch for whoever resolves it."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = base / "proj"
+            repo.mkdir()
+            git(repo, "init")
+            (repo / "a.txt").write_text("base\n", encoding="utf-8")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "init")
+            wt = base / "wt-conf"
+            git(repo, "worktree", "add", str(wt), "-b", "conf")
+            (wt / "a.txt").write_text("branch version\n",
+                                      encoding="utf-8")
+            git(wt, "add", "-A")
+            git(wt, "commit", "-m", "branch edit")
+            (repo / "a.txt").write_text("main version\n",
+                                        encoding="utf-8")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "main edit")
+
+            out = conductor.repo_merge(
+                {"path": str(repo), "worktree": str(wt),
+                 "branch": "conf"},
+                base / "data" / "runs", ["devin"],
+                projects={"proj": {"path": repo}})
+            res = out["result"]
+            self.assertEqual(res["conflict"], ["a.txt"])
+            # aborted cleanly: no MERGE_HEAD, main edit still there
+            self.assertFalse(conductor.merge_in_progress(repo))
+            self.assertEqual((repo / "a.txt").read_text().strip(),
+                             "main version")
+            self.assertTrue(conductor.local_branch_exists(repo, "conf"))
+
+    def test_repo_merge_dirty_main_and_guards(self):
+        """The mechanical path refuses a dirty main checkout, an
+        unwatched repo path, a stale worktree row and a branch moved
+        since the row was fetched."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = base / "proj"
+            repo.mkdir()
+            git(repo, "init")
+            (repo / "f.txt").write_text("0\n", encoding="utf-8")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "init")
+            wt = base / "wt-feat"
+            git(repo, "worktree", "add", str(wt), "-b", "feat")
+            (wt / "n.txt").write_text("n\n", encoding="utf-8")
+            git(wt, "add", "-A")
+            git(wt, "commit", "-m", "work")
+            runs = base / "data" / "runs"
+            projs = {"proj": {"path": repo}}
+
+            # unwatched path -> 404
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.repo_merge(
+                    {"path": str(base / "elsewhere"),
+                     "worktree": str(wt), "branch": "feat"},
+                    runs, ["devin"], projects=projs)
+            self.assertEqual(e.exception.status, 404)
+            # stale worktree row -> 404
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.repo_merge(
+                    {"path": str(repo), "worktree": str(base / "nope"),
+                     "branch": "feat"}, runs, ["devin"],
+                    projects=projs)
+            self.assertEqual(e.exception.status, 404)
+            # the worktree moved branches since the row rendered -> 409
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.repo_merge(
+                    {"path": str(repo), "worktree": str(wt),
+                     "branch": "other"}, runs, ["devin"],
+                    projects=projs)
+            self.assertEqual(e.exception.status, 409)
+            # a dirty main checkout refuses rather than sweeping the
+            # user's uncommitted work into a merge
+            (repo / "f.txt").write_text("dirty\n", encoding="utf-8")
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.repo_merge(
+                    {"path": str(repo), "worktree": str(wt),
+                     "branch": "feat"}, runs, ["devin"],
+                    projects=projs)
+            self.assertEqual(e.exception.status, 409)
+            self.assertIn("uncommitted", str(e.exception))
+
+    def test_repo_merge_routes_conductor_worktree(self):
+        """A data/worktrees/<run>/<step> path with a state.json step
+        record never takes the mechanical path - it hands off to the
+        run's own merge pipeline (which then keeps merged/merged_at
+        bookkeeping authoritative). Here the run has no manifest, so
+        the pipeline refuses - and the refusal proves the route."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = base / "proj"
+            repo.mkdir()
+            git(repo, "init")
+            (repo / "f.txt").write_text("0\n", encoding="utf-8")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "init")
+            wt = (base / "data" / "worktrees"
+                  / "20261019-010000-fakerun" / "s1")
+            git(repo, "worktree", "add", str(wt), "-b",
+                "conductor/20261019-010000-fakerun/s1")
+            (wt / "s.txt").write_text("s\n", encoding="utf-8")
+            git(wt, "add", "-A")
+            git(wt, "commit", "-m", "step work")
+            runs = base / "data" / "runs"
+            rd = runs / "20261019-010000-fakerun"
+            rd.mkdir(parents=True)
+            (rd / "state.json").write_text(json.dumps(
+                {"steps": {"s1": {
+                    "branch": "conductor/20261019-010000-fakerun/s1",
+                    "status": "done"}}}), encoding="utf-8")
+
+            # the run pipeline refuses (its manifest is gone) - and that
+            # refusal itself proves the row routed to merge_run_start
+            # instead of taking the mechanical git-merge path
+            with self.assertRaises(conductor.RequestError) as e:
+                conductor.repo_merge(
+                    {"path": str(repo), "worktree": str(wt),
+                     "branch": "conductor/20261019-010000-fakerun/s1"},
+                    runs, ["devin"], projects={"proj": {"path": repo}})
+            self.assertIn("manifest", str(e.exception))
+            # nothing got mechanically merged behind the pipeline's back
+            self.assertNotEqual(git(repo, "merge-base", "--is-ancestor",
+                                    "conductor/20261019-010000-fakerun/s1",
+                                    "HEAD").returncode, 0)
+
+    def test_repo_merge_agent_writes_draft_request(self):
+        """'send to an agent' is a draft request carrying the merge's
+        facts - branch, base, conflict files - for the user to review
+        and launch; nothing spawns itself."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = base / "proj"
+            repo.mkdir()
+            git(repo, "init")
+            (repo / "f.txt").write_text("0\n", encoding="utf-8")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "init")
+            wt = base / "wt-feat"
+            git(repo, "worktree", "add", str(wt), "-b", "feat")
+            (wt / "n.txt").write_text("n\n", encoding="utf-8")
+            git(wt, "add", "-A")
+            git(wt, "commit", "-m", "work")
+            reqs = base / "data" / "requests"
+            with mock.patch.object(
+                    conductor, "load_projects",
+                    return_value={"proj": {"path": repo}}):
+                out = conductor.repo_merge_agent(
+                    {"path": str(repo), "worktree": str(wt),
+                     "branch": "feat", "files": ["a.txt", "b.txt"]},
+                    reqs, base / "data" / "runs",
+                    projects={"proj": {"path": repo}})
+            rec = conductor._read_request(out["id"], reqs)
+            self.assertEqual(rec["status"], "draft")
+            self.assertIn("feat", rec["raw"])
+            self.assertIn("a.txt", rec["raw"])
+            self.assertIn("do NOT delete", rec["raw"])
+            self.assertEqual(rec["project"], "proj")
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_pool_ui_tracks_leases_between_identical_payloads(self):

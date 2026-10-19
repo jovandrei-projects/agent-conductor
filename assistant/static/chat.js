@@ -26,8 +26,11 @@
  *
  * Host bridge (provided by the dashboard's inline script):
  *   window.aiView() -> {detailKey, summaryView, runModalKey,
- *     modalRequest, modalQA, pool, trash, power, only, facets, projs,
- *     selectedRun, agents}
+ *     modalRequest, modalQA, pool, repo, trash, tour, tourCur, power,
+ *     only, facets, projs, selectedRun, agents}
+ *   A throwing/absent aiView must never silently read as 'dashboard' -
+ *   liveCtx reports the failure via ctxWarn and syncView surfaces it
+ *   on the about chip ('!') plus a dismissible note.
  *   window.aiNav = {agent(key), run(key), summary(key),
  *     runSummary(key), request(id)}
  *   window.aiSync is installed HERE and called by the host's applySel
@@ -224,14 +227,35 @@ function findAgent(akey) {
    liveCtx() is whatever is on screen right now; curCtx() is the
    pin-aware variant - a conversation pinned to a view keeps answering
    against it after the screen moves on. */
+var ctxWarn = '';
 function liveCtx() {
-  var v = (window.aiView ? window.aiView() : {}) || {};
+  var v = {};
+  ctxWarn = '';
+  if (window.aiView) {
+    try {
+      v = window.aiView() || {};
+    } catch (e) {
+      ctxWarn = 'reading the open view failed (' +
+        ((e && e.message) || e) + ') - context fell back to dashboard';
+    }
+  } else {
+    ctxWarn = 'the page did not report an open view - ' +
+      'context fell back to dashboard';
+  }
   var view = 'dashboard', refs = {};
-  /* precedence mirrors z-order: overlays (power, planner questions,
-     the request form) report above whatever detail modal sits under
-     them; inside #detail the request view and summary/detail views
-     are mutually exclusive so their order is by convention only. */
-  if (v.power) {
+  /* precedence mirrors z-order: overlays (the tour card, power, planner
+     questions, the request form) report above whatever detail modal
+     sits under them; inside #detail the request view and
+     summary/detail views are mutually exclusive so their order is by
+     convention only. */
+  if (v.tour) {
+    view = 'tour';
+    var cur = v.tourCur;
+    if (cur) {
+      if (cur.id) refs.entry_id = cur.id;
+      if (cur.title) refs.title = cur.title;
+    }
+  } else if (v.power) {
     view = 'power';
   } else if (v.modalQA && v.modalQA.id) {
     view = 'questions';
@@ -271,6 +295,8 @@ function liveCtx() {
     refs.run_key = v.runModalKey;
   } else if (v.pool) {
     view = 'pool';
+  } else if (v.repo) {
+    view = 'repos';
   } else if (v.trash) {
     view = 'trash';
   }
@@ -315,9 +341,13 @@ function ctxLabel(env) {
       return 'request ' + (r.request_id || '(new)');
     case 'questions': return 'planner questions';
     case 'pool': return 'agent pool';
+    case 'repos': return 'repositories';
     case 'trash': return 'trash';
     case 'power': return 'power dialog';
-    default: return 'dashboard';
+    case 'tour': return 'what\'s new';
+    /* an unknown slug must NOT pretend to be the dashboard - show the
+       raw view name so a missed mapping is visible, not silent */
+    default: return v === 'dashboard' ? 'dashboard' : 'view: ' + v;
   }
 }
 
@@ -388,9 +418,24 @@ function syncView() {
   if (chip) {
     /* keep textContent live in both modes: pinned or not, the frozen
        chip and the select's pinned option label share this label */
-    chip.textContent = 'about: ' + ctxLabel(env);
-    chip.title = 'the next question is answered against this view';
+    chip.textContent = 'about: ' + ctxLabel(env) + (ctxWarn ? ' !' : '');
+    chip.title = ctxWarn || 'the next question is answered against this view';
     chip.hidden = !!(fresh && sel);
+  }
+  /* a failed/absent view snapshot must be loud, not a silent dashboard
+     fallback: the chip gets a '!' and a dismissible warning lands once
+     per distinct message. The _ctxwarn tag on the note element marks
+     ours - another feature's note is never clobbered, and ours clears
+     itself when the view reads again */
+  if (ctxWarn !== S.ctxWarnShown) {
+    var nEl = byId('ai-note');
+    var free = !nEl || nEl.hidden || nEl._ctxwarn;
+    if (nEl && nEl._ctxwarn) { note(''); nEl._ctxwarn = false; }
+    S.ctxWarnShown = ctxWarn;
+    if (ctxWarn && free && nEl) {
+      note('context: ' + ctxWarn, false);
+      nEl._ctxwarn = true;
+    }
   }
   if (!sel) return;
   sel.hidden = !fresh;

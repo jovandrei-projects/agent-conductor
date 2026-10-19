@@ -5260,22 +5260,41 @@ def _git_commit_rows(repo_dir: Path, rev: str,
     return out
 
 
+def _wt_data_parts(wpath: Path) -> tuple[Path, str, str] | None:
+    """(runs_dir, run, step_part) when `wpath` is exactly
+    <root>/data/worktrees/<run>/<step> - derived from the path itself,
+    so a step worktree created by a driver on the MAIN checkout's data
+    dir links to its run state even when this serve runs inside a
+    worktree with its own data/ tree. None for any other layout."""
+    parts = wpath.parts
+    if len(parts) >= 4 and parts[-4] == "data" \
+            and parts[-3] == "worktrees":
+        return Path(*parts[:-3]) / "runs", parts[-2], parts[-1]
+    return None
+
+
 def _wt_conductor_link(runs_dir: Path, run_name: str,
                        step_part: str) -> dict | None:
     """state.json cross-check for a data/worktrees/<run>/<step> path
     (a trailing .merge is the step's merge-staging worktree): the run +
-    step it belongs to and the recorded merge bookkeeping - None when no
-    state.json matches, so a hand-made dir never pretends provenance."""
+    step it belongs to and the recorded merge bookkeeping. The link
+    names by path shape alone when no state.json matches - `state_found`
+    says whether the run's record actually backed it up (merge routing
+    requires it; display doesn't)."""
     staging = step_part.endswith(".merge")
     step = step_part[:-len(".merge")] if staging else step_part
     rec: dict = {}
+    found = False
     try:
         st = json.loads((runs_dir / run_name / "state.json")
                         .read_text(encoding="utf-8"))
         rec = (st.get("steps") or {}).get(step) or {}
+        found = True
     except (OSError, ValueError):
         pass
     return {"run": run_name, "step": step, "merge_staging": staging,
+            "state_found": found,
+            "branch": rec.get("branch"),
             "merged_recorded": rec.get("merged") is True,
             "merged_at": rec.get("merged_at"),
             "merge_target": rec.get("merge_target")}
@@ -5286,10 +5305,6 @@ def _repo_status(projects: dict[str, dict],
     """One section per watched repo - every configured project plus this
     repo - dedup'd by resolved path. Repos with no linked worktrees land
     in `quiet` so the modal keeps them to a footnote line."""
-    try:
-        wt_root = (runs_dir.parent / "worktrees").resolve()
-    except OSError:
-        wt_root = runs_dir.parent / "worktrees"
     seen: set[str] = set()
     repos, quiet = [], []
     cands = [("this repo (agent-conductor)", ROOT)] + [
@@ -5327,18 +5342,9 @@ def _repo_status(projects: dict[str, dict],
                    "prunable": w["prunable"], "dirty": False,
                    "merging": False, "ahead": None, "behind": None,
                    "commits": [], "conductor": None, "base": base}
-            rel_parts: tuple = ()
-            try:
-                rel = os.path.relpath(str(wpath.resolve()),
-                                      str(wt_root))
-                parts = Path(rel).parts
-                if parts and parts[0] != "..":
-                    rel_parts = parts
-            except (OSError, ValueError):
-                pass
-            if len(rel_parts) >= 2:
-                row["conductor"] = _wt_conductor_link(
-                    runs_dir, rel_parts[0], rel_parts[1])
+            link = _wt_data_parts(wpath)
+            if link is not None:
+                row["conductor"] = _wt_conductor_link(*link)
                 tgt = row["conductor"].get("merge_target")
                 if tgt and local_branch_exists(pdir, tgt):
                     # an explicit merge_target beats the default base -
@@ -5396,6 +5402,220 @@ def repo_status(runs_dir: Path, projects: dict | None = None,
         _REPO_STATUS_CACHE["at"] = now
         _REPO_STATUS_CACHE["payload"] = payload
         return payload
+
+
+def _repo_watched(path_str, projects: dict) -> tuple:
+    """Resolve a client-sent repo path against the watched set /api/repos
+    reports (this repo + every configured project). Returns
+    (label-or-slug, resolved Path); anything else is refused so the merge
+    endpoints can never operate on an arbitrary directory."""
+    raw = str(path_str or "").strip()
+    try:
+        want = Path(raw).resolve() if raw else None
+    except (OSError, TypeError):
+        want = None
+    if want is None:
+        raise RequestError("not a watched repository", 404)
+    key = os.path.normcase(str(want))
+    for name, pdir in [("this repo (agent-conductor)", ROOT)] + [
+            (slug, ent["path"]) for slug, ent in projects.items()]:
+        try:
+            if os.path.normcase(str(Path(pdir).resolve())) == key:
+                return name, want
+        except (OSError, TypeError):
+            continue
+    raise RequestError("not a watched repository", 404)
+
+
+def _repo_merge_base(rows: list) -> tuple:
+    """(main checkout path, its branch) - merges land on the MAIN
+    worktree, never in whichever worktree path keyed the repo."""
+    main = Path(rows[0]["path"])
+    base = rows[0]["branch"]
+    if not base:
+        raise RequestError(
+            "the main checkout is on a detached HEAD - nothing to "
+            "merge into", 409)
+    return main, base
+
+
+def _repo_merge_wt(repo: Path, main: Path, base: str, wrow: dict,
+                   devin_argv) -> dict:
+    """One worktree row -> one merge outcome dict.
+
+    A conductor step worktree (data/worktrees/<run>/<step> backed by a
+    state.json step record) lands through merge_run_start - the run's
+    own pipeline keeps merged/merged_at/events authoritative rather
+    than a side-channel git merge the record never hears about. Every
+    other worktree (Devin-Desktop/session checkouts, hand-made ones)
+    gets a plain `git merge --no-edit` in the main checkout under the
+    repo merge lock; a conflict aborts and reports its files. Nothing
+    is deleted either way - the worktree and branch stay put."""
+    branch = wrow.get("branch")
+    out = {"worktree": wrow["path"], "branch": branch}
+    if wrow.get("prunable"):
+        out["skipped"] = ("its directory is gone - `git worktree "
+                          "prune` clears the registration")
+        return out
+    if wrow.get("detached") or not branch:
+        out["skipped"] = "detached HEAD - no branch to merge"
+        return out
+    if branch == base:
+        out["skipped"] = f"{branch} IS the base branch"
+        return out
+    link = _wt_data_parts(Path(wrow["path"]))
+    if link is not None:
+        lruns, lrun, lstep = link
+        lk = _wt_conductor_link(lruns, lrun, lstep)
+        if lk.get("merge_staging"):
+            out["skipped"] = ("a merge staging dir - the run's own "
+                              "merge pipeline owns it")
+            return out
+        if lk.get("state_found") and lk.get("branch") == branch \
+                and not lk.get("merged_recorded"):
+            try:
+                out.update(merge_run_start(lrun, lruns, devin_argv,
+                                           only=[lk["step"]]))
+            except RequestError as exc:
+                out["error"] = str(exc)
+                out["status"] = exc.status
+            out["via"] = "run"
+            out["run"] = lrun
+            return out
+    if not local_branch_exists(repo, branch):
+        out["error"] = f"{branch}: the branch no longer exists"
+        return out
+    r = _git(repo, "rev-list", "--left-right", "--count",
+             f"{base}...{branch}")
+    ahead = 0
+    if r.returncode == 0 and len(r.stdout.split()) == 2:
+        ahead = int(r.stdout.split()[1])
+    if not ahead:
+        out["skipped"] = f"nothing to merge - {base} already has it all"
+        return out
+    out["ahead"] = ahead
+    try:
+        with _RepoMergeLock(main):
+            if merge_in_progress(main):
+                out["error"] = (f"{main} is mid-merge - finish or abort "
+                                "that merge first")
+                out["status"] = 409
+                return out
+            if git_dirty_tracked(main):
+                out["error"] = (f"{main} has uncommitted changes - "
+                                "commit or stash them first")
+                out["status"] = 409
+                return out
+            r = _git(main, "merge", "--no-edit", branch)
+            if r.returncode == 0:
+                ok = _git(main, "merge-base", "--is-ancestor", branch,
+                          "HEAD").returncode == 0
+                if ok:
+                    out["merged"] = True
+                    out["into"] = base
+                    return out
+                _git(main, "merge", "--abort")
+                out["error"] = ("the merge completed but the branch is "
+                                "not an ancestor of HEAD - refused it")
+                return out
+            files = unmerged_paths(main)[:40]
+            _git(main, "merge", "--abort")
+            if files:
+                out["conflict"] = files
+                out["into"] = base
+                return out
+            out["error"] = (r.stderr or "git merge failed")[:600].strip()
+            return out
+    except RequestError as exc:      # repo merge lock busy
+        out["error"] = str(exc)
+        out["status"] = exc.status
+        return out
+
+
+def repo_merge(body: dict, runs_dir: Path, devin_argv,
+               projects: dict | None = None) -> dict:
+    """POST /api/repos/merge - land one worktree branch (or every pending
+    row with all=true) into the repo's main checkout. Read the payload's
+    per-row results: {merged|conflict|skipped|error, ...}."""
+    projects = load_projects() if projects is None else projects
+    name, repo = _repo_watched(body.get("path"), projects)
+    rows = _worktree_rows(repo)
+    if len(rows) < 2:
+        raise RequestError("no linked worktrees", 404)
+    main, base = _repo_merge_base(rows)
+    if body.get("all") is True:
+        return {"repo": name, "base": base, "results": [
+            _repo_merge_wt(repo, main, base, w, devin_argv)
+            for w in rows[1:]]}
+    wt = str(body.get("worktree") or "").strip()
+    branch = str(body.get("branch") or "").strip()
+    wrow = next((w for w in rows[1:]
+                 if os.path.normcase(w["path"])
+                 == os.path.normcase(wt)), None)
+    if wrow is None:
+        raise RequestError("worktree not found - refresh the list", 404)
+    if wrow["branch"] != branch:
+        raise RequestError(
+            f"that worktree is on {wrow['branch'] or 'a detached HEAD'} "
+            "now - refresh the list", 409)
+    res = _repo_merge_wt(repo, main, base, wrow, devin_argv)
+    if res.get("error"):
+        raise RequestError(res["error"], res.get("status") or 409)
+    return {"repo": name, "base": base, "result": res}
+
+
+def repo_merge_agent(body: dict, requests_dir: Path,
+                     runs_dir: Path,
+                     projects: dict | None = None) -> dict:
+    """POST /api/repos/merge-agent - turn an unmerged/conflicting
+    worktree branch into a DRAFT request: a fresh session re-enters the
+    merge and resolves it. Nothing launches itself - the user reviews
+    the proposal and starts it like any other request."""
+    projects = load_projects() if projects is None else projects
+    name, repo = _repo_watched(body.get("path"), projects)
+    rows = _worktree_rows(repo)
+    if len(rows) < 2:
+        raise RequestError("no linked worktrees", 404)
+    main, base = _repo_merge_base(rows)
+    wt = str(body.get("worktree") or "").strip()
+    branch = str(body.get("branch") or "").strip()
+    wrow = next((w for w in rows[1:]
+                 if os.path.normcase(w["path"])
+                 == os.path.normcase(wt)), None)
+    if wrow is None or not wrow.get("branch") or wrow["branch"] != branch:
+        raise RequestError("worktree/branch not found - refresh", 404)
+    r = _git(repo, "rev-list", "--left-right", "--count",
+             f"{base}...{branch}")
+    ahead = r.stdout.split()[1] if r.returncode == 0 else "?"
+    files = [str(f).replace("\n", " ").strip() for f in
+             (body.get("files") or []) if str(f).strip()][:40]
+    # the request's project must be a real projects.toml slug - the same
+    # authority create_request validates against (a label like
+    # 'this repo (...)' is never a slug, so it degrades to none)
+    slug = name if name in load_projects() else ""
+    verify = (projects.get(slug) or {}).get("verify") or ""
+    prompt = (
+        f"The branch `{branch}` in the {name} repository ({main}) has "
+        f"{ahead} commit(s) that are not in `{base}`. A plain "
+        f"`git merge --no-edit {branch}` in the main checkout did not "
+        "land cleanly"
+        + (f" - it conflicted in: {', '.join(files)}." if files else ".")
+        + f"\n\nRe-enter the merge and resolve it:\n"
+        f"1. `git -C {main} merge --no-edit {branch}` (the earlier "
+        "attempt was aborted - start it fresh)\n"
+        "2. resolve every conflicted file, `git add` each, then "
+        "`git commit` to finish the merge\n"
+        + (f"3. run the project's verify gate (`{verify}`) and fix "
+           "anything the resolution broke\n" if verify else
+           "3. run the project's test/verify gate if it has one\n")
+        + f"4. do NOT delete the worktree at {wt} or the `{branch}` "
+        "branch - the session that created it may still be running, and "
+        "the merge must not discard its uncommitted state.")
+    rec = create_request(
+        {"raw": prompt, "label": f"merge {branch} into {base}",
+         "project": slug},
+        requests_dir, runs_dir)
+    return {"id": rec["id"], "status": rec["status"]}
 
 
 def _agent_slot_acquire(step: Step, run_dir: Path, state: dict,
@@ -15204,7 +15424,7 @@ td :is(a,button):focus-visible { outline-offset:-2px; }
 #detail .notice, #powerbox .notice, #tourcard .notice { color:#8b949e; background:#0d1117; border-left:3px solid #30363d; padding:8px 10px; margin:10px 0; }
 #detail .notice.warn, #powerbox .notice.warn, #tourcard .notice.warn { border-color:#d29922; color:#e6edf3; }
 #detail .notice.error, #powerbox .notice.error, #tourcard .notice.error { border-color:#f85149; color:#ffb2aa; }
-#powerbox .notice.ok, #tourcard .notice.ok { border-color:#3fb950; color:#c9d1d9; }
+#detail .notice.ok, #powerbox .notice.ok, #tourcard .notice.ok { border-color:#3fb950; color:#c9d1d9; }
 #powerbox .notice.info { border-color:#58a6ff; color:#c9d1d9; }
 #detail details.proposal { margin-top:14px; }
 #detail details.proposal summary { cursor:pointer; color:#58a6ff; }
@@ -15511,6 +15731,10 @@ let repoView = false;       // the repositories modal is open
 let repoData = null;        // last /api/repos payload
 let repoFetched = 0;        // Date.now() when it landed
 let repoBusy = false;       // a /api/repos fetch is in flight
+const repoMsgs = new Map(); // worktree path (or 'repo|<name>') ->
+                            // {cls, html} - last merge attempt's
+                            // outcome, shown under its row until the
+                            // modal closes
 const repologOpen = new Set();  // repo names whose base-log details
                                 // stays expanded across repaints
 let poolCapDraft = null;    // unapplied cap value in that modal (null = none)
@@ -15992,7 +16216,7 @@ function _closeDetailNow(keepStack){
   detailIdx = null; detailKey = null; modalRequest = null; modalQA = null;
   runModalKey = null; summaryView = null; detailHTML = '';
   modalRunKey = null; poolView = false; poolCapDraft = null;
-  repoView = false;
+  repoView = false; repoMsgs.clear();
   if (!keepStack){ modalHist.length = 0; modalScroll = null; }
   document.getElementById('backdrop').hidden = true;
   applySel();        // every row mark clears with the dialog it belongs to
@@ -18965,6 +19189,8 @@ function reposHtml(d){
     h += `<div class="notice error">${esc(d.error)}</div>`;
   for (const r of d.repos||[]){
     const head = (r.base_log||[])[0];
+    const pend = (r.worktrees||[]).filter(w=>wtMergeable(w));
+    const rmsg = repoMsgs.get('repo|'+r.path);
     h += `<div class="repoblk"><h4>${esc(r.name)}` +
       ` <span class="sub">${esc(r.path)}</span></h4>` +
       `<div class="repoline"><span class="stc st-ok">` +
@@ -18973,7 +19199,18 @@ function reposHtml(d){
         `${esc(head.subject)} <span class="sub">${ago(head.at)}` +
         `</span>`
         : `<span class="sub">no commits</span>`) +
+      (pend.length
+        ? ` <button type="button" class="btn slim" ` +
+          `data-merge-all data-repo="${esc(r.path)}" ` +
+          `title="land every pending worktree branch into ` +
+          `${esc(r.base||'the base')} - conductor worktrees go through ` +
+          `their run's own merge pipeline, the rest get a plain git ` +
+          `merge in the main checkout">merge ${pend.length} ` +
+          `pending</button>`
+        : '') +
       `</div>`;
+    if (rmsg) h += `<div class="notice ${esc(rmsg.cls)}">` +
+      `${rmsg.html}</div>`;
     if ((r.base_log||[]).length>1)
       h += `<details class="repolog" data-repolog="${esc(r.name)}"` +
         `${repologOpen.has(r.name)?' open':''}>` +
@@ -18981,8 +19218,9 @@ function reposHtml(d){
         r.base_log.map(cmtLine).join('') + `</details>`;
     h += `<div class="wrapw"><table class="repotab"><tr>` +
       `<th>worktree</th><th>vs ${esc(r.base||'base')}</th>` +
-      `<th>conductor</th><th>path</th></tr>` +
-      (r.worktrees||[]).map(wtRow).join('') + `</table></div></div>`;
+      `<th>conductor</th><th>path</th><th></th></tr>` +
+      (r.worktrees||[]).map(w=>wtRow(w,r)).join('') +
+      `</table></div></div>`;
   }
   if ((d.quiet||[]).length)
     h += `<div class="sub" style="margin-top:14px">no linked ` +
@@ -18991,11 +19229,22 @@ function reposHtml(d){
     h += `<div class="notice">no watched git repos.</div>`;
   return h;
 }
+// a row gets the merge affordance only when there's an actual branch
+// with commits not yet in the base - detached/prunable/mid-merge rows
+// have nothing safe to click.
+function wtMergeable(w){
+  return !!(w.branch && !w.detached && !w.prunable && !w.merging &&
+            (w.ahead||0) > 0);
+}
 // one worktree row: branch + unmerged commits, the merge-state chips,
 // the conductor run it belongs to (when it's a step worktree under
 // data/worktrees - a bookkeeping 'merged' that git disagrees with shows
-// red, not green), and its path tail.
-function wtRow(w){
+// red, not green), its path tail, and the merge action. A conductor
+// worktree routes through its run's own merge pipeline so the record's
+// merged bookkeeping stays authoritative; anything else gets a plain
+// `git merge` in the main checkout. A conflict reports its files and
+// offers a draft request an agent session can resolve.
+function wtRow(w, r){
   const c = w.conductor, ws = [];
   if (w.prunable)
     ws.push('<span class="stc st-bad" title="registered with git but ' +
@@ -19043,12 +19292,115 @@ function wtRow(w){
     ((w.ahead||0) > (w.commits||[]).length
       ? `<div class="cmt sub">+${w.ahead-w.commits.length} more</div>`
       : '');
+  let act = '';
+  if (wtMergeable(w)){
+    const viaRun = c && !c.merge_staging && !c.merged_recorded &&
+      c.state_found !== false;
+    act = `<button type="button" class="btn slim" data-wtmerge ` +
+      `data-repo="${esc(r.path)}" data-wt="${esc(w.path)}" ` +
+      `data-branch="${esc(w.branch)}" ` +
+      `title="${viaRun
+        ? 'land it through '+esc(c.run||'its run')+'&#39;s own merge ' +
+          'pipeline (updates its state.json too)'
+        : 'git merge --no-edit '+esc(w.branch)+' into '+
+          esc(w.base||'the base')+' in the main checkout - the '+
+          'worktree and branch stay put'}">merge</button>`;
+  }
+  const msg = repoMsgs.get(w.path);
+  if (msg) act += `<div class="notice ${esc(msg.cls)}">${msg.html}</div>`;
   return `<tr><td class="wrap"><code>${esc(w.branch||'(detached)')}` +
     `</code>${staging}${cmts}</td>` +
     `<td>${ws.join(' ')}${rec}</td>` +
     `<td class="wrap">${link}</td>` +
     `<td class="wrap"><span class="sub" title="${esc(w.path)}">` +
-    `${esc(tailPath(w.path))}</span></td></tr>`;
+    `${esc(tailPath(w.path))}</span></td>` +
+    `<td>${act}</td></tr>`;
+}
+// /api/repos/merge outcomes -> a persistent notice under the row. A
+// conflict keeps its file list and offers 'send to an agent' - the
+// draft-request escalation for merges no plain `git merge` can finish.
+function mergeMsg(res, base){
+  if (!res) return {cls:'error', html:'no result'};
+  if (res.error)
+    return {cls:'error', html:esc(res.error)};
+  if (res.merged)
+    return {cls:'ok', html:`merged into <b>${esc(res.into||base||'the '+
+      'base')}</b> &#10003; - the worktree + branch stay put`};
+  if (res.conflict){
+    const files = (res.conflict||[]).slice(0,8);
+    return {cls:'warn', files: res.conflict,
+      html:`conflicts in ${files.map(esc).join(', ')}` +
+      `${(res.conflict||[]).length>8?' &hellip;':''}<br>` +
+      `<button type="button" class="btn slim" data-merge-agent ` +
+      `data-repo="${esc(res._repo||'')}" data-wt="${esc(res.worktree||'')}"` +
+      ` data-branch="${esc(res.branch||'')}">send to an agent</button> ` +
+      `<span class="sub">a draft request asks a session to re-enter ` +
+      `the merge and resolve it</span>`};
+  }
+  if (res.via==='run')
+    return res.merging
+      ? {cls:'ok', html:`handed to <b>${esc(res.run||'its run')}</b>'s ` +
+        `merge pipeline - watch its run modal`}
+      : {cls:'', html:`the run's merge pipeline found nothing pending ` +
+        `there - already settled?`};
+  if (res.skipped)
+    return {cls:'', html:esc(res.skipped)};
+  return {cls:'ok', html:'done'};
+}
+async function repoMerge(repoPath, wtPath, branch, all){
+  const key = 'repo-merge:'+(all?repoPath:wtPath);
+  if (pendingActs.has(key)) return;
+  const ctl = new AbortController();
+  actBegin(key, all?`merging pending work - ${tailPath(repoPath)}`
+                  :`merging ${branch}`, ()=>ctl.abort());
+  try {
+    const out = await api('POST','/api/repos/merge',
+      all ? {path:repoPath, all:true}
+          : {path:repoPath, worktree:wtPath, branch},
+      0, ctl.signal);
+    if (all){
+      let bad = 0, good = 0;
+      for (const res of out.results||[]){
+        res._repo = repoPath;
+        repoMsgs.set(res.worktree, mergeMsg(res, out.base));
+        if (res.error || res.conflict) bad++;
+        else if (res.merged || res.via==='run') good++;
+      }
+      repoMsgs.set('repo|'+repoPath, {cls: bad?'warn':'ok',
+        html:`${good} landed, ${bad} need attention - ` +
+             `${(out.results||[]).length} row(s) tried`});
+    } else {
+      const res = out.result||{};
+      res._repo = repoPath;
+      repoMsgs.set(wtPath, mergeMsg(res, out.base));
+    }
+    renderRepos();
+    fetchRepos(true);
+  } catch(err){
+    repoMsgs.set(all?('repo|'+repoPath):wtPath,
+      {cls:'error', html:esc(err.message||String(err))});
+    renderRepos();
+  } finally { actEnd(key); }
+}
+async function repoMergeAgent(repoPath, wtPath, branch){
+  const key = 'repo-agent:'+wtPath;
+  if (pendingActs.has(key)) return;
+  actBegin(key, `drafting a merge-resolution request`, null);
+  try {
+    const res = (repoMsgs.get(wtPath)||{});
+    const out = await api('POST','/api/repos/merge-agent',
+      {path:repoPath, worktree:wtPath, branch, files:res.files||[]},
+      30000);
+    repoMsgs.set(wtPath, {cls:'ok',
+      html:`draft request created - <button type="button" ` +
+        `class="linkbtn" data-open-request="${esc(out.id||'')}">` +
+        `open it</button> to review and launch`});
+    renderRepos();
+  } catch(err){
+    repoMsgs.set(wtPath, {cls:'error',
+      html:esc(err.message||String(err))});
+    renderRepos();
+  } finally { actEnd(key); }
 }
 function poolStep(dlt){
   const sp = lastData && lastData.slot_pool;
@@ -19886,6 +20238,17 @@ document.addEventListener('click', async e=>{
   if (t.id==='repos-btn'){ openRepos(); return; }
   if (t.closest && t.closest('[data-repo-refresh]')){
     fetchRepos(true); return; }
+  const mAllEl = t.closest && t.closest('[data-merge-all]');
+  if (mAllEl){ repoMerge(mAllEl.dataset.repo, null, null, true);
+    return; }
+  const mWtEl = t.closest && t.closest('[data-wtmerge]');
+  if (mWtEl){
+    repoMerge(mWtEl.dataset.repo, mWtEl.dataset.wt,
+              mWtEl.dataset.branch, false); return; }
+  const mAgEl = t.closest && t.closest('[data-merge-agent]');
+  if (mAgEl){
+    repoMergeAgent(mAgEl.dataset.repo, mAgEl.dataset.wt,
+                   mAgEl.dataset.branch); return; }
   if (t.id==='cap-dec'){ poolStep(-1); return; }
   if (t.id==='cap-inc'){ poolStep(1); return; }
   if (t.id==='cap-apply'){ poolApply(t); return; }
@@ -21183,6 +21546,7 @@ function openTour(){
   tourSt = {feed:null, err:null, notice:null, idx:0, hi:0, mode:'deck',
     pending:false, returnEl:document.activeElement||null, _sc:null};
   tourBind(true);
+  applySel();           // Ask AI's about-chip follows into the tour
   tourShow();
   const card = document.getElementById('tourcard');
   if (card && card.focus) card.focus();
@@ -21197,6 +21561,7 @@ function tourClose(){
   const back = tourSt.returnEl;
   tourSt = null;
   tourShow();
+  applySel();           // the about-chip falls back to the dashboard
   const el = (back && back.focus && back.isConnected!==false)
     ? back : document.getElementById('tour-btn');
   if (el && el.focus) el.focus();
@@ -21303,6 +21668,8 @@ globalThis.aiView = () => ({
   pool: poolView,
   repo: repoView,
   trash: showTrash,
+  tour: !!tourSt,
+  tourCur: tourCur() && {id: tourCur().id, title: tourCur().title},
   power: !document.getElementById('powerwrap').hidden,
   only: [...only], facets: [...facets], projs: [...projs],
   selectedRun,
@@ -21809,6 +22176,12 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                         r"/api/runs/([^/]+)/steps/([^/]+)/notes", path)):
                     self._json(set_step_notes(
                         m.group(1), m.group(2), body, runs_dir), 202)
+                elif path == "/api/repos/merge":
+                    self._json(repo_merge(body, runs_dir, devin_argv),
+                               202)
+                elif path == "/api/repos/merge-agent":
+                    self._json(repo_merge_agent(
+                        body, requests_dir, runs_dir), 201)
                 elif path == "/api/auth/login":
                     # Login is an interactive console flow (trap 3) - the most a
                     # dashboard button can do is pop a REAL terminal for it.
