@@ -80,24 +80,46 @@ acknowledgment model, and refreshes the feed without blocking the deck.
   `history` keeps re-materialized viewed cards; snoozed/unviewed
   descriptors re-inject, skipping ids a live folded card covers.
 
-### Step walkthrough-ui - pending
+### Step walkthrough-ui - DONE
 
-Vanilla-JS two-section walkthrough in `_DASH_HTML`. Feed contract it
-consumes (all present now):
+Vanilla-JS two-section walkthrough in `_DASH_HTML`, landed on this
+step's branch. Render contract (all client-side, feed fields consumed
+as documented below):
 
-- `e.section` = `"tool"|"work"`, `e.section_title` = display name.
-- `e.kind`: `change|curated` (tool), `run|request|followup|pipeline`
-  (work), `unknown` (history stub).
-- Run/pipeline: `outcome`, `completed_at`, `proposed_at`,
-  `steps_done`/`steps_total`, `unreviewed` (task count to surface as a
-  review nudge), `tag` = outcome word.
-- Pipeline: `covers` (absorbed standalone ids), `followups[]` =
-  `{id,label,at,requests,runs}`.
-- Request/followup: `tag="ready"`, `proposed_at`; `runs[]` links a
-  launched run when one exists.
-- `history` entries share the same fields (`state=='viewed'`).
-- Card order inside `entries`: `at` ascending; `unseen_count` counts
-  state `new` only.
+- `tourLoad` partitions `entries` by `e.section` into Tool updates
+  (first) then Work digest, keeping feed `at` order inside each;
+  `tourSec` falls back to the id prefix for cards lacking `section`.
+  Empty section = no cards, nav never blanks; all-empty stays on the
+  'All caught up' card.
+- Card header: `.tsecname` section title + per-section `card i of n`
+  (was global `Update i of N`) + `stop_title`; `#tourcard` gets
+  `sec-tool`/`sec-work` top-edge accent following the current card
+  (cleared on close/loading/error/caught-up). `hist` mode keeps
+  `viewed i of N` with the same section prefix; `tourHistHtml` rows
+  label their section too.
+- Work-card `tag` renders FILLED (`.ttag.ev`, `background:<hex>26`)
+  with `run outcome - a record event`/`record event` titles; tool tags
+  stay outline `change type`. run/pipeline cards use verbatim
+  `e.outcome` over `e.tag`; unknown outcome words still print (color
+  defaults #8b949e) - the chip never lies about the event.
+- `.tmeta` line: `proposed`/`finished`/`k/n steps done` for work cards,
+  `loc(e.at)` for tool cards.
+- `e.unreviewed` on run/pipeline renders as a `.trev` chip wired to
+  `data-run-details=<runs[0]>` (the existing run modal; `0` = muted
+  'all reviewed'). Mark viewed stays notification-ack only.
+- Chips: run/pipeline = run chip only; request/followup/tool =
+  named requests + recorded runs only. Both kinds coexisting get
+  explicit `Request`/`Run` `.relk` prefixes + `rel req`/`rel run`
+  tints. Request chip = the request's own identity (stage row's `run`
+  label else bare rid - never the launched run's name); run chips
+  prefer the non-stage row sharing the key. `followups[]` render as
+  `.tfu` rows (request chip + recorded run links + stamp).
+- `tourAcked` (page-life Map id -> marked card): marked ids are
+  filtered out of re-pulled feeds (a pre-mark cache can still list
+  them) and reattached to `history` when absent - client ack is
+  authoritative for the deck, unview deletes the id. Transition
+  responses repaint the badge ONLY when `unseen_count` is numeric -
+  deferred/absent leaves the last-known pill to the `/api/state` poll.
 
 ### Step deferred-transition - pending
 
@@ -117,34 +139,30 @@ Closing review + next manifest only.
 
 ## Where it stopped
 
-feed-build merged to master via merge dd1df59 (conflict resolution:
-5 files, all semantic-equivalent both-changed regions - kept the
-branch's section stamping plus HEAD's stronger viewed->history
-assertions and `include_archived` archive-sweep isolation; 74 tour
-tests + the cumulative-elapsed test green). Next: `walkthrough-ui`
-step of run 20261019-031845-whats-new-split - split `_DASH_HTML`'s
-walkthrough into 'Tool updates' vs 'Work digest' sections using the
-feed contract above (cards carry `section`; render `unreviewed`,
-dates/outcome/steps on work cards; keep spotlight anchors on tool
-cards). Feed side is committed on this step's branch; only renderer
-work remains in scope there.
+walkthrough-ui implemented + verified on branch
+`conductor/20261019-031845-whats-new-split/walkthrough-ui` (feed-build
+had already merged to master via dd1df59). Next: `deferred-transition`
+step of run 20261019-031845-whats-new-split - move POST
+/api/tour/<id>/{viewed,snooze,unview} off the synchronous `_tour_build`
+(tour_transition, conductor.py ~line 14047): persist first, rebuild on
+a daemon, return a last-known/deferred `unseen_count` - the renderer
+already tolerates both shapes (numeric-only badge repaint + the
+`tourAcked` stale-feed filter documented above).
 
 ## Verification
 
-- `python -m unittest tests.test_tour_feeds` - 39/39 (28 prior + 11
-  new/changed SplitFeedTests + 2 adjusted).
-- `python -m unittest tests.test_tour_state tests.test_tour_api
-  tests.test_tour_dash` - 54/54.
-- `python -m unittest tests.test_tour_polish tests.test_tour_e2e` -
-  32/32.
-- `python run_tests.py --jobs 8` - 992 tests, 8/8 shards ok.
+- `python -m unittest tests.test_tour_dash` - 12/12 (10 prior updated
+  to the per-section `card i of n` position text + 2 new:
+  split-section order/chrome/chips and empty-section + deferred-count
+  + stale-feed no-reinsert).
+- `python -m unittest tests.test_tour_state tests.test_tour_feeds
+  tests.test_tour_api tests.test_tour_dash tests.test_tour_polish
+  tests.test_tour_e2e` - 127/127.
+- `python run_tests.py --jobs 8` - 999 tests, 8/8 shards ok.
 
-Pre-existing defect fixed en route (not tour scope but it gated the
-verify command): `test_conductor.CumulativeElapsedTests.
-test_dashboard_emits_cumulative_step_and_run_elapsed` had a stale
-`ended_at` fixture that `_auto_archive`'s 48h sweep started swallowing
-once wall-clock crossed 2026-10-18 - now isolates the sweep so the
-payload contract is what gets asserted.
+Earlier (feed-build): 39/39 test_tour_feeds, 54/54 state+api+dash,
+32/32 polish+e2e, 992-test suite green; cumulative-elapsed auto-archive
+flake fixed en route.
 
 ## Deferred or blocked
 

@@ -847,6 +847,36 @@ covers their id. `entries` excludes `state=='viewed'` cards even before
 the watermark advances - the live deck is the unread walkthrough;
 viewed cards stay reachable through `history`.
 
+The `_DASH_HTML` renderer (tour block at the end of the script) walks
+the unread deck as TWO separated sections - `tourLoad` reorders
+`entries` into Tool updates (change/curated) first, then the Work
+digest (record cards), each keeping the feed's `at` order; an empty
+section just contributes no cards. Every card header names its section
+(`tsecname` + per-section `card i of n` position, `sec-tool`/`sec-work`
+top-edge accent on #tourcard); `tourSec` falls back to the id prefix
+when a card lacks `section`. Work cards paint their `tag` FILLED
+(`.ttag.ev`, tinted hex-alpha) so record-event words (`ready`, the
+run's verbatim `outcome` - an unlisted word prints, only its color
+defaults) never read as change labels; run/pipeline cards carry a
+meta line (`proposed`/`finished`/`k/n steps done`) plus the run's
+`unreviewed` count as a `.trev` chip wired to `data-run-details` (the
+existing run modal) - 'Mark viewed' stays notification-ack only and
+never touches task review. Related-record chips: run/pipeline cards
+show ONLY their run chip; request/follow-up/tool cards show the
+requests the feed named plus run chips only for recorded launches; when
+both kinds coexist each chip gets an explicit `Request`/`Run` `.relk`
+prefix + `rel req`/`rel run` border tint. A request chip is labelled by
+the REQUEST's own identity (a still-staged proposal row's name, else
+its bare id) - never resolved to the run's name - and run chips prefer
+the non-stage row sharing the key. Folded follow-ups render one
+`.tfu` row each (request chip + recorded run links + stamp). Client
+acknowledgment is authoritative for the deck: `tourAcked` (Map id ->
+marked card, page-life) filters re-pulled stale feeds so a pre-mark
+build can never reinsert a dealt card, and reattaches it to `history`
+when the stale copy lacks it; transition responses repaint the badge
+only when `unseen_count` is a real number (a deferred/absent count
+leaves the last-known pill to the /api/state poll, which converges).
+
 The HTTP layer lives in conductor.py's `tour_ctx` block (just before
 `collect_dashboard`): one ctx per `make_dashboard_handler` holds the
 dirs, a ~60s `TOUR_FEED_TTL_S` feed cache, a count snapshot and a
