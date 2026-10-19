@@ -1,0 +1,196 @@
+[run]
+summarize = true
+name = "space-plan-core"
+description = "Build the local deterministic floorplan-first core: isolate world content, import plans into SceneState, prove structural accuracy with overlays, and document the future intake flow."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+parallel = false
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 90
+max_attempts = 3
+verify = "python run_tests.py"
+
+[[step]]
+name = "baseline-contracts"
+project = "apartment-3d"
+worktree = true
+merge_target = "main"
+timeout_min = 45
+prompt = '''
+Read AGENTS.md, ROADMAP.md, docs/PIPELINE.md, and docs/DECISIONS.md first. Establish the baseline and contracts for this deterministic-core run without implementing the later deliverables.
+
+Inspect the actual SceneState schema, frame: 'plan' convention, world loading, parameterized catalog, existing ctl.mode 3 rendering, and verification infrastructure. Inventory apt-1601-specific furniture, shell, skyline, media, layouts, and textures according to docs/PIPELINE.md. Record the minimal pack/import interfaces using existing conventions rather than introducing a competing state model.
+
+Locate the official A2 image in assets/floorplan/. Preserve an immutable local snapshot of the verified hand-built structure and baseline plan-view screenshots before any refactor. Record exact artifact paths, source image identity, units, coordinate conventions, and documented orientation evidence. This structure snapshot is a comparison oracle, not an input to the future importer. Keep personal imagery and derived screenshots out of tracked files.
+
+Gitignored assets may be absent from isolated worktrees. Identify a non-destructive, local-only way for subsequent worktrees to access the registered project's existing assets, and record the procedure and authoritative source location in the project's .agent_tasks files. Do not alter the source checkout or mistake missing worktree assets for absent source assets.
+
+Run npm run verify and python run_tests.py and record baseline results, blockers, artifact paths, and STATUS/NEXT handoff notes. Do not conceal pre-existing failures.
+
+Keep everything local: no uploads, cloud processing, force-adding ignored media, or 0.0.0.0 binds; autoplay must be muted. The scope excludes new editor features, multiplayer/community, concierge NPCs, elevator/floor-hopping, public hosting, and gaussian splats. Every structural element must trace to plan evidence or carry [ASSUMED] in docs/DECISIONS.md.
+'''
+
+[[step]]
+name = "world-pack"
+project = "apartment-3d"
+worktree = true
+merge_target = "main"
+timeout_min = 100
+depends_on = ["baseline-contracts"]
+prompt = '''
+Read AGENTS.md, ROADMAP.md, docs/PIPELINE.md, and docs/DECISIONS.md first. Read baseline-contracts STATUS/NEXT and .agent_tasks notes, confirm its artifacts actually exist, and use its local asset-access procedure. A failed prerequisite is not a usable implementation; report missing prerequisites rather than fabricating them.
+
+Implement the world-pack refactor following docs/PIPELINE.md. Quarantine apt-1601 builtins currently in src/furniture.js, shell/skyline/media content, src/layouts/*.json, and assets/textures ownership and references behind worlds/apt-1601. Preserve existing private assets non-destructively and keep them gitignored. The runtime must load a world document through a generic loading contract instead of assembling hardcoded apartment pieces. Default-world selection may name apt-1601 at the application composition boundary, not inside reusable geometry/state/editor code.
+
+Keep SceneState pure data and keep runtime, editor, and reusable catalog definitions generic. Preserve existing parameterized dimensions/material options, serialization, editing behavior, camera modes, and offline asset resolution. Make only compatibility wiring changes needed by the existing editor; add no editor features or new UI.
+
+Add focused regression tests proving that the pack loads equivalently to the preserved baseline, survives existing state round trips, and does not require apt-1601-specific imports in reusable layers. Use small synthetic data where a generic loading test needs another world; do not invent another real space or acquire assets.
+
+Run npm run verify and python run_tests.py. Investigate regressions without rewriting the ground-truth snapshot or weakening tests. Leave exact pack entry points, asset-resolution rules, test results, and STATUS/NEXT in .agent_tasks notes.
+
+Local processing only; no media uploads or force-adding ignored assets. Servers must bind to loopback, autoplay must be muted, and all out-of-scope tour features remain untouched.
+'''
+
+[[step]]
+name = "floorplan-importer"
+project = "apartment-3d"
+worktree = true
+merge_target = "main"
+timeout_min = 120
+depends_on = ["baseline-contracts", "world-pack"]
+prompt = '''
+Read AGENTS.md, ROADMAP.md, docs/PIPELINE.md, and docs/DECISIONS.md first. Inspect predecessor STATUS/NEXT, actual merged interfaces, and local asset-access notes. Report unavailable prerequisites rather than assuming terminal steps succeeded.
+
+Implement a reusable local tool that takes a PNG/JPG floorplan image and produces SceneState structure containing walls, doors, windows, openings, and room labels taken from plan annotations. Use the existing state and world-pack contracts. PDF support is optional and must not displace the required image workflow.
+
+Implement deterministic image-driven extraction using appropriate available dependencies. Do not deliver merely a hardcoded A2 coordinate table or a converter whose geometry comes from the verified hand-built structure. Explicit reusable calibration/correction annotations may resolve ambiguous image evidence, but document every manual intervention and its source. Identical image, options, and annotations must produce stable normalized output.
+
+Establish real-meter scale from dimension annotations or explicit evidence-backed calibration input. Record source identity, image coordinates, calibration, and structural provenance. Document ceiling height and any unsupported vertical dimensions as [ASSUMED] in docs/DECISIONS.md. Unreadable room labels and uncertain symbols must remain explicit uncertainties, not invented names or geometry.
+
+Handle the mirrored-unit trap, including the documented 1617 versus 1601 distinction. Respect the actual frame: 'plan' convention; record scale, rotation, translation, reflection, and orientation evidence without applying transforms twice. Detect or flag mirror ambiguity and require a recorded choice when evidence cannot distinguish candidates. Never silently choose orientation or scale by fitting the hand-built reference.
+
+Add deterministic tests for meter calibration, mirrored inputs, transform round trips, room annotations, structural element types, and actionable handling of ambiguous or unsupported inputs. Keep the frozen reference out of importer inputs.
+
+Run npm run verify and python run_tests.py. Record invocation, output and annotation formats, limitations, tests, and STATUS/NEXT in .agent_tasks. No new editor/intake UI or phase B/C inference. Keep all images and processing local, assets ignored, servers loopback-only, and autoplay muted.
+'''
+
+[[step]]
+name = "overlay-verifier"
+project = "apartment-3d"
+worktree = true
+merge_target = "main"
+timeout_min = 90
+depends_on = ["baseline-contracts", "world-pack", "floorplan-importer"]
+prompt = '''
+Read AGENTS.md, ROADMAP.md, docs/PIPELINE.md, and docs/DECISIONS.md first. Read predecessor notes and verify the merged importer and pack interfaces are available. Use the documented local-only asset-access procedure.
+
+Implement the reusable overlay verification harness, not the final A2 proof. Load imported structure through the generic runtime and render it through the existing orthographic plan view, ctl.mode 3, using Playwright. Isolate structural rendering from furniture, media, and decorative content without adding editor features.
+
+Scale-align the source plan and rendered structure using the recorded image-to-meter transform and explicit orientation convention. Preserve aspect ratio and document any reflection; do not use arbitrary warping or independent wall fitting to hide discrepancies. Produce reproducible screenshot pairs, an aligned overlay, and machine-readable plus readable mismatch reports in local artifact locations that do not track personal imagery.
+
+Report missing, extra, displaced, and incorrectly typed walls, doors, windows, and openings, including counts, dimensions/positions, and relevant connectivity. Distinguish plan text, furniture symbols, and annotations from structural evidence. Disclose masks and unsupported regions rather than silently excluding difficult areas. Preserve an evidence trail from each reported feature to the source image and generated structure.
+
+Define acceptance tolerances from image resolution and calibration uncertainty before the proof loop. Require exact justified element counts and documented geometric tolerances; a visually plausible screenshot alone is not a pass. The harness must signal failure for unresolved material mismatches.
+
+Add tests with synthetic perturbations: missing/extra doors and openings, displaced walls, and incorrect mirroring must be detected. Check repeatability and produce actionable report identifiers for subsequent corrections.
+
+Run npm run verify and python run_tests.py. Leave exact commands, report schema, tolerance rationale, artifact paths, and STATUS/NEXT in .agent_tasks. Keep processing local, ignored assets untracked, servers loopback-only, and autoplay muted; do not implement intake or out-of-scope tour features.
+'''
+
+[[step]]
+name = "a2-closed-loop"
+project = "apartment-3d"
+worktree = true
+merge_target = "main"
+timeout_min = 120
+depends_on = ["baseline-contracts", "world-pack", "floorplan-importer", "overlay-verifier"]
+prompt = '''
+Read AGENTS.md, ROADMAP.md, docs/PIPELINE.md, and docs/DECISIONS.md first. Inspect predecessor STATUS/NEXT, confirm the importer/verifier are actually merged and usable, and locate the immutable baseline using the recorded paths. Restore only non-destructive local access to existing ignored assets.
+
+Prove the closed loop on the official A2 plan already in assets/floorplan/. Generate apt-1601 structure from the image with the reusable importer, record all calibration/orientation/correction inputs, and preserve that candidate before comparing it with the frozen verified hand-built structure. Do not copy ground-truth coordinates into importer inputs or introduce A2-specific extraction branches.
+
+Render the generated candidate through ctl.mode 3, produce Playwright screenshot pairs and overlays against the source plan, and produce a separate normalized structural diff against the immutable hand-built reference. Explicitly demonstrate correct handling of the mirrored-neighbor trap. Assess walls, doors, windows, openings, room labels, real-meter scale, and documented height assumptions.
+
+Iterate evidence-backed extraction, calibration, or explicit correction annotations until the image overlay and reference comparison meet the previously declared criteria. Preserve meaningful iteration reports. Every correction must cite plan evidence or a documented [ASSUMED] decision; discrepancies in the reference must be reported, not silently erased. Do not relax thresholds or rewrite the oracle to manufacture success.
+
+Once the proof passes, make the regenerated structure usable through the apt-1601 world pack without losing existing nonstructural content or editing behavior. Preserve the original reference and repeat the full generation to demonstrate deterministic output. If material mismatches remain, report the proof as unfinished rather than replacing the known-good default with an unverified candidate.
+
+Use no new assets. Run npm run verify and python run_tests.py. Leave reproducible commands, source/output identities, before/after mismatch summaries, screenshot/report paths, assumptions, and truthful STATUS/NEXT in .agent_tasks. No uploads, cloud processing, forced asset tracking, non-loopback binds, unmuted autoplay, or new editor/tour features.
+'''
+
+[[step]]
+name = "intake-design"
+project = "apartment-3d"
+worktree = true
+merge_target = "main"
+timeout_min = 45
+depends_on = ["baseline-contracts", "world-pack", "floorplan-importer", "overlay-verifier", "a2-closed-loop"]
+prompt = '''
+Read AGENTS.md, ROADMAP.md, docs/PIPELINE.md, and docs/DECISIONS.md first. Read implementation notes and STATUS/NEXT so the design distinguishes delivered capabilities, assumptions, failures, and future proposals.
+
+Write docs/INTAKE.md only; do not implement intake UI, capture tooling, new editor features, or phase B/C inference.
+
+Cover the phased model for every space:
+- Phase A: authoritative structure from a floorplan, with calibration, orientation, labels, provenance, and explicit uncertainty.
+- Phase B: fixed accessories only from video/photos, including window bays, kitchen cabinetry/appliances, blinds, and bath fixtures. Never use this phase for furniture or invented geometry, and never let video appearance silently override authoritative plan structure. Allow explicitly documented sibling-unit inference when no video exists.
+- Phase C: furnishings as catalog instances, adapting generic parameterized definitions using evidence, such as piano-to-Yamaha options rather than bespoke hallucinated meshes.
+
+Describe the new-space wizard's inputs and routing when a floorplan, videos/photos, both, or neither are available. Specify human approval of the converted and labeled 2D plan before 3D construction. For plan-less spaces require human approval of an agent-drafted 2D guess-map, with assumptions clearly marked, before building.
+
+Describe guided capture for plan-less spaces: directed photos facing N/S/E/W, a slow orbit video, and agent follow-up questions requesting specific detail photos. Keep private capture data local and distinguish observed facts from inferred candidates.
+
+Evaluate a new tab/flow in agent-conductor versus a flow inside apartment-3d. Use the registered agent-conductor project's actual request-to-planner-to-proposed-steps-to-human-gate-to-run flow and "what's next" guided tour as read-only reference material, locating it through the project registry rather than guessing a checkout path. Recommend one location with concrete trade-offs for orchestration, approvals, local media, and the frozen editor. If reference inspection is unavailable, state that evidence gap honestly.
+
+Explicitly defer multiplayer/community, concierge NPCs, elevator/floor-hopping, public hosting, gaussian splats, and implementation of the proposed intake/capture experiences.
+
+Run npm run verify and python run_tests.py even though this is documentation-only. Record design coverage, reference evidence, open decisions, and STATUS/NEXT in .agent_tasks. Do not modify agent-conductor. No uploads, non-loopback servers, or unmuted autoplay.
+'''
+
+[[step]]
+name = "unseen-plan-check"
+project = "apartment-3d"
+worktree = true
+merge_target = "main"
+timeout_min = 75
+depends_on = ["baseline-contracts", "world-pack", "floorplan-importer", "overlay-verifier", "a2-closed-loop"]
+prompt = '''
+Read AGENTS.md, ROADMAP.md, docs/PIPELINE.md, and docs/DECISIONS.md first. Read predecessor notes and confirm that the delivered importer/verifier and A2 evidence are actually available.
+
+Check the authoritative local project's assets/floorplans/ for a second unit-type plan that arrived during this run. Check the source location identified by baseline-contracts, not just this worktree's potentially absent ignored-assets directory. Do not download a plan, manufacture one, or mistake another copy of A2 for an unseen unit type.
+
+If a distinct second plan is present, exercise the same generic image-to-SceneState-to-overlay pipeline on it as a never-seen-space test. Record its identity, evidence-backed scale and orientation, room labels, assumptions, and any explicit correction annotations. Produce local Playwright screenshot pairs, overlays, and mismatch reports against that plan; do not claim hand-built ground truth exists for the second space.
+
+Fix only general importer/verifier defects exposed by this test, add focused regressions, and rerun the A2 proof after any shared-code change. Do not hardcode the second unit, infer its structure from apt-1601, invent missing geometry, or add furnishings/accessories. Maintain the previously declared acceptance criteria. Missing scale or orientation evidence and unresolved mismatches must be reported as unfinished validation.
+
+If no second plan exists, record the conditional test as not exercised because its input was absent, not as a successful unseen-space proof. Recheck for arrivals before finishing this step.
+
+Run npm run verify and python run_tests.py in either case. Leave input-presence checks, commands, reports, regression results, and STATUS/NEXT in .agent_tasks. Keep personal media and generated screenshots local and untracked, use loopback-only servers and muted autoplay, and preserve the frozen editor and other scope exclusions.
+'''
+
+[[step]]
+name = "follow-up-plan"
+project = "apartment-3d"
+worktree = true
+merge_target = "main"
+timeout_min = 25
+depends_on = ["baseline-contracts", "world-pack", "floorplan-importer", "overlay-verifier", "a2-closed-loop", "intake-design", "unseen-plan-check"]
+prompt = '''
+Read AGENTS.md, ROADMAP.md, docs/PIPELINE.md, and docs/DECISIONS.md first. Perform the closing review and write a proposal only; do not implement follow-up work.
+
+Review this run against all four requested deliverables and the deterministic-core scope. Find the newest directory ending in space-plan-core under C:/Projects/agent-conductor/data/runs and inspect per-step logs, STATUS/NEXT lines, notes, verification results, and merge/resolver outcomes alongside each involved project's .agent_tasks files. Check actual merged code and artifacts rather than equating terminal status, passing generic tests, or parked worktrees with completed delivery.
+
+Assess world-pack isolation, image-driven deterministic import, meter calibration and mirrored orientation, structural provenance and [ASSUMED] decisions, A2 screenshot/overlay/reference evidence, conditional second-plan results, and complete design-only coverage in docs/INTAKE.md. Recheck assets/floorplans/ for a late second-plan arrival. If one is untested, use the already-delivered local importer/verifier without code changes where feasible; otherwise record that validation as unfinished. Never invent a successful proof.
+
+Run npm run verify and python run_tests.py against the integrated checkout and report failures without fixing them in this review step.
+
+Write a NEW conductor TOML manifest to C:/Projects/agent-conductor/manifests/space-plan-core-followup.toml proposing only still-unfinished work or newly discovered prerequisites/regressions necessary to fulfill this request. Do not expand the proposal into the larger building-tour vision or implementation of the intake design. If nothing actionable remains, state that in the TOML rather than inventing executable chores.
+
+Use registered project slugs, concrete scoped prompts, evidence-backed dependencies, local workers, worktree isolation, apartment-3d merge_target = "main", merge_resolver = true, checkpoint = true, on_failure = "continue", max_attempts = 3, and the appropriate registered verification commands for any proposed steps. Keep the run description within 300 characters and include no credentials or private media content. Validate TOML syntax without launching a run.
+
+Do not launch this manifest, start conductor work, or implement its proposals: a human reviews it. Record the saved path, remaining gaps, review evidence, and final STATUS/NEXT in .agent_tasks. Preserve local-only media handling, loopback-only servers, muted autoplay, and all scope exclusions.
+'''
