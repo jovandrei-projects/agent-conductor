@@ -126,7 +126,8 @@ class MarkupWiringTests(unittest.TestCase):
         js = self.h.split("<script>\n", 1)[1].split("</script>", 1)[0]
         for needle in ("globalThis.aiView = () => ({",
                        "modalQA: modalQA", "pool: poolView",
-                       "trash: showTrash", "globalThis.aiNav = {",
+                       "repo: repoView", "trash: showTrash",
+                       "tour: !!tourSt", "globalThis.aiNav = {",
                        "agent(k)", "openSummary(k)", "openRunSummary(k)",
                        "showRunDetails(k)", "openRequest(id)"):
             self.assertIn(needle, js)
@@ -1921,6 +1922,63 @@ setRoute((url,opt)=>{
   process.exitCode=1;});
 ''',
             route_js="setRoute(()=>({items:[]}));")
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_every_modal_maps_to_its_own_view(self):
+        """liveCtx covers every dashboard surface - the repos modal was
+        the burn (it fell through to 'dashboard'), and the tour card
+        had no mapping either. A throwing or absent aiView warns
+        visibly instead of silently labeling itself dashboard."""
+        p = run_node(r'''
+(async()=>{
+  window.AskAI.open();
+  await flush();
+  const cases=[
+    [{repo:true},'repos'],
+    [{tour:true,tourCur:{id:'e1',title:'X'}},'tour'],
+    [{pool:true,agents:[]},'pool'],
+    [{trash:true},'trash'],
+    [{power:true},'power'],
+    [{modalRequest:{id:'r1'}},'request'],
+    [{modalQA:{id:'r2'}},'questions'],
+    [{detailKey:'rk|s1',agents:[]},'agent'],
+    [{runModalKey:'rk'},'run'],
+    [{summaryView:{key:'rk|s1'},agents:[]},'summary'],
+    [{summaryView:{key:'run|rk'},agents:[]},'run-summary'],
+    [{agents:[]},'dashboard'],
+  ];
+  for (const [v,want] of cases){
+    window.aiView=()=>v;
+    window.aiSync();
+    const got=window.AskAI.ctx().view;
+    assert.equal(got, want,
+      JSON.stringify(v)+' -> '+got);
+  }
+  // labels for the newly-mapped views
+  window.aiView=()=>({repo:true});
+  window.aiSync();
+  assert.match(nodes.get('ai-ctx').textContent,/repositories/);
+  window.aiView=()=>({tour:true,tourCur:{id:'e1',title:'X'}});
+  window.aiSync();
+  assert.match(nodes.get('ai-ctx').textContent,/what's new/);
+  // a throwing aiView warns: chip gets '!' and the note strip shows it
+  window.aiView=()=>{throw new Error('boom')};
+  window.aiSync();
+  assert.match(nodes.get('ai-ctx').textContent,/dashboard !/);
+  assert.match(nodes.get('ai-note').innerHTML,/context:/);
+  assert.equal(nodes.get('ai-note').hidden,false);
+  // no bridge at all warns too
+  window.aiView=null;
+  window.aiSync();
+  assert.match(nodes.get('ai-note').innerHTML,/did not report/);
+  // and a working view again clears the warn note
+  window.aiView=()=>({agents:[]});
+  window.aiSync();
+  assert.equal(nodes.get('ai-ctx').textContent,'about: dashboard');
+  assert.equal(nodes.get('ai-note').hidden,true);
+})().then(()=>process.exitCode=0).catch(e=>{console.error(e);
+  process.exitCode=1;});
+''', route_js="setRoute(()=>({items:[]}));")
         self.assertEqual(p.returncode, 0, p.stderr)
 
     def test_new_chat_inherits_section(self):

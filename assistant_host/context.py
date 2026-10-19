@@ -123,6 +123,12 @@ _VIEW_WORKFLOWS = {
              "slot (and who waits on devices/merge locks instead)"],
     "trash": ["Restore an entry", "Empty trash (permanent)", "entries "
               "auto-purge ~48h after deletion"],
+    "repos": ["Merge one pending worktree branch into the base",
+              "Merge all pending rows at once",
+              "send a conflicting branch to an agent session to resolve",
+              "open a conductor worktree's run modal"],
+    "tour": ["mark a card viewed/unviewed", "snooze", "browse the "
+             "'viewed earlier' history", "skip the tour"],
 }
 
 
@@ -155,6 +161,7 @@ class ConductorContext:
         self._requests = (Path(requests_dir) if requests_dir
                           else self._runs.parent / "requests")
         self._projects = projects  # None -> conductor.load_projects() lazily
+        self._tour_ctx = None      # conductor.tour_ctx, built on demand
         self._now = now or time.time
         self._providers = {
             "dashboard": self._v_dashboard,
@@ -166,7 +173,9 @@ class ConductorContext:
             "questions": self._v_questions,
             "power": self._v_power,
             "pool": self._v_pool,
+            "repos": self._v_repos,
             "trash": self._v_trash,
+            "tour": self._v_tour,
         }
 
     def register_provider(self, view: str, fn) -> None:
@@ -572,3 +581,74 @@ class ConductorContext:
                      "expires_at": e.get("expires_at")}
                     for e in entries[:STEP_LIST_MAX]],
                 "entries_omitted": max(0, len(entries) - STEP_LIST_MAX)}}
+
+    def _v_repos(self, refs, filters, selection) -> dict:
+        """The repositories modal: every watched repo's base HEAD and
+        each linked worktree's merge state (ahead/behind/dirty/
+        conductor-provenance), from the same cached scan the modal
+        renders."""
+        try:
+            # the uncached scan: an enricher call must not poison the
+            # serve's shared 10s cache with a differently-scoped view
+            d = conductor._repo_status(self._projects_map(), self._runs)
+        except Exception as exc:             # noqa: BLE001 - never 500
+            return {"title": "repositories",
+                    "note": f"repo scan unavailable: {exc}"}
+        repos = []
+        for r in d.get("repos") or []:
+            wts = []
+            for w in (r.get("worktrees") or []):
+                c = w.get("conductor") or {}
+                wts.append({
+                    "branch": w.get("branch"),
+                    "path": _clip(w.get("path"), 200),
+                    "ahead": w.get("ahead"), "behind": w.get("behind"),
+                    "dirty": w.get("dirty"), "detached": w.get("detached"),
+                    "prunable": w.get("prunable"),
+                    "unmerged_commits": [
+                        _clip(c2.get("subject"), 120)
+                        for c2 in (w.get("commits") or [])[:8]],
+                    "conductor_run": c.get("run"),
+                    "conductor_step": c.get("step"),
+                    "merged_recorded": c.get("merged_recorded")})
+            head = (r.get("base_log") or [{}])[0]
+            repos.append({
+                "name": r.get("name"), "path": _clip(r.get("path"), 200),
+                "base": r.get("base"),
+                "base_head": {"sha": head.get("sha"),
+                              "subject": _clip(head.get("subject"), 120),
+                              "at": head.get("at")} if head else None,
+                "worktrees": wts})
+        return {"title": "repositories & worktrees",
+                "note": "'ahead' = commits on the worktree not in the "
+                        "base; the merge buttons land them in the MAIN "
+                        "checkout (conductor worktrees go through their "
+                        "run's merge pipeline)",
+                "generated_at": d.get("generated_at"),
+                "record": {"repos": repos,
+                           "quiet": d.get("quiet") or []}}
+
+    def _v_tour(self, refs, filters, selection) -> dict:
+        """The what's-new tour card: the unseen deck + the 'viewed
+        earlier' history, from the serve's cached feed build."""
+        try:
+            if self._tour_ctx is None:
+                self._tour_ctx = conductor.tour_ctx(
+                    self._runs, self._requests)
+            feed = conductor.tour_feed(self._tour_ctx)
+        except Exception as exc:             # noqa: BLE001
+            return {"title": "what's new tour",
+                    "note": f"tour feed unavailable: {exc}"}
+        cards = [{"id": e.get("id"), "kind": e.get("kind"),
+                  "title": _clip(e.get("title"), 120),
+                  "state": e.get("state") or "new"}
+                 for e in (feed.get("entries") or [])[:20]]
+        hist = [{"id": e.get("id"), "title": _clip(e.get("title"), 120)}
+                for e in (feed.get("history") or [])[:20]]
+        cur = str((refs or {}).get("entry_id") or "")
+        return {"title": "what's new tour",
+                "record": {"unseen_count": feed.get("unseen_count"),
+                           "on_card": cur or None,
+                           "deck": cards,
+                           "history": hist,
+                           "warnings": feed.get("warnings") or []}}

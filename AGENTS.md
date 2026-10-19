@@ -157,14 +157,33 @@ vs the base (`rev-list --left-right --count`), dirty/MERGE_HEAD/
 prunable flags, and its unmerged commits listed newest-first (8 max).
 A worktree under `data/worktrees/<run>/<step>` (or `<step>.merge`,
 the deferred-merge staging dir) is cross-checked against the run's
-state.json via `_wt_conductor_link` - `merged`/`merge_target` from the
-record are shown next to what git actually sees, so a recorded-but-not-
-really-merged step is a visible lie, not silent bookkeeping; an
-explicit `merge_target` overrides the default base for that row's
-counts. Rows link through to the run modal. Repos with no linked
-worktrees collapse to a `no linked worktrees:` footnote line; an open
-modal refetches on a ~15s cadence and each section's base-log fold
-survives repaints.
+state.json via `_wt_conductor_link` - the `data/` segment is located
+by path shape (`_wt_data_parts`), so step worktrees link to THEIR data
+tree's runs/ even when this serve runs inside a worktree with its own
+data/ - `merged`/`merge_target` from the record are shown next to what
+git actually sees, so a recorded-but-not-really-merged step is a
+visible lie, not silent bookkeeping; an explicit `merge_target`
+overrides the default base for that row's counts. `state_found` says
+whether a state.json actually backed the link (merge routing requires
+it; the name-only display link doesn't). Rows link through to the run
+modal. Repos with no linked worktrees collapse to a `no linked
+worktrees:` footnote line; an open modal refetches on a ~15s cadence
+and each section's base-log fold survives repaints.
+
+Merge from the modal: every pending row (ahead>0, real branch, not
+prunable/mid-merge) gets a `merge` button, and a repo with pending
+rows gets `merge N pending`. `POST /api/repos/merge` validates the
+path against the watched set, then routes per row: a conductor step
+worktree whose state.json names the same branch goes through
+`merge_run_start(only=[step])` - the run's own pipeline keeps
+merged/merged_at/events authoritative; anything else (Devin-Desktop
+session worktrees, hand-made ones) gets a plain `git merge --no-edit`
+in the MAIN checkout under `_RepoMergeLock`, refusing dirty or
+mid-merge checkouts. A conflict aborts, reports its paths, and offers
+`send to an agent` - `POST /api/repos/merge-agent` writes a DRAFT
+request (branch, base, conflict files in the prompt) that the user
+reviews and launches like any other. Nothing deletes the worktree or
+the branch - the session that created it may still be live.
 Parallel sessions get a PARALLEL_NOTE prompt block: share the box, own
 your checkout/leases/ports, never fight a peer or the user over a shared
 resource - if a genuinely exclusive resource is held, end `STATUS:

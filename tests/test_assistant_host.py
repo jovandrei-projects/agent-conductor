@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -567,6 +568,69 @@ class ContextEnrichTests(unittest.TestCase):
             self.assertEqual(len(ents), 1)
             self.assertEqual(ents[0]["name"], "old-run")
             self.assertEqual(ents[0]["kind"], "run")
+
+    def test_repos_view_reports_worktree_merge_state(self):
+        """The repositories provider hands the model the same scan the
+        modal renders - base HEAD plus each worktree's ahead/behind -
+        so 'are your changes merged?' is answerable."""
+        import shutil as _sh
+        import subprocess as _sp
+        with tempfile.TemporaryDirectory() as td:
+            if not _sh.which("git"):
+                self.skipTest("git unavailable")
+            repo = Path(td) / "proj"
+            repo.mkdir()
+
+            def g(*a, cwd=repo):
+                _sp.run(["git", "-C", str(cwd), *a],
+                        capture_output=True, check=True)
+            g("init")
+            (repo / "f.txt").write_text("0\n", encoding="utf-8")
+            g("add", "-A")
+            g("commit", "-m", "init")
+            wt = Path(td) / "wt-feat"
+            g("worktree", "add", str(wt), "-b", "feat")
+            (wt / "n.txt").write_text("n\n", encoding="utf-8")
+            g("add", "-A", cwd=wt)
+            g("commit", "-m", "feature work", cwd=wt)
+
+            runs, reqs = make_tree(Path(td))
+            ctx = ConductorContext(
+                runs_dir=runs, requests_dir=reqs,
+                projects={"proj": {"path": repo}}, now=lambda: NOW)
+            env = ctx.enrich({"view": "repos", "refs": {}})
+            rec = next(r for r in env["record"]["repos"]
+                       if r["name"] == "proj")
+            self.assertEqual(rec["worktrees"][0]["branch"], "feat")
+            self.assertEqual(rec["worktrees"][0]["ahead"], 1)
+            self.assertTrue(rec["base_head"]["subject"])
+            self.assertTrue(any("Merge" in w or "merge" in w
+                                for w in env["workflows"]))
+
+    def test_tour_view_reports_deck(self):
+        """The tour provider reports the unseen deck + history from the
+        serve's feed build, and the on-card ref the client sent."""
+        with tempfile.TemporaryDirectory() as td:
+            ctx = make_ctx(Path(td))
+            feed = {"generated_at": "2026-10-19T03:00:00",
+                    "unseen_count": 2,
+                    "entries": [{"id": "run:r1:x", "kind": "run",
+                                 "title": "Run finished: r1"},
+                                {"id": "feat:abc", "kind": "feature",
+                                 "title": "New: repos modal"}],
+                    "history": [{"id": "run:r0:y",
+                                 "title": "Run finished: r0"}],
+                    "warnings": []}
+            with mock.patch.object(conductor, "tour_feed",
+                                   return_value=feed):
+                env = ctx.enrich(
+                    {"view": "tour", "refs": {"entry_id": "feat:abc"}})
+            rec = env["record"]
+            self.assertEqual(rec["unseen_count"], 2)
+            self.assertEqual(rec["on_card"], "feat:abc")
+            self.assertEqual([c["id"] for c in rec["deck"]],
+                             ["run:r1:x", "feat:abc"])
+            self.assertEqual(rec["history"][0]["id"], "run:r0:y")
 
 
 class CoreIntegrationTests(unittest.TestCase):
