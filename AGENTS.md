@@ -146,15 +146,26 @@ lease changes alone don't move the sig. Note `slot_wait` stays stamped
 on a record after the lease lands - only `status='queued'` means still
 waiting.
 
-The topbar `repos` button opens the repositories modal (`/api/repos`,
-10s-cached scan, `repo_status`/`_repo_status`): one section per watched
-repo - every configured project plus this repo, dedup'd by path - with
-the MAIN checkout's branch as 'the base' (the served dir itself may be
-a worktree, so `current_branch` on it would lie; a detached main falls
-back to master/main), the base's latest 3 commits under a fold, and a
-row per linked worktree: branch or detached sha, ahead/behind counts
-vs the base (`rev-list --left-right --count`), dirty/MERGE_HEAD/
-prunable flags, and its unmerged commits listed newest-first (8 max).
+The topbar `repos` button opens the repositories modal. The scan is
+split per repo so it can narrate progress instead of blocking: `GET
+/api/repos` is the light name+path list (`repo_list`/`_repo_targets`),
+then the client walks `GET /api/repos/<name>` (`repo_one`, 10s-cached
+per repo) one at a time - the status line reads `scanning <name> ·
+i of n`, not-yet-scanned repos render queued/scanning placeholders,
+and a `{quiet: true}` answer folds into the footnote. A one-shot
+whole-set scan stays available as `repo_status`/`_repo_status` for the
+Ask-AI provider; a single `/api/repos` fetch used to time out under
+the 30s AbortSignal across ~14 repos ('signal timed out'), which is
+why the split exists. Each section reports the MAIN checkout's branch
+as 'the base' (the served dir itself may be a worktree, so
+`current_branch` on it would lie; a detached main falls back to
+master/main), the base's latest 3 commits under a fold, and a row per
+linked worktree: branch or detached sha, ahead/behind counts vs the
+base (`rev-list --left-right --count`), dirty/MERGE_HEAD/prunable
+flags, and its unmerged commits listed newest-first (8 max). The table
+is `table-layout:fixed` with a colgroup, so every repo's columns keep
+identical widths and the act column can't be squeezed off-screen; a
+row's merge outcome renders as a full-width second row.
 A worktree under `data/worktrees/<run>/<step>` (or `<step>.merge`,
 the deferred-merge staging dir) is cross-checked against the run's
 state.json via `_wt_conductor_link` - the `data/` segment is located
@@ -171,8 +182,10 @@ worktrees:` footnote line; an open modal refetches on a ~15s cadence
 and each section's base-log fold survives repaints.
 
 Merge from the modal: every pending row (ahead>0, real branch, not
-prunable/mid-merge) gets a `merge` button, and a repo with pending
-rows gets `merge N pending`. `POST /api/repos/merge` validates the
+prunable/mid-merge) gets a `merge` link, and a repo with pending rows
+gets `merge N pending` on its own actions line under the base HEAD (a
+long HEAD subject must never push it sideways); both are link-styled
+like the modal's other verbs. `POST /api/repos/merge` validates the
 path against the watched set, then routes per row: a conductor step
 worktree whose state.json names the same branch goes through
 `merge_run_start(only=[step])` - the run's own pipeline keeps

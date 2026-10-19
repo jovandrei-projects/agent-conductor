@@ -2160,6 +2160,161 @@ assert.match(html,/merge 2 pending/);
             self.assertIn("do NOT delete", rec["raw"])
             self.assertEqual(rec["project"], "proj")
 
+    def test_repo_list_and_repo_one_progressive_scan(self):
+        """The modal's progressive-scan endpoints: /api/repos is the
+        light name+path list (no worktree work - that's what the client
+        walks narrating 'scanning <name>'), and /api/repos/<name> is one
+        repo's section (or the quiet fold) with a per-repo cache that
+        ?fresh=1 busts."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = base / "proj"
+            repo.mkdir()
+            git(repo, "init")
+            (repo / "f.txt").write_text("0\n", encoding="utf-8")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "init")
+            git(repo, "worktree", "add", str(base / "wt"), "-b", "feat")
+            quiet = base / "quietproj"
+            quiet.mkdir()
+            git(quiet, "init")
+            (quiet / "q.txt").write_text("q\n", encoding="utf-8")
+            git(quiet, "add", "-A")
+            git(quiet, "commit", "-m", "init")
+            nogit = base / "notgit"          # exists, no .git -> filtered
+            nogit.mkdir()
+            projects = {"proj": {"path": repo},
+                        "quietproj": {"path": quiet},
+                        "notgit": {"path": nogit}}
+
+            lst = conductor.repo_list(projects)
+            names = [r["name"] for r in lst["repos"]]
+            self.assertEqual(
+                names[0], "this repo (agent-conductor)")
+            self.assertIn("proj", names)
+            self.assertIn("quietproj", names)
+            self.assertNotIn("notgit", names)   # non-git dir stays out
+            self.assertNotIn("worktrees", lst["repos"][0])
+
+            runs = base / "data" / "runs"
+            sect = conductor.repo_one("proj", runs, projects=projects)
+            self.assertEqual(sect["name"], "proj")
+            self.assertEqual(len(sect["worktrees"]), 1)
+            self.assertEqual(sect["worktrees"][0]["branch"], "feat")
+            q = conductor.repo_one("quietproj", runs, projects=projects)
+            self.assertTrue(q["quiet"])
+            with self.assertRaises(conductor.RequestError):
+                conductor.repo_one("nope", runs, projects=projects)
+            with self.assertRaises(conductor.RequestError):
+                conductor.repo_one("notgit", runs, projects=projects)
+
+            # the per-repo cache serves within the TTL and ?fresh busts
+            with mock.patch.object(
+                    conductor, "_repo_scan_one",
+                    side_effect=AssertionError("cache miss")):
+                again = conductor.repo_one("proj", runs,
+                                           projects=projects)
+            self.assertEqual(again["name"], "proj")
+            calls = []
+            with mock.patch.object(
+                    conductor, "_repo_scan_one",
+                    side_effect=lambda n, p: calls.append(n)
+                    or sect):
+                conductor.repo_one("proj", runs, projects=projects,
+                                   fresh=True)
+            self.assertEqual(calls, ["proj"])
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_repos_modal_progressive_scan_and_links(self):
+        """The modal walks GET /api/repos/<name> one repo at a time: the
+        status line narrates 'scanning <name> · i of n', not-yet-scanned
+        repos show queued/scanning placeholders, a {quiet:true} answer
+        folds into the footnote, a per-repo error stays a section-local
+        notice (the rest still render), and merge affordances are
+        link-styled on fixed-layout tables."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map();
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',parentElement:{classList:{toggle(){}}},
+  classList:{add(){},remove(){},contains:()=>false},dataset:{},
+  appendChild(){}}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,createElement:()=>({
+    id:'',hidden:false,innerHTML:'',appendChild(){}}),
+  body:{classList:{add(){},remove(){},toggle(){}},appendChild(){}},
+  addEventListener:()=>{}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},AbortController});
+vm.runInContext(src,ctx);
+const sectA={name:'a',path:'/a',base:'main',
+  base_log:[{sha:'e102e30',subject:'landed fix',at:'t'}],
+  worktrees:[{path:'/a/w',branch:'feat',ahead:2,behind:0,base:'main',
+    dirty:false,detached:false,prunable:false,merging:false,
+    commits:[{sha:'c1',subject:'w1',at:'t'},
+             {sha:'c2',subject:'w2',at:'t'}],conductor:null}]};
+(async()=>{
+  vm.runInContext('repoView=true;repoData=null;',ctx);
+  const calls=[], snapshots={};
+  vm.runInContext(`api = async (m,p,b)=>{
+    __calls.push(p);
+    __snap[p]=document.getElementById('dbody').innerHTML;
+    if (p==='/api/repos') return {generated_at:'g',repos:[
+      {name:'a',path:'/a'},{name:'b',path:'/b'},{name:'c',path:'/c'}]};
+    if (p==='/api/repos/b?fresh=1') return {name:'b',path:'/b',quiet:true};
+    if (p==='/api/repos/c?fresh=1') throw new Error('git exploded');
+    if (p==='/api/repos/a?fresh=1') return __sectA;
+    throw new Error('unexpected '+p);
+  }`,Object.assign(ctx,{__calls:calls,__snap:snapshots,__sectA:sectA}));
+  await vm.runInContext('fetchRepos(true)',ctx);
+  assert.deepEqual(calls,['/api/repos','/api/repos/a?fresh=1',
+    '/api/repos/b?fresh=1','/api/repos/c?fresh=1']);
+  // mid-scan: 'a' narrates as scanning, b/c queued behind it
+  assert.match(snapshots['/api/repos/a?fresh=1'],
+    /scanning <b>a<\/b> &middot; 1 of 3/);
+  assert.match(snapshots['/api/repos/a?fresh=1'],
+    /<h4>b <span class="sub">\/b<\/span>[\s\S]*queued/);
+  // mid-scan after a landed: its section rendered, b narrating
+  assert.match(snapshots['/api/repos/b?fresh=1'],
+    /scanning <b>b<\/b> &middot; 2 of 3/);
+  assert.match(snapshots['/api/repos/b?fresh=1'],/landed fix/);
+  const html=elem('dbody').innerHTML;
+  // done: status reads 'checked', a's section + c's error notice
+  // render, b folded into the footnote
+  assert.doesNotMatch(html,/scanning/);
+  assert.match(html,/checked/);
+  assert.match(html,/2 unmerged/);
+  assert.match(html,/git exploded/);
+  assert.match(html,/no linked worktrees: b/);
+  // link-styled actions + the fixed table skeleton
+  assert.match(html,/class="linkbtn" data-merge-all/);
+  assert.match(html,/merge 1 pending/);
+  assert.match(html,/class="linkbtn" data-wtmerge/);
+  assert.match(html,/table-layout:fixed|<colgroup>/);
+  // a merge outcome rescan only touches its own repo
+  const calls2=calls.splice(0);
+  vm.runInContext(`api = async (m,p,b)=>{
+    __calls.push(p);
+    if (m==='POST'&&p==='/api/repos/merge')
+      return {repo:'a',base:'main',
+        result:{merged:true,into:'main',worktree:'/a/w',branch:'feat'}};
+    if (p==='/api/repos/a?fresh=1') return __sectA;
+    throw new Error('unexpected '+p);
+  }`,ctx);
+  await vm.runInContext(
+    `repoMerge('/a','/a/w','feat',false)`,ctx);
+  assert.deepEqual(calls,['/api/repos/merge','/api/repos/a?fresh=1']);
+  assert.match(elem('dbody').innerHTML,/merged into <b>main<\/b>/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding='utf-8',
+                           timeout=15)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_pool_ui_tracks_leases_between_identical_payloads(self):
         """Regression: slot_pool is NOT part of the render signature, so

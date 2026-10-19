@@ -5300,82 +5300,133 @@ def _wt_conductor_link(runs_dir: Path, run_name: str,
             "merge_target": rec.get("merge_target")}
 
 
-def _repo_status(projects: dict[str, dict],
-                 runs_dir: Path) -> dict:
-    """One section per watched repo - every configured project plus this
-    repo - dedup'd by resolved path. Repos with no linked worktrees land
-    in `quiet` so the modal keeps them to a footnote line."""
+_REPO_TARGETS_TTL_S = 60.0   # the watched set changes when projects.toml
+                             # or a dir's .git does - a minute of staleness
+                             # beats ~5s of git spawns on every call
+_REPO_TARGETS_CACHE: dict = {}
+_REPO_TARGETS_LOCK = threading.Lock()
+
+
+def _repo_targets(projects: dict[str, dict]) -> list:
+    """[(name, resolved Path)] for every watched repo that exists and is
+    a git repo - 'this repo' first, then the configured projects in
+    registry order, dedup'd by resolved path. This is the light list
+    GET /api/repos answers and the ordered set per-repo scans work over;
+    _repo_watched matches client-sent paths against the same set.
+
+    is_git_repo is one `git rev-parse` subprocess per candidate (~0.3s
+    each on Windows), so the checks run concurrently and the result is
+    cached 60s - otherwise the 'light' list call and every per-repo scan
+    validation would pay seconds of spawn cost before doing any work."""
+    fp = tuple(sorted((k, str(v.get("path")))
+                      for k, v in projects.items()))
+    now = time.time()
+    with _REPO_TARGETS_LOCK:
+        hit = _REPO_TARGETS_CACHE.get(fp)
+        if hit is not None and now - hit["at"] < _REPO_TARGETS_TTL_S:
+            return hit["targets"]
     seen: set[str] = set()
-    repos, quiet = [], []
-    cands = [("this repo (agent-conductor)", ROOT)] + [
-        (slug, ent["path"]) for slug, ent in projects.items()]
-    for name, pdir in cands:
+    cands = []
+    for name, pdir in [("this repo (agent-conductor)", ROOT)] + [
+            (slug, ent["path"]) for slug, ent in projects.items()]:
         try:
             pdir = pdir.resolve()
         except (OSError, TypeError):
             continue
         key = os.path.normcase(str(pdir))
-        if key in seen or not is_git_repo(pdir):
-            continue
+        if key in seen or not pdir.is_dir():   # the stat is free; the
+            continue                           # git spawn is not
         seen.add(key)
-        rows = _worktree_rows(pdir)
-        if not rows:
-            continue
-        # 'the base' is what conductor merges into by default: the
-        # branch the MAIN checkout (worktree rows[0]) sits on. The
-        # served path itself may be a linked worktree (conductor often
-        # runs inside one), so current_branch(pdir) would report the
-        # session's own branch - the main checkout is the trunk the
-        # user means by 'merged into master'. A detached main falls
-        # back to master/main, then to comparing against HEAD sha.
-        base = rows[0]["branch"]
-        if base is None:
-            base = ("master" if local_branch_exists(pdir, "master")
-                    else "main" if local_branch_exists(pdir, "main")
-                    else None)
-        base_ref = base or "HEAD"
-        wts = []
-        for w in rows[1:]:                # rows[0] is the main checkout
-            wpath = Path(w["path"])
-            row = {"path": str(wpath), "branch": w["branch"],
-                   "detached": w["detached"],
-                   "prunable": w["prunable"], "dirty": False,
-                   "merging": False, "ahead": None, "behind": None,
-                   "commits": [], "conductor": None, "base": base}
-            link = _wt_data_parts(wpath)
-            if link is not None:
-                row["conductor"] = _wt_conductor_link(*link)
-                tgt = row["conductor"].get("merge_target")
-                if tgt and local_branch_exists(pdir, tgt):
-                    # an explicit merge_target beats the default base -
-                    # 'is it merged' means into THIS branch
-                    row["base"] = tgt
-            head = w["branch"] or w["head"]
-            bref = row["base"]
-            if head and bref and not w["prunable"]:
-                r2 = _git(pdir, "rev-list", "--left-right", "--count",
-                          f"{bref}...{head}")
-                if r2.returncode == 0:
-                    parts = r2.stdout.split()
-                    if len(parts) == 2:
-                        row["behind"], row["ahead"] = (int(parts[0]),
-                                                     int(parts[1]))
-                if row["ahead"]:
-                    row["commits"] = _git_commit_rows(
-                        pdir, f"{bref}..{head}", 8)
-            if wpath.is_dir():
-                row["dirty"] = bool(
-                    _git(wpath, "status", "--porcelain",
-                         "--untracked-files=normal").stdout.strip())
-                row["merging"] = _git(
-                    wpath, "rev-parse", "-q", "--verify",
-                    "MERGE_HEAD").returncode == 0
-            wts.append(row)
-        repo = {"name": name, "path": str(pdir), "base": base,
-                "base_log": _git_commit_rows(pdir, base_ref, 3),
-                "worktrees": wts}
-        (repos if wts else quiet).append(
-            repo if wts else name)
+        cands.append((name, pdir))
+    if cands:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(cands))) as ex:
+            gits = list(ex.map(lambda t: is_git_repo(t[1]), cands))
+        out = [t for t, ok in zip(cands, gits) if ok]
+    else:
+        out = []
+    with _REPO_TARGETS_LOCK:
+        _REPO_TARGETS_CACHE[fp] = {"at": now, "targets": out}
+    return out
+
+
+def _repo_scan_one(name: str, pdir: Path) -> dict | None:
+    """The full repos-modal section for ONE watched repo (base HEAD +
+    per-worktree merge state), or None when it has no linked worktrees -
+    callers fold a None into the 'quiet' footnote. Split out of
+    _repo_status so GET /api/repos/<name> can scan one repo at a time:
+    the modal narrates progress ('scanning <name>') and one slow repo
+    never stalls the rest."""
+    rows = _worktree_rows(pdir)
+    if not rows:
+        return None
+    # 'the base' is what conductor merges into by default: the
+    # branch the MAIN checkout (worktree rows[0]) sits on. The
+    # served path itself may be a linked worktree (conductor often
+    # runs inside one), so current_branch(pdir) would report the
+    # session's own branch - the main checkout is the trunk the
+    # user means by 'merged into master'. A detached main falls
+    # back to master/main, then to comparing against HEAD sha.
+    base = rows[0]["branch"]
+    if base is None:
+        base = ("master" if local_branch_exists(pdir, "master")
+                else "main" if local_branch_exists(pdir, "main")
+                else None)
+    base_ref = base or "HEAD"
+    wts = []
+    for w in rows[1:]:                # rows[0] is the main checkout
+        wpath = Path(w["path"])
+        row = {"path": str(wpath), "branch": w["branch"],
+               "detached": w["detached"],
+               "prunable": w["prunable"], "dirty": False,
+               "merging": False, "ahead": None, "behind": None,
+               "commits": [], "conductor": None, "base": base}
+        link = _wt_data_parts(wpath)
+        if link is not None:
+            row["conductor"] = _wt_conductor_link(*link)
+            tgt = row["conductor"].get("merge_target")
+            if tgt and local_branch_exists(pdir, tgt):
+                # an explicit merge_target beats the default base -
+                # 'is it merged' means into THIS branch
+                row["base"] = tgt
+        head = w["branch"] or w["head"]
+        bref = row["base"]
+        if head and bref and not w["prunable"]:
+            r2 = _git(pdir, "rev-list", "--left-right", "--count",
+                      f"{bref}...{head}")
+            if r2.returncode == 0:
+                parts = r2.stdout.split()
+                if len(parts) == 2:
+                    row["behind"], row["ahead"] = (int(parts[0]),
+                                                 int(parts[1]))
+            if row["ahead"]:
+                row["commits"] = _git_commit_rows(
+                    pdir, f"{bref}..{head}", 8)
+        if wpath.is_dir():
+            row["dirty"] = bool(
+                _git(wpath, "status", "--porcelain",
+                     "--untracked-files=normal").stdout.strip())
+            row["merging"] = _git(
+                wpath, "rev-parse", "-q", "--verify",
+                "MERGE_HEAD").returncode == 0
+        wts.append(row)
+    if not wts:
+        return None      # main checkout only -> the 'quiet' footnote
+    return {"name": name, "path": str(pdir), "base": base,
+            "base_log": _git_commit_rows(pdir, base_ref, 3),
+            "worktrees": wts}
+
+
+def _repo_status(projects: dict[str, dict],
+                 runs_dir: Path) -> dict:
+    """One section per watched repo - every configured project plus this
+    repo - dedup'd by resolved path. Repos with no linked worktrees land
+    in `quiet` so the modal keeps them to a footnote line."""
+    repos, quiet = [], []
+    for name, pdir in _repo_targets(projects):
+        sect = _repo_scan_one(name, pdir)
+        (repos if sect else quiet).append(
+            sect if sect else name)
     repos.sort(key=lambda r: (
         -sum(1 for w in r["worktrees"] if w.get("ahead")),
         -len(r["worktrees"]), r["name"]))
@@ -5383,14 +5434,26 @@ def _repo_status(projects: dict[str, dict],
             "quiet": quiet}
 
 
+def repo_list(projects: dict | None = None) -> dict:
+    """GET /api/repos - the LIGHT payload: just the watched repo names +
+    paths, no worktree scan (each scan runs several git subprocesses, so
+    the modal walks them one by one and narrates progress)."""
+    projects = load_projects() if projects is None else projects
+    return {"generated_at": now_iso(),
+            "repos": [{"name": n, "path": str(p)}
+                      for n, p in _repo_targets(projects)]}
+
+
 _REPO_STATUS_TTL_S = 10.0
 _REPO_STATUS_CACHE = {"at": 0.0, "payload": None}
+_REPO_ONE_CACHE: dict = {}          # normcase path -> {at, payload}
 _REPO_STATUS_LOCK = threading.Lock()
 
 
 def repo_status(runs_dir: Path, projects: dict | None = None,
                 fresh: bool = False) -> dict:
-    """GET /api/repos payload - the cached scan, or a fresh one."""
+    """The whole-set scan - the Ask-AI provider's payload (the modal
+    itself fetches per-repo so it can show live progress)."""
     now = time.time()
     with _REPO_STATUS_LOCK:
         if (not fresh and _REPO_STATUS_CACHE["payload"] is not None
@@ -5402,6 +5465,35 @@ def repo_status(runs_dir: Path, projects: dict | None = None,
         _REPO_STATUS_CACHE["at"] = now
         _REPO_STATUS_CACHE["payload"] = payload
         return payload
+
+
+def repo_one(name: str, runs_dir: Path,
+             projects: dict | None = None,
+             fresh: bool = False) -> dict:
+    """GET /api/repos/<name> - one watched repo's full section
+    (10s-cached per repo). A repo with no linked worktrees answers
+    {quiet: true} so the client folds it into the footnote."""
+    projects = load_projects() if projects is None else projects
+    tgt = next((t for t in _repo_targets(projects) if t[0] == name),
+               None)
+    if tgt is None:
+        raise RequestError(f"not a watched repository: {name}", 404)
+    name, pdir = tgt
+    key = os.path.normcase(str(pdir))
+    now = time.time()
+    with _REPO_STATUS_LOCK:
+        hit = _REPO_ONE_CACHE.get(key)
+        if (not fresh and hit is not None
+                and now - hit["at"] < _REPO_STATUS_TTL_S):
+            return hit["payload"]
+    # the scan itself is several git subprocesses - run it outside the
+    # lock so a slow repo never serializes other scans or merges
+    sect = _repo_scan_one(name, pdir)
+    payload = sect or {"name": name, "path": str(pdir),
+                       "quiet": True}
+    with _REPO_STATUS_LOCK:
+        _REPO_ONE_CACHE[key] = {"at": now, "payload": payload}
+    return payload
 
 
 def _repo_watched(path_str, projects: dict) -> tuple:
@@ -5417,13 +5509,9 @@ def _repo_watched(path_str, projects: dict) -> tuple:
     if want is None:
         raise RequestError("not a watched repository", 404)
     key = os.path.normcase(str(want))
-    for name, pdir in [("this repo (agent-conductor)", ROOT)] + [
-            (slug, ent["path"]) for slug, ent in projects.items()]:
-        try:
-            if os.path.normcase(str(Path(pdir).resolve())) == key:
-                return name, want
-        except (OSError, TypeError):
-            continue
+    for name, pdir in _repo_targets(projects):
+        if os.path.normcase(str(pdir)) == key:
+            return name, want
     raise RequestError("not a watched repository", 404)
 
 
@@ -15049,13 +15137,31 @@ h3.proj .sub { margin-bottom:0; font-weight:400; }
 .repoline { margin:2px 0 4px; }
 .repoline code, .cmt code { color:#58a6ff; font-size:11px;
   font-family:Consolas,monospace; }
+.repoacts { margin:2px 0 6px; }     /* 'merge N pending' sits on its own
+  line under the base HEAD - a long HEAD subject must never push it */
+.reposec { margin:2px 0 6px; font-style:italic; }
 .repolog { margin:2px 0 6px 14px; font-size:12px; color:#8b949e; }
 .repolog summary { cursor:pointer; }
 .cmt { padding:1px 0 1px 14px; font-size:12px; }
 .cmt .sub { margin-left:6px; }
-#detail table.repotab { table-layout:auto; }
+/* fixed layout + the colgroup: every repo's table keeps the same
+   column widths regardless of content - the act column (and its merge
+   link) can never get squeezed off-screen by a fat commit list */
+#detail table.repotab { table-layout:fixed; width:100%; }
+#detail table.repotab col.c-wt { width:41%; }
+#detail table.repotab col.c-vs { width:16%; }
+#detail table.repotab col.c-cond { width:17%; }
+#detail table.repotab col.c-path { width:18%; }
+#detail table.repotab col.c-act { width:8%; }
 #detail table.repotab td, #detail table.repotab th {
   padding-right:18px; }
+#detail .repotab code { word-break:break-all; }
+#detail .repotab .rpath { display:block; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }
+/* a row's merge outcome takes a full-width row of its own - conflict
+   file lists would crush the 8% act column */
+#detail tr.wtmsg td { padding-left:22px; }
+#detail tr.wtmsg .notice { margin:2px 0 6px; }
 /* task/run history feed (driver events.jsonl + dashboard action log) */
 .evlog { margin:6px 0 10px; max-height:220px; overflow:auto;
   border:1px solid #21262d; border-radius:7px; }
@@ -15866,9 +15972,11 @@ let runModalKey = null;     // runKey while the run-details modal shows
 let summaryView = null;     // {key: agentKey} while the summary modal shows
 let poolView = false;       // the agent-pool modal is open
 let repoView = false;       // the repositories modal is open
-let repoData = null;        // last /api/repos payload
-let repoFetched = 0;        // Date.now() when it landed
-let repoBusy = false;       // a /api/repos fetch is in flight
+let repoData = null;        // assembled {generated_at, repos, quiet}
+let repoScan = null;        // {list, i, current, fresh} while scanning
+let repoFetched = 0;        // Date.now() when the scan completed
+let repoBusy = false;       // a repo list/scan pass is in flight
+const repoSects = new Map();// repo name -> section | {quiet:true}
 const repoMsgs = new Map(); // worktree path (or 'repo|<name>') ->
                             // {cls, html} - last merge attempt's
                             // outcome, shown under its row until the
@@ -19270,9 +19378,14 @@ function poolHtml(d){
 // --- repositories modal --------------------------------------------------
 // 'is my work in master yet' without asking an agent: /api/repos gives
 // each watched repo's base HEAD and every linked worktree's merge state.
-// The fetch is its own endpoint (git work doesn't ride the 2s state
-// poll); while the modal is open it re-pulls every ~15s so merges that
-// land mid-look show up on their own.
+// The scan is split per repo on purpose: git work doesn't ride the 2s
+// state poll, and a one-shot scan of every watched repo can run tens of
+// seconds - long enough to trip the fetch timeout (the 'signal timed
+// out' notice). So the modal first pulls the light name+path list, then
+// walks GET /api/repos/<name> one at a time - the status line narrates
+// ('scanning apartment-3d · 2 of 14') and each section materializes as
+// it resolves. While the modal is open it re-pulls every ~15s so merges
+// that land mid-look show up on their own.
 function openRepos(){
   // same dirty-request guard every other modal opener takes
   if (!closeThen(closeDetail(false, true), openRepos)) return;
@@ -19291,11 +19404,49 @@ async function fetchRepos(fresh){
   if (repoBusy) return;
   repoBusy = true;
   try {
-    repoData = await api('GET',
-      '/api/repos'+(fresh?'?fresh=1':''), null, 30000);
+    const lst = await api('GET', '/api/repos', null, 15000);
+    repoScan = {list: lst.repos||[], i:0, current:null,
+                fresh: !!fresh, running: true};
+    if (!repoData) repoData = {generated_at:null, repos:[], quiet:[]};
+    if (repoView) renderRepos();
+    for (const it of repoScan.list){
+      if (!repoScan.running || !repoView) break;  // closed/superseded
+      repoScan.current = it.name;
+      if (repoView) renderRepos();
+      try {
+        const s = await api('GET',
+          '/api/repos/'+encodeURIComponent(it.name)+
+          (fresh?'?fresh=1':''), null, 30000);
+        repoSects.set(it.name, s);
+      } catch(err){
+        repoSects.set(it.name, {name:it.name, path:it.path,
+          error: err.message||String(err)});
+      }
+      repoScan.i++;
+      if (repoView) renderRepos();
+    }
+    repoScan = null;
+    // assemble: sections in scan order, quiet names folded out, then
+    // the same -pending/-worktree-count/name sort the one-shot payload
+    // used to apply server-side
+    const repos = [], quiet = [];
+    for (const it of (lst.repos||[])){
+      const s = repoSects.get(it.name);
+      if (!s) continue;
+      if (s.quiet) quiet.push(s.name);
+      else repos.push(s);
+    }
+    repos.sort((a,b)=>
+      ((b.worktrees||[]).filter(w=>(w.ahead||0)>0).length -
+       (a.worktrees||[]).filter(w=>(w.ahead||0)>0).length) ||
+      ((b.worktrees||[]).length - (a.worktrees||[]).length) ||
+      String(a.name).localeCompare(String(b.name)));
+    repoData = {generated_at:new Date().toISOString(),
+                repos, quiet};
     repoFetched = Date.now();
     if (repoView) renderRepos();
   } catch(err){
+    repoScan = null;
     if (repoView){
       repoData = {generated_at:null, repos:[], quiet:[],
                   error:err.message||String(err)};
@@ -19303,9 +19454,31 @@ async function fetchRepos(fresh){
     }
   } finally { repoBusy = false; }
 }
+// after a merge: rescan just that repo's section in place - the rest of
+// the assembled view stays put
+async function rescanRepo(name){
+  try {
+    const s = await api('GET',
+      '/api/repos/'+encodeURIComponent(name)+'?fresh=1', null, 30000);
+    repoSects.set(name, s);
+    if (repoData){
+      const i = (repoData.repos||[]).findIndex(r=>r.name===name);
+      if (s.quiet){
+        if (i>=0) repoData.repos.splice(i,1);
+        if (!repoData.quiet.includes(name)) repoData.quiet.push(name);
+      } else {
+        const q = (repoData.quiet||[]).indexOf(name);
+        if (q>=0) repoData.quiet.splice(q,1);
+        if (i>=0) repoData.repos[i] = s;
+        else repoData.repos.push(s);
+      }
+    }
+  } catch(err){ /* the merge notice already carries the outcome */ }
+  if (repoView) renderRepos();
+}
 function renderRepos(){
   if (!repoView) return;
-  const html = repoData ? reposHtml(repoData)
+  const html = (repoData || repoScan) ? reposHtml(repoData)
     : `<h3 id="modal-title">repositories</h3>` +
       `<div class="notice">scanning watched repos&hellip;</div>`;
   if (html===detailHTML) return;
@@ -19317,54 +19490,96 @@ function renderRepos(){
   restoreModalScroll(scap);
 }
 function reposHtml(d){
+  const d2 = d || {generated_at:null, repos:[], quiet:[]};
   let h = `<h3 id="modal-title">repositories</h3>` +
     `<div class="sub">each watched repo's base-branch HEAD plus every ` +
     `linked worktree's merge state - conductor step worktrees and devin ` +
-    `session worktrees alike. checked ${loc(d.generated_at)} ` +
+    `session worktrees alike. ` +
+    (repoScan && repoScan.running
+      ? `${repoScan.fresh?'rescann':'scann'}ing ` +
+        `<b>${esc(repoScan.current||'&hellip;')}</b> ` +
+        `&middot; ${repoScan.i+1} of ${repoScan.list.length} `
+      : `checked ${loc(d2.generated_at)} `) +
     `<button type="button" class="linkbtn" data-repo-refresh` +
     `${repoBusy?' disabled':''}>refresh</button></div>`;
-  if (d.error)
-    h += `<div class="notice error">${esc(d.error)}</div>`;
-  for (const r of d.repos||[]){
-    const head = (r.base_log||[])[0];
-    const pend = (r.worktrees||[]).filter(w=>wtMergeable(w));
-    const rmsg = repoMsgs.get('repo|'+r.path);
-    h += `<div class="repoblk"><h4>${esc(r.name)}` +
-      ` <span class="sub">${esc(r.path)}</span></h4>` +
-      `<div class="repoline"><span class="stc st-ok">` +
-      `${esc(r.base||'HEAD')}</span> ` +
-      (head ? `HEAD <code>${esc(head.sha)}</code> ` +
-        `${esc(head.subject)} <span class="sub">${ago(head.at)}` +
-        `</span>`
-        : `<span class="sub">no commits</span>`) +
-      (pend.length
-        ? ` <button type="button" class="btn slim" ` +
-          `data-merge-all data-repo="${esc(r.path)}" ` +
-          `title="land every pending worktree branch into ` +
-          `${esc(r.base||'the base')} - conductor worktrees go through ` +
-          `their run's own merge pipeline, the rest get a plain git ` +
-          `merge in the main checkout">merge ${pend.length} ` +
-          `pending</button>`
-        : '') +
-      `</div>`;
-    if (rmsg) h += `<div class="notice ${esc(rmsg.cls)}">` +
-      `${rmsg.html}</div>`;
-    if ((r.base_log||[]).length>1)
-      h += `<details class="repolog" data-repolog="${esc(r.name)}"` +
-        `${repologOpen.has(r.name)?' open':''}>` +
-        `<summary>latest ${r.base_log.length} commits</summary>` +
-        r.base_log.map(cmtLine).join('') + `</details>`;
-    h += `<div class="wrapw"><table class="repotab"><tr>` +
-      `<th>worktree</th><th>vs ${esc(r.base||'base')}</th>` +
-      `<th>conductor</th><th>path</th><th></th></tr>` +
-      (r.worktrees||[]).map(w=>wtRow(w,r)).join('') +
-      `</table></div></div>`;
+  if (d2.error)
+    h += `<div class="notice error">${esc(d2.error)}</div>`;
+  // mid-scan the footnote lists only repos confirmed quiet THIS pass -
+  // the previous pass's quiet names are stale until their rescan lands
+  const quiet = (repoScan && repoScan.running)
+    ? [] : [].concat(d2.quiet||[]);
+  let anySect = false;
+  if (repoScan && repoScan.running){
+    // mid-scan: walk the watched list in order; a repo whose section
+    // landed renders it, a quiet hit defers to the footnote, anything
+    // else is a skeleton placeholder narrating the queue
+    for (const it of repoScan.list){
+      const s = repoSects.get(it.name);
+      if (s === undefined){
+        h += `<div class="repoblk"><h4>${esc(it.name)} ` +
+          `<span class="sub">${esc(it.path)}</span></h4>` +
+          `<div class="sub reposec">${it.name===repoScan.current
+            ? 'scanning&hellip;' : 'queued&hellip;'}</div></div>`;
+        anySect = true;
+        continue;
+      }
+      if (s.quiet){ if (!quiet.includes(s.name)) quiet.push(s.name);
+                    continue; }
+      anySect = true;
+      h += repoSectHtml(s);
+    }
+  } else {
+    for (const r of d2.repos||[]){ anySect = true;
+                                   h += repoSectHtml(r); }
   }
-  if ((d.quiet||[]).length)
+  if (quiet.length)
     h += `<div class="sub" style="margin-top:14px">no linked ` +
-      `worktrees: ${d.quiet.map(esc).join(', ')}</div>`;
-  if (!(d.repos||[]).length && !(d.quiet||[]).length && !d.error)
+      `worktrees: ${quiet.map(esc).join(', ')}</div>`;
+  if (!anySect && !quiet.length && !d2.error)
     h += `<div class="notice">no watched git repos.</div>`;
+  return h;
+}
+// one watched repo's block: base-branch HEAD + fold, the repo-level
+// merge action on its own line (a long HEAD subject must never push it
+// sideways), and the per-worktree table
+function repoSectHtml(r){
+  const head = (r.base_log||[])[0];
+  const pend = (r.worktrees||[]).filter(w=>wtMergeable(w));
+  const rmsg = repoMsgs.get('repo|'+r.path);
+  let h = `<div class="repoblk"><h4>${esc(r.name)}` +
+    ` <span class="sub">${esc(r.path)}</span></h4>`;
+  if (r.error)
+    h += `<div class="notice error">${esc(r.error)}</div>`;
+  h += `<div class="repoline"><span class="stc st-ok">` +
+    `${esc(r.base||'HEAD')}</span> ` +
+    (head ? `HEAD <code>${esc(head.sha)}</code> ` +
+      `${esc(head.subject)} <span class="sub">${ago(head.at)}` +
+      `</span>`
+      : `<span class="sub">no commits</span>`) +
+    `</div>`;
+  if (pend.length)
+    h += `<div class="repoacts"><button type="button" ` +
+      `class="linkbtn" data-merge-all data-repo="${esc(r.path)}" ` +
+      `title="land every pending worktree branch into ` +
+      `${esc(r.base||'the base')} - conductor worktrees go through ` +
+      `their run's own merge pipeline, the rest get a plain git ` +
+      `merge in the main checkout">merge ${pend.length} ` +
+      `pending</button></div>`;
+  if (rmsg) h += `<div class="notice ${esc(rmsg.cls)}">` +
+    `${rmsg.html}</div>`;
+  if ((r.base_log||[]).length>1)
+    h += `<details class="repolog" data-repolog="${esc(r.name)}"` +
+      `${repologOpen.has(r.name)?' open':''}>` +
+      `<summary>latest ${r.base_log.length} commits</summary>` +
+      r.base_log.map(cmtLine).join('') + `</details>`;
+  h += `<div class="wrapw"><table class="repotab">` +
+    `<colgroup><col class="c-wt"><col class="c-vs">` +
+    `<col class="c-cond"><col class="c-path"><col class="c-act">` +
+    `</colgroup><tr>` +
+    `<th>worktree</th><th>vs ${esc(r.base||'base')}</th>` +
+    `<th>conductor</th><th>path</th><th></th></tr>` +
+    (r.worktrees||[]).map(w=>wtRow(w,r)).join('') +
+    `</table></div></div>`;
   return h;
 }
 // a row gets the merge affordance only when there's an actual branch
@@ -19434,7 +19649,7 @@ function wtRow(w, r){
   if (wtMergeable(w)){
     const viaRun = c && !c.merge_staging && !c.merged_recorded &&
       c.state_found !== false;
-    act = `<button type="button" class="btn slim" data-wtmerge ` +
+    act = `<button type="button" class="linkbtn" data-wtmerge ` +
       `data-repo="${esc(r.path)}" data-wt="${esc(w.path)}" ` +
       `data-branch="${esc(w.branch)}" ` +
       `title="${viaRun
@@ -19444,15 +19659,20 @@ function wtRow(w, r){
           esc(w.base||'the base')+' in the main checkout - the '+
           'worktree and branch stay put'}">merge</button>`;
   }
-  const msg = repoMsgs.get(w.path);
-  if (msg) act += `<div class="notice ${esc(msg.cls)}">${msg.html}</div>`;
-  return `<tr><td class="wrap"><code>${esc(w.branch||'(detached)')}` +
+  let h = `<tr><td class="wrap"><code>${esc(w.branch||'(detached)')}` +
     `</code>${staging}${cmts}</td>` +
     `<td>${ws.join(' ')}${rec}</td>` +
     `<td class="wrap">${link}</td>` +
-    `<td class="wrap"><span class="sub" title="${esc(w.path)}">` +
+    `<td class="wrap"><span class="sub rpath" title="${esc(w.path)}">` +
     `${esc(tailPath(w.path))}</span></td>` +
     `<td>${act}</td></tr>`;
+  // the merge outcome is a full-width row under its worktree - a
+  // conflict file list would crush the fixed act column otherwise
+  const msg = repoMsgs.get(w.path);
+  if (msg)
+    h += `<tr class="wtmsg"><td colspan="5">` +
+      `<div class="notice ${esc(msg.cls)}">${msg.html}</div></td></tr>`;
+  return h;
 }
 // /api/repos/merge outcomes -> a persistent notice under the row. A
 // conflict keeps its file list and offers 'send to an agent' - the
@@ -19469,7 +19689,7 @@ function mergeMsg(res, base){
     return {cls:'warn', files: res.conflict,
       html:`conflicts in ${files.map(esc).join(', ')}` +
       `${(res.conflict||[]).length>8?' &hellip;':''}<br>` +
-      `<button type="button" class="btn slim" data-merge-agent ` +
+      `<button type="button" class="linkbtn" data-merge-agent ` +
       `data-repo="${esc(res._repo||'')}" data-wt="${esc(res.worktree||'')}"` +
       ` data-branch="${esc(res.branch||'')}">send to an agent</button> ` +
       `<span class="sub">a draft request asks a session to re-enter ` +
@@ -19513,7 +19733,7 @@ async function repoMerge(repoPath, wtPath, branch, all){
       repoMsgs.set(wtPath, mergeMsg(res, out.base));
     }
     renderRepos();
-    fetchRepos(true);
+    rescanRepo(out.repo);
   } catch(err){
     repoMsgs.set(all?('repo|'+repoPath):wtPath,
       {cls:'error', html:esc(err.message||String(err))});
@@ -22218,12 +22438,17 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                 elif path == "/api/tour":
                     self._json(tour_feed(tour))
                 elif path == "/api/repos":
-                    # the repos modal: watched repos' base HEAD +
-                    # worktree merge state, 10s-cached server-side
+                    # the repos modal's light list: watched repo names +
+                    # paths only - the heavy worktree scan goes per-repo
+                    # below so the modal can narrate progress
+                    self._json(repo_list())
+                elif (m := re.fullmatch(r"/api/repos/(.+)", path)):
+                    # one watched repo's merge-state section, 10s-cached
+                    # per repo; ?fresh=1 busts (post-merge rescans)
                     q = urllib.parse.parse_qs(
                         urllib.parse.urlsplit(self.path).query)
-                    self._json(repo_status(
-                        runs_dir,
+                    self._json(repo_one(
+                        urllib.parse.unquote(m[1]), runs_dir,
                         fresh=q.get("fresh", [""])[0]
                         in ("1", "true", "yes")))
                 elif (m := re.fullmatch(
