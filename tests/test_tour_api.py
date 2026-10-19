@@ -222,6 +222,7 @@ class TourApiTests(unittest.TestCase):
         self.assertTrue(self.state_file()["viewed"][0].get("unviewed_at"))
 
     def test_snooze_defers_without_acknowledging(self):
+        self.get()                          # the deck a client acks from
         eid = f"area:assistant:{self.c_chat[:12]}"
         s, d = self.post(eid, "snooze")
         self.assertEqual(s, 200, d)
@@ -256,6 +257,7 @@ class TourApiTests(unittest.TestCase):
     def test_snoozed_entry_does_not_pin_the_watermark(self):
         """Snooze one, view the other: the deferred card is not 'new'
         so nothing blocks the advance."""
+        self.get()
         self.post(f"area:assistant:{self.c_chat[:12]}", "snooze")
         s, d = self.post(f"area:power:{self.c_power[:12]}", "viewed")
         self.assertTrue(d["advanced"], d)
@@ -267,6 +269,7 @@ class TourApiTests(unittest.TestCase):
     def test_unview_after_advancement_resurfaces_new(self):
         """An entry behind the advanced watermark keeps its range, so
         unview re-injects it into entries and the unseen count."""
+        self.get()
         for eid in (f"area:power:{self.c_power[:12]}",
                     f"area:assistant:{self.c_chat[:12]}"):
             self.post(eid, "viewed")
@@ -280,12 +283,15 @@ class TourApiTests(unittest.TestCase):
     def test_new_commit_in_viewed_area_is_new_again(self):
         """A fresh change in an already-viewed area gets a NEW id - it
         can never silently inherit 'viewed'."""
+        self.get()
         self.post(f"area:power:{self.c_power[:12]}", "viewed")
         c_new = commit(self.repo, "conductor.py", "y",
                        "Improve power dialog again")
-        # the ~60s cache still holds the pre-commit feed - expire it the
-        # way the TTL would, then the fresh card surfaces
-        self.tour["feed"]["at"] -= conductor.TOUR_FEED_TTL_S + 1
+        # the ~60s cache may still hold the pre-commit feed - expire it
+        # the way the TTL would (the transition's refresh may already
+        # have dropped it), then the fresh card surfaces
+        if self.tour["feed"] is not None:
+            self.tour["feed"]["at"] -= conductor.TOUR_FEED_TTL_S + 1
         ids = self.ids(self.call("GET", "/api/tour")[1])
         fresh = ids[f"area:power:{c_new[:12]}"]
         self.assertEqual(fresh["state"], "new")
@@ -293,6 +299,7 @@ class TourApiTests(unittest.TestCase):
                             f"area:power:{self.c_power[:12]}")
 
     def test_viewed_idempotent_and_snooze_moves_lists(self):
+        self.get()
         eid = f"area:power:{self.c_power[:12]}"
         self.post(eid, "viewed")
         s, d = self.post(eid, "viewed")          # re-mark: still one row
@@ -370,7 +377,11 @@ class TourApiTests(unittest.TestCase):
         self.get()
         self.assertEqual(self.tour["count"]["value"], 2)
         self.post(f"area:power:{self.c_power[:12]}", "viewed")
-        self.assertEqual(self.tour["count"]["value"], 1)
+        # the refresh is deferred: the cached count converges once the
+        # daemon rebuild lands, not inside the POST
+        self.assertTrue(_poll(
+            lambda: self.tour["count"] is not None
+            and self.tour["count"]["value"] == 1))
 
     # -------------------------------------------------- /api/state
 
@@ -415,14 +426,76 @@ class TourApiTests(unittest.TestCase):
         self.assertEqual(self.call("GET", "/api/state")[1]
                          ["tour_unseen"], 2)
         self.post(f"area:power:{self.c_power[:12]}", "viewed")
-        s, d = self.call("GET", "/api/state")
-        self.assertEqual(d["tour_unseen"], 1)    # no stale count
+        # the state poll reports the last-known count until the deferred
+        # refresh lands, then converges on the post-mutation value
+        self.assertTrue(_poll(
+            lambda: self.call("GET", "/api/state")[1]
+            ["tour_unseen"] == 1))
 
-    def test_transition_result_carries_fresh_count(self):
+    def test_transition_result_carries_count(self):
+        """The response's unseen_count is the count the retained feed
+        implies under the just-saved state - last-known, not rebuilt."""
+        self.get()
         s, d = self.post(f"area:power:{self.c_power[:12]}", "viewed")
         self.assertEqual(d["unseen_count"], 1)
         s, d = self.post("definitely-missing", "unview")
         self.assertEqual(s, 404)
+
+    def test_transition_returns_before_refresh_lands(self):
+        """The POST persists the mark and answers immediately - it never
+        waits on the deferred feed rebuild; the count cache and the
+        /api/state badge field converge once the daemon lands."""
+        self.get()                                # a deck to ack from
+        gate = threading.Event()
+        entered = threading.Event()
+        real = tour_feeds.build_feed
+        first = [True]
+
+        def slow(*a, **kw):
+            if first[0]:
+                first[0] = False
+                entered.set()
+                gate.wait(10)
+            return real(*a, **kw)
+
+        eid = f"area:power:{self.c_power[:12]}"
+        with mock.patch.object(tour_feeds, "build_feed",
+                               side_effect=slow):
+            t0 = time.time()
+            s, d = self.post(eid, "viewed")
+            self.assertLess(time.time() - t0, 5)   # prompt return
+            self.assertEqual(s, 200, d)
+            self.assertEqual(d["state"], "viewed")
+            self.assertEqual(d["unseen_count"], 1)   # last-known, not 0
+            self.assertTrue(d["count_pending"])
+            # the mark is durable even while the rebuild is still gated
+            self.assertEqual(self.state_file()["viewed"][0]["id"], eid)
+            self.assertTrue(entered.wait(5))          # daemon refreshing
+            gate.set()
+            self.assertTrue(_poll(
+                lambda: self.tour["count"] is not None
+                and self.tour["count"]["value"] == 1))
+            self.assertEqual(self.call("GET", "/api/state")[1]
+                             ["tour_unseen"], 1)
+
+    def test_transition_on_cold_ctx_uses_descriptors(self):
+        """No feed has ever built (a restart clears every cache, not the
+        file): a recorded descriptor still transitions - the mark lands
+        with a deferred (None) count and the daemon rebuild converges."""
+        eid = f"area:power:{self.c_power[:12]}"
+        self.seed_state(viewed=[{"id": eid, "range": {
+            "base": {"commit": self.c0, "at": "2020-01-01T00:00:00"},
+            "tip": {"commit": self.c_chat, "at": "2026-10-17T00:00:00"}},
+            "viewed_at": "2026-10-17T01:00:00"}])
+        s, d = self.post(eid, "unview")              # cold ctx, no feed
+        self.assertEqual(s, 200, d)
+        self.assertEqual(d["state"], "new")
+        self.assertIsNone(d["unseen_count"])         # nothing built yet
+        self.assertTrue(self.state_file()["viewed"][0]
+                        .get("unviewed_at"))
+        self.assertTrue(_poll(                       # converges on refresh
+            lambda: self.tour["count"] is not None
+            and self.tour["count"]["value"] == 2))   # both cards 'new'
 
 
 if __name__ == "__main__":

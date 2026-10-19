@@ -355,6 +355,13 @@ class TourE2ETests(unittest.TestCase):
         old_ids = list(self.ids(feed))
         c_late = commit(self.repo, "conductor.py", "z",
                         "Improve power dialog once more")
+        # the poll lands a post-commit feed (a real dashboard's deck
+        # re-pulls too), so the server's validator has SEEN the regroup -
+        # the stale id then 404s instead of acking a renamed card
+        self.expire_cache()
+        feed = self.get()
+        self.assertIn(f"area:power:{c_late[:12]}",
+                      self.ids(feed))
         gone, last = [], None
         for k in old_ids:
             s, d = self.post(k, "viewed")
@@ -475,13 +482,17 @@ class TourE2ETests(unittest.TestCase):
             return real(*a, **kw)
 
         eid = f"area:power:{self.c_power[:12]}"
+        self.get()                                 # retained feed for
+        # the POST to validate against (a client acks what it was dealt)
         with mock.patch.object(tour_feeds, "build_feed",
                                side_effect=slow):
-            s, _ = self.call("GET", "/api/state")  # arms the daemon build
-            self.assertEqual(s, 200)
+            self.expire_cache()                    # TTL-age the feed so
+            s, _ = self.call("GET", "/api/state")  # the poll arms the
+            self.assertEqual(s, 200)               # daemon build
             self.assertTrue(entered.wait(5))       # it holds S0 in flight
-            s, d = self.post(eid, "viewed")        # mutation + rebuild
-            self.assertEqual(s, 200, d)
+            s, d = self.post(eid, "viewed")        # persist, then the
+            self.assertEqual(s, 200, d)            # refresh is deferred:
+            # the daemon rebuild converges; the response already knows
             self.assertEqual(d["unseen_count"], self.N_CARDS - 1)
             gate.set()                             # stale build lands now
             self.assertTrue(_poll(lambda: not self.tour["busy"]))
@@ -494,8 +505,9 @@ class TourE2ETests(unittest.TestCase):
             self.assertEqual(feed["unseen_count"], self.N_CARDS - 1)
 
     def test_mutations_are_immediately_consistent(self):
-        """Within the TTL, every transition drops both caches and
-        rebuilds once - responses and the count are never pre-mutation."""
+        """Every transition drops the feed cache so the next GET rebuilds
+        post-mutation, and the response's count already reflects the
+        saved mark (the deferred daemon refresh only makes it official)."""
         self.get()                                    # warm the cache
         eid = f"area:power:{self.c_power[:12]}"
         s, d = self.post(eid, "snooze")
