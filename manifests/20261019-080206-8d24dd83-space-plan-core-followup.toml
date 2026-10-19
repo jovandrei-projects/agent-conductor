@@ -1,0 +1,181 @@
+# Follow-up proposal drafted by the space-plan-core run's closing
+# follow-up-plan step (run dir: data/runs/20261019-035841-space-plan-core,
+# request 20261019-034417-b712823e, source manifest
+# manifests/20261019-034417-b712823e-space-plan-core.toml).
+# Reviewed but NOT launched - a human decides whether to run it.
+#
+# Reviewed evidence: run state.json + events.jsonl, every step's
+# stdout/verify logs + export, per-step .agent_tasks STATE.md in the
+# surviving worktrees, the merged code on apartment-3d main (src/importer/,
+# docs/INTAKE.md, tools/floorplan-import*.mjs present; src/worlds/,
+# src/world.js, src/overlay/, tools/{pack-test,overlay-*} absent), git
+# ancestry of the unmerged branches, a trial merge-tree (conflicts only in
+# QUEUE.md/ROADMAP.md/DECISIONS.md), the canonical asset store itself
+# (assets/{videos,media,frames,extras,apartment-frames,textures/crops}
+# emptied ~04:20 - dirs exist, 0 files), survivor inventory (2 videos in
+# ~/Downloads, 5 runtime files in the mobile-bundle staging dir and in
+# sibling worktrees' real copies), and fresh gates on the integrated
+# checkout (npm run verify PASS 7 shots/0 console errors, python
+# run_tests.py OK, node tools/floorplan-import-test.mjs 31/31) - all on
+# leased port 8806 after repopulating the 5 boot-fetched files as real
+# copies in the review worktree.
+#
+# Per-deliverable verdict:
+#   1. world-pack isolation - CODE DONE + VERIFIED ON BRANCH, NOT MERGED.
+#      Branch conductor/.../world-pack: pack-test 40/40, suites 191 checks,
+#      verify PASS on 8807. Recorded `failed` solely because the worker
+#      printed `STATUS: complete` (invalid token), not done|partial|blocked.
+#   2. deterministic image->SceneState importer - DELIVERED + MERGED.
+#      31/31 on main, byte-identical docs, pxPerM 40.766 from calibration
+#      spans, mirror=x recorded (never baked), [ASSUMED] ceiling/conventions
+#      logged (DECISIONS 94-95). Gap: run_tests.py on main predates the
+#      node-suite wiring - fixed on the a2 branch.
+#   3. A2 closed-loop proof (overlay verifier + reference diff) - CODE +
+#      EVIDENCE DONE ON BRANCH, NOT MERGED. overlay-verifier and
+#      a2-closed-loop each ended without a STATUS line (turn exhausted mid
+#      report) -> recorded failed, branches kept. iter13 gate = overlay
+#      PASS 0 fail/14 warn vs source plan; doc-vs-oracle diff = 11
+#      evidence-cited records; oracle self-control fails 7 records on the
+#      same sheet (zero-fail-with-ref unreachable by design); mirror trap
+#      proven (x=0.776 vs none=0.264); determinism proven (sha256 pair);
+#      `?struct=imported` opt-in landed. Report: docs/importer/
+#      A2-CLOSED-LOOP.md on that branch. PNG/report artifacts are
+#      gitignored - they live only in the a2 worktree and must be copied
+#      into the run artifacts dir before that worktree is ever cleaned.
+#   4. docs/INTAKE.md - DELIVERED + MERGED. Phases A/B/C, evidence grades,
+#      wizard routing incl. plan-less guess-map gate, guided capture
+#      (N/S/E/W stills, orbit, scale anchor, follow-up questions),
+#      verified agent-conductor-vs-in-app evaluation + recommendation,
+#      explicit deferrals. Honest "failed this run" capability table.
+#   Conditional second-plan exercise - NOT EXERCISED, honestly recorded.
+#      Re-checked for this review: assets/floorplan/ holds only
+#      a2-apt1617.png + two A2 derivatives (annotated-arrows.png,
+#      minimap-flipped.png, sha256s logged by unseen-plan-check);
+#      assets/floorplans/ does not exist. No second unit-type plan.
+#
+# Newly discovered regressions/prerequisites this manifest repairs:
+#   R1 root cause - agent-conductor worktree teardown follows NTFS
+#      junctions on Windows (git worktree remove --force / shutil.rmtree
+#      paths; py3.11 islink does not detect junctions). It EMPTIED
+#      apartment-3d's canonical assets at 04:20 during the
+#      baseline-contracts post-merge teardown. Every future worktree that
+#      runs link-assets.mjs exposes the store again.
+#   R2 the emptied store itself - DECISIONS #96 "needs human restore".
+#      Survivors must be preserved before Downloads gets cleaned, and the
+#      restore/no-reshoot decision belongs to the human (phone queue).
+#   R3 merge bookkeeping - DECISIONS numbering collides (branch 96-106 vs
+#      main 96-97); QUEUE/ROADMAP conflicts; evidence preservation;
+#      importer STATE header still says in-progress. Folded into step 2.
+#
+# Deliberately not proposed (and why):
+#   - Re-running world-pack/overlay-verifier/a2-closed-loop as fresh work:
+#      the verified code exists; landing it is a merge, not a rewrite.
+#   - Adjudicating the 11 doc-vs-oracle deltas / promoting `?struct=` to
+#      default: the manifest's own contract called that "report the proof
+#      unfinished rather than replace the known-good default" - deltas are
+#      reported; adjudication is a human/editorial decision, optional and
+#      outside this request's four deliverables.
+#   - Implementing the INTAKE.md wizard/capture flow: explicitly deferred
+#      by both the request and the design doc.
+#   - Any building-tour / Phase-6 splat / mobile work: out of scope.
+#
+# Observations for the human (not steps):
+#   - The 3 unmerged branch worktrees still hold the only copies of the
+#      A2 evidence PNGs and (for world-pack/a2) real asset copies; do not
+#      clean data/worktrees/20261019-035841-space-plan-core/ until step 2
+#      has run.
+#   - verify.mjs on main now refuses to probe a port it did not bind only
+#      AFTER the a2 merge lands (the fix came in on the world-pack branch).
+#   - If the human prefers re-shooting the lost footage over restoring the
+#      Downloads survivors, step 3's phone-queue answer covers it - the
+#      step stages survivors regardless so the option stays open.
+
+[run]
+summarize = true
+name = "space-plan-core-followup"
+description = "Land the three verified-but-unmerged space-plan-core branches onto apartment-3d main, fix the junction-traversing worktree teardown that emptied its canonical asset store, and stage surviving assets for the human restore decision."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+parallel = false
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 60
+max_attempts = 3
+
+[[step]]
+name = "junction-safe-teardown"
+project = "agent-conductor"
+worktree = true
+merge_target = "master"
+timeout_min = 60
+verify = "python run_tests.py --jobs 8"
+prompt = '''
+Read AGENTS.md first. Fix a data-loss bug in conductor's worktree teardown, nothing else.
+
+Background evidence (already verified - do not re-litigate): run 20261019-035841-space-plan-core. At ~04:20 on 2026-10-19 the post-merge teardown of the baseline-contracts worktree followed NTFS directory junctions inside the worktree and emptied the junction TARGETS - apartment-3d's canonical `assets/{videos,media,frames,extras,apartment-frames,textures/crops}` (those dirs junctioned to C:\Projects\apartment-3d\assets via that project's tools/link-assets.mjs, DECISIONS #91; the loss is recorded in apartment-3d DECISIONS #96 and the a2-closed-loop STATE.md). Teardown call sites to audit: worktree_remove (`git worktree remove --force`, ~L1408) which git-for-windows performs by recursively deleting the tree and follows junctions, plus every shutil.rmtree over a worktree dir (merge staging ~L11313, debris/trash paths). Python 3.11 `os.path.islink` does NOT detect junctions - detection needs `os.lstat` FILE_ATTRIBUTE_REPARSE_POINT (or equivalent stdlib on this box's Python).
+
+Implement: before any conductor-owned recursive delete of a worktree directory, enumerate and unlink directory junctions/symlinks inside it (unlink the reparse point only - never traverse into the target), then proceed with the existing removal. Cover worktree_remove and the rmtree call sites that can see a worktree; leave trash/debris semantics, merge logic, leases, and everything else untouched. A junction whose target is already gone must still unlink cleanly.
+
+Add a regression test in the existing tests/ conventions: build a scratch worktree-shaped dir containing a junction to a canary dir with sentinel files, run the conductor deletion path, assert the canary's contents survive and the junction itself is gone. No sleeps/timing games; stdlib only per house rules.
+
+Run `python run_tests.py --jobs 8`. Commit in logical groups with why-messages. Local worker - no cloud, no pushing. Leave STATUS/NEXT per the worker contract.
+'''
+
+[[step]]
+name = "land-space-plan-branches"
+project = "apartment-3d"
+worktree = true
+merge_target = "main"
+timeout_min = 90
+depends_on = ["junction-safe-teardown"]
+verify = "python run_tests.py"
+prompt = '''
+Read AGENTS.md, ROADMAP.md, docs/PIPELINE.md, docs/DECISIONS.md first, then the three surviving STATE.md files under data/worktrees/20261019-035841-space-plan-core/{world-pack,overlay-verifier,a2-closed-loop}/.agent_tasks/. Context: steps 32/34/35 of run 20261019-035841-space-plan-core were recorded `failed` ONLY because their STATUS lines were absent or malformed - all three steps produced verified, committed work on their branches. Branch `conductor/20261019-035841-space-plan-core/a2-closed-loop` already contains world-pack and overlay-verifier as ancestors (confirmed via git merge-base), so ONE merge lands all three deliverables.
+
+Land it: in your worktree (branched from main), `git merge --no-edit conductor/20261019-035841-space-plan-core/a2-closed-loop`. A trial merge already showed code merges clean; conflicts are expected only in .agent_tasks/QUEUE.md, ROADMAP.md, docs/DECISIONS.md (SESSION_LOG.md auto-merges). Resolution rules:
+
+- DECISIONS.md: keep main's #96 (asset store emptied) and #97 (intake home). Renumber the incoming branch's entries 96-106 to 98-108 and update every textual cross-reference (docs/importer/A2-CLOSED-LOOP.md cites "decisions 103-106" -> 105-108; the overlay STATE cites "96-102" -> 98-102; grep for other citations of those numbers before finishing).
+- QUEUE.md rows 32/34/35 -> done, citing where the merged code/evidence lives. ROADMAP phase-8 boxes for world-pack/overlay-verifier/a2-closed-loop -> tick ONLY after the merged tree re-verifies below.
+- Carry the three tasks' STATE.md folders into .agent_tasks/{world-pack,overlay-verifier,a2-closed-loop}/ from the sibling worktrees (those folders don't exist on main) and add a "landed on main" header line to each. Fix floorplan-importer STATE.md's stale "in-progress" header - its work is merged and verified.
+- docs/SESSION_LOG.md: append a run-closing entry recording that the three `failed` records were report-contract artifacts, what the merge landed, and the merge sha.
+
+Preserve the gitignored evidence BEFORE any worktree cleanup: copy the a2 worktree's final artifacts - shots/overlay-a2-iter13/ and shots/overlay-a2-iter13-noref/ (render+plan+overlay+mask PNGs, overlay-report.{json,md}), shots/a2/iter13*/ (doc, meta, import-debug), and the iteration dirs shots/overlay-a2-iter{5,9,10,10b}/ - into C:\Projects\agent-conductor\data\runs\20261019-035841-space-plan-core\artifacts\a2-proof\ (run dir is shared across worktrees and survives cleanup; artifacts stay untracked as required for personal-derived imagery).
+
+Assets for the gates: do NOT create junctions into the canonical store - it is emptied per DECISIONS #96, and never write to C:\Projects\apartment-3d. Repopulate the 5 boot-fetched files as REAL copies inside your worktree: assets/media/{tv-golf,lap-city}.mp4 and assets/textures/crops/{mon-karaoke,mon-onepiece,skyline-canvas}.jpg from C:\Projects\apartment-3d\mobile\app\src\main\assets\assets\{media,textures\crops} (read-only source - the untouched mobile-bundle staging dir).
+
+Verify the MERGED tree (npm ci first if node_modules is absent): npm run build; node tools/pack-test.mjs; node tools/overlay-test.mjs; node tools/floorplan-import-test.mjs; node tools/{state,store,variant,finish}-test.mjs; then npm run verify and python run_tests.py with APT3D_PORT set to your leased $CONDUCTOR_SERVICE_PORT. Everything green on the integrated result - investigate any regression as a real merge bug, never by weakening a test.
+
+Record in the landing notes, verbatim-honest: the 11 doc-vs-oracle delta records are REPORTED deltas, not resolved ones; `?struct=imported` stays opt-in with the hand-built shell as default; promoting it requires per-element adjudication and is explicitly out of scope. Re-run the A2 gate once on the merged tree (commands in docs/importer/A2-CLOSED-LOOP.md: import -> overlay-verify --out shots/overlay-a2-postmerge-noref --port $PORT, and the --ref diff vs the frozen oracle doc in the run artifacts dir) and confirm it still reports PASS 0-fail vs the source plan and the same ~11-record delta list - investigate any drift rather than editing the oracle.
+
+House rules: local only, loopback-only servers on the leased port, muted autoplay, no new editor/intake/tour features, assets stay gitignored. Commit in logical groups with why-messages. Update QUEUE/STATE so the next session resumes cleanly; leave STATUS/NEXT/OUTCOME as the last stdout lines.
+'''
+
+[[step]]
+name = "asset-recovery-staging"
+project = "apartment-3d"
+worktree = true
+merge_target = "main"
+timeout_min = 45
+depends_on = ["land-space-plan-branches"]
+verify = "python run_tests.py"
+prompt = '''
+Read AGENTS.md and docs/DECISIONS.md #96 first. The canonical asset store at C:\Projects\apartment-3d\assets\ was emptied mid-run by a junction-traversing worktree teardown; the restore decision belongs to the human. Your job: preserve every survivor and prepare a one-command restore - WITHOUT writing to C:\Projects\apartment-3d (the shared checkout stays read-only to workers).
+
+Stage into a new directory `C:\Projects\apartment-3d-recovery\` (outside the shared checkout, survives runs):
+
+- Copy the two surviving source videos from %USERPROFILE%\Downloads: 20261013_014405.mp4 (~437 MB) and 20261013_080414.mp4 (~2.3 GB). Record sha256 + size of each.
+- Copy the runtime-critical files from the untouched mobile-bundle staging dir C:\Projects\apartment-3d\mobile\app\src\main\assets\assets\: media/{tv-golf,lap-city}.mp4 and textures/crops/*.jpg - record the same hashes.
+- Copy the surviving personal-adjacent files from the canonical store read-only: assets/floorplan/* (3 files incl. a2-apt1617.png), assets/avatar/ref-photo.jpg + NOTES.md.
+- Write RECOVERY.md there: full inventory with hashes + restore command per item (e.g. `copy <recovery>\videos\*.mp4 C:\Projects\apartment-3d\assets\videos\`), and an explicit PERMANENTLY LOST list - the other source videos, assets/frames/* (regenerable only if footage returns via tools/extract-frames.sh), assets/extras/*, assets/apartment-frames/*.
+
+Then post the decision to the phone queue exactly once:
+`python C:\Projects\mobile-apps\pc-bridge\task.py ask --project apartment-3d --title "apartment-3d assets: restore or reshoot?" --body "Run space-plan-core emptied the canonical asset store (DECISIONS #96). Survivors staged at C:\Projects\apartment-3d-recovery\ (2/4 videos, runtime media+crops, floorplan+avatar). RECOVERY.md has the restore commands. Restore survivors + accept 2-video loss, or reshoot the lost footage first?"`
+
+In your own worktree only: update the DECISIONS #96 row's status to "recovery staged at C:\Projects\apartment-3d-recovery\ - human restore pending (phone queue)" and add an .agent_tasks/asset-recovery-staging/STATE.md with the inventory + question id. Run `python run_tests.py` (verify command; no code changed, it just proves the worktree still boots - repopulate the 5 boot-fetched media/crops files as real copies in your worktree first if needed, never junctions into the emptied store).
+
+Finish STATUS: blocked naming the human restore decision - that is the honest terminal state; on_failure=continue lets the run still report it.
+'''
