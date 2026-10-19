@@ -34,6 +34,36 @@ already-viewed area yields a NEW id (it can never silently inherit
 (``request:<rid>``, ``run:<dir>:<ended>``, ``followup:<rid>``) - a
 re-finished run is a new event, not the old card acknowledged again.
 
+Sections + record events
+------------------------
+Every card carries ``section`` ('tool' | 'work') + ``section_title``:
+change/curated cards are "Tool updates" (spotlight anchors preserved);
+run/request/follow-up/pipeline cards are the "Work digest" (anchored on
+the runs/requests surfaces). Record cards' ``tag`` is EVENT-derived -
+'ready' for proposals (plain or follow-up), the run's terminal
+``outcome`` for run/pipeline cards - never the change-style
+new/improved/fixed labels, which stay reserved for tool updates.
+
+Work-card folding
+-----------------
+A request and the run it launched fold into ONE pipeline card ONLY when
+both events sit inside the same window (request ``created_at`` and run
+``ended_at`` in ``(base.at, tip.at]``): the run card absorbs the
+proposal - id stays ``run:<dir>:<ended>`` (the completion is the newest
+event), ``kind`` becomes ``pipeline``, and ``covers`` lists the
+absorbed standalone ids so a viewed ``request:<rid>`` descriptor still
+re-materializes to it. The card carries ``proposed_at`` +
+``completed_at``, the actual terminal ``outcome`` (a recorded
+``aborted`` reason wins, else the step verdicts), ``steps_done`` /
+``steps_total`` and the run's ``unreviewed`` task count. A follow-up
+proposal folds into its ASSOCIATED request's work card (``followups``
+list + ``covers``) when that request is in the window - association is
+the recorded ``source_request`` / ``source_run`` -> ``request_id``
+link, never a display-name match. Requests whose run finished in a
+different window, runs whose request was acknowledged earlier, and
+follow-ups whose associated request is outside the window all keep
+their standalone cards.
+
 Curated records ({stop, blurb, title?, tag?, commits?/requests?/runs?})
 associate to the window through the identities they name; records whose
 identities resolve to nothing in the window belong to a different range
@@ -51,12 +81,18 @@ Unattributed merges group normally.
 ``history()`` re-materializes recorded (viewed/snoozed/unviewed) entry
 descriptors over their own stored ``{base,tip}`` ranges, which is how a
 viewed card stays retrievable after the live watermark advances past it.
+Within one ``build_feed`` every distinct ``{base,tip}`` range collects
+ONCE - the live window and descriptor windows share a per-build memo -
+and cards that are already 'viewed' never sit in the live ``entries``
+deck (they remain reachable through ``history``).
 """
 import datetime as dt
+import hashlib
 import json
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 import tour_state
@@ -72,6 +108,21 @@ TAGS = ("new", "improved", "fixed")
 _CARD_KM = 12          # sha prefix length used inside entry ids
 _BLURB_MAX = 600
 _TITLE_MAX = 160
+
+# The feed's two sections: change/curated cards are tool updates (the
+# tool changed); record cards are the work digest (things the conductor
+# DID). The renderer splits the walkthrough on this - change kind
+# 'pipeline' is a request+run folded work card.
+SECTIONS = {"tool": "Tool updates", "work": "Work digest"}
+_TOOL_KINDS = {"change", "curated"}
+_WORK_KINDS = {"run", "request", "followup", "pipeline"}
+
+# Record-event tags - deliberately distinct from the change-style TAGS
+# so a proposal's 'ready' or a run's 'done'/'failed' never reads as a
+# feature-change label.
+TAG_REQUEST = "ready"
+
+DEFAULT_FLAGS_DIR = Path(tempfile.gettempdir()) / "agent-conductor-flags"
 
 # ------------------------------------------------------------------- stops
 # The tour's feature-area -> DOM anchor registry. Every selector names an
@@ -237,6 +288,96 @@ def _stop_title(stop: str | None) -> str:
     if stop and stop in TOUR_STOPS:
         return TOUR_STOPS[stop]["title"]
     return _AREA_TITLES.get(stop or "", "Other changes")
+
+
+def _section(e: dict) -> str:
+    """The feed section a card belongs to. 'unknown' history stubs keep
+    whatever their id prefix says (record ids are work, the rest tool)."""
+    k = e.get("kind")
+    if k in _TOOL_KINDS:
+        return "tool"
+    if k in _WORK_KINDS:
+        return "work"
+    i = e.get("id") or ""
+    return ("work" if i.startswith(("request:", "run:", "followup:"))
+            else "tool")
+
+
+def _run_outcome(st: dict) -> str:
+    """The run's actual terminal outcome: a recorded halt reason
+    ('paused', 'stopped', 'drained', ...) wins; otherwise the step
+    verdicts - 'done' only when every recorded step closed clean."""
+    ab = st.get("aborted")
+    if isinstance(ab, str) and ab:
+        return ab
+    sts = [r.get("status") for r in (st.get("steps") or {}).values()
+           if isinstance(r, dict)]
+    if not sts:
+        return "ended"
+    if any(s in ("failed", "timed_out", "lost") for s in sts):
+        return "failed"
+    if all(s in ("done", "superseded", "skipped") for s in sts):
+        return "done"
+    return "partial"
+
+
+# ------------------------------------------------------------- review data
+# The unreviewed-task count a work card carries. Mirrors conductor.py's
+# sentinel/folded review-mark layering (review-* flags in the shared
+# flags dir win on `at` ties over the mark folded into state.json) -
+# duplicated here, stdlib-only, so this module never imports the
+# monolith. Read-only: counting never writes a mark.
+
+def _flag_key(run_dir: Path) -> str:
+    """Same name conductor._flag_key derives: the sentinel pins the run's
+    resolved path so equal dir names in two checkouts don't collide."""
+    h = hashlib.sha256(os.path.normcase(
+        str(run_dir.resolve())).encode()).hexdigest()[:8]
+    safe = re.sub(r"[^\w.-]", "_", run_dir.name)
+    return f"{safe}-{h}"
+
+
+def _review_mark(run_dir: Path, stored, step: str | None,
+                 flags_dir: Path) -> dict | None:
+    """The newest task review mark: the live sentinel body when present,
+    else the mark already folded into state.json - whichever is newer
+    by `at`."""
+    n = "review-" + _flag_key(run_dir)
+    safe = re.sub(r"[^\w.-]", "_", step) if step else ""
+    p = flags_dir / (f"{n}-{safe}" if safe else n)
+    flag = None
+    try:
+        body = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(body, dict) and "reviewed" in body:
+            flag = body
+    except (OSError, ValueError):
+        pass
+    if flag is None:
+        return stored if isinstance(stored, dict) else None
+    s_at = str(stored.get("at") or "") if isinstance(stored, dict) else ""
+    return flag if str(flag.get("at") or "") >= s_at else stored
+
+
+def _needs_review(seq, mark: dict | None) -> bool:
+    """Same rule as conductor._needs_review: an explicit tombstone, or a
+    recorded completion_seq the newest mark does not cover."""
+    if isinstance(mark, dict) and mark.get("reviewed") is False:
+        return True
+    return seq is not None and (not isinstance(mark, dict)
+                                or mark.get("seq") != seq)
+
+
+def _unreviewed_tasks(run_dir: Path, st: dict, flags_dir: Path) -> int:
+    """How many of a finished run's task records still need a human
+    look - the count the dashboard derives from the same marks."""
+    n = 0
+    for sname, srec in (st.get("steps") or {}).items():
+        if isinstance(srec, dict) and _needs_review(
+                srec.get("completion_seq"),
+                _review_mark(run_dir, srec.get("review"), sname,
+                             flags_dir)):
+            n += 1
+    return n
 
 
 # ------------------------------------------------------------------ git
@@ -512,7 +653,8 @@ def _resolve_curated(records: list[dict], commits: list[dict],
 
 def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
                     requests_dir: Path, manifests_dir: Path,
-                    warnings: list[str], polish=None) -> list[dict]:
+                    warnings: list[str], polish=None,
+                    flags_dir: Path = DEFAULT_FLAGS_DIR) -> list[dict]:
     """Raw feed entries for one {base,tip} window - no state annotation.
     Reused by build_feed (live window) and history (stored windows).
 
@@ -533,6 +675,9 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
     key_by_dir = {d: _run_key(d, st, p) for d, p, st in runs_all}
     run_key_by_req = {st.get("request_id"): _run_key(d, st, p)
                       for d, p, st in runs_all if st.get("request_id")}
+    req_by_dir = {d: st.get("request_id")
+                  for d, p, st in runs_all if st.get("request_id")}
+    req_by_id = {r["id"]: r for r in reqs_all}
 
     def run_key_of(ref: str) -> str:
         # a curated 'runs' entry may name a dir, a request:<id> key, or
@@ -542,10 +687,10 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
         rid = ref.split(":", 1)[-1]
         return run_key_by_req.get(rid, ref)
 
-    win_runs = {}   # run key -> (dir_name, st)
+    win_runs = {}   # run key -> (dir_name, dir_path, st)
     for d, p, st in runs_all:
         if _in_window(st.get("ended_at"), base.get("at"), tip.get("at")):
-            win_runs[key_by_dir[d]] = (d, st)
+            win_runs[key_by_dir[d]] = (d, p, st)
     win_reqs = {}   # request id -> rec
     for rec in reqs_all:
         if _in_window(rec.get("created_at"), base.get("at"), tip.get("at")):
@@ -568,8 +713,42 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
     suppress_req = {rid for card in cards for rid in card["requests"]}
     suppress_run = {rk for card in cards for rk in card["runs"]}
 
+    # ---- work-card folding: a request + the run it launched share one
+    # card when both events sit inside this window; a follow-up proposal
+    # folds into its associated request's card when that request is also
+    # in the window. Links are the RECORDED relationships (request_id /
+    # source_request / source_run), never display-name matches.
+    def assoc_req(rec: dict) -> str | None:
+        """The request a follow-up proposal belongs to: its recorded
+        source_request, else the source run's own request link."""
+        if isinstance(rec.get("source_request"), str) \
+                and rec["source_request"]:
+            return rec["source_request"]
+        if isinstance(rec.get("source_run"), str):
+            rid = req_by_dir.get(rec["source_run"])
+            if rid:
+                return rid
+        k = rec.get("source_run_key") or ""
+        return k.split(":", 1)[1] if k.startswith("request:") else None
+
+    fold_into: dict[str, str] = {}   # follow-up rid -> associated rid
+    pipe: dict[str, str] = {}        # request rid -> in-window run key
+    for rid, rec in win_reqs.items():
+        if rid in suppress_req:
+            continue
+        launched = run_key_by_req.get(rid)
+        has_run = launched in win_runs and launched not in suppress_run
+        if _is_followup_request(rec):
+            src = assoc_req(rec)
+            if src and src != rid and src in win_reqs \
+                    and src not in suppress_req:
+                fold_into[rid] = src
+                continue
+        if has_run:
+            pipe[rid] = launched
+
     # ---- run cards (finished runs) + conductor-merge attribution
-    run_by_dir = {d: k for k, (d, _st) in win_runs.items()}
+    run_by_dir = {d: k for k, (d, _p, _st) in win_runs.items()}
     claim_to_run: dict[str, str] = {}     # commit sha -> run key
     for c in commits:
         if c["merge"] and c["merge"][0] in run_by_dir \
@@ -580,40 +759,59 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
                 claim_to_run.setdefault(chain_sha, rk)
 
     entries: list[dict] = []
-    for key, (dname, st) in win_runs.items():
+    cards_for_rid: dict[str, dict] = {}   # rid -> its emitted card
+    for key, (dname, dirp, st) in win_runs.items():
         if key in suppress_run:
             continue
         own = [c for c in commits if claim_to_run.get(c["sha"]) == key]
         counts = {}
-        for rec in (st.get("steps") or {}).values():
-            s = rec.get("status", "?")
+        for srec in (st.get("steps") or {}).values():
+            s = (srec or {}).get("status", "?")
             counts[s] = counts.get(s, 0) + 1
         bits = ", ".join(f"{n} {s}" for s, n in sorted(counts.items()))
+        outcome = _run_outcome(st)
+        rid = st.get("request_id")
+        prec = win_reqs.get(rid) if rid else None
+        folded = prec is not None and pipe.get(rid) == key
         name = st.get("run") or dname
         title = f"Run finished: {name}"
-        aug = fold_run.get(key)
-        entries.append({
+        aug = fold_run.get(key) or (fold_req.get(rid) if folded else None)
+        label = ((prec or {}).get("label") or (prec or {}).get("raw")
+                 or rid) if prec else None
+        e = {
             "id": f"run:{dname}:{st.get('ended_at')}",
-            "kind": "run", "stop": "runs",
+            "kind": "pipeline" if folded else "run", "stop": "runs",
             "title": (aug["title"] or title) if aug else title,
             "blurb": aug["blurb"] if aug else
-                     _short((st.get("description") or "") +
-                            (f"  Steps: {bits}." if bits else ""),
+                     _short((f"Proposal '{label}' - " if folded else "")
+                            + (st.get("description") or "")
+                            + (f"  Steps: {bits}." if bits else ""),
                             _BLURB_MAX) or title,
-            "tag": _card_tag(own, aug["tag"] if aug else None)
-                   if own else (aug["tag"] if aug and aug["tag"] else
-                                _tag_for_subject(
-                                    f"{name} {st.get('description') or ''}")),
+            "tag": outcome,
             "commits": [{"sha": c["sha"], "subject": c["subject"]}
                         for c in own],
             "runs": [key],
-            "requests": ([st["request_id"]] if st.get("request_id")
-                         else []),
-            "at": st.get("ended_at"), "range": rng})
+            "requests": ([rid] if rid else []),
+            "at": st.get("ended_at"), "range": rng,
+            # the run's terminal verdict + delivery detail - the 'done/
+            # failed' event words the work digest renders on the card
+            "outcome": outcome,
+            "completed_at": st.get("ended_at"),
+            "proposed_at": ((prec or req_by_id.get(rid) or {})
+                            .get("created_at") if rid else None),
+            "steps_done": counts.get("done", 0),
+            "steps_total": len(st.get("steps") or {}),
+            "unreviewed": _unreviewed_tasks(dirp, st, flags_dir)}
+        if folded:
+            e["covers"] = [f"followup:{rid}" if _is_followup_request(prec)
+                           else f"request:{rid}"]
+            cards_for_rid[rid] = e
+        entries.append(e)
 
-    # ---- request + follow-up cards
+    # ---- request + follow-up cards (events whose counterparts fell in
+    # a different window stay standalone)
     for rid, rec in win_reqs.items():
-        if rid in suppress_req:
+        if rid in suppress_req or rid in pipe or rid in fold_into:
             continue
         launched = run_key_by_req.get(rid)
         label = rec.get("label") or rec.get("raw") or rid
@@ -623,33 +821,81 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
                        or (run_key_of(rec["source_run"])
                            if rec.get("source_run") else None))
             title = f"Follow-up proposal: {_short(label, 80)}"
-            entries.append({
-                "id": f"followup:{rid}", "kind": "followup",
-                "stop": "requests",
-                "title": (aug["title"] or title) if aug else title,
-                "blurb": aug["blurb"] if aug else
-                         _short(rec.get("description")
-                                or f"Registered from {rec.get('source_run')}",
-                                _BLURB_MAX),
-                "tag": (aug["tag"] or "new") if aug else "new",
-                "commits": [], "requests": [rid],
-                "runs": ([src_key] if src_key else [])
-                        + ([launched] if launched else []),
-                "at": rec.get("created_at"), "range": rng})
+            e = {"id": f"followup:{rid}", "kind": "followup",
+                 "stop": "requests",
+                 "title": (aug["title"] or title) if aug else title,
+                 "blurb": aug["blurb"] if aug else
+                          _short(rec.get("description")
+                                 or f"Registered from {rec.get('source_run')}",
+                                 _BLURB_MAX),
+                 "tag": TAG_REQUEST,
+                 "commits": [], "requests": [rid],
+                 "runs": ([src_key] if src_key else [])
+                         + ([launched] if launched else []),
+                 "at": rec.get("created_at"), "range": rng,
+                 "proposed_at": rec.get("created_at")}
         else:
             title = f"New proposal: {_short(label, 80)}"
+            e = {"id": f"request:{rid}", "kind": "request",
+                 "stop": "requests",
+                 "title": (aug["title"] or title) if aug else title,
+                 "blurb": aug["blurb"] if aug else
+                          (_short(rec.get("description") or rec.get("raw")
+                                  or "", _BLURB_MAX)
+                           or "A new request record was filed."),
+                 "tag": TAG_REQUEST,
+                 "commits": [], "requests": [rid],
+                 "runs": [launched] if launched else [],
+                 "at": rec.get("created_at"), "range": rng,
+                 "proposed_at": rec.get("created_at")}
+        entries.append(e)
+        cards_for_rid[rid] = e
+
+    # ---- fold follow-up proposals into their associated request's
+    # card - the root card after chasing fold chains (a follow-up's
+    # associated request may itself be a folded follow-up)
+    for frid, src in fold_into.items():
+        seen, root = {frid}, src
+        while root in fold_into and root not in seen:
+            seen.add(root)
+            root = fold_into[root]
+        card = cards_for_rid.get(root)
+        rec = win_reqs[frid]
+        if card is None:
+            # no reachable card (theoretical fold cycle): keep the
+            # standalone follow-up card rather than dropping the event
+            launched = run_key_by_req.get(frid)
+            src_key = (rec.get("source_run_key")
+                       or (run_key_of(rec["source_run"])
+                           if rec.get("source_run") else None))
+            label = rec.get("label") or rec.get("raw") or frid
             entries.append({
-                "id": f"request:{rid}", "kind": "request",
+                "id": f"followup:{frid}", "kind": "followup",
                 "stop": "requests",
-                "title": (aug["title"] or title) if aug else title,
-                "blurb": aug["blurb"] if aug else
-                         (_short(rec.get("description") or rec.get("raw")
-                                 or "", _BLURB_MAX)
-                          or "A new request record was filed."),
-                "tag": (aug["tag"] or "new") if aug else "new",
-                "commits": [], "requests": [rid],
-                "runs": [launched] if launched else [],
-                "at": rec.get("created_at"), "range": rng})
+                "title": f"Follow-up proposal: {_short(label, 80)}",
+                "blurb": _short(rec.get("description")
+                                or f"Registered from "
+                                   f"{rec.get('source_run')}",
+                                _BLURB_MAX),
+                "tag": TAG_REQUEST,
+                "commits": [], "requests": [frid],
+                "runs": ([src_key] if src_key else [])
+                        + ([launched] if launched else []),
+                "at": rec.get("created_at"), "range": rng,
+                "proposed_at": rec.get("created_at")})
+            continue
+        launched = run_key_by_req.get(frid)
+        src_key = (rec.get("source_run_key")
+                   or (run_key_of(rec["source_run"])
+                       if rec.get("source_run") else None))
+        card.setdefault("followups", []).append({
+            "id": f"followup:{frid}",
+            "label": rec.get("label") or rec.get("raw") or frid,
+            "at": rec.get("created_at"),
+            "requests": [frid],
+            "runs": ([src_key] if src_key else [])
+                    + ([launched] if launched else [])})
+        card.setdefault("covers", []).append(f"followup:{frid}")
 
     # ---- commit cards: validated LLM groupings first (they claim the
     # commits they name), then deterministic area grouping for the rest.
@@ -763,16 +1009,20 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
     return entries
 
 
-def _rematerialize(desc: dict, kwargs: dict) -> dict:
+def _rematerialize(desc: dict, collect) -> dict:
     """Rebuild the card a recorded descriptor pointed at, over the
     descriptor's own stored range - the only way a viewed entry stays
-    retrievable once the live watermark advanced past its window."""
+    retrievable once the live watermark advanced past its window. The
+    descriptor's standalone id also matches a card that lists it in
+    ``covers`` (a request card folded into a pipeline still resolves).
+    The returned dict is a copy: the shared per-build collection must
+    never be mutated by card assembly."""
     rng = desc.get("range") or {}
-    warnings: list[str] = []
     try:
-        for e in _collect_window(rng, warnings=warnings, **kwargs):
-            if e["id"] == desc["id"]:
-                return e
+        for e in collect(rng):
+            if e["id"] == desc["id"] \
+                    or desc["id"] in (e.get("covers") or ()):
+                return dict(e)
     except Exception:
         pass
     return {"id": desc["id"], "kind": "unknown", "stop": None,
@@ -784,18 +1034,28 @@ def _rematerialize(desc: dict, kwargs: dict) -> dict:
             "unavailable": True}
 
 
+def _range_key(rng: dict) -> tuple:
+    """The exact (base, tip) window a collection covers - the per-build
+    memo key."""
+    b, t = (rng or {}).get("base") or {}, (rng or {}).get("tip") or {}
+    return (b.get("commit"), b.get("at"), t.get("commit"), t.get("at"))
+
+
 def build_feed(state: dict | None = None, boundary: dict | None = None,
                *, repo_dir: Path = DEFAULT_REPO,
                runs_dir: Path = DEFAULT_RUNS_DIR,
                requests_dir: Path = DEFAULT_REQUESTS_DIR,
                manifests_dir: Path = DEFAULT_MANIFESTS_DIR,
+               flags_dir: Path | None = None,
                now: float | None = None, polish=None) -> dict:
     """The full tour feed for the current watermark + boundary.
 
-    ``entries`` = window cards plus re-injected snoozed/unviewed
-    descriptors (each annotated with its persisted state); ``history`` =
-    re-materialized viewed cards; ``unseen_count`` = entries still
-    'new'. Pure reads only - nothing here mutates persisted state.
+    ``entries`` = window cards still needing eyes (state 'new' or
+    'snoozed' - 'viewed' cards are excluded from the live deck even
+    before the watermark advances) plus re-injected unviewed
+    descriptors; ``history`` = re-materialized viewed cards for explicit
+    reopening; ``unseen_count`` = entries still 'new'. Pure reads only -
+    nothing here mutates persisted state.
 
     ``polish`` is an optional ``(rng) -> cards|None`` hook (the tour
     enrichment cache, tour_polish.Polisher.cards_for): it is consulted
@@ -807,7 +1067,9 @@ def build_feed(state: dict | None = None, boundary: dict | None = None,
     warnings: list[str] = []
     kw = dict(repo_dir=repo_dir, runs_dir=runs_dir,
               requests_dir=requests_dir, manifests_dir=manifests_dir,
-              polish=polish)
+              polish=polish,
+              flags_dir=Path(flags_dir) if flags_dir is not None
+              else DEFAULT_FLAGS_DIR)
 
     wm_status = tour_state.watermark_status(state, repo_dir)
     base_commit = rng["base"].get("commit")
@@ -818,30 +1080,63 @@ def build_feed(state: dict | None = None, boundary: dict | None = None,
         rng = {"base": {"commit": None, "at": rng["base"].get("at")},
                "tip": rng["tip"]}
 
-    entries = _collect_window(rng, warnings=warnings, **kw)
+    # One collection per distinct range per build: the live window and
+    # every descriptor's stored window share this memo (descriptors of
+    # one acknowledgment round usually record the SAME range). Entries
+    # are copied before card assembly annotates them - the shared
+    # results themselves are never mutated.
+    collected: dict[tuple, list[dict]] = {}
+
+    def collect(r: dict) -> list[dict]:
+        key = _range_key(r)
+        if key not in collected:
+            collected[key] = _collect_window(r, warnings=warnings, **kw)
+        return collected[key]
+
+    entries = [dict(e) for e in collect(rng)]
     seen_ids = {e["id"] for e in entries}
-    history: list[dict] = []
+    hist: dict[str, dict] = {}
     for desc in tour_state.entries(state):
         if desc["state"] == "viewed":
-            h = _rematerialize(desc, kw)
+            h = _rematerialize(desc, collect)
             h["state"] = "viewed"
             for k in ("viewed_at", "snoozed_at", "unviewed_at"):
                 if desc.get(k):
                     h[k] = desc[k]
-            history.append(h)
-        elif desc["id"] not in seen_ids:
+            # two descriptors can resolve to the same card (a folded
+            # pipeline covers the standalone request id): keep one -
+            # prefer a real card over a lost-window stub, and an
+            # exact-id descriptor over a covered one
+            if h["id"] not in hist or not h.get("unavailable") and (
+                    hist[h["id"]].get("unavailable")
+                    or desc["id"] == h["id"]):
+                hist[h["id"]] = h
+        elif desc["id"] in seen_ids:
+            continue                        # already live in the deck
+        else:
             # snoozed deferral or an explicitly unviewed card whose
             # producing window is already behind the watermark - it
-            # still belongs to the tour.
-            e = _rematerialize(desc, kw)
+            # still belongs to the tour. Skip when a live folded card
+            # already covers its id (no duplicate of the same event).
+            e = _rematerialize(desc, collect)
+            if e["id"] in seen_ids:
+                continue
             entries.append(e)
-            seen_ids.add(desc["id"])
+            seen_ids.add(e["id"])
+    history = list(hist.values())
 
     for e in entries + history:
         if "state" not in e:
             e["state"] = tour_state.entry_state(state, e["id"])
         e["anchor"] = _anchor(e.get("stop"))
         e["stop_title"] = _stop_title(e.get("stop"))
+        e["section"] = _section(e)
+        e["section_title"] = SECTIONS[e["section"]]
+    # the live deck is the UNREAD walkthrough: a 'viewed' card leaves it
+    # as soon as it is acknowledged - the watermark advancing past its
+    # window is NOT a precondition. Viewed history stays reachable via
+    # `history` for explicit reopening.
+    entries = [e for e in entries if e["state"] != "viewed"]
     entries.sort(key=lambda e: (_iso_ts(e.get("at")) or 0, e["id"]))
     history.sort(key=lambda e: (_iso_ts(e.get("viewed_at")) or 0,
                                 e["id"]), reverse=True)
