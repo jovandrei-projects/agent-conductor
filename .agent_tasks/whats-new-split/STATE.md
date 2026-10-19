@@ -121,9 +121,41 @@ as documented below):
   responses repaint the badge ONLY when `unseen_count` is numeric -
   deferred/absent leaves the last-known pill to the `/api/state` poll.
 
-### Step deferred-transition - pending
+### Step deferred-transition - DONE
 
-Asynchronous feed refresh / transition behavior per manifest.
+Deferred-rebuild transition, landed on this step's branch:
+
+- `tour_transition` never builds inline: the id validates against
+  `ctx["last"]` (the newest payload ever stored - entries + history +
+  folded `covers`, TTL-agnostic, so a once-seen card stays acknowledgeable
+  after the live feed moved on; a renamed id the newest build lacks is
+  still 'unknown'), falling back to persisted tour_state descriptors when
+  nothing has built this serve. A descriptor-only mark lands but never
+  advances the watermark blind (`remaining_new=None`).
+- The transition persists through tour_state FIRST, drops `ctx["feed"]`
+  (GET can never serve pre-mutation), bumps `gen`, then arms a daemon
+  `_tour_build` via `_tour_refresh` - the extracted busy-flag helper now
+  shared with `tour_unseen`, with a `wanted` rerun flag so a stale
+  in-flight build can't eat the post-mutation rebuild (coalesced: at most
+  one extra build). Failures only `LOG.exception` - the mark stands,
+  `busy` clears, and any poll/transition re-arms, so caches can't wedge.
+- Response `unseen_count` = `_tour_count_now(payload, state)`: the count
+  the retained feed implies under just-saved states (re-derived per card
+  via `tour_state.entries`, plus unviewed-descriptor re-entries unless a
+  covering card is live), or None when nothing has ever built;
+  `count_pending: true` marks the refresh in flight. The badge repaints
+  on a real number, else keeps last-known and converges via /api/state.
+- A no-op transition (`changed` false) skips invalidation + refresh.
+- `ctx` gained `last` (retained payload) and `wanted` (rerun flag).
+- Client unchanged (walkthrough-ui already tolerates both count shapes);
+  comments updated to document deferred semantics.
+
+Test adjustments (narrow): api tests that POSTed before any GET now warm
+the feed first (a client always pulls the deck it acks);
+count-after-mutation assertions poll for convergence; the e2e
+mid-acknowledgment test rebuilds once post-commit so the renamed-id 404
+is deterministic; the in-flight-daemon-build test warms `last` before
+gating. New: POST-returns-while-gated + cold-ctx descriptor-unview tests.
 
 ### Step tour-tests - pending
 
@@ -139,26 +171,26 @@ Closing review + next manifest only.
 
 ## Where it stopped
 
-walkthrough-ui implemented + verified on branch
-`conductor/20261019-031845-whats-new-split/walkthrough-ui` (feed-build
-had already merged to master via dd1df59). Next: `deferred-transition`
-step of run 20261019-031845-whats-new-split - move POST
-/api/tour/<id>/{viewed,snooze,unview} off the synchronous `_tour_build`
-(tour_transition, conductor.py ~line 14047): persist first, rebuild on
-a daemon, return a last-known/deferred `unseen_count` - the renderer
-already tolerates both shapes (numeric-only badge repaint + the
-`tourAcked` stale-feed filter documented above).
+deferred-transition implemented + verified on branch
+`conductor/20261019-031845-whats-new-split/deferred-transition`
+(feed-build + walkthrough-ui already merged). Next: `tour-tests` step
+of run 20261019-031845-whats-new-split - comprehensive regression
+expansion per manifest (deterministic concurrency coverage for the
+daemon refresh/coalescing belongs there; this step only added the two
+focused cases above).
 
 ## Verification
 
-- `python -m unittest tests.test_tour_dash` - 12/12 (10 prior updated
-  to the per-section `card i of n` position text + 2 new:
-  split-section order/chrome/chips and empty-section + deferred-count
-  + stale-feed no-reinsert).
-- `python -m unittest tests.test_tour_state tests.test_tour_feeds
-  tests.test_tour_api tests.test_tour_dash tests.test_tour_polish
-  tests.test_tour_e2e` - 127/127.
-- `python run_tests.py --jobs 8` - 999 tests, 8/8 shards ok.
+- deferred-transition: `python -m unittest tests.test_tour_api` -
+  20/20 (incl. 2 new: gated-refresh prompt return + cold-ctx
+  descriptor unview); `tests.test_tour_state tests.test_tour_feeds
+  tests.test_tour_dash tests.test_tour_polish tests.test_tour_e2e` -
+  109/109; `python run_tests.py --jobs 8` - 1001 tests, 8/8 shards ok.
+- walkthrough-ui: `python -m unittest tests.test_tour_dash` - 12/12
+  (10 prior updated to the per-section `card i of n` position text +
+  2 new: split-section order/chrome/chips and empty-section +
+  deferred-count + stale-feed no-reinsert); six-file tour run 127/127;
+  `python run_tests.py --jobs 8` - 999 tests, 8/8 shards ok.
 
 Earlier (feed-build): 39/39 test_tour_feeds, 54/54 state+api+dash,
 32/32 polish+e2e, 992-test suite green; cumulative-elapsed auto-archive

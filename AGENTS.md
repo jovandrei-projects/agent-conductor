@@ -879,19 +879,33 @@ leaves the last-known pill to the /api/state poll, which converges).
 
 The HTTP layer lives in conductor.py's `tour_ctx` block (just before
 `collect_dashboard`): one ctx per `make_dashboard_handler` holds the
-dirs, a ~60s `TOUR_FEED_TTL_S` feed cache, a count snapshot and a
-busy flag, so tests/second dashboards never share state (the handler
-takes `tour_repo=`; the ctx is `Handler.tour_ctx`). `GET /api/tour`
-serves `tour_feed(ctx)` = `{generated_at, boundary, range, entries,
-history, unseen_count, warnings}` - read-only end to end (the state
-file first appears on a mutation). `POST /api/tour/<id>/{viewed,
-snooze,unview}` runs `tour_transition`: the id is validated against
-entries+history (one fresh rebuild on a cache miss, else 404), the
-persisted transition runs, then BOTH caches drop and one rebuild lands
-- no pre-mutation state can be served; the result carries the fresh
-`unseen_count` (+ `advanced`/`advance_blocked`/`watermark` on viewed).
+dirs, a ~60s `TOUR_FEED_TTL_S` feed cache, the retained last-built
+payload (`last`), a count snapshot, a mutation epoch (`gen`) and
+busy/wanted refresh coalescing, so tests/second dashboards never share
+state (the handler takes `tour_repo=`; the ctx is `Handler.tour_ctx`).
+`GET /api/tour` serves `tour_feed(ctx)` = `{generated_at, boundary,
+range, entries, history, unseen_count, warnings}` - the ONLY endpoint
+that builds inline; read-only end to end (the state file first appears
+on a mutation). `POST /api/tour/<id>/{viewed,snooze,unview}` runs
+`tour_transition`, which never builds inline: the id is validated
+against the newest built payload (`last` - entries + history + folded
+`covers`, TTL-agnostic, so a once-seen card stays acknowledgeable
+after the live feed moved on; a renamed id the newest build lacks is
+still 'unknown') or, when nothing has ever built, against the persisted
+descriptors (a restart clears caches, not the file). The transition
+then persists through tour_state FIRST, drops the feed cache + bumps
+`gen` (a pre-mutation build can never store), and arms a daemon
+refresh via `_tour_refresh` - coalesced: one build in flight plus one
+`wanted` rerun, so a stale in-flight build can't eat the post-mutation
+rebuild. The response's `unseen_count` is the count the retained feed
+implies under the just-saved states (`_tour_count_now` - last-known,
+not a fresh collection; None when nothing has ever built), with
+`count_pending` marking the refresh the /api/state poll converges on.
+A descriptor-only mark lands but cannot judge the remaining deck, so
+the watermark never advances blind (`remaining_new=None`). A no-op
+transition (`changed` false) skips invalidation entirely.
 `/api/state` gains only `tour_unseen`: `tour_unseen(ctx)` returns the
-last computed count (null = never computed) and re-arms ONE daemon
+last computed count (null = never computed) and re-arms a daemon
 `_tour_build` when the feed is stale/absent - the same busy-flag
 pattern as `_SESS_BUSY`, so the paint path never runs git log.
 Endpoint tests are tests/test_tour_api.py.
