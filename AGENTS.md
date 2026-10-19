@@ -768,29 +768,54 @@ tmp+replace writes.
 
 `tour_feeds.py` (repo root, stdlib-only, imports `tour_state`) builds
 the deterministic feed: `build_feed(state, boundary, repo_dir=,
-runs_dir=, requests_dir=, manifests_dir=)` -> `{entries, history,
-unseen_count, range, boundary, warnings}` - no LLM, no HTTP. Commits
-come from `git log <base.commit>..<tip.commit>` (null base = unbounded;
-an unresolvable base warns + falls back unbounded, never a silent
-reset) and group one card per feature area: TOUR_STOPS (repo registry
-`{id: {selector, title}}` of real _DASH_HTML anchors; `tour` uses
-`#tour-btn, #power-btn` so it anchors once the dashboard step adds the
-button) plus unanchored pseudo-areas (conductor/mobile/tests/manifests/
-tracking/mixed). Records use their OWN event stamps inside
+runs_dir=, requests_dir=, manifests_dir=, flags_dir=)` -> `{entries,
+history, unseen_count, range, boundary, warnings}` - no LLM, no HTTP.
+Every card carries `section`/`section_title` splitting the feed in two:
+change + curated cards are "Tool updates" (spotlight anchors), record
+cards are the "Work digest". Records use their OWN event stamps inside
 `(base.at, tip.at]`: requests+follow-ups on `created_at`, runs on
-`ended_at` - never run creation. Card ids embed the newest commit
-(`area:<stop>:<tip>`) or the record identity (`request:<rid>`,
-`run:<dir>:<ended_at>`, `followup:<rid>`, `curated:<stop>:<tip>`), so
-re-feeds bind viewed state but a fresh commit in a viewed area reads
-'new' again. Dedup: a finished run absorbs its `conductor/<dir>/<step>`
-merge commits + chains; `manifests/whatsnew.jsonl` curated lines
-`{stop, blurb, title?, tag?, commits|since+until|requests|runs}` fold
-into the named card when they claim exactly its own change, extract to
-a dedicated card otherwise, and get skipped (with a `warnings` note)
-when malformed or out of range. `history` re-materializes recorded
-descriptors over their stored `{base,tip}` ranges - viewed cards stay
-retrievable after the watermark advances past them; snoozed/unviewed
-descriptors re-inject into `entries`.
+`ended_at` - never run creation. Commits come from `git log
+<base.commit>..<tip.commit>` (null base = unbounded; an unresolvable
+base warns + falls back unbounded, never a silent reset) and group one
+card per feature area: TOUR_STOPS (repo registry `{id: {selector,
+title}}` of real _DASH_HTML anchors; `tour` uses `#tour-btn,
+#power-btn` so it anchors once the dashboard step adds the button)
+plus unanchored pseudo-areas (conductor/mobile/tests/manifests/
+tracking/mixed). Card ids embed the newest commit (`area:<stop>:<tip>`)
+or the record identity (`request:<rid>`, `run:<dir>:<ended_at>`,
+`followup:<rid>`, `curated:<stop>:<tip>`), so re-feeds bind viewed
+state but a fresh commit in a viewed area reads 'new' again. Dedup: a
+finished run absorbs its `conductor/<dir>/<step>` merge commits +
+chains; `manifests/whatsnew.jsonl` curated lines `{stop, blurb, title?,
+tag?, commits|since+until|requests|runs}` fold into the named card when
+they claim exactly its own change, extract to a dedicated card
+otherwise, and get skipped (with a `warnings` note) when malformed or
+out of range.
+
+Work-card folding (record events only, matched on the RECORDED
+`request_id`/`source_request`/`source_run` links, never display names):
+a request and the run it launched share ONE card when both events sit
+inside the window - `kind` becomes `pipeline`, id stays
+`run:<dir>:<ended>` (completion is the newest event) and `covers` lists
+the absorbed standalone ids so viewed descriptors still resolve. The
+card carries `proposed_at`+`completed_at`, `outcome` (a recorded
+`aborted` reason wins, else the step verdicts), `steps_done`/
+`steps_total`, and `unreviewed` - the run's unreviewed-task count
+derived read-only from the review sentinels/folded marks. Follow-up
+proposals fold into their associated request's work card (`followups`
+list + `covers`) when that request is in the window; counterparts in
+different windows keep standalone cards. Record-card `tag` is
+event-derived - `ready` for proposals, the terminal `outcome` for
+run/pipeline cards - never change-style new/improved/fixed, which stay
+reserved for tool updates. One build collects each distinct `{base,tip}`
+range ONCE (live window + descriptor windows share the per-build memo;
+results are copied before annotation - never a persistent cache).
+`history` re-materializes recorded descriptors over their stored
+ranges (a `covers` hit resolves to the folded card); snoozed/unviewed
+descriptors re-inject into `entries` unless a live folded card already
+covers their id. `entries` excludes `state=='viewed'` cards even before
+the watermark advances - the live deck is the unread walkthrough;
+viewed cards stay reachable through `history`.
 
 The HTTP layer lives in conductor.py's `tour_ctx` block (just before
 `collect_dashboard`): one ctx per `make_dashboard_handler` holds the
