@@ -910,6 +910,22 @@ last computed count (null = never computed) and re-arms a daemon
 pattern as `_SESS_BUSY`, so the paint path never runs git log.
 Endpoint tests are tests/test_tour_api.py.
 
+The full contract is regression-pinned across tests/test_tour_*.py:
+section classification + stub/id-prefix fallback + folding +
+unreviewed counts + per-build range memoization + legacy-descriptor
+compat in test_tour_feeds.py; state/watermark machinery in
+test_tour_state.py; the HTTP/daemon path in test_tour_api.py -
+including gated-rebuild concurrency (POSTs racing an in-flight build
+coalesce to exactly ONE wanted rerun via `gen` + `wanted`), refresh
+failure recovery (the mark stands, `busy` clears, the next poll's
+re-armed build converges), and the mark-viewed-never-writes-review pin
+(run state.json byte-identical, no `review-*` sentinel); renderer
+behavior in test_tour_dash.py (Node-vm stub DOM - section headers and
+fallback, chip identities/modal targets, empty sections, partial-review
+reopen); the HTTP lifecycle in test_tour_e2e.py. Daemon-path tests
+synchronize on threading.Event gates - never sleeps - and release the
+gate via addCleanup so a failed assert can't park a worker.
+
 Ask-AI assistant transports: exchanges answer on one of two provider
 transports (`settings.transport` = `cli` | `fast`; frozen on each
 message's settings snapshot; decision record `assistant/TRANSPORT.md`,

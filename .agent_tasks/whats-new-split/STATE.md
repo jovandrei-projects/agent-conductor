@@ -157,13 +157,57 @@ mid-acknowledgment test rebuilds once post-commit so the renamed-id 404
 is deterministic; the in-flight-daemon-build test warms `last` before
 gating. New: POST-returns-while-gated + cold-ctx descriptor-unview tests.
 
-### Step tour-tests - pending
+### Step tour-tests - DONE
 
-Comprehensive regression expansion per manifest (this step only made
-the minimal adjustments: folded-card expectations in
-test_tour_feeds/api/e2e, viewed-in-history assertions, new
-SplitFeedTests class, and a pre-existing 48h auto-archive time-bomb fix
-in test_conductor's cumulative-elapsed payload test).
+Comprehensive regression coverage for the split + fold + deferred
+redesign, added on this step's branch. **No implementation changes
+were needed - the new tests surfaced no regressions.**
+
+- feeds (`tests/test_tour_feeds.py`, SplitFeedTests +11): every card
+  kind carries `section`/`section_title`; `unknown` stubs classify by
+  id prefix; two unrelated pipelines stay distinct and unlinked
+  records never fold (no display-name matching); an in-window request
+  whose run finished in a prior window keeps a standalone card that
+  still links the recorded launch; follow-up fold resolves via
+  `source_run` association and transitive chains land on the root
+  card; event tags (`ready`/outcome word) never read as
+  new/improved/fixed even on change-flavored names (partial/ended/
+  paused-verified outcomes pinned); feed builds are read-only for
+  review data (no `review-*` write, no `state.json` mark); marking a
+  covered standalone id viewed keeps the live folded card `new` while
+  history gains the viewed copy; a descriptor whose range IS the live
+  window reuses the one collection; legacy descriptors without a
+  `range` key still bind (real card for records, honest stub for
+  commit cards).
+- api (`tests/test_tour_api.py` +5): two marks racing during a gated
+  daemon rebuild coalesce to exactly one `wanted` rerun - the `gen`
+  bump rejects the pre-mutation store, both marks persist, the
+  watermark advances to the captured boundary; a daemon build that
+  raises only logs - the mark stands, `busy` clears, and the next
+  `/api/state` poll's re-armed build converges feed + count (exactly
+  2 builds total); marking a run card never writes task-review state
+  (`state.json` byte-identical, no `review-*` sentinel); the persisted
+  file stays exactly `{watermark, viewed, snoozed}`; range-less legacy
+  descriptors still bind and resurface on unview.
+- dash (`tests/test_tour_dash.py` +7): a tool-only feed walks its one
+  section with no blank card or dead nav; section-less cards partition
+  by id prefix (and `viewed earlier` rows label it); reopening after a
+  partial review deals only the unread cards while the acknowledged
+  one stays reopenable from history; an unlisted outcome word prints
+  verbatim with the default color and `unreviewed:0` renders 'all
+  reviewed' still wired to the run modal; an unlaunched request shows
+  only its request chip (no fabricated run link, no `relk` prefixes);
+  Request/Run chips keep distinct identities (staged proposal label
+  vs. the run row's name) and correct modal targets; a pipeline card
+  shows only the run chip, renders folded follow-ups as `.tfu` rows,
+  anchors to `#runs`, and its `unreviewed` chip opens the run modal.
+
+Determinism + worker cleanup: gated builds synchronize on
+`threading.Event` pairs (`entered` + `gate`) and the failure case uses
+a raise-once wrapper; every gated test registers
+`addCleanup(gate.set)` so a failed assert never leaves a daemon parked
+on the gate. No sleeps were added for background-work assertions (the
+existing `_poll` convergence helpers only).
 
 ### Step follow-up-plan - pending
 
@@ -171,16 +215,18 @@ Closing review + next manifest only.
 
 ## Where it stopped
 
-deferred-transition implemented + verified on branch
-`conductor/20261019-031845-whats-new-split/deferred-transition`
-(feed-build + walkthrough-ui already merged). Next: `tour-tests` step
-of run 20261019-031845-whats-new-split - comprehensive regression
-expansion per manifest (deterministic concurrency coverage for the
-daemon refresh/coalescing belongs there; this step only added the two
-focused cases above).
+tour-tests implemented + verified on branch
+`conductor/20261019-031845-whats-new-split/tour-tests`. Next:
+`follow-up-plan` step of run 20261019-031845-whats-new-split - closing
+review + follow-up manifest proposal only (no product changes).
 
 ## Verification
 
+- tour-tests: `python -m unittest tests.test_tour_feeds` - 50/50;
+  `tests.test_tour_api` - 25/25; `tests.test_tour_dash` - 19/19;
+  six-file tour run (`test_tour_state test_tour_feeds test_tour_api
+  test_tour_dash test_tour_polish test_tour_e2e`) - 152/152;
+  `python run_tests.py --jobs 8` - 1024 tests, 8/8 shards ok.
 - deferred-transition: `python -m unittest tests.test_tour_api` -
   20/20 (incl. 2 new: gated-refresh prompt return + cold-ctx
   descriptor unview); `tests.test_tour_state tests.test_tour_feeds
