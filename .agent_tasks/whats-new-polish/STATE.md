@@ -11,11 +11,15 @@ the same load-flake family seen on pristine main.
 
 ## Where it stopped
 
-2026-10-20 - Closing review (follow-up-plan) complete. Parked branches,
-all merge-clean vs main individually
+2026-10-20 - Closing review (follow-up-plan) complete.
+`progressive-tour` landed on main via resolver merge 2e28604 (conflicts
+were .agent_tasks tail-appends only; tour code byte-identical to branch;
+112 feeds/api/dash + 8/8 e2e tests green on the merged tree). Four
+branches still parked, all merge-clean vs main individually
 (`conductor/20261020-030142-whats-new-polish/<step>`):
 
-- progressive-tour   992cd26 - staged snapshot feed + guarded client
+- ~~progressive-tour   992cd26 - staged snapshot feed + guarded client~~
+  MERGED 2e28604
 - run-outcome-tags   4c4469f - proportionate `_run_outcome` tags
 - summary-regressions 097a73a - stats block + canonical headings + pills
 - html-summary-report d19db2f - run.summary.html artifact + sanitizer
