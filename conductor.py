@@ -5553,10 +5553,11 @@ def _worktree_rows(repo_dir: Path) -> list[dict]:
 
 
 def _git_commit_rows(repo_dir: Path, rev: str,
-                     n: int = 8) -> list[dict]:
-    """[{sha, subject, at}] newest-first for `git log -n <n> <rev>`."""
-    r = _git(repo_dir, "log", f"-{n}", "--format=%h%x09%s%x09%cI",
-             rev, "--")
+                     n: int = 8, skip: int = 0) -> list[dict]:
+    """[{sha, subject, at}] newest-first for `git log -n <n> <rev>`
+    (`skip` pages deeper - the repos modal's 'older' link)."""
+    r = _git(repo_dir, "log", f"-{n}", f"--skip={skip}",
+             "--format=%h%x09%s%x09%cI", rev, "--")
     if r.returncode != 0:
         return []
     out = []
@@ -5730,7 +5731,7 @@ def _repo_scan_one(name: str, pdir: Path) -> dict | None:
     if not wts:
         return None      # main checkout only -> the 'quiet' footnote
     return {"name": name, "path": str(pdir), "base": base,
-            "base_log": _git_commit_rows(pdir, base_ref, 3),
+            "base_log": _git_commit_rows(pdir, base_ref, 5),
             "worktrees": wts}
 
 
@@ -5786,16 +5787,28 @@ def repo_status(runs_dir: Path, projects: dict | None = None,
 
 def repo_one(name: str, runs_dir: Path,
              projects: dict | None = None,
-             fresh: bool = False) -> dict:
+             fresh: bool = False,
+             log_skip: int | None = None) -> dict:
     """GET /api/repos/<name> - one watched repo's full section
     (10s-cached per repo). A repo with no linked worktrees answers
-    {quiet: true} so the client folds it into the footnote."""
+    {quiet: true} so the client folds it into the footnote.
+    `?log_skip=N` is the light variant for the base log's 'older'
+    link: just the next page of base commits - one git log spawn,
+    no worktree scan, uncached."""
     projects = load_projects() if projects is None else projects
     tgt = next((t for t in _repo_targets(projects) if t[0] == name),
                None)
     if tgt is None:
         raise RequestError(f"not a watched repository: {name}", 404)
     name, pdir = tgt
+    if log_skip is not None:
+        rows = _worktree_rows(pdir)
+        base = (rows[0]["branch"] if rows else None) or \
+            ("master" if local_branch_exists(pdir, "master")
+             else "main" if local_branch_exists(pdir, "main") else None)
+        return {"name": name, "path": str(pdir), "base": base,
+                "base_log": _git_commit_rows(pdir, base or "HEAD", 5,
+                                             skip=log_skip)}
     key = os.path.normcase(str(pdir))
     now = time.time()
     with _REPO_STATUS_LOCK:
@@ -15876,8 +15889,11 @@ h3.proj .sub { margin-bottom:0; font-weight:400; }
 #detail table.repotab td, #detail table.repotab th {
   padding-right:18px; }
 /* run dir names are long unbroken slugs - without break-all they
-   overflow the narrow conductor column into the path column */
+   overflow the narrow conductor column into the path column, and the
+   shared 18px padding still reads too tight next to the path cell */
 #detail .repotab .ccond { word-break:break-all; }
+#detail .repotab td.ccond, #detail .repotab th:nth-child(3) {
+  padding-right:34px; }
 #detail .repotab code { word-break:break-all; }
 #detail .repotab .rpath { display:block; overflow:hidden;
   text-overflow:ellipsis; white-space:nowrap; }
@@ -20345,6 +20361,28 @@ async function rescanRepo(name){
   } catch(err){ /* the merge notice already carries the outcome */ }
   if (repoView) renderRepos();
 }
+// the base-log fold's 'older commits' link pages deeper into the base
+// branch: one light /api/repos/<name>?log_skip=N call (a single git
+// log spawn, no worktree rescan) - the page APPENDS under the newest
+// commits so nothing the user already read moves. A short page marks
+// the repo done and the link becomes a 'no older commits' note.
+async function repoLogMore(name){
+  const r = (repoData && repoData.repos || []).find(x=>x.name===name);
+  if (!r || r._logDone || r._logBusy) return;
+  r._logBusy = true;
+  try {
+    const d = await api('GET',
+      '/api/repos/'+encodeURIComponent(name)+
+      '?log_skip='+((r.base_log||[]).length), null, 30000);
+    const more = (d && d.base_log) || [];
+    if (more.length < 5) r._logDone = true;
+    const seen = new Set((r.base_log||[]).map(c=>c.sha));
+    r.base_log = (r.base_log||[]).concat(
+      more.filter(c=>!seen.has(c.sha)));
+  } catch(err){ /* leave the link - a retry is just another click */ }
+  r._logBusy = false;
+  if (repoView) renderRepos();
+}
 function renderRepos(){
   if (!repoView) return;
   const html = (repoData || repoScan) ? reposHtml(repoData)
@@ -20459,7 +20497,14 @@ function repoSectHtml(r){
     h += `<details class="repolog" data-repolog="${esc(r.name)}"` +
       `${repologOpen.has(r.name)?' open':''}>` +
       `<summary>latest ${r.base_log.length} commits</summary>` +
-      r.base_log.map(cmtLine).join('') + `</details>`;
+      r.base_log.map(cmtLine).join('') +
+      (r._logDone
+        ? `<div class="cmt sub">no older commits</div>`
+        : `<button type="button" class="linkbtn" data-logmore ` +
+          `data-repo="${esc(r.name)}" title="the next 5 commits on ` +
+          `${esc(r.base||'the base')} - appended below">` +
+          `older commits &rarr;</button>`) +
+      `</details>`;
   h += `<div class="wrapw"><table class="repotab">` +
     `<colgroup><col class="c-wt"><col class="c-vs">` +
     `<col class="c-cond"><col class="c-path"><col class="c-age">` +
@@ -20756,6 +20801,8 @@ function render(d){
     `${d.agents.length-planned} agents | ${planned} planned | ${live.length} running | ` +
     `cpu ${d.cpu_count||'?'} cores | free ram ${d.free_ram_gb||'?'} GB | ` +
     `refreshed ${loc(d.generated_at)}` +
+    ` | restarted <span title="when this dashboard process started: ` +
+    `${esc(loc(d.serve_boot))}">${ago(d.serve_boot)}</span>` +
     (d.pricing && d.pricing.models
       ? ` | ${d.pricing.models} model rates` +
         (d.pricing.fetched ? ` @ ${loc(d.pricing.fetched)}` : '')
@@ -21496,6 +21543,8 @@ document.addEventListener('click', async e=>{
   if (t.id==='repos-btn'){ openRepos(); return; }
   if (t.closest && t.closest('[data-repo-refresh]')){
     fetchRepos(true); return; }
+  const logMoreEl = t.closest && t.closest('[data-logmore]');
+  if (logMoreEl){ repoLogMore(logMoreEl.dataset.repo); return; }
   const mAllEl = t.closest && t.closest('[data-merge-all]');
   if (mAllEl){ repoMerge(mAllEl.dataset.repo, null, null, true);
     return; }
@@ -23676,10 +23725,17 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     # per repo; ?fresh=1 busts (post-merge rescans)
                     q = urllib.parse.parse_qs(
                         urllib.parse.urlsplit(self.path).query)
+                    try:
+                        log_skip = (int(q["log_skip"][0])
+                                    if q.get("log_skip") else None)
+                        if log_skip is not None and log_skip < 0:
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        raise RequestError("log_skip must be >= 0")
                     self._json(repo_one(
                         urllib.parse.unquote(m[1]), runs_dir,
                         fresh=q.get("fresh", [""])[0]
-                        in ("1", "true", "yes")))
+                        in ("1", "true", "yes"), log_skip=log_skip))
                 elif (m := re.fullmatch(
                         r"/api/projects/([^/]+)/branches", path)):
                     # Merge-target selector data: eligible local branches of
