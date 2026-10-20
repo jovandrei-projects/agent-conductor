@@ -2201,6 +2201,9 @@ assert.match(html,/merge 2 pending/);
             self.assertEqual(sect["name"], "proj")
             self.assertEqual(len(sect["worktrees"]), 1)
             self.assertEqual(sect["worktrees"][0]["branch"], "feat")
+            # the age column's server fields: dir creation + HEAD date
+            self.assertTrue(sect["worktrees"][0]["created"])
+            self.assertTrue(sect["worktrees"][0]["head_at"])
             q = conductor.repo_one("quietproj", runs, projects=projects)
             self.assertTrue(q["quiet"])
             with self.assertRaises(conductor.RequestError):
@@ -7950,6 +7953,57 @@ const run=async()=>{
   assert.equal(order,'b,a','a rescan must keep the on-screen order');
   assert.equal(vm.runInContext(
     'repoData.repos.find(r=>r.name==="a").worktrees.length',ctx),3);
+};
+run().then(()=>process.exit(0),e=>{console.error(e);process.exit(1)});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_repos_modal_conductor_link_and_age_column(self):
+        """The worktree row's conductor link resolves to the run modal:
+        run keys are 'request:<rid>' or the dir path, while the link (and
+        the tour's run chips) carries the run dir NAME - showRunDetails
+        must resolve it via the dir basename. The table also gains an
+        age column (created/updated) and the conductor cell wraps."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',value:'',checked:false,disabled:false,dataset:{},
+  classList:{add(){},remove(){},toggle(){}}}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,fn)=>{handlers[ev]=fn;}};
+const ctx=vm.createContext({document,location:{reload:()=>{}},
+  setTimeout:()=>{},fetch:async()=>({ok:true,json:async()=>({})}),
+  confirm:()=>true,alert:()=>{}});
+vm.runInContext(src,ctx);
+const run=async()=>{
+  // a request-launched run keys 'request:<rid>'; its dir name is what
+  // the worktree link carries
+  vm.runInContext('lastData={runs:[{run:"n",key:"request:rid1",' +
+    'dir:"/x/20261020-092813-whats-x",counts:{}}],agents:[]}',ctx);
+  vm.runInContext('showRunDetails("20261020-092813-whats-x")',ctx);
+  await new Promise(r=>setImmediate(r));
+  assert.equal(vm.runInContext('runModalKey',ctx),'request:rid1');
+  // the row emits the dir-name link plus the new age cell
+  const now=new Date(), twoH=new Date(now-2*3600e3).toISOString();
+  const w={path:'/p/repo/w0',branch:'b',ahead:1,behind:0,detached:false,
+    prunable:false,dirty:false,merging:false,
+    commits:[{sha:'c0',subject:'wip',at:'2026-01-01'}],
+    conductor:{run:'20261020-092813-whats-x',step:'s0'},
+    created:now.toISOString(),head_at:twoH,base:'main'};
+  const h=vm.runInContext('wtRow('+JSON.stringify(w)+',{base:"main"})',ctx);
+  assert.match(h,/data-run-details="20261020-092813-whats-x"/);
+  assert.match(h,/class="wrap ccond"/);
+  assert.match(h,/created just now/);
+  assert.match(h,/updated 2h ago/);
 };
 run().then(()=>process.exit(0),e=>{console.error(e);process.exit(1)});
 '''

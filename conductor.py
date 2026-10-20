@@ -5409,6 +5409,16 @@ def _repo_scan_one(name: str, pdir: Path) -> dict | None:
             row["merging"] = _git(
                 wpath, "rev-parse", "-q", "--verify",
                 "MERGE_HEAD").returncode == 0
+            # age column: dir ctime ~ when the worktree was created
+            # (Windows ctime is creation time); HEAD's committer date is
+            # the honest "last updated" - file mtimes lie about it.
+            try:
+                row["created"] = _iso_from(wpath.stat().st_ctime)
+            except OSError:
+                pass
+            rl = _git(wpath, "log", "-1", "--format=%cI")
+            if rl.returncode == 0 and rl.stdout.strip():
+                row["head_at"] = rl.stdout.strip()
         wts.append(row)
     if not wts:
         return None      # main checkout only -> the 'quiet' footnote
@@ -15148,13 +15158,17 @@ h3.proj .sub { margin-bottom:0; font-weight:400; }
    column widths regardless of content - the act column (and its merge
    link) can never get squeezed off-screen by a fat commit list */
 #detail table.repotab { table-layout:fixed; width:100%; }
-#detail table.repotab col.c-wt { width:41%; }
-#detail table.repotab col.c-vs { width:16%; }
-#detail table.repotab col.c-cond { width:17%; }
-#detail table.repotab col.c-path { width:18%; }
+#detail table.repotab col.c-wt { width:33%; }
+#detail table.repotab col.c-vs { width:14%; }
+#detail table.repotab col.c-cond { width:15%; }
+#detail table.repotab col.c-path { width:16%; }
+#detail table.repotab col.c-age { width:14%; }
 #detail table.repotab col.c-act { width:8%; }
 #detail table.repotab td, #detail table.repotab th {
   padding-right:18px; }
+/* run dir names are long unbroken slugs - without break-all they
+   overflow the narrow conductor column into the path column */
+#detail .repotab .ccond { word-break:break-all; }
 #detail .repotab code { word-break:break-all; }
 #detail .repotab .rpath { display:block; overflow:hidden;
   text-overflow:ellipsis; white-space:nowrap; }
@@ -17461,8 +17475,14 @@ function runCtl(r){
       unfinished};
 }
 function showRunDetails(key, keepStack){
-  const r = lastData?.runs.find(x=>runKey(x)===key);
+  // Canonical keys are runKey(r) ('request:<rid>' or the run dir), but
+  // several emitters hand over the run DIR NAME instead - the repos
+  // modal's conductor link, the tour's Related run chip - so a dir
+  // basename resolves too before the silent bail.
+  const r = lastData?.runs.find(x=>runKey(x)===key)
+        || lastData?.runs.find(x=>x.dir && base(x.dir)===key);
   if (!r) return;
+  key = runKey(r);             // rest of the modal works on canonical keys
   // a non-null snapshot means a modal view is on screen - this is a
   // modal->modal jump, so the Back stack survives the closeDetail below
   const snap = keepStack ? null : snapshotModal();
@@ -19617,10 +19637,12 @@ function repoSectHtml(r){
       r.base_log.map(cmtLine).join('') + `</details>`;
   h += `<div class="wrapw"><table class="repotab">` +
     `<colgroup><col class="c-wt"><col class="c-vs">` +
-    `<col class="c-cond"><col class="c-path"><col class="c-act">` +
-    `</colgroup><tr>` +
+    `<col class="c-cond"><col class="c-path"><col class="c-age">` +
+    `<col class="c-act"></colgroup><tr>` +
     `<th>worktree</th><th>vs ${esc(r.base||'base')}</th>` +
-    `<th>conductor</th><th>path</th><th></th></tr>` +
+    `<th>conductor</th><th>path</th>` +
+    `<th title="worktree creation / newest HEAD commit">age</th>` +
+    `<th></th></tr>` +
     (r.worktrees||[]).map(w=>wtRow(w,r)).join('') +
     `</table></div></div>`;
   return h;
@@ -19684,6 +19706,12 @@ function wtRow(w, r){
       `data-run-details="${esc(c.run)}" title="open this run's ` +
       `details">${esc(c.run)}</button>` +
       `<div class="sub">${esc(c.step)}</div>` : '';
+  const age = (w.created || w.head_at)
+    ? `<div class="sub" title="worktree directory creation time">` +
+      `created ${ago(w.created)}</div>` +
+      `<div class="sub" title="newest commit on the worktree's HEAD">` +
+      `updated ${ago(w.head_at)}</div>`
+    : '-';
   const cmts = (w.commits||[]).map(cmtLine).join('') +
     ((w.ahead||0) > (w.commits||[]).length
       ? `<div class="cmt sub">+${w.ahead-w.commits.length} more</div>`
@@ -19705,15 +19733,16 @@ function wtRow(w, r){
   let h = `<tr><td class="wrap"><code>${esc(w.branch||'(detached)')}` +
     `</code>${staging}${cmts}</td>` +
     `<td>${ws.join(' ')}${rec}</td>` +
-    `<td class="wrap">${link}</td>` +
+    `<td class="wrap ccond">${link}</td>` +
     `<td class="wrap"><span class="sub rpath" title="${esc(w.path)}">` +
     `${esc(tailPath(w.path))}</span></td>` +
+    `<td class="wrap">${age}</td>` +
     `<td>${act}</td></tr>`;
   // the merge outcome is a full-width row under its worktree - a
   // conflict file list would crush the fixed act column otherwise
   const msg = repoMsgs.get(w.path);
   if (msg)
-    h += `<tr class="wtmsg"><td colspan="5">` +
+    h += `<tr class="wtmsg"><td colspan="6">` +
       `<div class="notice ${esc(msg.cls)}">${msg.html}</div></td></tr>`;
   return h;
 }
