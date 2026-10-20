@@ -869,13 +869,15 @@ const FEED2={generated_at:'g1',boundary:{commit:'b',at:'t'},range:{},
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_loading_progress_narrates_the_build(self):
-        """While GET /api/tour is in flight the card polls
-        /api/tour/progress and paints the stage it names under the
-        spinner - 'loading run records' etc - instead of a bare wait."""
+        """The feed protocol IS the progress channel: a 'partial'
+        snapshot keeps the client polling /api/tour, paints elapsed
+        time + done/pending group marks (never a fabricated percent),
+        keeps the first cards usable while later groups land, and stops
+        polling when the complete snapshot arrives."""
         self._node(r'''
 (async()=>{
   vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
-  // give the tour a live interval: capture the progress poll callback
+  // give the tour a live interval: capture the snapshot-poll callback
   // (globalThis inside the vm IS ctx, so this lands where we can call it)
   vm.runInContext(
     'setInterval=f=>{globalThis.__iv=f;return 7};' +
@@ -886,27 +888,153 @@ const FEED2={generated_at:'g1',boundary:{commit:'b',at:'t'},range:{},
   assert.match(card(),/loading the change feed/);
   assert.match(card(),/asking the server/);
   assert.match(card(),/not an\s+agent task/);   // honesty footnote
-  // the interval fires: its progress probe pends like any fetch
-  ctx.__iv(); await flush();
-  const probe=defers.find(d=>d.u==='/api/tour/progress');
-  assert.ok(probe,'the progress poll must issue GET /api/tour/progress');
-  probe.r({ok:true,json:async()=>({busy:true,
-    stage:'loading run records'})});
-  await flush();
-  assert.equal(elem('tourstage').textContent,
-    'loading run records…');
-  // a quieter probe ('not busy' between phases) leaves the line alone
-  ctx.__iv(); await flush();
-  defers.find(d=>d.u==='/api/tour/progress'&&d!==probe)
-    .r({ok:true,json:async()=>({busy:false,stage:''})});
-  await flush();
-  assert.equal(elem('tourstage').textContent,
-    'loading run records…');
-  // the feed landing clears the stage line and stops the poll
-  defers.find(d=>d.u==='/api/tour').r({ok:true,json:async()=>FEED});
+  // the first snapshot is PARTIAL - the tool card is already usable
+  // and the loading line narrates the groups still publishing
+  const p1={generated_at:'g',boundary:{},range:{},seq:1,partial:true,
+    unseen_count:1,warnings:[],history:[],entries:[
+    {id:'area:power:aaa111bbb222',kind:'change',section:'tool',
+     section_title:'Tool updates',stop:'power',
+     stop_title:'Dashboard power',title:'Power <img>',blurb:'b',
+     tag:'improved',anchor:'#power-btn',commits:[],runs:[],requests:[],
+     at:'2026-10-17T01:00:00',range:{},state:'new'}],
+    loading:{busy:true,elapsed_s:2.5,stage:'loading run records',
+      groups:{collect:'done',tool:'done',work:'running',
+              history:'pending'},
+      sources:{commits:'ok',runs:'ok',requests:'pending'}}};
+  defers.find(d=>d.u==='/api/tour').r({ok:true,json:async()=>p1});
   await p; await flush();
+  let h=card();
+  assert.match(h,/Tool updates<\/span> · card 1 of 1/);
+  assert.match(h,/2\.5s/);
+  assert.match(h,/sources done/);
+  assert.match(h,/tool updates done/);
+  assert.match(h,/work digest \u2026|work digest \.\.\./);
+  assert.match(h,/viewed history pending/);
+  // nav + mark are live while the rest of the feed builds
+  assert.match(h,/data-tour="mark"/);
+  // the poll fires: it re-GETs /api/tour - no separate progress probe
+  ctx.__iv(); await flush();
+  assert.ok(defers.filter(d=>d.u==='/api/tour').length>=2,
+    'the poll must re-issue GET /api/tour');
+  assert.ok(!defers.some(d=>d.u==='/api/tour/progress'));
+  // the next snapshot merges the work group in place - the tool card's
+  // spot is kept (no selection reset), the new card appends
+  const p2=Object.assign({},p1,{seq:2,
+    entries:p1.entries.concat([
+      {id:'request:req9',kind:'request',section:'work',
+       section_title:'Work digest',stop:'requests',
+       stop_title:'Proposals & requests',title:'New proposal: nine',
+       blurb:'d',tag:'ready',anchor:'#runs',commits:[],runs:[],
+       requests:['req9'],at:'2026-10-17T05:00:00',
+       proposed_at:'2026-10-17T05:00:00',range:{},state:'new'}]),
+    loading:{busy:true,elapsed_s:3.1,stage:'rebuilding viewed history',
+      groups:{collect:'done',tool:'done',work:'done',
+              history:'running'},
+      sources:{commits:'ok',runs:'ok',requests:'ok',curated:'ok'}}});
+  defers[defers.length-1].r({ok:true,json:async()=>p2});
+  await flush();
+  h=card();
+  assert.match(h,/Tool updates<\/span> · card 1 of 1/);   // still on it
+  assert.match(h,/3\.1s/);                              // elapsed advances
+  assert.match(h,/work digest done/);
+  // a repeat seq is a no-op (stale publications never reapply)
+  ctx.__iv(); await flush();
+  defers[defers.length-1].r({ok:true,json:async()=>p2});
+  await flush();
+  // the complete snapshot lands: the poll interval is cleared
+  ctx.__iv(); await flush();
+  const fin=Object.assign({},p2,{seq:3,partial:false,
+    unseen_count:2,loading:{busy:false}});
+  defers[defers.length-1].r({ok:true,json:async()=>fin});
+  await flush();
   assert.equal(ctx.__cl,7);
-  assert.doesNotMatch(card(),/tourstage/);
+  h=card();
+  assert.doesNotMatch(h,/still loading|elapsed_s/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_partial_shell_and_acked_card_never_reinserts(self):
+        """An empty partial shell lands on the picker with 'loading'
+        rows (not a fake 'all caught up'); a card marked viewed while
+        later groups still publish is never reinserted by a stale
+        partial snapshot that still lists it - tourAcked filters every
+        apply, and the card waits for the user in viewed history."""
+        self._node(r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  vm.runInContext(
+    'setInterval=f=>{globalThis.__iv=f;return 7};' +
+    'clearInterval=i=>{globalThis.__cl=i}',ctx);
+  defers=[];
+  const p=open();
+  await flush();
+  // snapshot 1: an empty shell - the build hasn't published content
+  const shell={generated_at:'g',boundary:{},range:{},seq:1,
+    partial:true,unseen_count:null,warnings:[],entries:[],history:[],
+    loading:{busy:true,elapsed_s:0.4,stage:'reading commit log',
+      groups:{collect:'running',tool:'pending',work:'pending',
+              history:'pending'},sources:{}}};
+  defers.find(d=>d.u==='/api/tour').r({ok:true,json:async()=>shell});
+  await p; await flush();
+  let h=card();
+  assert.match(h,/What's new/);                  // picker, not a card
+  assert.equal((h.match(/loading&hellip;/g)||[]).length,2);
+  assert.doesNotMatch(h,/all caught up/);        // never lies 'empty'
+  // snapshot 2: the tool group lands - auto-walks its single deck
+  const tool={id:'area:power:aaa111bbb222',kind:'change',section:'tool',
+    section_title:'Tool updates',stop:'power',
+    stop_title:'Dashboard power',title:'Power',blurb:'b',
+    tag:'improved',anchor:'#power-btn',commits:[],runs:[],requests:[],
+    at:'2026-10-17T01:00:00',range:{},state:'new'};
+  ctx.__iv(); await flush();
+  defers[defers.length-1].r({ok:true,json:async()=>
+    Object.assign({},shell,{seq:2,entries:[tool],
+      loading:Object.assign({},shell.loading,{elapsed_s:1.2,
+        groups:{collect:'done',tool:'done',work:'running',
+                history:'pending'}})})});
+  await flush();
+  assert.match(card(),/Tool updates<\/span> · card 1 of 1/);
+  // mark it viewed NOW - mid-build; the POST returns a deferred count
+  await click(act('mark'));
+  defers.find(d=>d.u.includes('/viewed')).r(
+    {ok:true,json:async()=>({id:tool.id,state:'viewed',
+      changed:true,unseen_count:null})});
+  await flush();
+  assert.match(card(),/All caught up|What's new/);
+  // snapshot 3 (stale): still lists the acked card + lands a work card
+  // - the session acked-set must keep the marked one out
+  const work={id:'request:req9',kind:'request',section:'work',
+    section_title:'Work digest',stop:'requests',
+    stop_title:'Proposals & requests',title:'New proposal: nine',
+    blurb:'d',tag:'ready',anchor:'#runs',commits:[],runs:[],
+    requests:['req9'],at:'2026-10-17T05:00:00',
+    proposed_at:'2026-10-17T05:00:00',range:{},state:'new'};
+  ctx.__iv(); await flush();
+  defers[defers.length-1].r({ok:true,json:async()=>
+    Object.assign({},shell,{seq:3,entries:[tool,work],
+      loading:Object.assign({},shell.loading,{elapsed_s:2.0,
+        groups:{collect:'done',tool:'done',work:'done',
+                history:'running'}})})});
+  await flush();
+  h=card();
+  assert.doesNotMatch(h,/class="tpos"/);         // no card dealt back
+  await click(act('menu'));
+  h=card();
+  assert.match(h,/tsecname work">1 card</);      // work card landed
+  await click(act('sec',{sec:'work'}));
+  assert.match(card(),/New proposal: nine/);
+  // the complete lands: acked card sits in viewed history, never dealt
+  ctx.__iv(); await flush();
+  defers[defers.length-1].r({ok:true,json:async()=>
+    Object.assign({},shell,{seq:4,partial:false,unseen_count:1,
+      entries:[work],history:[tool],
+      loading:{busy:false}})});
+  await flush();
+  h=card();
+  assert.match(h,/viewed earlier \(1\)/);
+  assert.doesNotMatch(h,/<h3 id="tourcard-title">Power<\/h3>/);
+  assert.match(h,/New proposal: nine/);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 ''')
 
