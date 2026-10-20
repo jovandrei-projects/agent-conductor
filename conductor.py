@@ -15897,6 +15897,8 @@ h3.proj .sub { margin-bottom:0; font-weight:400; }
 #detail .repotab code { word-break:break-all; }
 #detail .repotab .rpath { display:block; overflow:hidden;
   text-overflow:ellipsis; white-space:nowrap; }
+#detail .repotab .wage { margin:0; }      /* .sub's 14px gap inflates rows */
+#detail .repotab .wagec { display:none; color:#8b949e; }
 /* a row's merge outcome takes a full-width row of its own - conflict
    file lists would crush the 8% act column */
 #detail tr.wtmsg td { padding-left:22px; }
@@ -16001,6 +16003,10 @@ body.compact td.wrap, body.compact td.res {
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 body.compact td .sub { display:none; }
 body.compact td br { display:none; }
+/* the repos worktree age column's only content is .sub lines - the
+   blanket hide empties the whole column, so compact swaps in the
+   single condensed stamp instead */
+body.compact #detail .repotab td .wagec { display:inline; }
 /* .toksub carries the labeled planner:/steps:/est token lines in a
    run's steps cell - compact density hides them entirely (the numbers
    stay reachable at full density and in the run modal). .rlabels is a
@@ -20576,11 +20582,17 @@ function wtRow(w, r){
       `data-run-details="${esc(c.run)}" title="open this run's ` +
       `details">${esc(c.run)}</button>` +
       `<div class="sub">${esc(c.step)}</div>` : '';
+  // .wage divs carry the two lines at full density; .wagec is the
+  // compact-mode stand-in (compact hides td .sub wholesale, which would
+  // leave this column blank otherwise)
   const age = (w.created || w.head_at)
-    ? `<div class="sub" title="worktree directory creation time">` +
+    ? `<div class="sub wage" title="worktree directory creation time">` +
       `created ${ago(w.created)}</div>` +
-      `<div class="sub" title="newest commit on the worktree's HEAD">` +
-      `updated ${ago(w.head_at)}</div>`
+      `<div class="sub wage" title="newest commit on the worktree's ` +
+      `HEAD">updated ${ago(w.head_at)}</div>` +
+      `<span class="wagec" title="created ${ago(w.created)} / ` +
+      `updated ${ago(w.head_at)}">${w.head_at?'upd ':'new '}` +
+      `${ago(w.head_at||w.created)}</span>`
     : '-';
   const cmts = (w.commits||[]).map(cmtLine).join('') +
     ((w.ahead||0) > (w.commits||[]).length
