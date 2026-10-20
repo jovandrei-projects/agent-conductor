@@ -2372,6 +2372,16 @@ assert.match(html,/merge 2 pending/);
             self.assertTrue(sect["worktrees"][0]["head_at"])
             q = conductor.repo_one("quietproj", runs, projects=projects)
             self.assertTrue(q["quiet"])
+            # ?log_skip=N is the light 'older commits' variant: just the
+            # paged base log - no worktree scan keys in the payload
+            page = conductor.repo_one("proj", runs, projects=projects,
+                                      log_skip=1)
+            self.assertEqual(page["name"], "proj")
+            self.assertEqual(page["base_log"], [])  # 1-commit repo
+            self.assertNotIn("worktrees", page)
+            page = conductor.repo_one("proj", runs, projects=projects,
+                                      log_skip=0)
+            self.assertEqual(len(page["base_log"]), 1)
             with self.assertRaises(conductor.RequestError):
                 conductor.repo_one("nope", runs, projects=projects)
             with self.assertRaises(conductor.RequestError):
@@ -8247,7 +8257,17 @@ const document={getElementById:elem,querySelector:()=>null,
   querySelectorAll:()=>[],activeElement:null,
   addEventListener:(ev,fn)=>{handlers[ev]=fn;}};
 const ctx=vm.createContext({document,location:{reload:()=>{}},
-  setTimeout:()=>{},fetch:async()=>({ok:true,json:async()=>({})}),
+  setTimeout:()=>{},
+  fetch:async(p)=>{
+    p=String(p);
+    if (p.includes('log_skip=5'))
+      return {ok:true,json:async()=>({name:'a',base:'main',base_log:
+        [1,2,3,4,5].map(i=>({sha:'o'+i,subject:'old'+i,at:'t'}))})};
+    if (p.includes('log_skip=10'))
+      return {ok:true,json:async()=>({name:'a',base:'main',base_log:
+        [{sha:'o6',subject:'old6',at:'t'}]})};
+    return {ok:true,json:async()=>({})};
+  },
   confirm:()=>true,alert:()=>{}});
 vm.runInContext(src,ctx);
 const run=async()=>{
@@ -8270,6 +8290,20 @@ const run=async()=>{
   assert.match(h,/class="wrap ccond"/);
   assert.match(h,/created just now/);
   assert.match(h,/updated 2h ago/);
+  // the base-log fold offers 'older commits' and APPENDS pages under
+  // the newest - a short page marks the repo done
+  vm.runInContext('repoData={generated_at:"g",repos:[{name:"a",' +
+    'path:"/p/a",base:"main",base_log:' +
+    '[1,2,3,4,5].map(i=>({sha:"h"+i,subject:"c"+i,at:"t"})),' +
+    'worktrees:[]}],quiet:[]}; repoView=true; renderRepos()',ctx);
+  assert.match(elem('dbody').innerHTML,/data-logmore data-repo="a"/);
+  await vm.runInContext('repoLogMore("a")',ctx);
+  assert.equal(vm.runInContext('repoData.repos[0].base_log.length',ctx),10);
+  assert.match(elem('dbody').innerHTML,/old5/);
+  assert.match(elem('dbody').innerHTML,/latest 10 commits/);
+  await vm.runInContext('repoLogMore("a")',ctx);
+  assert.equal(vm.runInContext('repoData.repos[0].base_log.length',ctx),11);
+  assert.match(elem('dbody').innerHTML,/no older commits/);
 };
 run().then(()=>process.exit(0),e=>{console.error(e);process.exit(1)});
 '''
