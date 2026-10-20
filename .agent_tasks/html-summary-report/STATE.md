@@ -102,5 +102,21 @@ worktree; `python run_tests.py --jobs 8` green (see Verification).
 
 ## Verification
 
-`python run_tests.py --jobs 8` — full suite incl. tour_* and the
-node harness inside test_conductor.
+- `python -m unittest tests.test_conductor.RunSummaryHtmlTests` —
+  15/15 green (artifact collection, endpoint contract, sanitizer
+  battery, node append-harness).
+- `python -m unittest tests.test_conductor.RunSummaryTests
+  tests.test_conductor.PowerDialogTests` — 26/26 green (markdown
+  summary surface untouched).
+- `python run_tests.py --jobs 8` — 1062 tests / 8 shards; shards
+  0/2/4/6 ok, shards 1/3/5/7 reported 6 failures, ALL box-load timing
+  flakes that pass in isolation: `test_summarize_manifest_autospawns`
+  (detached spawn deadline), `test_branches_endpoint_lists_real_repo_-
+  branches` (HTTP timeout), `test_live_owner_queues_until_release`
+  (device-lease PermissionError), `test_idle_session_reaped_and_-
+  reloadable` (ACP adapter), `test_get_is_read_only` /
+  `test_concurrent_transitions_coalesce_refresh` /
+  `test_transition_returns_before_refresh_lands` (tour_api daemon
+  timing). Suite took 951s on a heavily loaded shared box (~3x
+  normal); re-verified each 6 green standalone.
+- `node --check` on the extracted dashboard script — clean.
