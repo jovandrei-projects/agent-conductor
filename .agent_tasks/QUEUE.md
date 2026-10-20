@@ -1384,3 +1384,47 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   have been dead (no poolBump handler survives the merge) - PLUS the
   branch's #tour-btn 'What's new' button, which the cleanly-merged
   tour CSS/JS (.tbadge, openTour/tourAct) wires up.
+
+- DONE 2026-10-20 (progressive-tour, wave step of run
+  20261020-030142-whats-new-polish): GET /api/tour is now a PROGRESSIVE
+  snapshot protocol instead of an all-or-nothing inline build.
+  tour_feeds.build_feed collects the window's four scans (commit log,
+  run dirs, request files, curated whatsnew) on ONE bounded
+  ThreadPoolExecutor (workers= default 4, shared with same-window
+  merge chains + descriptor ranges) - each source returns an isolated
+  result folded in _SOURCE_ORDER, so a raising source degrades to a
+  warning while siblings still feed. A new emit=(group, parts) hook
+  publishes collect/tool/work/history as it lands; every emitted group
+  is already annotated + viewed-filtered. conductor.py tour_ctx gained
+  `snap` (newest published snapshot), `build` (running publication
+  record: gen/started_at/groups/sources), and a monotonic `seq`;
+  _tour_build's publish() composes each emit into ctx["snap"] under
+  the captured gen so polls serve growing partial snapshots (Tool
+  updates first) and a stale build (a transition bumped gen) can
+  never publish or store. A raised build publishes a TERMINAL
+  partial:false + error snapshot (pollers stop, cards gathered so
+  far stay usable) and the next request re-arms. tour_transition now
+  validates ids against `last`, THEN `snap` (a partial-published card
+  is markable), THEN persisted descriptors; it persists first, drops
+  feed+snap, bumps gen, and returns the persisted result promptly -
+  _tour_refresh's busy/wanted coalescing still lands exactly one
+  post-mutation rebuild. tour_feed(progressive=True) joins/serves
+  snapshots; a warm cache is only fast-pathed when no build is in
+  flight so a poll can't stop on the superseded build's answer.
+  /api/tour/progress reports {busy,stage,at} + started_at/groups/
+  sources + per-call elapsed_s. The client polls /api/tour itself
+  (500ms) - every snapshot carries seq + loading {elapsed_s, groups,
+  sources, stage} so elapsed advances across polls, stale-seq/
+  duplicate publications never re-apply, the picker labels
+  still-loading sections instead of lying 'all caught up', tourAcked
+  keeps marked cards out of late partials, and a deliberate retry
+  re-picks the entry deck while mid-stream merges preserve
+  section/card selection. tests: +5 feed tests (source overlap, emit
+  order+annotation, tool-before-gated-work, failure degradation,
+  serial/parallel byte-identity), +6 api tests (partial-before-work +
+  mid-build mark, one-build coalescing, stale-build no-resurrection
+  via compose spy, terminal error + re-arm, empty window, progress
+  narration), 2 rewritten/new dash node tests (progressive loading
+  narration + shell/acked-card merge), plus get()/get_partial()
+  helpers; api 32/32, feeds+state+polish 106/106, dash 24/24,
+  e2e 8/8 green.
