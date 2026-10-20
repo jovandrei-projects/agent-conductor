@@ -616,8 +616,9 @@ class TourApiTests(unittest.TestCase):
             self.assertEqual({v["id"] for v in st["viewed"]}, {e1, e2})
             gate.set()
             # the gated pre-mutation build + exactly one coalesced
-            # rerun - then busy and wanted both clear
-            self.assertTrue(_poll(lambda: not self.tour["busy"]))
+            # rerun - then busy and wanted both clear (a real build's
+            # cost under a loaded shard box, not an instant)
+            self.assertTrue(_poll(lambda: not self.tour["busy"], 15))
             self.assertEqual(spy.call_count, 2)
             self.assertFalse(self.tour["wanted"])
             # converged caches reflect BOTH marks - the stale build's
