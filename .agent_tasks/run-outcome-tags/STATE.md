@@ -78,12 +78,25 @@ cards still render `e.outcome` verbatim over `e.tag`.
   `summarize.launch.log` at TemporaryDirectory cleanup). Passes in
   isolation (19.3s); pre-existing flake class, unrelated to this
   change - the summarizer spawn path is untouched.
-- `python run_tests.py --jobs 8` - <FULL_SUITE_RESULT>.
+- `python run_tests.py --jobs 8` (continuation attempt, log in
+  `full-suite.log`) - 1055 tests over 8 shards; 4 shards each carried
+  ONE error, all pre-existing load flakes under a box busy with
+  parallel agent sessions, all green on isolated re-run:
+  `test_tour_api.test_concurrent_transitions_coalesce_refresh` and
+  `test_conductor.test_http_trash_routes` hit socket timeouts on
+  `GET /api/state*`; `test_assistant_acp.test_attach_reaps_live_orphan_
+  before_load` saw a still-None session on attach;
+  `test_assistant_runtime.test_cancel_kills_and_keeps_partial` raced
+  the cancel vs partial-write then hit the same WinError 32 tempdir
+  teardown class as the summarize flake above. None touch
+  `_run_outcome`, feed sectioning, or the tag rendering.
 
 ## Where it stopped
 
-DONE - classification reweighted, badge reused, all suites green;
-nothing carried forward.
+DONE - classification reweighted, badge reused. Attempt 2 finished
+the leftover verification: focused tests re-green (29/29), full suite
+recorded (4 unrelated load flakes, all pass in isolation). Nothing
+carried forward.
 
 ## Deferred or blocked
 
