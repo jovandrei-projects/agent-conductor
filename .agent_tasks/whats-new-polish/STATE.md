@@ -20,8 +20,12 @@ both-append + test_tour_feeds.py kept BOTH appended test classes -
 ProgressiveEmitTests and RunOutcomeTests; 63/63 tests in the merged file
 green). `summary-regressions` landed on main via resolver merge bee3f0b
 (both conflicts doc tail-appends only - QUEUE.md + efficiency_stats.md;
-conductor.py and test_conductor.py merged clean). Two branches still
-parked, all merge-clean vs main individually
+conductor.py and test_conductor.py merged clean). `html-summary-report`
+landed on main via resolver merge c5778f3 (doc tail-appends plus ONE
+real conflict in `_summary_prompt` - kept BOTH instruction blocks:
+canonical step headings AND '## Also write run.summary.html'; 37/37
+*RunSummary* tests green on the merged tree). One branch still
+parked, merge-clean vs main individually
 (`conductor/20261020-030142-whats-new-polish/<step>`):
 
 - ~~progressive-tour   992cd26 - staged snapshot feed + guarded client~~
@@ -30,7 +34,8 @@ parked, all merge-clean vs main individually
   MERGED 6ffb4e5
 - ~~summary-regressions 097a73a - stats block + canonical headings + pills~~
   MERGED bee3f0b
-- html-summary-report d19db2f - run.summary.html artifact + sanitizer
+- ~~html-summary-report d19db2f - run.summary.html artifact + sanitizer~~
+  MERGED c5778f3
 - chat-font          e3fb85e - sans prose / mono code in chat.css
 
 Simulated manifest-order merges: conflicts only in `.agent_tasks/
