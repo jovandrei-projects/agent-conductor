@@ -1384,3 +1384,44 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   have been dead (no poolBump handler survives the merge) - PLUS the
   branch's #tour-btn 'What's new' button, which the cleanly-merged
   tour CSS/JS (.tbadge, openTour/tourAct) wires up.
+
+- DONE 2026-10-20 (summary-regressions, parallel-pool step of run
+  20261020-030142-whats-new-polish): restored the three run-summary
+  behaviors LLM summaries displaced. Statistics: `_run_stats_lines`/
+  `_run_stats_md`/`_ensure_stats_block` (conductor.py ~2784-2832,
+  extracted from `run_report_md` so both docs share one fact sheet)
+  now tops every served run summary - `summarize_run` bakes it into
+  run.summary.md between the `_written_` byline and the LLM prose
+  (regeneration rewrites the file, never stacks), and
+  `run_summary_doc` injects it on the read for legacy files whose
+  body lacks `- **steps:**` anywhere (stored artifact untouched, a
+  second block impossible). Numbers come from `_run_step_stats` over
+  step records: per-status counts (failed/timed_out/lost stay
+  distinct), started/ended + `_run_elapsed_md` driver elapsed,
+  prompt+completion(+cached) tokens, merged/parked-branch tallies;
+  unrecorded values render '-' (mocks show `- **tokens:** -`), and a
+  retried step counts once (rec['tokens'] already banks every
+  attempt once). Headings: `_summary_prompt` (~2888) now instructs
+  the model to head EVERY step '## <step-name> - <status>' verbatim,
+  copied from its '### <step> - <status>' source lines under
+  '## Steps' - thematic prose goes in non-step sections.
+  decorateRunSum needed NO code change: it already accepts h2/h3/h4,
+  -/–/— separators, case-insensitive step names, every recorded
+  status word + '?', skips aux/unknown/prose headings, and the
+  dataset.sumstep guard keeps refresh re-decoration idempotent
+  (task-modal link, .stc status color, mark-as-reviewed/needing-
+  review toggle, strike-through). Styling: '#detail .sumdoc code'
+  now wears the Ask-AI chip (rgba(110,118,129,.16) + .32 border +
+  #a5d6ff) with overflow-wrap:anywhere for long slugs like
+  deferred-transition; '.sumdoc pre code' resets inside fences;
+  summary_html's standalone per-task page got the same chip+wrap+
+  pre-reset. Scoped to summary containers - #aichat and dashboard
+  typography untouched; no HTML report, no badge changes (siblings
+  own those). Tests: +6 RunSummaryTests (write-time block, regen
+  single-block, legacy injection, honest missing, canonical prompt,
+  CSS) + 1 node-harness case (h2/h3+em-dash decoration, both toggle
+  directions, strike, untouched prose, idempotency); 22/22
+  RunSummaryTests + 150/150 tour green; --jobs 8 suite ran with only
+  load flakes - http_draft_review, tour_api timing asserts
+  (assertLess t<5 at ~9s), ACP _pending KeyError - each verified
+  failing identically on pristine HEAD under parallel-agent load.
