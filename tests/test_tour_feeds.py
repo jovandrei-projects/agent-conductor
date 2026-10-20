@@ -694,7 +694,8 @@ class SplitFeedTests(unittest.TestCase):
             r = base/"r"
             write_run(r, "20261017-050000-f", "2026-10-17T06:00:00",
                       steps={"s1": {"status": "done"},
-                             "s2": {"status": "failed"}})
+                             "s2": {"status": "failed"},
+                             "s3": {"status": "timed_out"}})  # bad majority
             write_run(r, "20261017-070000-s", "2026-10-17T08:00:00",
                       aborted="stopped",
                       steps={"s1": {"status": "done"}})
@@ -1201,7 +1202,8 @@ class SplitFeedTests(unittest.TestCase):
                              "s2": {"status": "superseded"}})
             write_run(r, "20261017-070000-mixed", "2026-10-17T08:00:00",
                       steps={"s1": {"status": "done"},
-                             "s2": {"status": "lost"}})
+                             "s2": {"status": "lost"},
+                             "s3": {"status": "timed_out"}})  # bad majority
             write_run(r, "20261017-080000-part", "2026-10-17T09:00:00",
                       steps={"s1": {"status": "done"},
                              "s2": {"status": "running"}})
@@ -1570,6 +1572,118 @@ class ProgressiveEmitTests(unittest.TestCase):
             par = tour_feeds.build_feed(st, boundary(repo),
                                         workers=4, **kw)
             self.assertEqual(serial, par)
+
+
+class RunOutcomeTests(unittest.TestCase):
+    """_run_outcome weighs the step verdicts: failed/timed_out/lost are
+    the unsuccessful outcomes; 'failed' needs a strict unsuccessful
+    majority of the decisive verdicts (done + unsuccessful) or no done
+    step at all - a mostly-done run, an even split, and every
+    nonterminal mix read 'partial' instead of wearing the failure word."""
+
+    @staticmethod
+    def st(*statuses):
+        return {"steps": {f"s{i}": {"status": s}
+                          for i, s in enumerate(statuses)}}
+
+    def test_aborted_reason_still_wins(self):
+        for word in ("paused", "stopped", "drained", "auth"):
+            self.assertEqual(
+                tour_feeds._run_outcome(
+                    {"aborted": word, "steps":
+                     {"s1": {"status": "failed"}}}), word)
+        # a non-string abort flag falls through to the step verdicts
+        self.assertEqual(
+            tour_feeds._run_outcome(
+                {"aborted": True, **self.st("done")}), "done")
+
+    def test_empty_and_never_started_runs_are_ended_not_failed(self):
+        self.assertEqual(tour_feeds._run_outcome({}), "ended")
+        self.assertEqual(tour_feeds._run_outcome({"steps": {}}), "ended")
+        self.assertEqual(tour_feeds._run_outcome({"steps": None}),
+                         "ended")
+        # non-dict step records can't invent a failure
+        self.assertEqual(tour_feeds._run_outcome(
+            {"steps": {"s1": None}}), "ended")
+
+    def test_mostly_done_runs_with_each_unsuccessful_status(self):
+        """The workflow-ux-safety shape - 29 done + 1 unsuccessful -
+        reads 'partial', never 'failed' or 'done', for all three
+        unsuccessful statuses."""
+        for bad in ("failed", "timed_out", "lost"):
+            self.assertEqual(
+                tour_feeds._run_outcome(
+                    self.st(*(["done"] * 29), bad)), "partial",
+                f"29 done + 1 {bad}")
+
+    def test_unsuccessful_majority_and_no_done_runs_fail(self):
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("done", "failed", "timed_out")), "failed")
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("failed")), "failed")
+        # unsuccessful + zero done - even padded with non-decisive
+        # skipped/superseded verdicts - is still a failure
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("skipped", "lost")), "failed")
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("superseded", "failed", "failed")), "failed")
+
+    def test_even_splits_are_partial_not_a_failure_majority(self):
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("done", "failed")), "partial")
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("done", "done", "lost", "timed_out")), "partial")
+        # skipped/superseded don't count as decisive on either side
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("done", "skipped", "superseded", "failed")),
+            "partial")
+        # a nonterminal leftover doesn't tip the balance either
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("done", "failed", "running")), "partial")
+
+    def test_clean_and_nonterminal_runs(self):
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("done", "done")), "done")
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("done", "superseded", "skipped")), "done")
+        # stopped/blocked are reviewable verdicts but not the
+        # unsuccessful set - their presence still reads 'partial'
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("done", "stopped")), "partial")
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("done", "blocked")), "partial")
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("stopped")), "partial")
+        # nonterminal leftovers on a finished run stay 'partial'
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("done", "running")), "partial")
+        self.assertEqual(tour_feeds._run_outcome(
+            self.st("running", "queued")), "partial")
+
+    def test_mostly_done_run_card_carries_the_partial_word(self):
+        """End to end through build_feed: the workflow-ux-safety shape
+        (29 done + 1 lost) emits a work card whose tag AND outcome both
+        read 'partial' - the section, tallies and run identity left
+        untouched."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = make_repo(base)
+            r = base/"r"
+            write_run(r, "20261016-013719-workflow-ux-safety",
+                      "2026-10-17T06:00:00",
+                      steps={f"step{i:02d}": {"status": "done"}
+                             for i in range(29)} |
+                            {"lost-one": {"status": "lost"}})
+            st = wm(None, "2026-10-17T00:00:00")
+            f = feed(repo, r, base/"q", base/"m", st,
+                     boundary(repo, "2026-10-17T12:00:00"))
+            e = f["entries"][0]
+            self.assertEqual(e["kind"], "run")
+            self.assertEqual(e["section"], "work")
+            self.assertEqual(e["tag"], "partial")
+            self.assertEqual(e["outcome"], "partial")
+            self.assertEqual(e["steps_done"], 29)
+            self.assertEqual(e["steps_total"], 30)
 
 
 class ProgressTests(unittest.TestCase):

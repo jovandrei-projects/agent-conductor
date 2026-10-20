@@ -1430,6 +1430,30 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   helpers; api 32/32, feeds+state+polish 106/106, dash 24/24,
   e2e 8/8 green.
 
+- DONE 2026-10-20 (run-outcome-tags, wave step of run
+  20261020-030142-whats-new-polish): the What's-new work-digest run tag
+  is now proportionate - tour_feeds._run_outcome counts
+  failed/timed_out/lost as the unsuccessful verdicts and marks the run
+  'failed' only when they are a strict majority of the decisive
+  verdicts (done + unsuccessful) or no step is done at all; a mostly-
+  done run and an even split read 'partial' (the workflow-ux-safety
+  shape 29 done + 1 lost -> partial, was 'failed'). Recorded 'aborted'
+  reasons still win verbatim, empty/never-started runs stay 'ended'
+  (never failed on done==0 alone), all-clean stays 'done', and
+  nonterminal leftovers stay 'partial' - sectioning, ordering,
+  grouping and persisted run/step verdicts untouched. No new CSS:
+  'partial' already sat in TOUR_TAG_STYLE (#d29922) and work-section
+  cards already paint record-event words FILLED via .ttag.ev, so the
+  tag renders verbatim + amber + filled, distinct from green 'done'
+  and red 'failed'. New RunOutcomeTests (7) + feed-level 29+1 card pin
+  + node-harness test for the amber chip in the Work digest; two stale
+  fixtures (test_tour_feeds, test_tour_e2e) retargeted to real
+  failure-majorities. Verified: 7/7 new tests, 166/166 tour suite,
+  test_conductor 453/453 modulo one pre-existing tempdir-teardown
+  flake (summarize.launch.log lock on test_summarize_manifest_
+  autospawns - passes standalone, unrelated); .agent_tasks/
+  run-outcome-tags/STATE.md has the full rule + matrix.
+
 - DONE 2026-10-20 (follow-up-plan, closing review of run
   20261020-030142-whats-new-polish): the run's five features are all
   written and self-tested but ZERO landed - every step's verify gate
