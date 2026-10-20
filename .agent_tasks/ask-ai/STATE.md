@@ -1201,13 +1201,16 @@ intact.
 Verification: ChatTypographyTests 5/5; test_assistant_ui 52/52;
 node --check chat.js/md.js clean; tour suites 158/158 (two timing
 flakes under the combined 6-file load, both green on focused re-runs);
-test_conductor 453/453. `run_tests.py --jobs 8` = 1052 tests, 7/8
-shards ok; shard 3's only error was
-PauseRunTests.test_stop_run_now_kills_then_resumes - a stop-signal
-timing assertion (`None != 'stopped'`) whose tempdir teardown then
-hit the known WinError-32 lock cascade -> RecursionError; the test
-passes standalone (50.9s). Environmental flake, unrelated to this
-step (CSS + test additions only).
+test_conductor 453/453. `run_tests.py --jobs 8` ran twice on the
+shared box: run 1 = 7/8 shards ok, one error
+(PauseRunTests.test_stop_run_now_kills_then_resumes - stop-signal
+timing `None != 'stopped'` + WinError-32 tempdir-lock teardown
+cascade); run 2 = 4/8 ok, nine failures/errors across unrelated async
+tests (tour_api daemon-poll tests, TourE2E paint-poll, draft-review
+and trash http routes) as shard runtimes ballooned ~3-5x under load.
+Every named failure passes standalone; test_tour_api itself is 26/26
+green alone. All flakes are timing/environmental - none touch
+chat.css or test_assistant_ui.py.
 
 Remaining typography issues: none known. By design the small chrome
 inside the surface (chips, usage/session-id readouts, meta badges)
