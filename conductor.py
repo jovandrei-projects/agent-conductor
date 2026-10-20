@@ -2781,26 +2781,66 @@ def _run_step_stats(st: dict) -> dict:
             "cached": cached, "merged": merged, "parked": parked}
 
 
-def run_report_md(st: dict) -> str:
-    """Deterministic run roll-up - run stats plus each step's own closing
-    report in record order. Served by the run summary endpoint whenever
-    no LLM-written run.summary.md exists, and embedded verbatim in the
-    summarizer prompt as the source material."""
+def _run_stats_lines(st: dict) -> list[str]:
+    """The deterministic fact-sheet bullets that top every run summary:
+    per-status step counts (each unsuccessful outcome keeps its own
+    count), the run's timestamps and driver elapsed, token totals, and
+    merge tallies - all from the step records via _run_step_stats, so a
+    retried step still counts once and only its banked tokens roll up.
+    Anything the state never recorded renders as '-' or an omitted
+    claim, never an invented number."""
     agg = _run_step_stats(st)
-    L = [f"# {st.get('run') or '?'} - run summary", "",
-         "- **steps:** " + (", ".join(
+    L = ["- **steps:** " + (", ".join(
              f"{n} {k}" for k, n in sorted(agg["counts"].items()))
              or "none"),
          f"- **started:** {st.get('started_at') or '-'} · "
          f"**ended:** {st.get('ended_at') or '-'} · "
          f"**elapsed:** {_run_elapsed_md(st)}"]
-    if agg["prompt"] or agg["completion"]:
+    if agg["prompt"] or agg["completion"] or agg["cached"]:
         L.append(f"- **tokens:** {_fmtK(agg['prompt'])} prompt + "
                  f"{_fmtK(agg['completion'])} completion"
                  + (f" ({_fmtK(agg['cached'])} cached)"
                     if agg["cached"] else ""))
+    else:
+        L.append("- **tokens:** -")
     L.append(f"- **merged:** {agg['merged']} · "
              f"**parked branch:** {agg['parked']}")
+    return L
+
+
+def _run_stats_md(st: dict) -> str:
+    return "\n".join(_run_stats_lines(st))
+
+
+def _ensure_stats_block(md: str, st: dict) -> str:
+    """Serve an LLM-written run.summary.md with exactly one statistics
+    block at the top. Files written by summarize_run already carry it
+    and are returned untouched - a legacy file without it gets the block
+    injected under its own title/byline for this read only (the stored
+    artifact stays as written; regenerating rewrites it on disk)."""
+    # the whole document is scanned, not just the head - a file whose
+    # body already carries the steps bullet anywhere must never grow a
+    # second stats block
+    if re.search(r"^- \*\*steps:\*\*", md, re.M):
+        return md
+    blocks = md.split("\n\n")
+    pos = 0
+    if blocks and blocks[0].lstrip().startswith("# "):
+        pos = 1
+        # the generated '_written <ts> · session ..._' byline rides
+        # directly under the title - stats belong below it
+        if len(blocks) > 1 and blocks[1].strip().startswith("_"):
+            pos = 2
+    return "\n\n".join(blocks[:pos] + [_run_stats_md(st)] + blocks[pos:])
+
+
+def run_report_md(st: dict) -> str:
+    """Deterministic run roll-up - run stats plus each step's own closing
+    report in record order. Served by the run summary endpoint whenever
+    no LLM-written run.summary.md exists, and embedded verbatim in the
+    summarizer prompt as the source material."""
+    L = [f"# {st.get('run') or '?'} - run summary", ""]
+    L += _run_stats_lines(st)
     for name, rec in (st.get("steps") or {}).items():
         meta = [_elapsed_md(rec),
                 rec.get("model_actual") or rec.get("model") or "?"]
@@ -2836,8 +2876,7 @@ def _summary_prompt(st: dict) -> str:
         "reading the dashboard in the morning:",
         "",
         "- what the run set out to do and whether it got there",
-        "- what actually landed (merged vs parked vs failed); group by",
-        "  theme when that reads better than step order",
+        "- what actually landed (merged vs parked vs failed)",
         "- failures, surprises, unfinished work, anything worth a",
         "  human look in the morning",
         "- do NOT invent work or verification - only report what the",
@@ -2847,6 +2886,16 @@ def _summary_prompt(st: dict) -> str:
         "Plain markdown, ~300-600 words unless the run earned more.",
         "Your final message IS the document - output only the summary,",
         "no preamble, no sign-off.",
+        "",
+        "Give EVERY step its own section headed exactly",
+        "'## <step-name> - <status>' - the step slug and the status word",
+        "copied verbatim from the '### <step> - <status>' source lines",
+        "under '## Steps' below (e.g. '## build-ui - done'). The",
+        "dashboard rewires those exact headings into task links and",
+        "review toggles; 'Step build-ui: ...', '## build-ui (done)' or a",
+        "shared section heading read as prose and silently lose the",
+        "wiring. Thematic narrative is welcome in additional non-step",
+        "sections; the per-step headings must survive verbatim.",
         "",
         "## Run",
         "",
@@ -2991,8 +3040,12 @@ def summarize_run(run_dir: Path, devin_argv: list[str] | None = None,
         header = (f"# {st.get('run') or run_dir.name} - run summary\n\n"
                   f"_written {now_iso()}"
                   + (f" · session `{sid}`" if sid else "") + "_\n\n")
+        # The LLM writes prose; the fact sheet is ours - the same
+        # deterministic block the roll-up leads with, baked in once at
+        # write time so regeneration replaces rather than stacks it.
         (run_dir / "run.summary.md").write_text(
-            header + report.rstrip() + "\n", encoding="utf-8")
+            header + _run_stats_md(st) + "\n\n" + report.rstrip() + "\n",
+            encoding="utf-8")
         _summary_result(st, run_dir, "done", t0, export_path, model, rc,
                         session=sid)
         log_event(run_dir, event="run_summarized",
@@ -3010,7 +3063,8 @@ def run_summary_doc(name: str, runs_dir: Path = RUNS_DIR) -> str:
     d, st = _run_dir_checked(name, runs_dir)
     f = d / "run.summary.md"
     if f.is_file():
-        return f.read_text(encoding="utf-8", errors="replace")
+        md = f.read_text(encoding="utf-8", errors="replace")
+        return _ensure_stats_block(md, st)
     return run_report_md(st)
 
 

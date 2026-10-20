@@ -11847,11 +11847,18 @@ class RunSummaryTests(unittest.TestCase):
             self.assertIn("merged", md)
             self.assertIn("## s2 - failed", md)
             self.assertIn("ended without a closing report", md)
-            # an LLM-written run.summary.md takes precedence on disk
+            # an LLM-written run.summary.md takes precedence on disk -
+            # served with the deterministic stats block injected under
+            # its title (pre-stats-block artifacts get it for the read;
+            # the stored file is left alone)
             (rd / "run.summary.md").write_text("# llm roll-up\n",
                                                encoding="utf-8")
+            md2 = conductor.run_summary_doc("20261015-000000-sum", runs)
+            self.assertIn("# llm roll-up", md2)
+            self.assertEqual(md2.count("- **steps:**"), 1)
+            self.assertIn("- **steps:** 1 done, 1 failed", md2)
             self.assertEqual(
-                conductor.run_summary_doc("20261015-000000-sum", runs),
+                (rd / "run.summary.md").read_text(encoding="utf-8"),
                 "# llm roll-up\n")
 
     def test_summary_prompt_carries_reports(self):
