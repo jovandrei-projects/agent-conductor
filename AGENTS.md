@@ -1275,6 +1275,21 @@ Append as they are hit.
     machine pool. While a step sits in this window the record now
     carries `reported` - the worker's printed STATUS - so the
     dashboard can say 'reported done' instead of a bare 'running'.
+18. **`verify_timeout_min` defaults to 10 min - too small for the
+    registered gate on a busy box.** Burned 20261020-030142-whats-new-
+    polish end to end: `python run_tests.py --jobs 8` needs ~8-14 min
+    wall even lightly loaded and more while sibling agents + their own
+    gates hold the machine, so all five parallel steps printed `STATUS:
+    done`, all five gates timed out at 600s (one hit shard flakes
+    instead), every step recorded `failed`, and the merge pipeline kept
+    every worktree (`step_merge_kept`) - a full run's worth of finished,
+    self-tested work parked unmerged with zero defects in it. A failed
+    verify is terminal: retries only fire on `timed_out`, never on
+    `failed`. Any manifest whose registered gate approaches the cap -
+    especially a `parallel = true` pool where gates run while agents
+    still own the box - must set `verify_timeout_min` explicitly (~30
+    for `--jobs 8`) in `[defaults]` or per step, or it will burn the
+    same way.
 
 ## The task workspace - read before starting work
 
