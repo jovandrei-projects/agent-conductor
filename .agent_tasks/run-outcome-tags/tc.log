@@ -1,0 +1,372 @@
+﻿python : ...........................................................................................C:\Python311\Lib\su
+bprocess.py:1127: ResourceWarning: subprocess 14804 is still running
+At line:1 char:1
++ python -m unittest tests.test_conductor 2>&1 | Out-File -Encoding utf ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (..................s still running:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+.......................................................................................................................
+.......request 20261020-034051-088717a8 generation failed: unavailable
+....................C:\Projects\agent-conductor\data\worktrees\20261020-030142-whats-new-polish\run-outcome-tags\tests\
+test_conductor.py:12354: ResourceWarning: unclosed <socket.socket fd=2852, family=2, type=1, proto=0, 
+laddr=('127.0.0.1', 52832), raddr=('127.0.0.1', 52812)>
+  break
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+...C:\Python311\Lib\subprocess.py:1127: ResourceWarning: subprocess 32424 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+...........................................................request 20261020-034241-f2aa5e94 generation failed: 
+unavailable
+..........request 20261020-034255-fa24aeae generation failed: Planner ignored the selected model or effort; regenerate 
+or edit the TOML directly
+.................................................................E.....step one spawn failed: [WinError 2] The system 
+cannot find the file specified
+.........................................................................
+======================================================================
+ERROR: test_summarize_manifest_autospawns (tests.test_conductor.RunSummaryTests.test_summarize_manifest_autospawns)
+[run] summarize = true fires the detached `conductor.py
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Python311\Lib\shutil.py", line 620, in _rmtree_unsafe
+    os.unlink(fullname)
+PermissionError: [WinError 32] The process cannot access the file because it is being used by another process: 
+'C:\\Users\\andry\\AppData\\Local\\Temp\\tmpfhyk8941\\runs\\20261020-034431-t\\summarize.launch.log'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Python311\Lib\tempfile.py", line 878, in onerror
+    _os.unlink(path)
+PermissionError: [WinError 32] The process cannot access the file because it is being used by another process: 
+'C:\\Users\\andry\\AppData\\Local\\Temp\\tmpfhyk8941\\runs\\20261020-034431-t\\summarize.launch.log'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Projects\agent-conductor\data\worktrees\20261020-030142-whats-new-polish\run-outcome-tags\tests\test_conduct
+or.py", line 11934, in test_summarize_manifest_autospawns
+    with tempfile.TemporaryDirectory() as td:
+  File "C:\Python311\Lib\tempfile.py", line 904, in __exit__
+    self.cleanup()
+  File "C:\Python311\Lib\tempfile.py", line 908, in cleanup
+    self._rmtree(self.name, ignore_errors=self._ignore_cleanup_errors)
+  File "C:\Python311\Lib\tempfile.py", line 890, in _rmtree
+    _shutil.rmtree(name, onerror=onerror)
+  File "C:\Python311\Lib\shutil.py", line 759, in rmtree
+    return _rmtree_unsafe(path, onerror)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python311\Lib\shutil.py", line 617, in _rmtree_unsafe
+    _rmtree_unsafe(fullname, onerror)
+  File "C:\Python311\Lib\shutil.py", line 617, in _rmtree_unsafe
+    _rmtree_unsafe(fullname, onerror)
+  File "C:\Python311\Lib\shutil.py", line 622, in _rmtree_unsafe
+    onerror(os.unlink, fullname, sys.exc_info())
+  File "C:\Python311\Lib\tempfile.py", line 881, in onerror
+    cls._rmtree(path, ignore_errors=ignore_errors)
+  File "C:\Python311\Lib\tempfile.py", line 890, in _rmtree
+    _shutil.rmtree(name, onerror=onerror)
+  File "C:\Python311\Lib\shutil.py", line 759, in rmtree
+    return _rmtree_unsafe(path, onerror)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python311\Lib\shutil.py", line 603, in _rmtree_unsafe
+    onerror(os.scandir, path, sys.exc_info())
+  File "C:\Python311\Lib\shutil.py", line 600, in _rmtree_unsafe
+    with os.scandir(path) as scandir_it:
+         ^^^^^^^^^^^^^^^^
+NotADirectoryError: [WinError 267] The directory name is invalid: 
+'C:\\Users\\andry\\AppData\\Local\\Temp\\tmpfhyk8941\\runs\\20261020-034431-t\\summarize.launch.log'
+
+----------------------------------------------------------------------
+Ran 453 tests in 1782.176s
+
+FAILED (errors=1)
+[    done] s1
+[    done] s2
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpl5ut_wdd\runs\20261020-032229-t)
+[  failed] s1
+stopping run after wave
+run t: {'failed': 1}  (C:\Users\andry\AppData\Local\Temp\tmpp9708ipc\runs\20261020-032240-t)
+[resume] 20261020-032240-t
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpp9708ipc\runs\20261020-032240-t)
+[resume] 20260101-000000-t
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpkadtovix\runs\20260101-000000-t)
+[  failed] s1
+stopping run after wave
+run t: {'failed': 1}  (C:\Users\andry\AppData\Local\Temp\tmp8oh4__5c\runs\20261020-032245-t)
+[resume] 20261020-032245-t
+[  failed] s1
+stopping run after wave
+run t: {'failed': 1}  (C:\Users\andry\AppData\Local\Temp\tmp8oh4__5c\runs\20261020-032245-t)
+[resume] 20261020-032245-t
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp8oh4__5c\runs\20261020-032245-t)
+[ stopped] s1
+run t: {'stopped': 1}  (C:\Users\andry\AppData\Local\Temp\tmpk3w6o60p\runs\20261020-032250-t)
+[resume] 20261020-032250-t
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpk3w6o60p\runs\20261020-032250-t)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmphlj6sucm\runs\20261020-032342-t)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp4xioudqc\runs\20261020-032349-t)
+[    done] s1
+[    done] s2
+run ra: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmp0hm_0wkz\runs\20261020-032352-ra)
+[    done] s1
+[    done] s2
+run rb: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmp0hm_0wkz\runs\20261020-032355-rb)
+[ blocked] mob
+stopping run after wave
+run t: {'blocked': 1}  (C:\Users\andry\AppData\Local\Temp\tmp8pseu25m\runs\20261020-032422-t)
+[    done] mob
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpghsmb190\runs\20261020-032425-t)
+[    done] hold
+[    done] waiter
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpw_q0mzik\runs\20261020-032434-t)
+[    done] mob
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpf6ukuqa7\runs\20261020-032456-t)
+[    done] mob
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpnvtygtg7\runs\20261020-032504-t)
+[    done] mob
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpcm7fctio\runs\20261020-032511-t)
+[    done] mob
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpv69pinxm\runs\20261020-032516-t)
+[    done] mob
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp6uey488x\runs\20261020-032518-t)
+[    done] mob
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpgmdem16u\runs\20261020-032520-t)
+[    done] mob
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp4istzw83\runs\20261020-032523-t)
+[ skipped] mob
+run t: {'skipped': 1}  (C:\Users\andry\AppData\Local\Temp\tmpd6ssqlmq\runs\20261020-032524-t)
+[ blocked] mob
+stopping run after wave
+run t: {'blocked': 1}  (C:\Users\andry\AppData\Local\Temp\tmpnvtche4w\runs\20261020-032525-t)
+[    done] mob
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpe2wkz4ra\runs\20261020-032526-t)
+[    done] iso
+[    done] plain
+run cfg: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpdbkdxfpm\runs\20261020-032529-cfg)
+[    done] s1
+[    done] follow-up-plan
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpe6e_6n0a\runs\20261020-032813-t)
+[followup] 20261020-032813-t: follow-up registered -> request 20261020-032831-e22bed5e
+[regen] spawning: devin --print --prompt-file 'C:\Users\andry\AppData\Local\Temp\conductor-furegen-468t1k56\regen.md' --permission-mode bypass --respect-workspace-trust false --export 'C:\Users\andry\AppData\Local\Temp\tmpr3iaw90h\requests\20261020-032856-35926b04.regen.export.json' --model swe-2
+[regen] publish: updated -> request 20261020-032856-35926b04 (empty)
+[regen] spawning: devin --print --prompt-file 'C:\Users\andry\AppData\Local\Temp\conductor-furegen-pdwo0s_z\regen.md' --permission-mode bypass --respect-workspace-trust false --export 'C:\Users\andry\AppData\Local\Temp\tmpfmc_l7lc\requests\20261020-032915-f07ec205.regen.export.json' --model swe-2
+[regen] session exited rc=3
+[regen] spawning: devin --print --prompt-file 'C:\Users\andry\AppData\Local\Temp\conductor-furegen-ypr3yulx\regen.md' --permission-mode bypass --respect-workspace-trust false --export 'C:\Users\andry\AppData\Local\Temp\tmpnm_cpyzf\requests\20261020-032920-173af533.regen.export.json' --model swe-2
+[regen] publish: edited -> request 20261020-032920-173af533 (ready)
+[regen] spawning: devin --print --prompt-file 'C:\Users\andry\AppData\Local\Temp\conductor-furegen-sjdmbl4_\regen.md' --permission-mode bypass --respect-workspace-trust false --export 'C:\Users\andry\AppData\Local\Temp\tmpxsagoqz5\requests\20261020-032929-960e5848.regen.export.json' --model swe-2
+[regen] publish: updated -> request 20261020-032929-960e5848 (ready)
+[regen] spawning: devin --print --prompt-file 'C:\Users\andry\AppData\Local\Temp\conductor-furegen-r4peudwa\regen.md' --permission-mode bypass --respect-workspace-trust false --export 'C:\Users\andry\AppData\Local\Temp\tmpv3ei6p9c\requests\20261020-032955-0fcae791.regen.export.json' --model swe-2
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpgjvx18r7\runs\20260101-000000-t)
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmprwd1f_h6\runs\20261020-033033-t)
+[    done] s1
+[    done] s2
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmprji0qdce\runs\20261020-033100-t)
+[ stopped] s1
+run t: {'stopped': 1}  (C:\Users\andry\AppData\Local\Temp\tmpyr8s0zo6\runs\20261020-033136-t)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpq14hn0y4\runs\20261020-033455-t)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpw2hd_lu9\runs\20261020-033556-t)
+[    done] alpha
+[    done] beta
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpvf8cp_tz\runs\20261020-033631-t)
+[ partial] one
+run t: {'partial': 1}  (C:\Users\andry\AppData\Local\Temp\tmprxqt6v21\runs\20261020-033729-t)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpirpehuq2\runs\20261020-033742-t)
+[resume] 20261020-033742-t
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpirpehuq2\runs\20261020-033742-t)
+run paused by user - no further steps launch (resume with --resume 20260101-000000-t)
+run t: {'skipped': 1}  (C:\Users\andry\AppData\Local\Temp\tmp29r_7qtk\runs\20260101-000000-t)
+[    done] s1
+run paused by user - no further steps launch (resume with --resume 20261020-033832-t)
+run t: {'done': 1, 'skipped': 2}  (C:\Users\andry\AppData\Local\Temp\tmpd9o4ga4v\runs\20261020-033832-t)
+[    done] s1
+run paused by user - no further steps launch (resume with --resume 20261020-033859-t)
+run t: {'done': 1, 'skipped': 1}  (C:\Users\andry\AppData\Local\Temp\tmpypa4xlbs\runs\20261020-033859-t)
+[resume] 20261020-033859-t
+[skip ] s1 (done)
+[    done] s2
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpypa4xlbs\runs\20261020-033859-t)
+[ stopped] s1
+run stopped by user - no further steps launch (resume with --resume 20261020-033935-t)
+run t: {'stopped': 1, 'skipped': 1}  (C:\Users\andry\AppData\Local\Temp\tmp204e9nf8\runs\20261020-033935-t)
+[resume] 20261020-033935-t
+[    done] s1
+[    done] s2
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmp204e9nf8\runs\20261020-033935-t)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpy3mt_g9u\runs\20261020-034123-t)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp_buttal0\runs\20261020-034126-t)
+[resume] 20260101-000000-t
+[skip ] s1 (done)
+[    done] s2
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmphankz_d2\runs\20260101-000000-t)
+[resume] 20260101-000000-t
+[skip ] s1 (done)
+[    done] s2
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpj0x6pb43\runs\20260101-000000-t)
+[    done] organize
+run catalog-cleanup: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpw6eby907\runs\20261020-034154-catalog-cleanup)
+[    done] a
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpj471i34g\runs\20261020-034156-t)
+[    done] organize
+run catalog-cleanup: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpyw9grfe7\runs\20261020-034250-catalog-cleanup)
+[    done] p1
+[    done] p2
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpk6p5ad9a\runs\20261020-034320-t)
+[    done] organize
+run catalog-cleanup: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp691rwxgl\runs\20261020-034326-catalog-cleanup)
+[resume] 20261020-034326-catalog-cleanup
+[skip ] organize (done)
+run catalog-cleanup: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp691rwxgl\runs\20261020-034326-catalog-cleanup)
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp98illvb0\runs\20261020-034334-t)
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp7xo4x8xw\runs\20261020-034336-t)
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp_5ix1udz\runs\20261020-034339-t)
+[  failed] s1
+stopping run after wave
+run t: {'failed': 1}  (C:\Users\andry\AppData\Local\Temp\tmp_o9xbcnk\runs\20261020-034343-t)
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp0lx70v16\runs\20261020-034345-t)
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpvjf_7neb\runs\20261020-034348-t)
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpkmi9l4aj\runs\20261020-034351-t)
+[ stopped] s1
+run stopped by user - no further steps launch (resume with --resume 20261020-034353-t)
+run t: {'stopped': 1, 'skipped': 1}  (C:\Users\andry\AppData\Local\Temp\tmpcl9z1w4x\runs\20261020-034353-t)
+[resume] 20261020-034353-t
+[    done] s1
+[    done] s2
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpcl9z1w4x\runs\20261020-034353-t)
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpaevo6prq\runs\20261020-034406-t)
+[    done] s1
+[    done] s2
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpp2ep__s8\runs\20261020-034409-t)
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpxd0hk4_7\runs\20261020-034419-t)
+[    done] s1
+[    done] s2
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpze51n5cf\runs\20261020-034422-t)
+[    done] s1
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp3r4usfnx\runs\20261020-034428-t)
+[resume] 20261020-034428-t
+[skip ] s1 (done)
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp3r4usfnx\runs\20261020-034428-t)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpfhyk8941\runs\20261020-034431-t)
+[summary] LLM run-summary session launched (run.summary.md lands when it finishes)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpdyjsydjj\runs\20261020-034435-t)
+[summary] spawning: C:/Python311/python.exe C:/Projects/agent-conductor/data/worktrees/20261020-030142-whats-new-polish/run-outcome-tags/tests/mock_devin.py --print --prompt-file 'C:\Users\andry\AppData\Local\Temp\conductor-summary-ppcpbk00\summarize.md' --permission-mode bypass --respect-workspace-trust false --export 'C:\Users\andry\AppData\Local\Temp\tmpdyjsydjj\runs\20261020-034435-t\summarize.export.json'
+[summary] wrote C:\Users\andry\AppData\Local\Temp\tmpdyjsydjj\runs\20261020-034435-t\run.summary.md
+[    done] one
+devin auth lost mid-run; remaining steps -> blocked (fix auth, then --resume)
+[  failed] one
+stopping run after wave
+run t: {'failed': 1}  (C:\Users\andry\AppData\Local\Temp\tmpchb48obh\runs\20261020-034441-t)
+[  failed] one
+stopping run after wave
+run t: {'failed': 1}  (C:\Users\andry\AppData\Local\Temp\tmpuvo8jyze\runs\20261020-034442-t)
+[  failed] one
+stopping run after wave
+run t: {'failed': 1}  (C:\Users\andry\AppData\Local\Temp\tmpozh_vz1e\runs\20261020-034445-t)
+[    done] one
+[  failed] bad
+[    done] three
+run t: {'done': 2, 'failed': 1}  (C:\Users\andry\AppData\Local\Temp\tmp4sh9ji9v\runs\20261020-034447-t)
+[    done] p1
+[    done] p2
+[    done] after
+run t: {'done': 3}  (C:\Users\andry\AppData\Local\Temp\tmpmz3or1xh\runs\20261020-034451-t)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpwpnkgpan\runs\20261020-034456-t)
+[resume] 20260101-000000-t
+[merged] wtstep (merge on resume)
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp1djlznbf\runs\20260101-000000-t)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpri_e10v3\runs\20261020-034505-t)
+[resume] 20261020-034505-t
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpri_e10v3\runs\20261020-034505-t)
+[  failed] one
+stopping run after wave
+run t: {'failed': 1}  (C:\Users\andry\AppData\Local\Temp\tmp2kiap_w1\runs\20261020-034509-t)
+[resume] 20261020-034509-t
+[skip ] one (done)
+[    done] two
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmp2kiap_w1\runs\20261020-034509-t)
+[    done] a
+[    done] b
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpvj6gm7iw\runs\20261020-034518-t)
+[    done] one
+[    done] two
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpvynf_lgz\runs\20261020-034528-t)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpdf7in1yi\runs\20261020-034604-t)
+[  failed] one
+stopping run after wave
+run t: {'failed': 1}  (C:\Users\andry\AppData\Local\Temp\tmpx1d94a5z\runs\20261020-034614-t)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpujttku4y\runs\20261020-034646-t)
+[  failed] one
+stopping run after wave
+run t: {'failed': 1}  (C:\Users\andry\AppData\Local\Temp\tmpua390x_3\runs\20261020-034705-t)
+[    done] slow
+[    done] fast
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpyp76xrvj\runs\20261020-034719-t)
+[    done] p1
+[    done] p2
+stopping run after wave
+run t: {'done': 1, 'failed': 1}  (C:\Users\andry\AppData\Local\Temp\tmpp_0fipgn\runs\20261020-034741-t)
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmp9d_tup0y\runs\20261020-034801-t)
+1 conductor-spawned session(s) registered:
+  mock-fqgzcb            one              done      age=0.0h  kept  proj
+1 conductor-spawned session(s) registered:
+  mock-fqgzcb            one              done      age=0.0h  rm-eligible  proj
+  rm mock-fqgzcb: ok
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpc3oqjlb1\runs\20261020-034805-t)
+1 conductor-spawned session(s) registered:
+  mock-gnttlq            one              done      age=0.0h  kept  proj
+[    done] one
+run t: {'done': 1}  (C:\Users\andry\AppData\Local\Temp\tmpsyenwzw2\runs\20261020-034811-t)
+run repro3  started ?  ended still running  elapsed -  (C:\Users\andry\AppData\Local\Temp\tmp4ul6qzxy\repro)
+[    done] s1
+[ skipped] s2
+[    done] s3
+run t: {'done': 2, 'skipped': 1}  (C:\Users\andry\AppData\Local\Temp\tmpytu4_mpp\runs\20261020-034936-t)
+[    done] s1
+[ skipped] s2
+run t: {'done': 1, 'skipped': 1}  (C:\Users\andry\AppData\Local\Temp\tmp29xvssjn\runs\20261020-035004-t)
+[resume] 20261020-035004-t
+[skip ] s1 (done)
+[ skipped] s2
+run t: {'done': 1, 'skipped': 1}  (C:\Users\andry\AppData\Local\Temp\tmp29xvssjn\runs\20261020-035004-t)
+[resume] 20261020-035004-t
+[skip ] s1 (done)
+[    done] s2
+run t: {'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmp29xvssjn\runs\20261020-035004-t)
+[ stopped] s1
+[    done] s2
+[    done] s3
+run t: {'stopped': 1, 'done': 2}  (C:\Users\andry\AppData\Local\Temp\tmpc5vxkpdx\runs\20261020-035021-t)
+C:\Python311\Lib\subprocess.py:1127: ResourceWarning: subprocess 48124 is still running

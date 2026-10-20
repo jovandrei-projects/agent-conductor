@@ -161,7 +161,8 @@ class TourE2ETests(unittest.TestCase):
             {"run": "somename", "request_id": self.RID1,
              "ended_at": "2026-10-17T02:00:00",
              "steps": {"s1": {"status": "done"},
-                       "s2": {"status": "failed"}}}), encoding="utf-8")
+                       "s2": {"status": "failed"},
+                       "s3": {"status": "timed_out"}}}), encoding="utf-8")
         (self.requests / f"{self.RID2}.json").write_text(json.dumps(
             {"id": self.RID2, "status": "ready", "label": "follow up",
              "source_run": self.RUN_DIR,
@@ -289,11 +290,11 @@ class TourE2ETests(unittest.TestCase):
         # three events share the window)
         self.assertEqual(run["kind"], "pipeline")
         self.assertEqual(run["section"], "work")
-        self.assertEqual(run["tag"], "failed")      # s2 failed
+        self.assertEqual(run["tag"], "failed")    # bad verdicts majority
         self.assertEqual(run["outcome"], "failed")
         self.assertEqual(run["proposed_at"], "2026-10-17T01:00:00")
         self.assertEqual(run["steps_done"], 1)
-        self.assertEqual(run["steps_total"], 2)
+        self.assertEqual(run["steps_total"], 3)
         self.assertEqual({c for c in run["covers"]},
                          {f"request:{self.RID1}", f"followup:{self.RID2}"})
         fu = run["followups"][0]

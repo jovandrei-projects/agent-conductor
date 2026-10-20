@@ -759,6 +759,53 @@ const FEED2={generated_at:'g1',boundary:{commit:'b',at:'t'},range:{},
 ''')
 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_partial_outcome_tag_renders_amber_in_work_deck(self):
+        """A mostly-done run's 'partial' word rides the same FILLED
+        event chip as done/failed - amber #d29922, verbatim text, the
+        'run outcome' title - inside the Work digest deck, which keeps
+        its own position counter and section chrome; the tool deck and
+        its outline change tag are untouched."""
+        self._node(self._SPLIT + r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  const f=JSON.parse(JSON.stringify(FEED2));
+  // the workflow-ux-safety shape: 29/30 steps clean + 1 lost -> partial
+  f.entries[0]=Object.assign({},f.entries[0],{
+    title:'Run finished: workflow-ux-safety',
+    tag:'partial',outcome:'partial',steps_done:29,steps_total:30});
+  queue.push({ok:true,json:async()=>f});
+  await open();
+  // sectioning unchanged: same two decks, same counts
+  let h=card();
+  assert.match(h,/tsecname tool">1 card</);
+  assert.match(h,/tsecname work">2 cards</);
+  await click(act('sec',{sec:'work'}));
+  h=card();
+  assert.match(h,/Work digest<\/span> · card 1 of 2/);
+  assert.equal(elem('tourcard').classList.contains('sec-work'),true);
+  // the partial word: verbatim, amber, FILLED - never red 'failed'
+  assert.match(h,/class="ttag ev"[^>]*>partial</);
+  assert.match(h,/style="color:#d29922;border-color:#d29922/);
+  assert.match(h,/background:#d2992226/);
+  assert.match(h,/title="run outcome - a record event"/);
+  assert.doesNotMatch(h,/>failed</);
+  assert.match(h,/29\/30 steps done/);
+  // the rest of the deck is untouched: request card + its tag
+  await click(act('next'));
+  h=card();
+  assert.match(h,/Work digest<\/span> · card 2 of 2/);
+  assert.match(h,/class="ttag ev"[^>]*>ready</);
+  // and the tool card keeps its own outline change tag
+  await click(act('menu'));
+  await click(act('sec',{sec:'tool'}));
+  h=card();
+  assert.match(h,/Tool updates<\/span> · card 1 of 1/);
+  assert.match(h,/class="ttag"[^>]*>improved</);
+  assert.doesNotMatch(h,/ttag ev/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_unlaunched_request_shows_no_run_chip(self):
         """A proposal no run ever launched links ONLY its own request
         chip - no fabricated run chip, and (being the only chip) no

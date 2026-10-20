@@ -306,7 +306,11 @@ def _section(e: dict) -> str:
 def _run_outcome(st: dict) -> str:
     """The run's actual terminal outcome: a recorded halt reason
     ('paused', 'stopped', 'drained', ...) wins; otherwise the step
-    verdicts - 'done' only when every recorded step closed clean."""
+    verdicts, weighed - failed/timed_out/lost mark the run 'failed'
+    only when they outnumber its done steps (decisive verdicts are
+    done + unsuccessful, so a tie still reads 'partial') or when
+    nothing finished at all. 'done' stays reserved for every recorded
+    step closing clean; a run with no steps is 'ended', never failed."""
     ab = st.get("aborted")
     if isinstance(ab, str) and ab:
         return ab
@@ -314,8 +318,12 @@ def _run_outcome(st: dict) -> str:
            if isinstance(r, dict)]
     if not sts:
         return "ended"
-    if any(s in ("failed", "timed_out", "lost") for s in sts):
+    done = sum(1 for s in sts if s == "done")
+    bad = sum(1 for s in sts if s in ("failed", "timed_out", "lost"))
+    if bad and (not done or bad > done):
         return "failed"
+    if bad:
+        return "partial"
     if all(s in ("done", "superseded", "skipped") for s in sts):
         return "done"
     return "partial"
