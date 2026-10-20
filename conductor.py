@@ -27,6 +27,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import html
+import html.parser
 import http.server
 import json
 import logging
@@ -2897,6 +2898,28 @@ def _summary_prompt(st: dict) -> str:
         "wiring. Thematic narrative is welcome in additional non-step",
         "sections; the per-step headings must survive verbatim.",
         "",
+        "## Also write run.summary.html",
+        "",
+        "Before your final message, write a file named run.summary.html",
+        "in your current directory - a standalone HTML executive report",
+        "of the SAME run, collected next to (never replacing) the",
+        "markdown. Requirements:",
+        "- a complete self-contained document (<!doctype html>, <head>",
+        "  carrying its own <style>, <body>) that renders with zero",
+        "  network access - no external links, fonts, scripts, images",
+        "  or resources of any kind",
+        "- lavish but compact organization: a <header> with the run",
+        "  name and a stat strip (one <ul> of <li><strong>N</strong>",
+        "  label</li> items), then <section>s of findings grouped by",
+        "  theme, then a steps <section> holding one <article> per",
+        "  step (<h3>step - status</h3>, key facts, a short paragraph)",
+        "- palette + scale: background #0d1117, panels #161b22, accent",
+        "  #58a6ff, text #c9d1d9, headings #e6edf3, borders #21262d,",
+        "  system sans at dashboard size (~13px)",
+        "- every number comes from the run data below - never invent",
+        "- inert markup only: no scripts, no event handlers, no forms,",
+        "  no embedded media, no URLs of any kind",
+        "",
         "## Run",
         "",
         f"- name: {st.get('run') or '?'}",
@@ -3027,6 +3050,18 @@ def summarize_run(run_dir: Path, devin_argv: list[str] | None = None,
                 log_event(run_dir, event="run_summary_failed",
                           exit_code=rc, timed_out=timed_out)
                 return False
+            # second artifact: the session's run.summary.html rides the
+            # same session into the run dir - the markdown contract
+            # (closing message -> run.summary.md) is untouched, and a
+            # missing/oversized HTML file just means no second artifact
+            try:
+                produced = Path(wd) / "run.summary.html"
+                if (produced.is_file() and 0 < produced.stat().st_size
+                        <= _REPORT_HTML_MAX_BYTES):
+                    shutil.copyfile(produced,
+                                    run_dir / "run.summary.html")
+            except OSError as exc:
+                print(f"[summary] run.summary.html not collected: {exc}")
         report = final_report(export_path)
         if not report:
             print("[summary] session produced no closing report")
@@ -3066,6 +3101,209 @@ def run_summary_doc(name: str, runs_dir: Path = RUNS_DIR) -> str:
         md = f.read_text(encoding="utf-8", errors="replace")
         return _ensure_stats_block(md, st)
     return run_report_md(st)
+
+
+# --- HTML report sanitization ------------------------------------------
+# run.summary.html is LLM-authored and stored in the run dir - both the
+# file and anything later written into it are UNTRUSTED at render time.
+# The sanitizer re-serializes through html.parser (never regex alone):
+# an allowlist of inert elements survives, only a tiny set of inert
+# attributes is kept (no URL-bearing, id/name, style, or event
+# attributes - so no network access, no DOM-identifier collisions and
+# no dashboard classes on report markup), and emitted tags are always
+# balanced so the fragment cannot break out of its container on reparse.
+# Styling comes only from the fixed stylesheet scoped under
+# .run-summary-report - generated <style> elements and inline styles
+# are dropped with everything else.
+
+_REPORT_HTML_MAX_BYTES = 512 * 1024      # larger artifacts are rejected
+
+# Elements re-serialized into the fragment. Anything else is either
+# dropped with its subtree (_REPORT_DROP) or unwrapped to its children.
+_REPORT_ALLOWED = frozenset({
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "header", "section", "article", "aside", "footer", "main", "nav",
+    "figure", "figcaption",
+    "p", "div", "span", "ul", "ol", "li", "dl", "dt", "dd",
+    "blockquote", "pre", "code", "hr", "br", "wbr",
+    "strong", "em", "b", "i", "u", "s", "small", "mark",
+    "sub", "sup", "kbd", "samp", "var", "abbr", "dfn", "cite", "q",
+    "time", "a", "bdi", "bdo", "ins", "del",
+    "details", "summary",
+    "table", "caption", "colgroup", "col", "thead", "tbody", "tfoot",
+    "tr", "th", "td",
+})
+
+# Active, raw-text, or foreign-content subtrees removed whole - their
+# text children (script source, CSS, RCDATA) must not surface either.
+_REPORT_DROP = frozenset({
+    "script", "style", "template", "noscript", "iframe", "object",
+    "applet", "frameset", "head", "title", "textarea",
+    "xmp", "plaintext", "listing", "noembed", "noframes",
+    "svg", "math", "canvas", "audio", "video", "map", "select",
+    "datalist", "dialog",
+})
+
+# Dropped resource/form voids - they have no contents, so they never
+# reach the drop stack (an <embed> would otherwise swallow the rest).
+_REPORT_DROP_VOID = frozenset({
+    "embed", "link", "img", "input", "meta", "base", "source", "track",
+    "area", "frame", "param", "keygen",
+})
+
+# Allowlisted elements that never take an end tag.
+_REPORT_VOID = frozenset({"br", "hr", "wbr", "col"})
+
+# The only attributes that survive - inert metadata only. Nothing
+# URL-bearing (href/src/srcset/action/formaction/poster/cite/
+# background/ping/data), nothing identifying (id/name/for), nothing
+# presentational (style), and no event handlers (on*): report markup
+# can never navigate, load, collide with dashboard DOM ids, or pick up
+# a dashboard class.
+_REPORT_ATTRS = {
+    "td": ("colspan", "rowspan"),
+    "th": ("colspan", "rowspan", "scope"),
+    "col": ("span",),
+    "colgroup": ("span",),
+    "time": ("datetime",),
+    "details": ("open",),
+}
+_REPORT_ATTRS_GLOBAL = ("title",)
+_REPORT_INT_ATTRS = frozenset({"colspan", "rowspan", "span"})
+_REPORT_SCOPE_VALUES = frozenset({"row", "col", "rowgroup", "colgroup"})
+
+
+class _ReportSanitizer(html.parser.HTMLParser):
+    """Streaming re-serializer for report HTML: allowed tags emit with
+    filtered attributes, disallowed tags unwrap to their children,
+    drop-set subtrees are skipped whole, and every emitted open tag is
+    force-closed at EOF so output stays balanced on malformed input."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.out: list[str] = []
+        self.open_tags: list[str] = []
+        self.drop_stack: list[str] = []
+
+    def _emit(self, tag: str, attrs: list, close: bool) -> None:
+        keep: list[str] = []
+        extra = _REPORT_ATTRS.get(tag, ())
+        for k, v in attrs:
+            k = k.lower()
+            if k not in _REPORT_ATTRS_GLOBAL and k not in extra:
+                continue
+            if k in _REPORT_INT_ATTRS:
+                try:
+                    v = str(max(1, min(100, int(str(v).strip()))))
+                except (TypeError, ValueError):
+                    continue
+            elif k == "scope" and str(v).lower() not in _REPORT_SCOPE_VALUES:
+                continue
+            if v is None:
+                keep.append(f" {k}")
+            else:
+                keep.append(f' {k}="{html.escape(str(v), quote=True)}"')
+        self.out.append("<" + tag + "".join(keep) + ">")
+        if tag in _REPORT_VOID:
+            return
+        if close:
+            self.out.append(f"</{tag}>")
+        else:
+            self.open_tags.append(tag)
+
+    def handle_starttag(self, tag, attrs):
+        if self.drop_stack:
+            if tag in _REPORT_DROP:
+                self.drop_stack.append(tag)
+            return
+        if tag in _REPORT_DROP:
+            self.drop_stack.append(tag)
+            return
+        if tag in _REPORT_DROP_VOID:
+            return
+        if tag in _REPORT_ALLOWED:
+            self._emit(tag, attrs, close=False)
+        # anything else unwraps: its children still get their own pass
+
+    def handle_startendtag(self, tag, attrs):
+        # "/>" on an element HTML never self-closes (script, iframe) is
+        # an OPEN tag in a real parser - treat it like one
+        if self.drop_stack:
+            return
+        if tag in _REPORT_DROP:
+            self.drop_stack.append(tag)
+            return
+        if tag in _REPORT_DROP_VOID:
+            return
+        if tag in _REPORT_ALLOWED:
+            self._emit(tag, attrs, close=True)
+
+    def handle_endtag(self, tag):
+        if self.drop_stack:
+            if tag == self.drop_stack[-1]:
+                self.drop_stack.pop()
+            elif tag in _REPORT_DROP and tag in self.drop_stack:
+                # mismatched nesting - close the drop frames down to it
+                while self.drop_stack and self.drop_stack[-1] != tag:
+                    self.drop_stack.pop()
+                if self.drop_stack:
+                    self.drop_stack.pop()
+            return
+        if tag in self.open_tags:
+            while self.open_tags:
+                t = self.open_tags.pop()
+                self.out.append(f"</{t}>")
+                if t == tag:
+                    break
+
+    def handle_data(self, data):
+        if not self.drop_stack:
+            self.out.append(html.escape(data))
+
+    # comments, decls, PIs and CDATA sections never survive (base
+    # handlers are no-ops, which is exactly the drop we want)
+
+    def result(self) -> str:
+        while self.open_tags:
+            self.out.append(f"</{self.open_tags.pop()}>")
+        return "".join(self.out)
+
+
+def sanitize_report_html(src: str) -> str:
+    """Sanitize an LLM-authored run.summary.html to inert markup for
+    in-dashboard rendering. Parser-based, never regex substitution:
+    allowed elements are re-serialized with filtered attributes, active
+    and foreign subtrees drop whole, and output is always balanced."""
+    p = _ReportSanitizer()
+    try:
+        p.feed(src[:_REPORT_HTML_MAX_BYTES])
+        p.close()
+    except Exception:                        # malformed input degrades
+        pass                                 # to what was emitted so far
+    return p.result().strip()
+
+
+def run_summary_html(name: str, runs_dir: Path = RUNS_DIR) -> str:
+    """GET /api/runs/<run>/summary.html - the summarizer session's
+    second artifact, re-sanitized on every read (a stored file edited
+    after generation is still untrusted) and wrapped in the
+    .run-summary-report container the dashboard stylesheet scopes to.
+    Missing or unrenderable artifacts 404 so the modal just skips them.
+    """
+    d, _st = _run_dir_checked(name, runs_dir)
+    f = d / "run.summary.html"
+    if not f.is_file():
+        raise RequestError("No HTML report for this run", 404)
+    try:
+        raw = f.read_bytes()[:_REPORT_HTML_MAX_BYTES + 1]
+    except OSError as exc:
+        raise RequestError("Cannot read the HTML report", 500) from exc
+    frag = sanitize_report_html(
+        raw[:_REPORT_HTML_MAX_BYTES].decode("utf-8", errors="replace"))
+    if not frag:
+        raise RequestError("The HTML report has no renderable content",
+                           404)
+    return '<div class="run-summary-report">' + frag + "</div>"
 
 
 def summarize_run_start(name: str, runs_dir: Path = RUNS_DIR,
@@ -13891,7 +14129,10 @@ def summary_agent(st: dict, key: str, run_dir: Path,
         "task_full": None, "purpose": None,
         "note": rs.get("note"), "next": None,
         "exit_code": rs.get("exit_code"),
-        "outcome": ("wrote run.summary.md"
+        "outcome": (("wrote run.summary.md"
+                     + (" + run.summary.html"
+                        if (run_dir / "run.summary.html").is_file()
+                        else ""))
                     if rs.get("generated_at") else None),
         "outcomes": None,
         "branch": None, "merged": None,
@@ -14903,6 +15144,7 @@ def _arch_run_sig(sj: Path, st: dict, requests_dir: Path,
               fsig(run_dir / "summarize.export.json"),
               fsig(run_dir / "events.jsonl"),
               fsig(run_dir / "run.summary.md"),
+              fsig(run_dir / "run.summary.html"),
               fsig(run_dir / "resume.launch.log")]
     if rid:
         files += [fsig(requests_dir / f"{rid}.json"),
@@ -15971,6 +16213,46 @@ a { color:#58a6ff; text-decoration:none; }
 #detail .sumdoc code { background:rgba(110,118,129,.16); border:1px solid rgba(110,118,129,.32); border-radius:5px; padding:.5px 5px; font-size:.92em; color:#a5d6ff; overflow-wrap:anywhere; }
 #detail .sumdoc pre code { background:none; border:0; padding:0; color:inherit; font-size:inherit; }
 #detail .sumdoc strong { color:#e6edf3; }
+/* the summarize session's second artifact paints as inert markup under
+   .run-summary-report - the sanitizer strips every class/id/style/URL,
+   so element selectors beneath the wrapper are the ONLY styling
+   channel: nothing here can reach the dashboard, the markdown sumdoc,
+   or the chat, and no report rule exists outside this block */
+#detail .run-summary-report { margin-top:18px; padding-top:14px; border-top:1px solid #30363d; color:#c9d1d9; font-size:13px; line-height:1.5; }
+#detail .run-summary-report header { margin-bottom:12px; }
+#detail .run-summary-report h1 { font-size:15px; font-weight:600; color:#e6edf3; margin:0 0 4px; }
+#detail .run-summary-report h2 { font-size:13px; font-weight:600; color:#79b8ff; margin:0 0 6px; }
+#detail .run-summary-report h3 { font-size:12px; font-weight:600; color:#e6edf3; margin:0 0 4px; }
+#detail .run-summary-report h4, #detail .run-summary-report h5,
+#detail .run-summary-report h6 { font-size:12px; font-weight:600; color:#8b949e; margin:8px 0 4px; }
+/* the stat strip: the report header's <ul> of <strong>N</strong>-led
+   items renders as a row of stat cards */
+#detail .run-summary-report header ul { list-style:none; display:flex; flex-wrap:wrap; gap:8px; padding:0; margin:10px 0 0; }
+#detail .run-summary-report header ul li { background:#161b22; border:1px solid #21262d; border-radius:6px; padding:6px 12px; font-size:11px; color:#8b949e; }
+#detail .run-summary-report header ul li strong { display:block; font-size:16px; font-weight:600; color:#58a6ff; }
+#detail .run-summary-report section { background:#161b22; border:1px solid #21262d; border-radius:6px; padding:10px 14px; margin:10px 0; }
+#detail .run-summary-report article { border-left:2px solid #58a6ff; padding:2px 10px; margin:10px 0; }
+#detail .run-summary-report article h3 { color:#58a6ff; }
+#detail .run-summary-report p { margin:6px 0; }
+#detail .run-summary-report ul, #detail .run-summary-report ol { padding-left:20px; margin:6px 0; }
+#detail .run-summary-report li { margin:3px 0; }
+#detail .run-summary-report dl { margin:6px 0; }
+#detail .run-summary-report dt { font-size:11px; color:#8b949e; }
+#detail .run-summary-report dd { margin:0 0 6px; color:#e6edf3; }
+#detail .run-summary-report pre { background:#0d1117; border:1px solid #21262d; border-radius:6px; padding:10px 12px; font-size:12px; overflow:auto; white-space:pre-wrap; }
+#detail .run-summary-report code { background:#0d1117; border:1px solid #21262d; border-radius:4px; padding:1px 5px; font-size:12px; }
+#detail .run-summary-report pre code { border:none; padding:0; }
+#detail .run-summary-report blockquote { border-left:3px solid #21262d; margin:8px 0; padding:2px 12px; color:#8b949e; }
+#detail .run-summary-report table { border-collapse:collapse; margin:8px 0; font-size:12px; }
+#detail .run-summary-report th, #detail .run-summary-report td { border:1px solid #21262d; padding:4px 10px; text-align:left; }
+#detail .run-summary-report th { background:#0d1117; color:#8b949e; font-weight:600; }
+#detail .run-summary-report details { margin:6px 0; }
+#detail .run-summary-report summary { cursor:pointer; color:#58a6ff; }
+#detail .run-summary-report a { color:#58a6ff; text-decoration:none; }
+#detail .run-summary-report hr { border:none; border-top:1px solid #21262d; margin:12px 0; }
+#detail .run-summary-report strong { color:#e6edf3; }
+#detail .run-summary-report mark { background:#3b2d00; color:#e6edf3; padding:0 2px; border-radius:3px; }
+#detail .run-summary-report small { color:#8b949e; }
 /* the summary modal's own title - quiet, like the doc header under it */
 #detail h3.sumtitle { font-size:13px; font-weight:500; color:#8b949e; margin:0 170px 4px 0; }
 /* the task prompt box: a fixed visual slot in modal and summary alike,
@@ -17295,8 +17577,35 @@ async function openRunSummary(key, push=true){
       `below is the interim answer.</div>`:'') +
     (err!=null ? `<div class="notice error">${esc(err)}</div>`
       : `<div class="sumdoc">${frag}</div>`);
+  runReportFor=null;               // this paint owns the report slot now
   decorateRunSum(document.querySelector('#detail .sumdoc'), key);
   applyModalScroll();
+  appendRunReport(key, r.dir);     // second artifact rides its own fetch
+}
+// The summarizer's second artifact - run.summary.html - lands BELOW the
+// markdown sumdoc as one .run-summary-report block. The server already
+// re-serialized the stored file to inert markup (no scripts, styles,
+// handlers, ids, classes or URLs - the fixed stylesheet owns every
+// surviving rule), so it can be painted verbatim. Two guards keep the
+// append honest: the view must still be THIS run's summary when the
+// fetch lands, and runReportFor makes a racing duplicate or a re-open
+// of the same run paint the report exactly once.
+let runReportFor=null;             // run key whose report the modal holds
+async function appendRunReport(rkey, dir){
+  if (!dir) return;
+  let frag=null;
+  try{
+    const res=await fetch('/api/runs/'+encodeURIComponent(base(dir))+
+      '/summary.html');
+    if (res.ok) frag=await res.text();
+  }catch(e){}
+  if (frag==null || !frag.trim()) return;   // no artifact (older runs),
+                                            // rejected or malformed HTML
+  if (!summaryView || summaryView.key!=='run|'+rkey) return;
+  if (document.getElementById('backdrop').hidden) return;
+  if (runReportFor===rkey) return;          // already appended (or racing)
+  runReportFor=rkey;
+  document.getElementById('dbody').insertAdjacentHTML('beforeend', frag);
 }
 // A run summary's '<step> - <status>' headings are live controls, not
 // prose: the step name (rendered in its canonical lowercase, even when
@@ -23413,6 +23722,14 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                             frag = '<div class="llmsum">' + frag + '</div>'
                         self._send(frag.encode("utf-8"),
                                    "text/html; charset=utf-8")
+                elif (m := re.fullmatch(
+                        r"/api/runs/([^/]+)/summary\.html", path)):
+                    # the summarizer's second artifact - served already
+                    # re-sanitized under .run-summary-report; the stored
+                    # file itself is never handed out raw
+                    self._send(run_summary_html(m.group(1), runs_dir)
+                               .encode("utf-8"),
+                               "text/html; charset=utf-8")
                 elif (m := re.fullmatch(
                         r"/api/runs/([^/]+)/steps/([^/]+)/trajectory",
                         path)):

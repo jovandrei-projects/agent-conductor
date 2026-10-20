@@ -1495,6 +1495,30 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   (assertLess t<5 at ~9s), ACP _pending KeyError - each verified
   failing identically on pristine HEAD under parallel-agent load.
 
+- DONE 2026-10-20 (html-summary-report, wave step of run
+  20261020-030142-whats-new-polish): the summarize session now drops a
+  second artifact - `_summary_prompt` gained an additive
+  `## Also write run.summary.html` block (self-contained lavish doc:
+  header stat strip + `<section>` findings + per-step `<article>`s,
+  dashboard palette, stats from real run data) and `summarize_run`
+  collects `run.summary.html` into the run dir next to
+  `run.summary.md` (untouched). `GET /api/runs/<run>/summary.html`
+  serves it re-sanitized on every read under
+  `.run-summary-report` (missing/unrenderable -> 404, run-identity
+  checks intact); `sanitize_report_html` is a real
+  `html.parser`-based allowlist re-serializer - no scripts, styles,
+  handlers, URLs, ids, classes or active content can survive, output
+  always balanced, input capped at 512 KiB. The modal appends the
+  fragment once at the END of `openRunSummary` below the sumdoc
+  (`runReportFor` + `summaryView.key` + backdrop guards kill stale
+  and duplicate appends); a fixed `#detail .run-summary-report`
+  element-selector stylesheet is the only styling channel. 15 new
+  `RunSummaryHtmlTests` (artifact gen/loading, endpoint, adversarial
+  sanitizer battery, node-harness ordering/legacy/malformed/stale/
+  decoration checks). Markdown statistics, canonical step headings
+  and decorateRunSum review controls stay with the sibling
+  summary-regressions step - untouched here.
+
 - DONE 2026-10-20 (follow-up-plan, closing review of run
   20261020-030142-whats-new-polish): the run's five features are all
   written and self-tested but ZERO landed - every step's verify gate

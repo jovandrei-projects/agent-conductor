@@ -168,6 +168,19 @@ def main() -> int:
                              "message": "Executive summary (mock): the "
                                         "run's steps reported done; "
                                         "everything landed."}]
+            # ... and the second artifact: the session drops
+            # run.summary.html in its cwd, conductor collects it into
+            # the run dir
+            (cwd / "run.summary.html").write_text(
+                '<!doctype html><html><head><meta charset="utf-8">'
+                '<title>run summary (mock)</title><style>'
+                'body{background:#0d1117;color:#c9d1d9}</style></head>'
+                '<body><header><h1>run - run summary (mock)</h1>'
+                '<ul><li><strong>1</strong> steps</li></ul></header>'
+                '<section><h2>Findings</h2><p>Executive HTML report '
+                '(mock).</p></section><section><h2>Steps</h2><article>'
+                '<h3>one - done</h3><p>did the work</p></article>'
+                '</section></body></html>', encoding="utf-8")
         Path(export).write_text(json.dumps(doc), encoding="utf-8")
 
     env_line = " ".join(f"{k}={v}" for k, v in sorted(os.environ.items())

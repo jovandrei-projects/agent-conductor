@@ -12344,6 +12344,388 @@ assert.equal(heads[0].innerHTML.match(/data-review-step/g).length,1);
             self.assertNotIn(gone, h)
 
 
+class RunSummaryHtmlTests(unittest.TestCase):
+    """The summarizer's second artifact: the session drops
+    run.summary.html in its tempdir, conductor collects it next to
+    run.summary.md, the endpoint serves it re-sanitized under
+    .run-summary-report, and the modal appends it once below the
+    markdown sumdoc."""
+
+    def _run_state(self, td, steps, run="20261015-000000-sum"):
+        runs = Path(td) / "runs"
+        rd = runs / run
+        rd.mkdir(parents=True)
+        st = {"run": "sum", "started_at": "2026-10-15T00:00:00",
+              "ended_at": "2026-10-15T01:00:00", "steps": steps}
+        (rd / "state.json").write_text(json.dumps(st), encoding="utf-8")
+        return runs, rd
+
+    def _server(self, runs, td):
+        handler = conductor.make_dashboard_handler(
+            runs, ["no-such-devin"], Path(td) / "reqs",
+            Path(td) / "manifests")
+        srv = conductor.http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv
+
+    def _get(self, port, path):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", path,
+                     headers={"Host": f"127.0.0.1:{port}"})
+        res = conn.getresponse()
+        body = res.read().decode("utf-8")
+        ctype = res.getheader("Content-Type")
+        conn.close()
+        return res.status, body, ctype
+
+    # -- artifact generation + persistence ------------------------------
+
+    def test_summarize_run_collects_html_artifact(self):
+        """The same session drops run.summary.html next to
+        run.summary.md - the markdown contract is untouched and the
+        bookkeeping row advertises both files."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            rd = next(runs.iterdir())
+            self.assertTrue(conductor.summarize_run(
+                rd, shlex.split(MOCK)))
+            md = (rd / "run.summary.md").read_text(encoding="utf-8")
+            self.assertIn("Executive summary (mock)", md)
+            rep = rd / "run.summary.html"
+            self.assertTrue(rep.is_file())
+            body = rep.read_text(encoding="utf-8")
+            self.assertIn("run summary (mock)", body)
+            self.assertIn("<article>", body)
+            d = conductor.collect_dashboard(
+                runs, ["no-such-devin"], base / "requests")
+            aux = [a for a in d["agents"] if a.get("aux")][0]
+            self.assertIn("run.summary.md", aux["outcome"])
+            self.assertIn("run.summary.html", aux["outcome"])
+
+    def test_summary_prompt_instructs_html_report(self):
+        """The prompt names the second artifact and its contract - the
+        markdown instructions stay the document's own."""
+        prompt = conductor._summary_prompt({"run": "r", "steps": {}})
+        self.assertIn("run.summary.html", prompt)
+        self.assertIn("<article>", prompt)
+        self.assertIn("#0d1117", prompt)
+
+    # -- the serving endpoint -------------------------------------------
+
+    def test_run_summary_html_endpoint(self):
+        """GET /api/runs/<run>/summary.html - always served re-sanitized
+        under .run-summary-report; missing or unrenderable is 404."""
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run_state(td, {
+                "s1": {"status": "done", "task": "t"}})
+            srv = self._server(runs, td)
+            port = srv.server_port
+            url = "/api/runs/20261015-000000-sum/summary.html"
+            status, body, _ = self._get(port, url)
+            self.assertEqual(status, 404)          # legacy run: no file
+            (rd / "run.summary.html").write_text(
+                '<!doctype html><html><head><style>x{}</style></head>'
+                '<body><header><h1>sum report</h1></header>'
+                '<section><p>ok</p><script>alert(1)</script></section>'
+                '</body></html>', encoding="utf-8")
+            status, body, ctype = self._get(port, url)
+            self.assertEqual(status, 200)
+            self.assertIn("text/html", ctype)
+            self.assertTrue(body.startswith(
+                '<div class="run-summary-report">'))
+            self.assertIn("<h1>sum report</h1>", body)
+            self.assertNotIn("<script", body)
+            self.assertNotIn("<style", body)
+            # a tampered stored artifact is re-sanitized on every read -
+            # handlers, frames and loopback loads never reach the page
+            (rd / "run.summary.html").write_text(
+                '<section><p onclick="x()">ev</p>'
+                '<iframe src="http://127.0.0.1:8809/"></iframe></section>',
+                encoding="utf-8")
+            status, body, _ = self._get(port, url)
+            self.assertEqual(status, 200)
+            self.assertNotIn("iframe", body)
+            self.assertNotIn("onclick", body)
+            # an all-active document sanitizes to nothing -> 404
+            (rd / "run.summary.html").write_text(
+                "<script>x</script>", encoding="utf-8")
+            status, body, _ = self._get(port, url)
+            self.assertEqual(status, 404)
+
+    # -- the sanitizer itself --------------------------------------------
+
+    def test_sanitize_strips_active_content(self):
+        out = conductor.sanitize_report_html(
+            '<p>a</p><script>alert(1)</script>'
+            '<script src="http://x"></script>'
+            '<iframe src="http://127.0.0.1:8809/x"></iframe>'
+            '<object data="x"></object><embed src="x">'
+            '<link rel="stylesheet" href="http://x"><img src="x.png">'
+            '<audio src="x">a</audio><video src="x">v</video>'
+            '<form action="/x"><input><select><option>o</option>'
+            '</select></form><p>b</p>')
+        self.assertIn("<p>a</p>", out)
+        self.assertIn("<p>b</p>", out)
+        for bad in ("script", "iframe", "object", "embed", "<link",
+                    "<img", "audio", "video", "form", "input",
+                    "select", "option"):
+            self.assertNotIn("<" + bad, out)
+
+    def test_sanitize_strips_handlers_styles_ids(self):
+        """Event handlers, inline styles, <style>, DOM identifiers and
+        dashboard classes all go - markup can't collide with or restyle
+        the host page."""
+        out = conductor.sanitize_report_html(
+            '<p onclick="x()" onmouseover="y()">t</p>'
+            '<div id="backdrop" name="n" for="x" class="modal sumdoc" '
+            'style="position:fixed;inset:0" tabindex="0">c</div>'
+            '<style>.x{position:fixed}</style>'
+            '<p style="background:url(http://x)">s</p>')
+        self.assertIn("<p>t</p>", out)
+        self.assertIn("<div>c</div>", out)
+        self.assertIn("<p>s</p>", out)
+        for bad in ("onclick", "onmouseover", 'id="backdrop"', "name=",
+                    'for="', "class=", "style=", "<style"):
+            self.assertNotIn(bad, out)
+
+    def test_sanitize_neutralizes_urls(self):
+        """No URL-bearing attribute survives on any element - the report
+        can never navigate out or load external/loopback resources."""
+        out = conductor.sanitize_report_html(
+            '<a href="javascript:alert(1)">j</a>'
+            '<a href="http://127.0.0.1:8773/api">l</a>'
+            '<a href="#frag">f</a><a href>x</a>'
+            '<q cite="http://x">q</q>'
+            '<form><button formaction="http://x">b</button></form>')
+        self.assertIn("<a>j</a>", out)
+        self.assertIn("<a>l</a>", out)
+        self.assertIn("<a>f</a>", out)
+        self.assertIn("<q>q</q>", out)
+        for bad in ("href", "javascript:", "cite=", "formaction",
+                    "127.0.0.1"):
+            self.assertNotIn(bad, out)
+
+    def test_sanitize_keeps_inert_structure(self):
+        out = conductor.sanitize_report_html(
+            '<header><h1>t</h1><ul><li><strong>2</strong> done</li></ul>'
+            '</header><section><h2>F</h2><p>x</p>'
+            '<table><thead><tr><th scope="col">h</th></tr></thead>'
+            '<tbody><tr><td colspan="99" rowspan="x">c</td></tr></tbody>'
+            '</table><details open><summary>d</summary>body</details>'
+            '<pre>a &lt; b</pre><time datetime="2026-01-01">t</time>'
+            '<mark>m</mark><abbr title="Abbr">a</abbr></section>')
+        self.assertIn("<header>", out)
+        self.assertIn("<strong>2</strong>", out)
+        self.assertIn('<th scope="col">h</th>', out)
+        self.assertIn('<td colspan="99">c</td>', out)     # bad int dropped
+        self.assertIn("<details open>", out)
+        self.assertIn('<time datetime="2026-01-01">t</time>', out)
+        self.assertIn('<abbr title="Abbr">a</abbr>', out)
+        self.assertIn("a &lt; b", out)                    # text escaped
+
+    def test_sanitize_balanced_on_malformed(self):
+        """Truncated/unbalanced input still emits balanced markup - the
+        fragment can't break out of its container on reparse."""
+        out = conductor.sanitize_report_html(
+            '<section><h2>t</h2><p>unclosed<div>deep')
+        for tag in ("section", "p", "div", "h2"):
+            self.assertEqual(out.count("<" + tag + ">"),
+                             out.count("</" + tag + ">"))
+        self.assertTrue(out.endswith("</section>"))
+
+    def test_sanitize_drops_foreign_and_rawtext(self):
+        """svg/math/template/RCDATA subtrees go whole - their text
+        children never surface either."""
+        out = conductor.sanitize_report_html(
+            '<svg><a xlink:href="x">s</a><style>p{}</style></svg>'
+            '<math><mi>x</mi></math><template><p>hidden</p></template>'
+            '<textarea><b>raw</b></textarea><noscript>n</noscript>'
+            '<xmp><i>x</i></xmp><p>keep</p>')
+        self.assertIn("<p>keep</p>", out)
+        for bad in ("<svg", "<math", "<mi", "xlink", "hidden", "raw",
+                    "<style", "p{}", "<i>x", "<noscript"):
+            self.assertNotIn(bad, out)
+
+    def test_sanitize_drops_comments_and_decls(self):
+        out = conductor.sanitize_report_html(
+            '<!doctype html><!-- c --><?php echo 1 ?><p>x</p>'
+            '<![CDATA[ <p>y</p> ]]>')
+        self.assertIn("<p>x</p>", out)
+        for bad in ("php", "<!--", "CDATA", "<p>y"):
+            self.assertNotIn(bad, out)
+
+    def test_sanitize_report_cap(self):
+        """Oversized artifacts are rejected, not buffered whole."""
+        big = "<p>" + "x" * (conductor._REPORT_HTML_MAX_BYTES + 10) \
+            + "</p>"
+        out = conductor.sanitize_report_html(big)
+        self.assertLessEqual(len(out),
+                             conductor._REPORT_HTML_MAX_BYTES + 200)
+
+    # -- the modal-side append (node harness) -----------------------------
+
+    _JS_STUB = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, fetches=[];
+const mkEl=id=>({id,innerHTML:'',hidden:true,textContent:'',scrollTop:0,
+  insertAdjacentHTML(pos,h){ this.innerHTML+=h; },
+  querySelector:()=>null,querySelectorAll:()=>[]});
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,mkEl(id)); return nodes.get(id); };
+// a stand-in .sumdoc for decorateRunSum: two heading stubs it can lift
+const heads=[
+  {textContent:'s1 - done',dataset:{},innerHTML:'',
+   classList:{toggle(){}}},
+  {textContent:'prose heading',dataset:{},innerHTML:'',
+   classList:{toggle(){}}}];
+const sumdoc={querySelectorAll:sel=>sel==='h2,h3,h4'?heads:[],dataset:{}};
+const document={getElementById:elem,
+  querySelector:s=>s==='#detail .sumdoc'?sumdoc:null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const defers=[], htmlFrags={};        // 'defer' parks a summary.html fetch
+const fetch=url=>{
+  fetches.push(url);
+  const m=url.match(/runs\/([^/]+)\/summary\.html/);
+  if (m){
+    const dir=decodeURIComponent(m[1]), v=htmlFrags[dir];
+    if (v==='defer') return new Promise(r=>defers.push({dir,r}));
+    if (v!=null) return Promise.resolve({ok:true,status:200,
+      text:async()=>v,json:async()=>({})});
+    return Promise.resolve({ok:false,status:404,
+      json:async()=>({error:'No HTML report for this run'}),
+      text:async()=>''});
+  }
+  if (url.includes('/summary')) return Promise.resolve({ok:true,
+    status:200,
+    text:async()=>'<h1>sum - run summary</h1><h2>s1 - done</h2>',
+    json:async()=>({})});
+  throw new Error('no net '+url);
+};
+const ctx=vm.createContext({document,fetch,confirm:()=>true,alert:()=>{},
+  location:{reload:()=>{}},setTimeout:(fn)=>{fn();return 0;},
+  setInterval:()=>0,clearInterval:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'g0',agents:[
+  {step:'s1',run:'rA',run_dir:'/rA',run_key:'/rA',slug:'p',
+   status:'done',task:'t1',seq:0},
+  {step:'s1',run:'rB',run_dir:'/rB',run_key:'/rB',slug:'p',
+   status:'done',task:'t1',seq:0}],
+  runs:[{run:'rA',dir:'/rA',key:'/rA',counts:{done:1}},
+        {run:'rB',dir:'/rB',key:'/rB',counts:{done:1}},
+        {run:'rC',dir:'/rC',key:'/rC',counts:{done:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const body=()=>elem('dbody').innerHTML;
+const openRun=k=>vm.runInContext(
+  'openRunSummary('+JSON.stringify(k)+')',ctx);
+const countReport=()=>(body().match(/run-summary-report/g)||[]).length;
+const flush=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
+'''
+
+    def _node(self, body):
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        p = subprocess.run(["node", "-e", self._JS_STUB + body],
+                           input=js, capture_output=True, text=True,
+                           encoding="utf-8", timeout=15)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_report_appends_below_sumdoc_js(self):
+        """The report lands at the END of the modal, after the markdown
+        sumdoc, and the heading decoration still runs on the markdown."""
+        self._node(r'''
+(async()=>{
+  htmlFrags['rA']='<div class="run-summary-report"><header><h1>rA rep' +
+    '</h1></header></div>';
+  await openRun('/rA'); await flush();
+  const b=body();
+  const si=b.indexOf('class="sumdoc"'), ri=b.indexOf('run-summary-report');
+  assert.ok(si>=0 && ri>si, 'report must land below the markdown sumdoc');
+  assert.equal(b.lastIndexOf('run-summary-report'), ri);   // exactly once
+  assert.match(b,/<h2>s1 - done<\/h2>/);                   // sumdoc intact
+  // markdown decoration preserved: the '<step> - <status>' heading is
+  // still a live task link + review toggle, prose headings untouched
+  assert.match(heads[0].innerHTML,/data-agent-detail="\/rA\|s1"/);
+  assert.match(heads[0].innerHTML,/sumh-rev/);
+  assert.equal(heads[1].innerHTML,'');
+  // the report sits inside #detail's fixed stylesheet scope
+  assert.match(b,/<div class="run-summary-report"><header><h1>rA rep/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_report_missing_or_malformed_skipped_js(self):
+        """Legacy runs (404) and empty/rejected fragments append
+        nothing - the markdown view stands alone."""
+        self._node(r'''
+(async()=>{
+  await openRun('/rC'); await flush();           // no htmlFrags -> 404
+  assert.match(body(),/class="sumdoc"/);
+  assert.equal(countReport(),0);
+  // a whitespace-only fragment is skipped too
+  htmlFrags['rA']='   ';
+  await openRun('/rA'); await flush();
+  assert.equal(countReport(),0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_report_once_and_stale_guard_js(self):
+        """Repeated rendering never stacks a second report, and a stale
+        fetch from a previous run can't paint into the new view."""
+        self._node(r'''
+(async()=>{
+  htmlFrags['rA']='<div class="run-summary-report"><p>A</p></div>';
+  htmlFrags['rB']='<div class="run-summary-report"><p>B</p></div>';
+  await openRun('/rA'); await flush();
+  assert.equal(countReport(),1);
+  // a racing duplicate fetch for the same run can't double-append
+  await openRun('/rA'); await flush();
+  assert.equal(countReport(),1);
+  // stale-guard: rA's deferred fetch must not land on rB's view
+  htmlFrags['rA']='defer';
+  await openRun('/rA'); await flush();
+  assert.equal(defers.length,1);          // rA report still in flight
+  await openRun('/rB'); await flush();    // user moved on to rB
+  assert.equal(countReport(),1);
+  assert.match(body(),/<p>B<\/p>/);
+  defers.forEach(x=>x.r({ok:true,status:200,
+    text:async()=>'<div class="run-summary-report"><p>A2</p></div>',
+    json:async()=>({})}));
+  await flush();
+  assert.equal(countReport(),1);
+  assert.doesNotMatch(body(),/<p>A2<\/p>/);   // the stale frag was dropped
+  assert.match(body(),/<p>B<\/p>/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    def test_report_stylesheet_scoped(self):
+        """Every report rule lives under #detail .run-summary-report -
+        report markup (classes stripped) can only be styled there."""
+        css = conductor._DASH_HTML.split("<style>", 1)[1].split(
+            "</style>", 1)[0]
+        self.assertIn(".run-summary-report", css)
+        for line in css.splitlines():
+            s = line.strip()
+            if "run-summary-report" not in s or "{" not in s:
+                continue
+            if not s.startswith("#detail .run-summary-report"):
+                self.fail(f"unscoped report rule: {s}")
+
+
 class PowerDialogTests(unittest.TestCase):
     """The dashboard's Stop/Restart: a themed dialog backed by
     /api/serve/power that flags live merges, this process's in-flight
