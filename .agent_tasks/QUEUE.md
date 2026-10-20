@@ -27,7 +27,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 14 | Ask AI assistant: persistent contextual chat on dashboard + every modal, history db, view-context, citations, images, dictation, model settings, read-only gate, controlled actions, usage/cost | in progress | ask-ai/ | manifest run 20261017-051357-dashboard-ask-ai; research+design done (ask-ai/DESIGN.md): devin -p -r transport + gpt-6-luna-low-priority + vision + permission gate all live-verified; ACP session/new blocked on devin 3000.6.2 session-db migration; persistent-chat-core + view-context-and-retrieval + assistant-runtime done (assistant/ pkg + sqlite store; ConductorContext + ConductorRetrieval + static preamble; devin_print provider + AssistantRuntime dispatcher + tool loop + reconcile; modelpick catalog validation; /api/assistant/* registered in serve; live -p/-r smoke verified on gpt-6-luna-low-priority; persistent-chat-interface done (assistant/static chat.js+md.js+chat.css, #dask shell launcher, aiView/aiNav bridge, /api/assistant/static/*, 16 UI tests + :8806 smoke); images-and-dictation done (id-gated /api/assistant/attachments raw POST + row-id GET, composer paste/pick/preview/remove/bind, SpeechRecognition mic with unavailable/permission states + teardown; 24 UI + 134 assistant tests + 667-test quick suite green, headless-Chromium :8806 probe). guarded-dashboard-actions done (ConductorActions adapter over the same conductor.py functions: 28-kind whitelist, propose-time validation, launch-tier second-confirm acks, readonly re-check at execute, rejected proposals audited as failed rows, action cards + armed confirm in chat.js; 37 new tests, schema v4 actions.explain; 170 assistant + 702-test suite green). usage-and-price-visibility done (dispatch-time rate snapshots + priced fail/cancel paths, extra total_* counter passthrough into usage_extra, by-model rollup + unpriced honesty in GET .../usage, expandable per-exchange <details> usage breakdown + header conversation panel + settings price provenance in chat.js; 18 new tests, 130 assistant tests green). integration-and-design-review done (fetch-by-key re-resolution + nav/label synthesis, kinds/status filters, batch seq, fast-without-effort resolve, bounded pow, raced-terminal/attachment/ack fixes, conv-scoped actions + attachments, usage-details repaint, settings focus/outage, z-order, in-text nav links; 734-test suite green minus 1 transient file-lock, 46-browser-check probe, 2 live exchanges ~$0.034 verified incl. --noEmit + apartment-3d camera answers with working citations). fast-transport run 20261017-164321-assistant-fast-transport (parallel, 4 steps) ALL LANDED: transport-investigation done - warm ACP pool chosen over direct HTTP + api.devin.ai (assistant/TRANSPORT.md; ACP verified live on 3000.6.2, earlier session-db block was non-fatal); provider-adapter done (assistant/providers/devin_acp.py pooled devin-acp adapter + tests/fake_devin_chat.py acp ndjson fake + 25 tests in tests/test_assistant_acp.py green); runtime-and-settings done (per-conversation transport + fallback {from,to,reason} + read-only routing; landed merge 4a08d9c); chat-ui-and-verification done (feature-detected Transport select cli/fast + per-reply .aim-tp chip + fallback display + progressive repaint reuse; 6 ChatTransportTests; wire contract in DESIGN.md s12). Next: follow-up-plan |
 | 15 | Dashboard What's new tour: persistent state + feeds + API + walkthrough UI + optional LLM polish | done | dashboard-whats-new/ | manifest run 20261017-145726-dashboard-whats-new; all 6 steps done incl. tour-validation: both parked branches merged, 8-test real-HTTP e2e suite, 3 in-feature defects found+fixed (stale-build epoch guard on tour_ctx gen, curated fold-in surviving polish regrouping via aug_shas, mark-404 deck resync in tourMark), tail_status stale-base guard backported from master, 2 tempdir-teardown flake classes hardened; 114/114 tour tests + full suite 907 green (8/8 shards) |
 | 16 | What's new split: 'Tool updates' vs 'Work digest' feed sections + folded work cards + async refresh | done | whats-new-split/ | manifest run 20261019-031845-whats-new-split; feed-build done (sections/folding/tags/unreviewed/memoization + viewed-deck exclusion; 39 feed + 125 tour tests green); walkthrough-ui done (two-section deck, event tags, unreviewed+Request/Run chips, tourAcked stale-feed guard; 12 dash tests + 999-suite green); deferred-transition done (persist-first POST + retained-payload validation + coalesced daemon refresh w/ wanted-rerun + projected last-known unseen_count; 20 api + 109 tour-side tests green); tour-tests done (+23 deterministic regression tests incl. gated-daemon concurrency, no regressions found; 152/152 tour + 1024-test suite green); closing review done - all 7 requested items verified merged; empty follow-up proposal manifests/whats-new-split-followup.toml registers 'no work remains' |
-| 17 | What's new polish landing: merge the 5 parked whats-new-polish branches + integrated verification | next | whats-new-polish/ | run 20261020-030142-whats-new-polish: all 5 steps reported done but verify gates died (verify_timeout_min 10m < loaded --jobs 8 suite); ALL 5 branches now landed via merges 2e28604 + 6ffb4e5 + bee3f0b + c5778f3 + 53b6e0e (chat-font) - remaining work is integrated verification on the combined tree; proposal manifests/whats-new-polish-followup.toml (auto-registered 20261020-053816-aa91a839) still covers land-* steps that are now no-ops + the integrated-validation step - human launches via `conductor.py run`, or just run the suite on main |
+| 17 | What's new polish landing: merge the 5 parked whats-new-polish branches + integrated verification | done | whats-new-polish/ | run 20261020-030142-whats-new-polish: all 5 steps reported done but verify gates died (verify_timeout_min 10m < loaded --jobs 8 suite); all 5 branches landed via resolver merges 2e28604 + 6ffb4e5 + bee3f0b + c5778f3 + 53b6e0e; integrated-validation verified all 5 requirements present + full suite 1093 tests, 8/8 shards ok, zero failures |
 
 ## Not yet filed as tasks
 
@@ -1616,3 +1616,35 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   code touched; the branch carried no QUEUE.md bullet of its own.
   All five whats-new-polish branches are now landed - task 17's
   remaining work is the integrated verification.
+
+- DONE 2026-10-20 (integrated-validation, closing step of run
+  20261020-092813-whats-new-polish-followup): verified all five
+  whats-new-polish requirements on the combined main tree, then ran
+  the full suite green. Per-requirement verdicts: (a) progressive
+  What's-new PRESENT - tour_feeds emit(group, parts) staged hook,
+  conductor ctx["snap"]/ctx["gen"]/_tour_compose/_tour_snapshot,
+  GET /api/tour serves snapshots via tour_feed(progressive=True),
+  tour_transition persists then defers the rebuild (never blocks on
+  a feed build, gen bump guards stale builds), /api/tour/progress
+  busy/stage/elapsed_s narration, client tourPoll+tourApplyFeed
+  seq-guarded incremental merge; (b) proportionate run tags PRESENT -
+  tour_feeds._run_outcome fails only on a strict unsuccessful majority
+  of decisive verdicts (bad>done) or zero done, aborted verbatim,
+  empty -> ended, 29 done + 1 lost -> partial; (c) summary
+  regressions PRESENT - _run_stats_lines/_run_stats_md/
+  _ensure_stats_block, canonical '## <step-name> - <status>' headings
+  in _summary_prompt, '#detail .sumdoc code' pill +
+  overflow-wrap:anywhere; (d) HTML report PRESENT -
+  run.summary.html collected by summarize_run,
+  sanitize_report_html html.parser allowlist, GET
+  /api/runs/<run>/summary.html re-sanitized per read under
+  .run-summary-report, modal appends once below the sumdoc via
+  runReportFor, mock_devin.py emits it; (e) chat font PRESENT -
+  chat.css #aichat/#ai-rail/#aiset on the system-sans stack,
+  aim-body code/.mdpre/.act-params/.act-tgt pinned ui-monospace.
+  Failing tests: NONE - `python run_tests.py --jobs 8` -> 1093
+  tests, 8/8 shards ok (covers test_tour_feeds/api/dash/state/
+  polish/e2e, test_conductor, and the node-VM dashboard harness in
+  test_tour_dash.py); the known shared-box flake family did not
+  reproduce, so no suspect needed a standalone re-run. Task 17
+  closed; whats-new-polish/STATE.md 'Where it stopped' refreshed.
