@@ -3230,10 +3230,14 @@ def summary_html(md: str, title: str) -> str:
             "h1{font-size:20px;border-bottom:1px solid #21262d;"
             "padding-bottom:8px}h2{font-size:15px;color:#58a6ff;"
             "margin:20px 0 6px}ul{padding-left:20px}li{margin:3px 0}"
-            "code{background:#161b22;border-radius:4px;padding:1px 5px;"
-            "font-size:12px}pre{background:#161b22;border-radius:6px;"
+            "code{background:rgba(110,118,129,.16);border:1px solid "
+            "rgba(110,118,129,.32);border-radius:5px;padding:.5px 5px;"
+            "font-size:.92em;color:#a5d6ff;overflow-wrap:anywhere}"
+            "pre{background:#161b22;border-radius:6px;"
             "padding:10px 12px;font-size:12px;overflow:auto;"
-            "white-space:pre-wrap}strong{color:#e6edf3}</style></head>"
+            "white-space:pre-wrap}pre code{background:none;border:0;"
+            "padding:0;color:inherit;font-size:inherit}"
+            "strong{color:#e6edf3}</style></head>"
             f"<body>{_summary_body(md)}</body></html>")
 
 
@@ -15732,7 +15736,12 @@ a { color:#58a6ff; text-decoration:none; }
 #detail .sumdoc ul { padding-left:20px; margin:6px 0; }
 #detail .sumdoc li { margin:3px 0; }
 #detail .sumdoc p { margin:8px 0; }
-#detail .sumdoc code { background:#0d1117; border-radius:4px; padding:1px 5px; font-size:12px; }
+/* inline code is the same soft tinted chip the Ask-AI body uses - muted
+   translucent fill + hairline border + accent text - and long slugs
+   (deferred-transition, a run dir name) wrap instead of overflowing;
+   fenced pre blocks keep their own chrome */
+#detail .sumdoc code { background:rgba(110,118,129,.16); border:1px solid rgba(110,118,129,.32); border-radius:5px; padding:.5px 5px; font-size:.92em; color:#a5d6ff; overflow-wrap:anywhere; }
+#detail .sumdoc pre code { background:none; border:0; padding:0; color:inherit; font-size:inherit; }
 #detail .sumdoc strong { color:#e6edf3; }
 /* the summary modal's own title - quiet, like the doc header under it */
 #detail h3.sumtitle { font-size:13px; font-weight:500; color:#8b949e; margin:0 170px 4px 0; }
