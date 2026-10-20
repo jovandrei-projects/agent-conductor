@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -1363,6 +1364,212 @@ class SplitFeedTests(unittest.TestCase):
             self.assertEqual(area["state"], "viewed")
             self.assertTrue(area["unavailable"])       # honest stub
             self.assertEqual(area["section"], "tool")
+
+
+class ProgressiveEmitTests(unittest.TestCase):
+    """build_feed's staged-delivery contract: the emit hook publishes
+    'collect' source status, then 'tool' cards, 'work' cards, and
+    'history' last - every emitted group already annotated and
+    viewed-filtered, identical in content to the returned payload. The
+    shared pool overlaps the four independent window scans (bounded),
+    a failed source degrades to a warning rather than losing the feed,
+    and serial/parallel builds are byte-identical."""
+
+    def _fixture(self, td):
+        """repo + records: one tool card, one work card, one viewed
+        descriptor re-materialized into history."""
+        base = Path(td)
+        repo = make_repo(base)
+        r, q, m = base/"r", base/"q", base/"m"
+        c0 = rev(repo)
+        c1 = commit(repo, "assistant/a.py", "x", "chat panel")
+        write_run(r, "20261017-050000-x", "2026-10-17T06:00:00",
+                  steps={"s1": {"status": "done"}})
+        write_request(q, "20261017-070000-9999aaaa",
+                      "2026-10-17T07:00:00", label="follow-on")
+        st = wm(c0, "2020-01-01T00:00:00")
+        st["viewed"] = [{"id": f"area:mobile:{c1[:12]}",
+                         "range": rng(
+                             base_commit=c0,
+                             base_at="2020-01-01T00:00:00",
+                             tip_commit=c1,
+                             tip_at="2026-10-17T00:00:00"),
+                         "viewed_at": "2026-10-17T01:00:00"}]
+        return base, repo, r, q, m, c0, c1, st
+
+    def test_emit_groups_in_order_and_complete(self):
+        with tempfile.TemporaryDirectory() as td:
+            base, repo, r, q, m, c0, c1, st = self._fixture(td)
+            emitted = []
+            out = tour_feeds.build_feed(
+                st, boundary(repo), repo_dir=repo, runs_dir=r,
+                requests_dir=q, manifests_dir=m,
+                emit=lambda g, p: emitted.append((g, p)))
+            groups = [g for g, _p in emitted]
+            # collect's interim publishes lead, each content group once,
+            # history last
+            self.assertEqual(groups[0], "collect")
+            for g in ("tool", "work", "history"):
+                self.assertEqual(groups.count(g), 1)
+            self.assertLess(groups.index("collect"), groups.index("tool"))
+            self.assertLess(groups.index("tool"), groups.index("work"))
+            self.assertLess(groups.index("work"), groups.index("history"))
+            # every emitted entry is fully annotated + non-viewed (the
+            # history group's 'entries' are live-deck reinjects, its
+            # 'history' the re-materialized viewed cards)
+            cards = [e for _g, p in emitted
+                     for e in (p.get("entries") or [])]
+            for e in cards:
+                for k in ("state", "anchor", "stop_title", "section",
+                          "section_title"):
+                    self.assertIn(k, e)
+                self.assertNotEqual(e["state"], "viewed")
+            emitted_ids = {e["id"] for g, p in emitted
+                           for e in (p.get("entries") or [])}
+            self.assertEqual(emitted_ids,
+                             {e["id"] for e in out["entries"]})
+            # history group carries the re-materialized viewed card
+            hist_p = [p for g, p in emitted if g == "history"][0]
+            self.assertEqual(
+                {h["id"] for h in out["history"]},
+                {h["id"] for h in hist_p.get("history") or []})
+            # the collect group's opening publish stamps boundary+range,
+            # its completion publish reports per-source status
+            first = [p for g, p in emitted if g == "collect"][0]
+            self.assertEqual(first["range"]["tip"]["commit"], rev(repo))
+            coll = [p for g, p in emitted if g == "collect" and
+                    p.get("complete")]
+            self.assertEqual(len(coll), 1)
+            for s in ("commits", "runs", "requests", "curated"):
+                self.assertEqual(coll[0]["sources"][s], "ok")
+
+    def test_tool_group_publishes_before_work_assembly(self):
+        """The Tool updates group publishes while the work digest's
+        card assembly is still gated - the first usable card never
+        waits on run-record detail."""
+        with tempfile.TemporaryDirectory() as td:
+            base, repo, r, q, m, c0, c1, st = self._fixture(td)
+            emitted = []
+            tool_seen = threading.Event()
+            allow_work = threading.Event()
+            self.addCleanup(allow_work.set)
+            real = tour_feeds._unreviewed_tasks
+
+            def gated(*a, **kw):
+                allow_work.wait(15)
+                return real(*a, **kw)
+
+            def emit(group, parts):
+                emitted.append((group, parts))
+                if group == "tool":
+                    tool_seen.set()
+
+            tour_feeds._unreviewed_tasks = gated
+            try:
+                done = []
+                t = threading.Thread(
+                    target=lambda: done.append(
+                        tour_feeds.build_feed(
+                            st, boundary(repo), repo_dir=repo,
+                            runs_dir=r, requests_dir=q,
+                            manifests_dir=m, emit=emit)),
+                    daemon=True)
+                t.start()
+                self.assertTrue(tool_seen.wait(15))
+                # tool cards are out while work assembly still blocks
+                groups = [g for g, _p in emitted]
+                self.assertNotIn("work", groups)
+                tool_entries = [e for g, p in emitted if g == "tool"
+                                for e in p["entries"]]
+                self.assertTrue(tool_entries)
+                self.assertTrue(all(e["section"] == "tool"
+                                    for e in tool_entries))
+            finally:
+                allow_work.set()
+            t.join(15)
+            groups = [g for g, _p in emitted]
+            self.assertLess(groups.index("tool"), groups.index("work"))
+            self.assertIn("history", groups)
+
+    def test_collectors_overlap_on_the_shared_pool(self):
+        """The four window scans run concurrently: each collector blocks
+        until all four have entered - a serial build would deadlock and
+        degrade to warnings, the pooled one doesn't."""
+        with tempfile.TemporaryDirectory() as td:
+            base, repo, r, q, m, c0, c1, st = self._fixture(td)
+            entered = []
+            release = threading.Event()
+            real = {"commits": tour_feeds.collect_commits,
+                    "runs": tour_feeds._iter_runs,
+                    "requests": tour_feeds._iter_requests,
+                    "curated": tour_feeds.load_curated}
+
+            def gate_fn(name):
+                def inner(*a, **kw):
+                    entered.append(name)
+                    if len(entered) == len(real):
+                        release.set()
+                    if not release.wait(15):
+                        raise RuntimeError(f"{name} ran alone")
+                    return real[name](*a, **kw)
+                return inner
+
+            saved = {k: getattr(tour_feeds, v.__name__)
+                     for k, v in real.items()}
+            try:
+                for k, v in saved.items():
+                    setattr(tour_feeds, v.__name__, gate_fn(k))
+                out = tour_feeds.build_feed(
+                    st, boundary(repo), repo_dir=repo, runs_dir=r,
+                    requests_dir=q, manifests_dir=m)
+            finally:
+                for k, v in saved.items():
+                    setattr(tour_feeds, v.__name__, v)
+            self.assertEqual(set(entered), set(real))
+            self.assertFalse([w for w in out["warnings"]
+                              if "scan failed" in w])
+            self.assertTrue(out["entries"])
+
+    def test_source_failure_degrades_to_a_warning(self):
+        """A collector that raises costs that source only: its warning
+        lands, every other group still builds, the feed returns."""
+        with tempfile.TemporaryDirectory() as td:
+            base, repo, r, q, m, c0, c1, st = self._fixture(td)
+            saved = tour_feeds._iter_runs
+            try:
+                tour_feeds._iter_runs = \
+                    lambda _p: (_ for _ in ()).throw(
+                        OSError("disk gone"))
+                emitted = []
+                out = tour_feeds.build_feed(
+                    st, boundary(repo), repo_dir=repo, runs_dir=r,
+                    requests_dir=q, manifests_dir=m,
+                    emit=lambda g, p: emitted.append((g, p)))
+            finally:
+                tour_feeds._iter_runs = saved
+            self.assertTrue(any("runs scan failed" in w
+                                for w in out["warnings"]))
+            # commit + request cards still made it
+            kinds = {e["kind"] for e in out["entries"]}
+            self.assertIn("change", kinds)
+            self.assertIn("request", kinds)
+            self.assertNotIn("run", kinds)
+            # and the collect group reported the failed source honestly
+            coll = [p for g, p in emitted if g == "collect"
+                    and p.get("complete")][0]
+            self.assertEqual(coll["sources"]["runs"], "error")
+            self.assertEqual(coll["sources"]["commits"], "ok")
+
+    def test_serial_and_parallel_builds_are_identical(self):
+        with tempfile.TemporaryDirectory() as td:
+            base, repo, r, q, m, c0, c1, st = self._fixture(td)
+            kw = dict(repo_dir=repo, runs_dir=r, requests_dir=q,
+                      manifests_dir=m)
+            serial = tour_feeds.build_feed(st, boundary(repo),
+                                           workers=1, **kw)
+            par = tour_feeds.build_feed(st, boundary(repo),
+                                        workers=4, **kw)
+            self.assertEqual(serial, par)
 
 
 class ProgressTests(unittest.TestCase):

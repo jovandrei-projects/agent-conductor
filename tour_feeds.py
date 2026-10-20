@@ -93,6 +93,7 @@ import os
 import re
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import tour_state
@@ -123,6 +124,29 @@ _WORK_KINDS = {"run", "request", "followup", "pipeline"}
 TAG_REQUEST = "ready"
 
 DEFAULT_FLAGS_DIR = Path(tempfile.gettempdir()) / "agent-conductor-flags"
+
+# Bounded collector concurrency: the four independent window scans (commit
+# log, run dirs, request records, curated jsonl) plus merge-chain lookups
+# share one pool per build - never more than this many git/fs calls at once.
+_COLLECT_WORKERS = 4
+# The window scans, in the order callers/tests expect their stages and
+# warnings to appear.
+_SOURCE_ORDER = ("commits", "runs", "requests", "curated")
+_SOURCE_STAGE = {
+    "commits": "reading commit log",
+    "runs": "loading run records",
+    "requests": "loading requests",
+}
+_SOURCE_DONE = {
+    "commits": "commit log collected",
+    "runs": "run records collected",
+    "requests": "requests collected",
+    "curated": "curated records collected",
+}
+_SOURCE_LABEL = {
+    "commits": "commits", "runs": "runs",
+    "requests": "requests", "curated": "curated",
+}
 
 # ------------------------------------------------------------------- stops
 # The tour's feature-area -> DOM anchor registry. Every selector names an
@@ -651,11 +675,94 @@ def _resolve_curated(records: list[dict], commits: list[dict],
     return cards, claimed, augments, aug_shas
 
 
+def _source_tasks(rng: dict, *, repo_dir: Path, runs_dir: Path,
+                  requests_dir: Path, manifests_dir: Path) -> dict:
+    """The four independent collectors for one window as {name: fn}.
+    Each returns the partial sources dict it fills and has no shared
+    mutable state, so they can run on a shared pool."""
+    base, tip = rng.get("base") or {}, rng.get("tip") or {}
+
+    def _commits():
+        commits, warn = collect_commits(repo_dir, base.get("commit"),
+                                        tip.get("commit"))
+        return {"commits": commits, "commit_warn": warn}
+
+    def _runs():
+        return {"runs_all": _iter_runs(runs_dir)}
+
+    def _requests():
+        return {"reqs_all": _iter_requests(requests_dir)}
+
+    def _curated():
+        records, warns = load_curated(manifests_dir)
+        return {"curated": records, "curated_warns": warns}
+
+    return {"commits": _commits, "runs": _runs,
+            "requests": _requests, "curated": _curated}
+
+
+def _source_run(name: str, fn) -> tuple[str, dict, str | None]:
+    """Run one collector into a (name, partial-sources, error) triple -
+    a source that raises degrades to an empty partial result so the
+    window keeps every other collection."""
+    try:
+        return name, fn(), None
+    except Exception as exc:                            # noqa: BLE001
+        return name, {}, f"{_SOURCE_LABEL[name]} scan failed: {exc}"
+
+
+def _collect_sources(tasks: dict, *, pool=None, warnings=None,
+                     progress=None, on_source=None) -> dict:
+    """Reduce one window's collectors into the sources dict.
+
+    Serial without a pool; with one, the independent scans overlap
+    (bounded by the pool's size) and gather on the caller's thread, so
+    no result dict is ever shared across workers. Per-source warnings
+    land in _SOURCE_ORDER regardless of completion order, and
+    ``on_source(name, error)`` reports each completion for staged
+    progress."""
+    def _stage(s: str | None) -> None:
+        if s and progress:
+            progress(s)
+
+    out = {"commits": [], "commit_warn": None, "runs_all": [],
+           "reqs_all": [], "curated": [], "curated_warns": []}
+    warns: dict[str, str] = {}
+    if pool is None:
+        for name in _SOURCE_ORDER:
+            _stage(_SOURCE_STAGE.get(name))
+            _, res, err = _source_run(name, tasks[name])
+            out.update(res)
+            if err:
+                warns[name] = err
+            else:
+                _stage(_SOURCE_DONE[name])
+            if on_source is not None:
+                on_source(name, err)
+    else:
+        for name in _SOURCE_ORDER:
+            _stage(_SOURCE_STAGE.get(name))
+        futs = {name: pool.submit(_source_run, name, tasks[name])
+                for name in _SOURCE_ORDER}
+        for fut in as_completed(futs.values()):
+            name, res, err = fut.result()      # _source_run never raises
+            out.update(res)
+            if err:
+                warns[name] = err
+            else:
+                _stage(_SOURCE_DONE[name])
+            if on_source is not None:
+                on_source(name, err)
+    if warnings is not None:
+        warnings.extend(warns[n] for n in _SOURCE_ORDER if n in warns)
+    return out
+
+
 def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
                     requests_dir: Path, manifests_dir: Path,
                     warnings: list[str], polish=None,
                     flags_dir: Path = DEFAULT_FLAGS_DIR,
-                    progress=None) -> list[dict]:
+                    progress=None, pool=None, emit=None) -> list[dict]:
     """Raw feed entries for one {base,tip} window - no state annotation.
     Reused by build_feed (live window) and history (stored windows).
 
@@ -666,22 +773,47 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
     curated cards, leftover commits - stays deterministic.
 
     ``progress`` is an optional ``(stage: str) -> None`` hook called at
-    phase boundaries - the dashboard's loading screen narrates it."""
+    phase boundaries - the dashboard's loading screen narrates it.
+
+    ``pool`` is an optional shared ThreadPoolExecutor used for the four
+    independent window scans and for merge-chain lookups (submissions
+    only ever come from this thread - pool workers never submit, so the
+    bounded pool can't deadlock).
+
+    ``emit`` is the staged-publish hook ``emit(group, parts)``: interim
+    'collect' parts carry ``{"sources": {name: 'ok'|'error'}}`` (with
+    ``"complete": True`` once every scan resolved); 'tool' and 'work'
+    parts carry ``{"entries": [raw cards]}`` - raw, unannotated cards,
+    emitted as soon as each group is assembled so a caller can publish
+    tool updates while the work digest is still being built. Raw card
+    dicts stay owned by this window's result - sinks must copy, never
+    mutate."""
     def _stage(s: str) -> None:
         if progress:
             progress(s)
 
     base, tip = rng.get("base") or {}, rng.get("tip") or {}
-    _stage("reading commit log")
-    commits, warn = collect_commits(repo_dir, base.get("commit"),
-                                    tip.get("commit"))
+    seen_src: dict[str, str] = {}
+
+    def _src_done(name: str, err: str | None) -> None:
+        seen_src[name] = "error" if err else "ok"
+        if emit is not None:
+            emit("collect", {"sources": dict(seen_src),
+                             "complete": False})
+
+    sources = _collect_sources(
+        _source_tasks(rng, repo_dir=repo_dir, runs_dir=runs_dir,
+                      requests_dir=requests_dir,
+                      manifests_dir=manifests_dir),
+        pool=pool, warnings=warnings, progress=progress,
+        on_source=_src_done)
+    if emit is not None:
+        emit("collect", {"sources": dict(seen_src), "complete": True})
+    commits, warn = sources["commits"], sources["commit_warn"]
     if warn:
         warnings.append(warn)
-
-    _stage("loading run records")
-    runs_all = _iter_runs(runs_dir)
-    _stage("loading requests")
-    reqs_all = _iter_requests(requests_dir)
+    runs_all = sources["runs_all"]
+    reqs_all = sources["reqs_all"]
     # association maps over ALL records, not just the window's
     key_by_dir = {d: _run_key(d, st, p) for d, p, st in runs_all}
     run_key_by_req = {st.get("request_id"): _run_key(d, st, p)
@@ -710,11 +842,10 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
     # ---- curated records (claims resolve before cards form so a change
     # never appears both curated and raw)
     _stage("resolving curated updates")
-    curated, warns = load_curated(manifests_dir)
-    warnings.extend(warns)
+    warnings.extend(sources["curated_warns"])
     cards, claimed, augments, aug_shas = _resolve_curated(
-        curated, commits, win_reqs, win_runs, run_key_of, repo_dir,
-        warnings)
+        sources["curated"], commits, win_reqs, win_runs, run_key_of,
+        repo_dir, warnings)
     fold_req = {}                       # request id -> rec
     fold_run = {}                       # run key -> rec
     for rec in augments.get("records", []):
@@ -759,18 +890,143 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
         if has_run:
             pipe[rid] = launched
 
-    # ---- run cards (finished runs) + conductor-merge attribution
+    # ---- conductor-merge attribution: a merge naming an in-window run
+    # claims its whole chain for that run's card. Chain lookups are
+    # independent git calls - the shared pool overlaps them.
     run_by_dir = {d: k for k, (d, _p, _st) in win_runs.items()}
+    need_chains = {c["sha"]: run_by_dir[c["merge"][0]] for c in commits
+                   if c["merge"] and c["merge"][0] in run_by_dir
+                   and run_by_dir[c["merge"][0]] not in suppress_run}
+    if pool is not None and len(need_chains) > 1:
+        chain_futs = {s: pool.submit(_merged_chain, repo_dir, s)
+                      for s in need_chains}
+        chains = {s: f.result() for s, f in chain_futs.items()}
+    else:
+        chains = {s: _merged_chain(repo_dir, s) for s in need_chains}
     claim_to_run: dict[str, str] = {}     # commit sha -> run key
+    for sha, rk in need_chains.items():
+        claim_to_run[sha] = rk
+        for chain_sha in chains.get(sha, ()):
+            claim_to_run.setdefault(chain_sha, rk)
+    # ---- Tool updates first: commit/curated cards assemble from the
+    # shared maps and publish before the work digest so the first usable
+    # card is never behind run-directory detail scans.
+    # Validated LLM groupings first (they claim the commits they name),
+    # then deterministic area grouping for the rest. A polished card
+    # keeps the deterministic id scheme (area:<stop>:<newest-sha>) so
+    # persisted viewed/snoozed descriptors re-resolve identically;
+    # curated fold-ins still win over generated text, and record links
+    # are re-filtered against this window's real records.
+    _stage("assembling cards")
+    tool: list[dict] = []
+    grouped: set[str] = set()
+    aug_used: set[str] = set()
+    try:
+        polished = polish(rng) if callable(polish) else None
+    except Exception:                                    # noqa: BLE001
+        polished = None         # a broken enrichment hook never breaks
+        #                       # the deterministic feed
+    if polished:
+        free = {c["sha"]: c for c in commits
+                if c["sha"] not in claimed and c["sha"] not in claim_to_run}
+        for card in polished:
+            if not isinstance(card, dict):
+                continue
+            stop, title, blurb = (card.get("stop"), card.get("title"),
+                                  card.get("blurb"))
+            if not isinstance(stop, str) or not stop \
+                    or not isinstance(title, str) \
+                    or not isinstance(blurb, str):
+                continue
+            want = {s for s in (card.get("commits") or [])
+                    if isinstance(s, str)}
+            cs = [c for c in commits
+                  if c["sha"] in want and c["sha"] in free
+                  and c["sha"] not in grouped]
+            if not cs:
+                continue
+            grouped.update(c["sha"] for c in cs)
+            # a curated fold-in still wins over generated text: first the
+            # augment naming this stop, else an augment whose claimed
+            # commits this card grouped under a different stop
+            aug_key = (stop if stop in augments and stop != "records"
+                       and stop not in aug_used else None)
+            if aug_key is None:
+                cshas = {c["sha"] for c in cs}
+                aug_key = next((k for k, shas in aug_shas.items()
+                                if k not in aug_used and shas & cshas),
+                               None)
+            aug = augments.get(aug_key) if aug_key is not None else None
+            if aug is not None:
+                aug_used.add(aug_key)
+            tag = card.get("tag")
+            tool.append({
+                "id": f"area:{stop}:{cs[0]['sha'][:_CARD_KM]}",
+                "kind": "change", "stop": stop,
+                "title": (aug["title"] if aug and aug["title"]
+                          else _short(title, _TITLE_MAX)),
+                "blurb": aug["blurb"] if aug
+                         else _short(blurb, _BLURB_MAX),
+                "tag": _card_tag(cs, (aug["tag"] if aug else
+                                      (tag if tag in TAGS else None))),
+                "commits": [{"sha": c["sha"], "subject": c["subject"]}
+                            for c in cs],
+                "runs": [r for r in (card.get("runs") or [])
+                         if r in win_runs],
+                "requests": [r for r in (card.get("requests") or [])
+                             if r in win_reqs],
+                "at": cs[0]["at"], "range": rng, "polished": True})
+    groups: dict[str, list[dict]] = {}
     for c in commits:
-        if c["merge"] and c["merge"][0] in run_by_dir \
-                and run_by_dir[c["merge"][0]] not in suppress_run:
-            rk = run_by_dir[c["merge"][0]]
-            claim_to_run[c["sha"]] = rk
-            for chain_sha in _merged_chain(repo_dir, c["sha"]):
-                claim_to_run.setdefault(chain_sha, rk)
+        if c["sha"] in claimed or c["sha"] in claim_to_run \
+                or c["sha"] in grouped:
+            continue
+        groups.setdefault(_commit_area(c["subject"], c["files"]),
+                          []).append(c)
+    for area, cs in groups.items():
+        aug = augments.get(area) if area != "records" \
+            and area not in aug_used else None
+        if aug is not None:
+            aug_used.add(area)
+        subjects = [c["subject"] for c in cs]
+        title = (aug["title"] if aug and aug["title"]
+                 else (_short(subjects[0], _TITLE_MAX) if len(cs) == 1
+                       else f"{_stop_title(area)} - {len(cs)} changes"))
+        blurb = (aug["blurb"] if aug else
+                 _short(" · ".join(subjects[:3])
+                        + (f" (+{len(cs) - 3} more)" if len(cs) > 3
+                           else ""), _BLURB_MAX))
+        tool.append({
+            "id": f"area:{area}:{cs[0]['sha'][:_CARD_KM]}",
+            "kind": "change", "stop": area, "title": title,
+            "blurb": blurb, "tag": _card_tag(cs, aug["tag"] if aug else None),
+            "commits": [{"sha": c["sha"], "subject": c["subject"]}
+                        for c in cs],
+            "runs": [], "requests": [],
+            "at": cs[0]["at"], "range": rng})
 
-    entries: list[dict] = []
+    # ---- dedicated curated cards (claims spanning areas, or naming a
+    # stop different from the commits' own grouping)
+    for card in cards:
+        rec, cs = card["rec"], card["commits"]
+        title = rec["title"] or (_short(cs[0]["subject"], _TITLE_MAX)
+                                 if len(cs) == 1 else
+                                 _stop_title(card["stop"]))
+        tool.append({
+            "id": card["id"], "kind": "curated", "stop": card["stop"],
+            "title": title, "blurb": rec["blurb"],
+            "tag": _card_tag(cs, rec["tag"]),
+            "commits": [{"sha": c["sha"], "subject": c["subject"]}
+                        for c in cs],
+            "runs": card["runs"], "requests": card["requests"],
+            "at": (cs[0]["at"] if cs else rec["at"] or tip.get("at")),
+            "range": rng})
+    if emit is not None:
+        emit("tool", {"entries": tool})
+
+    # ---- work digest: finished runs' cards + conductor-merge
+    # attribution, then standalone request/follow-up cards
+    work: list[dict] = []
     cards_for_rid: dict[str, dict] = {}   # rid -> its emitted card
     for key, (dname, dirp, st) in win_runs.items():
         if key in suppress_run:
@@ -818,7 +1074,7 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
             e["covers"] = [f"followup:{rid}" if _is_followup_request(prec)
                            else f"request:{rid}"]
             cards_for_rid[rid] = e
-        entries.append(e)
+        work.append(e)
 
     # ---- request + follow-up cards (events whose counterparts fell in
     # a different window stay standalone)
@@ -860,7 +1116,7 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
                  "runs": [launched] if launched else [],
                  "at": rec.get("created_at"), "range": rng,
                  "proposed_at": rec.get("created_at")}
-        entries.append(e)
+        work.append(e)
         cards_for_rid[rid] = e
 
     # ---- fold follow-up proposals into their associated request's
@@ -881,7 +1137,7 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
                        or (run_key_of(rec["source_run"])
                            if rec.get("source_run") else None))
             label = rec.get("label") or rec.get("raw") or frid
-            entries.append({
+            work.append({
                 "id": f"followup:{frid}", "kind": "followup",
                 "stop": "requests",
                 "title": f"Follow-up proposal: {_short(label, 80)}",
@@ -908,118 +1164,9 @@ def _collect_window(rng: dict, *, repo_dir: Path, runs_dir: Path,
             "runs": ([src_key] if src_key else [])
                     + ([launched] if launched else [])})
         card.setdefault("covers", []).append(f"followup:{frid}")
-
-    # ---- commit cards: validated LLM groupings first (they claim the
-    # commits they name), then deterministic area grouping for the rest.
-    # A polished card keeps the deterministic id scheme
-    # (area:<stop>:<newest-sha>) so persisted viewed/snoozed descriptors
-    # re-resolve identically; curated fold-ins still win over generated
-    # text, and record links are re-filtered against this window's real
-    # records.
-    _stage("assembling cards")
-    grouped: set[str] = set()
-    aug_used: set[str] = set()
-    try:
-        polished = polish(rng) if callable(polish) else None
-    except Exception:                                    # noqa: BLE001
-        polished = None         # a broken enrichment hook never breaks
-        #                       # the deterministic feed
-    if polished:
-        free = {c["sha"]: c for c in commits
-                if c["sha"] not in claimed and c["sha"] not in claim_to_run}
-        for card in polished:
-            if not isinstance(card, dict):
-                continue
-            stop, title, blurb = (card.get("stop"), card.get("title"),
-                                  card.get("blurb"))
-            if not isinstance(stop, str) or not stop \
-                    or not isinstance(title, str) \
-                    or not isinstance(blurb, str):
-                continue
-            want = {s for s in (card.get("commits") or [])
-                    if isinstance(s, str)}
-            cs = [c for c in commits
-                  if c["sha"] in want and c["sha"] in free
-                  and c["sha"] not in grouped]
-            if not cs:
-                continue
-            grouped.update(c["sha"] for c in cs)
-            # a curated fold-in still wins over generated text: first the
-            # augment naming this stop, else an augment whose claimed
-            # commits this card grouped under a different stop
-            aug_key = (stop if stop in augments and stop != "records"
-                       and stop not in aug_used else None)
-            if aug_key is None:
-                cshas = {c["sha"] for c in cs}
-                aug_key = next((k for k, shas in aug_shas.items()
-                                if k not in aug_used and shas & cshas),
-                               None)
-            aug = augments.get(aug_key) if aug_key is not None else None
-            if aug is not None:
-                aug_used.add(aug_key)
-            tag = card.get("tag")
-            entries.append({
-                "id": f"area:{stop}:{cs[0]['sha'][:_CARD_KM]}",
-                "kind": "change", "stop": stop,
-                "title": (aug["title"] if aug and aug["title"]
-                          else _short(title, _TITLE_MAX)),
-                "blurb": aug["blurb"] if aug
-                         else _short(blurb, _BLURB_MAX),
-                "tag": _card_tag(cs, (aug["tag"] if aug else
-                                      (tag if tag in TAGS else None))),
-                "commits": [{"sha": c["sha"], "subject": c["subject"]}
-                            for c in cs],
-                "runs": [r for r in (card.get("runs") or [])
-                         if r in win_runs],
-                "requests": [r for r in (card.get("requests") or [])
-                             if r in win_reqs],
-                "at": cs[0]["at"], "range": rng, "polished": True})
-    groups: dict[str, list[dict]] = {}
-    for c in commits:
-        if c["sha"] in claimed or c["sha"] in claim_to_run \
-                or c["sha"] in grouped:
-            continue
-        groups.setdefault(_commit_area(c["subject"], c["files"]),
-                          []).append(c)
-    for area, cs in groups.items():
-        aug = augments.get(area) if area != "records" \
-            and area not in aug_used else None
-        if aug is not None:
-            aug_used.add(area)
-        subjects = [c["subject"] for c in cs]
-        title = (aug["title"] if aug and aug["title"]
-                 else (_short(subjects[0], _TITLE_MAX) if len(cs) == 1
-                       else f"{_stop_title(area)} - {len(cs)} changes"))
-        blurb = (aug["blurb"] if aug else
-                 _short(" · ".join(subjects[:3])
-                        + (f" (+{len(cs) - 3} more)" if len(cs) > 3
-                           else ""), _BLURB_MAX))
-        entries.append({
-            "id": f"area:{area}:{cs[0]['sha'][:_CARD_KM]}",
-            "kind": "change", "stop": area, "title": title,
-            "blurb": blurb, "tag": _card_tag(cs, aug["tag"] if aug else None),
-            "commits": [{"sha": c["sha"], "subject": c["subject"]}
-                        for c in cs],
-            "runs": [], "requests": [],
-            "at": cs[0]["at"], "range": rng})
-
-    # ---- dedicated curated cards (claims spanning areas, or naming a
-    # stop different from the commits' own grouping)
-    for card in cards:
-        rec, cs = card["rec"], card["commits"]
-        title = rec["title"] or (_short(cs[0]["subject"], _TITLE_MAX)
-                                 if len(cs) == 1 else
-                                 _stop_title(card["stop"]))
-        entries.append({
-            "id": card["id"], "kind": "curated", "stop": card["stop"],
-            "title": title, "blurb": rec["blurb"],
-            "tag": _card_tag(cs, rec["tag"]),
-            "commits": [{"sha": c["sha"], "subject": c["subject"]}
-                        for c in cs],
-            "runs": card["runs"], "requests": card["requests"],
-            "at": (cs[0]["at"] if cs else rec["at"] or tip.get("at")),
-            "range": rng})
-    return entries
+    if emit is not None:
+        emit("work", {"entries": work})
+    return work + tool
 
 
 def _rematerialize(desc: dict, collect) -> dict:
@@ -1061,7 +1208,8 @@ def build_feed(state: dict | None = None, boundary: dict | None = None,
                manifests_dir: Path = DEFAULT_MANIFESTS_DIR,
                flags_dir: Path | None = None,
                now: float | None = None, polish=None,
-               progress=None) -> dict:
+               progress=None, emit=None, workers: int | None = None,
+               _pool=None) -> dict:
     """The full tour feed for the current watermark + boundary.
 
     ``entries`` = window cards still needing eyes (state 'new' or
@@ -1077,7 +1225,20 @@ def build_feed(state: dict | None = None, boundary: dict | None = None,
     so polished cards reproduce the same ids a descriptor recorded.
 
     ``progress`` is an optional ``(stage: str) -> None`` hook the
-    dashboard's loading screen narrates while the build runs."""
+    dashboard's loading screen narrates while the build runs.
+
+    ``emit`` is the optional staged-delivery hook ``emit(group, parts)``
+    the server uses to publish progressively: each group's parts arrive
+    already state-annotated and viewed-filtered, with ``warnings``
+    attached - 'collect' (``sources`` status + the live
+    ``boundary``/``range``), 'tool' and 'work' (``entries``), and
+    'history' (``entries`` reinjections + ``history`` cards). A
+    ``workers`` count bounds the shared collection pool (default
+    _COLLECT_WORKERS; 1 keeps every scan serial); ``_pool`` lets a
+    caller inject its own bounded executor instead. The emitted groups
+    are exactly the same cards the returned payload carries - nothing
+    extra and nothing missing, so serial, parallel and staged builds
+    are identical."""
     def _stage(s: str) -> None:
         if progress:
             progress(s)
@@ -1087,6 +1248,37 @@ def build_feed(state: dict | None = None, boundary: dict | None = None,
     boundary = boundary or tour_state.capture_boundary(repo_dir, now=now)
     rng = tour_state.feed_range(state, boundary)
     warnings: list[str] = []
+
+    def annotate(e: dict) -> dict:
+        e = dict(e)
+        if "state" not in e:
+            e["state"] = tour_state.entry_state(state, e["id"])
+        e["anchor"] = _anchor(e.get("stop"))
+        e["stop_title"] = _stop_title(e.get("stop"))
+        e["section"] = _section(e)
+        e["section_title"] = SECTIONS[e["section"]]
+        return e
+
+    def _emit(group: str, parts: dict) -> None:
+        """Annotate + viewed-filter a raw group, then forward it to the
+        caller's sink. Emitted entries already look like the final
+        payload's, so a published snapshot never deals a viewed card.
+        A broken sink never breaks the feed."""
+        if emit is None:
+            return
+        out = dict(parts)
+        for k in ("entries", "history"):
+            if out.get(k) is not None:
+                out[k] = [annotate(e) for e in out[k]]
+        if out.get("entries") is not None:
+            out["entries"] = [e for e in out["entries"]
+                              if e["state"] != "viewed"]
+        out["warnings"] = list(warnings)
+        try:
+            emit(group, out)
+        except Exception:                                # noqa: BLE001
+            pass
+
     kw = dict(repo_dir=repo_dir, runs_dir=runs_dir,
               requests_dir=requests_dir, manifests_dir=manifests_dir,
               polish=polish, progress=progress,
@@ -1102,51 +1294,68 @@ def build_feed(state: dict | None = None, boundary: dict | None = None,
         rng = {"base": {"commit": None, "at": rng["base"].get("at")},
                "tip": rng["tip"]}
 
-    # One collection per distinct range per build: the live window and
-    # every descriptor's stored window share this memo (descriptors of
-    # one acknowledgment round usually record the SAME range). Entries
-    # are copied before card assembly annotates them - the shared
-    # results themselves are never mutated.
-    collected: dict[tuple, list[dict]] = {}
+    n_workers = _COLLECT_WORKERS if workers is None else workers
+    pool = _pool if _pool is not None else (
+        ThreadPoolExecutor(max_workers=n_workers)
+        if n_workers and n_workers > 1 else None)
+    try:
+        # One collection per distinct range per build: the live window
+        # and every descriptor's stored window share this memo
+        # (descriptors of one acknowledgment round usually record the
+        # SAME range). Entries are copied before card assembly annotates
+        # them - the shared results themselves are never mutated.
+        collected: dict[tuple, list[dict]] = {}
 
-    def collect(r: dict) -> list[dict]:
-        key = _range_key(r)
-        if key not in collected:
-            collected[key] = _collect_window(r, warnings=warnings, **kw)
-        return collected[key]
+        def collect(r: dict) -> list[dict]:
+            key = _range_key(r)
+            if key not in collected:
+                collected[key] = _collect_window(
+                    r, warnings=warnings, pool=pool, **kw)
+            return collected[key]
 
-    entries = [dict(e) for e in collect(rng)]
-    seen_ids = {e["id"] for e in entries}
-    _stage("rebuilding viewed history")
-    hist: dict[str, dict] = {}
-    for desc in tour_state.entries(state):
-        if desc["state"] == "viewed":
-            h = _rematerialize(desc, collect)
-            h["state"] = "viewed"
-            for k in ("viewed_at", "snoozed_at", "unviewed_at"):
-                if desc.get(k):
-                    h[k] = desc[k]
-            # two descriptors can resolve to the same card (a folded
-            # pipeline covers the standalone request id): keep one -
-            # prefer a real card over a lost-window stub, and an
-            # exact-id descriptor over a covered one
-            if h["id"] not in hist or not h.get("unavailable") and (
-                    hist[h["id"]].get("unavailable")
-                    or desc["id"] == h["id"]):
-                hist[h["id"]] = h
-        elif desc["id"] in seen_ids:
-            continue                        # already live in the deck
-        else:
-            # snoozed deferral or an explicitly unviewed card whose
-            # producing window is already behind the watermark - it
-            # still belongs to the tour. Skip when a live folded card
-            # already covers its id (no duplicate of the same event).
-            e = _rematerialize(desc, collect)
-            if e["id"] in seen_ids:
-                continue
-            entries.append(e)
-            seen_ids.add(e["id"])
-    history = list(hist.values())
+        _emit("collect", {"boundary": boundary, "range": rng,
+                          "sources": {}, "complete": False})
+        live = _collect_window(rng, warnings=warnings, pool=pool,
+                               emit=_emit, **kw)
+        collected[_range_key(rng)] = live
+        entries = [dict(e) for e in live]
+        seen_ids = {e["id"] for e in entries}
+        _stage("rebuilding viewed history")
+        hist: dict[str, dict] = {}
+        reinjects: list[dict] = []
+        for desc in tour_state.entries(state):
+            if desc["state"] == "viewed":
+                h = _rematerialize(desc, collect)
+                h["state"] = "viewed"
+                for k in ("viewed_at", "snoozed_at", "unviewed_at"):
+                    if desc.get(k):
+                        h[k] = desc[k]
+                # two descriptors can resolve to the same card (a folded
+                # pipeline covers the standalone request id): keep one -
+                # prefer a real card over a lost-window stub, and an
+                # exact-id descriptor over a covered one
+                if h["id"] not in hist or not h.get("unavailable") and (
+                        hist[h["id"]].get("unavailable")
+                        or desc["id"] == h["id"]):
+                    hist[h["id"]] = h
+            elif desc["id"] in seen_ids:
+                continue                        # already live in the deck
+            else:
+                # snoozed deferral or an explicitly unviewed card whose
+                # producing window is already behind the watermark - it
+                # still belongs to the tour. Skip when a live folded card
+                # already covers its id (no duplicate of the same event).
+                e = _rematerialize(desc, collect)
+                if e["id"] in seen_ids:
+                    continue
+                entries.append(e)
+                reinjects.append(e)
+                seen_ids.add(e["id"])
+        history = list(hist.values())
+        _emit("history", {"entries": reinjects, "history": history})
+    finally:
+        if pool is not None and _pool is None:
+            pool.shutdown(wait=True)
 
     for e in entries + history:
         if "state" not in e:
