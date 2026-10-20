@@ -2393,9 +2393,9 @@ assert.match(html,/merge 2 pending/);
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_repos_modal_progressive_scan_and_links(self):
         """The modal walks GET /api/repos/<name> one repo at a time: the
-        status line narrates 'scanning <name> · i of n', not-yet-scanned
-        repos show queued/scanning placeholders, a {quiet:true} answer
-        folds into the footnote, a per-repo error stays a section-local
+        status line narrates 'scanning <name> · i of n' with NO
+        per-repo skeleton placeholders, a {quiet:true} answer folds
+        into the footnote, a per-repo error stays a section-local
         notice (the rest still render), and merge affordances are
         link-styled on fixed-layout tables."""
         js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
@@ -2438,11 +2438,11 @@ const sectA={name:'a',path:'/a',base:'main',
   await vm.runInContext('fetchRepos(true)',ctx);
   assert.deepEqual(calls,['/api/repos','/api/repos/a?fresh=1',
     '/api/repos/b?fresh=1','/api/repos/c?fresh=1']);
-  // mid-scan: 'a' narrates as scanning, b/c queued behind it
+  // mid-scan: 'a' narrates as scanning; no skeleton blocks for b/c
   assert.match(snapshots['/api/repos/a?fresh=1'],
     /scanning <b>a<\/b> &middot; 1 of 3/);
-  assert.match(snapshots['/api/repos/a?fresh=1'],
-    /<h4>b <span class="sub">\/b<\/span>[\s\S]*queued/);
+  assert.doesNotMatch(snapshots['/api/repos/a?fresh=1'],
+    /queued|scanning&hellip;/);
   // mid-scan after a landed: its section rendered, b narrating
   assert.match(snapshots['/api/repos/b?fresh=1'],
     /scanning <b>b<\/b> &middot; 2 of 3/);

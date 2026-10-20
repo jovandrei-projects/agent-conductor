@@ -390,26 +390,35 @@ def acp_main():
             rid, sid, rec = pending
             pending = None
             reply = rec["reply"]
-            if os.environ.get("FAKE_ACP_SNAPSHOT"):
-                _acp_update(sid, {"sessionUpdate": "agent_message_chunk",
-                                  "content": {"type": "text",
-                                              "text": reply[:len(reply)//2]},
-                                  "_meta": {"cognition.ai/timestamp":
-                                            next_ts()}})
-                _acp_update(sid, {"sessionUpdate": "agent_message_chunk",
-                                  "content": {"type": "text",
-                                              "text": reply},
-                                  "_meta": {"cognition.ai/timestamp":
-                                            next_ts()}})
-            else:
+            # FAKE_ACP_NO_TS / FAKE_ACP_CONST_TS imitate hosts whose live
+            # deltas carry no timestamp or a shared one - the dedup sig
+            # collapses every repeated fragment unless the adapter only
+            # dedups replay-stamped chunks. Replayed history always keeps
+            # its real timestamps.
+            live_meta = None
+            if os.environ.get("FAKE_ACP_CONST_TS"):
+                live_meta = {"cognition.ai/timestamp": "ts-turn"}
+            elif not os.environ.get("FAKE_ACP_NO_TS"):
+                def live_meta():  # noqa: F811 - per-chunk unique ts
+                    return {"cognition.ai/timestamp": next_ts()}
+            def _meta_of():
+                return live_meta() if callable(live_meta) else live_meta
+            chunks = None
+            if os.environ.get("FAKE_CHUNKS"):
+                # verbatim delta list - lets a test emit repeated
+                # fragment texts (the live-dedup corruption case)
+                chunks = json.loads(os.environ["FAKE_CHUNKS"])
+            if chunks is None and os.environ.get("FAKE_ACP_SNAPSHOT"):
+                chunks = [reply[:len(reply)//2], reply]
+            if chunks is None:
                 mid = max(1, len(reply) // 2)
-                for part in (reply[:mid], reply[mid:]):
-                    _acp_update(sid, {"sessionUpdate":
-                                      "agent_message_chunk",
-                                      "content": {"type": "text",
-                                                  "text": part},
-                                      "_meta": {"cognition.ai/timestamp":
-                                                next_ts()}})
+                chunks = [reply[:mid], reply[mid:]]
+            for part in chunks:
+                _acp_update(sid, {"sessionUpdate":
+                                  "agent_message_chunk",
+                                  "content": {"type": "text",
+                                              "text": part},
+                                  "_meta": _meta_of()})
             _acp_update(sid, {"sessionUpdate": "agent_thought_chunk",
                               "content": {"type": "text",
                                           "text": "thoughts..."},

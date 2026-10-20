@@ -15329,10 +15329,10 @@ h3.proj .sub { margin-bottom:0; font-weight:400; }
    column widths regardless of content - the act column (and its merge
    link) can never get squeezed off-screen by a fat commit list */
 #detail table.repotab { table-layout:fixed; width:100%; }
-#detail table.repotab col.c-wt { width:41%; }
-#detail table.repotab col.c-vs { width:16%; }
+#detail table.repotab col.c-wt { width:33%; }
+#detail table.repotab col.c-vs { width:23%; }
 #detail table.repotab col.c-cond { width:17%; }
-#detail table.repotab col.c-path { width:18%; }
+#detail table.repotab col.c-path { width:19%; }
 #detail table.repotab col.c-act { width:8%; }
 #detail table.repotab td, #detail table.repotab th {
   padding-right:18px; }
@@ -19929,7 +19929,9 @@ function wtRow(w, r){
   }
   let h = `<tr><td class="wrap"><code>${esc(w.branch||'(detached)')}` +
     `</code>${staging}${cmts}</td>` +
-    `<td>${ws.join(' ')}${rec}</td>` +
+    // wrap: 'up to date' + 'dirty' + 'N behind' chips stack rather
+    // than ellipsis-clip inside the fixed vs column
+    `<td class="wrap">${ws.join(' ')}${rec}</td>` +
     `<td class="wrap">${link}</td>` +
     `<td class="wrap"><span class="sub rpath" title="${esc(w.path)}">` +
     `${esc(tailPath(w.path))}</span></td>` +

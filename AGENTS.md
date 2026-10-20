@@ -1044,6 +1044,13 @@ provider sessions register in the assistant workspace's own cwd-scoped
 only run-recorded ids - so leaks surface there and die by
 `devin rm <id>` (the id is in `exchanges.provider_session_id`), while
 a crashed serve leaves live children adoptable via reconcile() by pid.
+ACP chunk dedup exists ONLY for `session/load` replayed history
+(timestamped chunks re-sent verbatim). Live `agent_message_chunk`
+deltas may carry no `_meta` timestamp or a shared one - deduping them
+on (kind,ts,text) silently eats every repeated fragment (markdown
+repeats bullets/backticks constantly); the 'garbled answer' incident
+of 2026-10-20 was exactly that. Only `turn is ws.replay` may add sigs;
+a live turn only rejects sigs seeded from the replay set.
 
 ## Traps
 
