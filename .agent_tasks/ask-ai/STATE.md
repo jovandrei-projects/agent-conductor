@@ -1160,3 +1160,57 @@ and reconcile adoption. Commit bf2000a.
   per family (swe-2 has no fast variant; resolution errors name verified
   alternatives, e.g. `gpt-6-luna-<effort>-priority`).
 - Phone access is out of scope (loopback-only dashboard boundary).
+
+## Implemented (chat-font, wave step of run 20261020-030142-whats-new-polish)
+
+Chat prose moved off the inherited dashboard monospace onto a system
+sans stack; code stays mono. `assistant/static/chat.css` only:
+
+- `#aichat` (panel root), `#ai-rail`, `#aiset` declare
+  `font-family: system-ui, -apple-system, "Segoe UI", Inter, Roboto,
+  "Helvetica Neue", Arial, sans-serif`. Every `font: inherit` child
+  picks it up: message text (`.aim-body` + rendered markdown
+  p/h/ul/ol/blockquote/.mdtable/a), meta lines, action cards, usage
+  readouts, notice strip, rail titles + rename input, settings
+  labels/selects, and the composer - `#ai-text` keeps `font: inherit`,
+  which is what routes a textarea past its UA widget font to the panel
+  stack. System lookups only: no @import/@font-face/url().
+- Pinned to the dashboard stack `ui-monospace,Consolas,monospace`:
+  `.aim-body code` (code pills, both bubble colors),
+  `.aim-body .mdpre` (+ `.mdpre code` via `font-family: inherit`),
+  `.act-params`, `.act-tgt` (literal k=v/JSON/target strings).
+- `#aifab`/`#dask` keep the shell font deliberately - they sit fused
+  with dashboard chrome (FAB floats over the page, #dask pins beside
+  the modal's Close X).
+- Untouched by contract: UI scale (13px prose/12px pre), spacing,
+  wrapping (`overflow-wrap: anywhere` + `word-break: break-word`,
+  `white-space: pre-wrap`), pill contrast (rgba(110,118,129,.16) +
+  #a5d6ff, white-on-blue variant). Header comment updated to record
+  the typography split.
+
+Tests: `tests/test_assistant_ui.py` gained `ChatTypographyTests` (5
+tests) with a small font-family cascade resolver
+(`_rules`/`_sel_match`/`_resolve_font`) replaying chat.css + the
+dashboard inline `<style>` over representative ancestor paths -
+asserts RESOLVED families (~22 sans paths incl. the composer via
+`font: inherit`; mono on code/.mdpre/.act-params/.act-tgt; mono on
+body/#detail/#aifab/#dask), that every chat.css selector is scoped to
+the feature's own ids, no font loading, and pill contrast/sizes
+intact.
+
+Verification: ChatTypographyTests 5/5; test_assistant_ui 52/52;
+node --check chat.js/md.js clean; tour suites 158/158 (two timing
+flakes under the combined 6-file load, both green on focused re-runs);
+test_conductor 453/453. `run_tests.py --jobs 8` = 1052 tests, 7/8
+shards ok; shard 3's only error was
+PauseRunTests.test_stop_run_now_kills_then_resumes - a stop-signal
+timing assertion (`None != 'stopped'`) whose tempdir teardown then
+hit the known WinError-32 lock cascade -> RecursionError; the test
+passes standalone (50.9s). Environmental flake, unrelated to this
+step (CSS + test additions only).
+
+Remaining typography issues: none known. By design the small chrome
+inside the surface (chips, usage/session-id readouts, meta badges)
+also renders sans - only literal code/pre/params were kept mono;
+if a reviewer wants the data readouts mono too, pin `.aim-use`/`.um-l`
+the same way.

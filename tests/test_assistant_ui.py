@@ -8,6 +8,7 @@ stub document/window/fetch/localStorage. Convention: C:\\Projects\\TESTING.md
 """
 import http.client
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -2009,6 +2010,321 @@ setRoute((url,opt)=>{
 ''',
             route_js="setRoute(()=>({items:[]}));")
         self.assertEqual(p.returncode, 0, p.stderr)
+
+
+# ------------------------------------------------------------ typography
+# Resolved-font assertions for the chat typography split: prose runs a
+# system-sans stack while code/pre/code pills + literal action
+# params/targets stay on the dashboard's ui-monospace stack. The
+# fake-DOM node harness cannot compute styles, so a small font-family
+# resolver replays the real cascade over chat.css + the dashboard's
+# inline <style>: rules match against an ancestor path, the winner is
+# picked by (specificity, source order), `font:` shorthands collapse to
+# font-family, elements with no declaration use their UA default
+# (monospace for code/pre, a widget font for form controls) or inherit.
+# Deliberate limits, safe for every font-bearing selector in these two
+# stylesheets: @-rules are stripped (media/keyframes carry no font
+# declarations here), pseudo-class/attribute selectors never match, and
+# every combinator is treated as descendant.
+
+_SANS_STACK = ('system-ui, -apple-system, "Segoe UI", Inter, Roboto, '
+               '"Helvetica Neue", Arial, sans-serif')
+_MONO_STACK = 'ui-monospace,Consolas,monospace'
+
+
+def _el(tag, eid=None, cls=()):
+    """One element in an ancestor path: tag, optional id, classes."""
+    return {'tag': tag, 'id': eid, 'cls': frozenset(cls)}
+
+
+def _strip_css(css):
+    """Comments and @-rules out: @media/@keyframes/@print nest braces
+    and would break the flat rule regex below."""
+    css = re.sub(r'/\*.*?\*/', '', css, flags=re.S)
+    out, i, n = [], 0, len(css)
+    while i < n:
+        at = css.find('@', i)
+        if at < 0:
+            out.append(css[i:])
+            break
+        out.append(css[i:at])
+        k = at
+        while k < n and css[k] not in '{;':
+            k += 1
+        if k < n and css[k] == '{':
+            depth = 1
+            k += 1
+            while k < n and depth:
+                depth += (css[k] == '{') - (css[k] == '}')
+                k += 1
+            i = k
+        else:
+            i = k + 1
+    return ''.join(out)
+
+
+def _rules(css):
+    """[(selector, [(prop, value), ...])] in source order. Declaration
+    order is kept because `font:` vs `font-family:` inside one block
+    resolve by position; comma selectors split into separate entries."""
+    out = []
+    for sel, body in re.findall(r'([^{}]+)\{([^{}]*)\}', css):
+        decls = []
+        for d in body.split(';'):
+            if ':' in d:
+                k, v = d.split(':', 1)
+                decls.append((k.strip(), v.strip()))
+        for s in sel.split(','):
+            s = s.strip()
+            if s:
+                out.append((s, decls))
+    return out
+
+
+def _spec(sel):
+    """(ids, classes, tags) specificity of a selector."""
+    ids = len(re.findall(r'#[\w-]+', sel))
+    cls = len(re.findall(r'\.[\w-]+', sel))
+    tags = len(re.findall(r'(?<![#\w.-])[\w-]+', sel))
+    return (ids, cls, tags)
+
+
+def _comp(comp, el):
+    """One compound selector ('#aichat', 'label.check', 'code') vs el."""
+    for tok in re.findall(r'[#.]?[\w-]+', comp):
+        if tok[0] == '#':
+            if el['id'] != tok[1:]:
+                return False
+        elif tok[0] == '.':
+            if tok[1:] not in el['cls']:
+                return False
+        elif el['tag'] != tok:
+            return False
+    return True
+
+
+def _sel_match(sel, path):
+    """True when sel matches path[-1] within that ancestor chain."""
+    if re.search(r'[:[\]]', sel):
+        return False      # pseudo-class/attribute selectors never match
+    comps = [c for c in re.split(r'\s*>\s*|\s+', sel.strip()) if c]
+    if not comps or not _comp(comps[-1], path[-1]):
+        return False
+    i = len(path) - 1
+    for comp in reversed(comps[:-1]):
+        i -= 1
+        while i >= 0 and not _comp(comp, path[i]):
+            i -= 1
+        if i < 0:
+            return False
+    return True
+
+
+def _decl_family(decls):
+    """The font-family a declaration block sets, or None. `font:`
+    counts too - the later of font/font-family in block order wins."""
+    fam = None
+    for k, v in decls:
+        v = v.split('!important')[0].strip()
+        if k == 'font':
+            if v == 'inherit':
+                fam = 'inherit'
+            else:
+                m = re.match(r'[\d.]+[a-z%]*(?:/\S+)?\s+(.+)$', v)
+                fam = m.group(1).strip() if m else v
+        elif k == 'font-family':
+            fam = v
+    # declarations can wrap across lines - compare on collapsed space
+    return ' '.join(fam.split()) if fam else fam
+
+
+_UA_MONO_TAGS = {'code', 'kbd', 'pre', 'samp', 'tt'}
+_UA_CTRL_TAGS = {'input', 'textarea', 'button', 'select'}
+
+
+def _resolve_font(rules, path):
+    """Resolved font-family for path[-1]. Per ancestor the winning
+    declaration is (specificity, source order); 'inherit' and absent
+    declarations pass the parent value down, and an element with no
+    declaration at all falls back to its UA default - so a form control
+    only renders prose when `font: inherit` is present."""
+    resolved = []
+    for depth, el in enumerate(path):
+        sub, best = path[:depth + 1], None
+        for order, (sel, decls) in enumerate(rules):
+            fam = _decl_family(decls)
+            if fam is None or not _sel_match(sel, sub):
+                continue
+            cand = (_spec(sel), order, fam)
+            if best is None or cand > best:
+                best = cand
+        fam = best[2] if best else None
+        if fam is None:
+            fam = ('monospace(UA)' if el['tag'] in _UA_MONO_TAGS else
+                   'control(UA)' if el['tag'] in _UA_CTRL_TAGS else
+                   resolved[-1] if resolved else 'ua-default')
+        elif fam == 'inherit':
+            fam = resolved[-1] if resolved else 'inherit'
+        resolved.append(fam)
+    return resolved[-1]
+
+
+class ChatTypographyTests(unittest.TestCase):
+    """The chat surface reads as prose: a system-sans stack on the
+    panel, the history rail and the settings dialog, while code,
+    preformatted blocks, code pills and literal action params/targets
+    stay pinned to the dashboard's ui-monospace stack. Nothing outside
+    the feature's own selectors changes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.css = (STATIC_DIR / 'chat.css').read_text(encoding='utf-8')
+        # real cascade order: chat.css is <link>ed before the inline
+        # dashboard <style> in _DASH_HTML's <head>
+        dash = conductor._DASH_HTML.split('<style>', 1)[1] \
+            .split('</style>', 1)[0]
+        cls.rules = (_rules(_strip_css(cls.css)) +
+                     _rules(_strip_css(dash)))
+        body = [_el('body')]
+        cls.panel = body + [_el('div', 'aichat')]
+        lst = cls.panel + [_el('div', cls=('ai-main',)),
+                           _el('div', cls=('ai-list',))]
+        cls.aim_a = lst + [_el('div', cls=('aim', 'aim-a'))]
+        cls.aim_u = lst + [_el('div', cls=('aim', 'aim-u'))]
+        cls.abody = cls.aim_a + [_el('div', cls=('aim-body',))]
+        cls.ubody = cls.aim_u + [_el('div', cls=('aim-body',))]
+        cls.rail = body + [_el('div', 'ai-rail')]
+        cls.aset = body + [_el('div', 'aisetwrap'),
+                           _el('div', 'aiset')]
+        cls.detail = body + [_el('div', 'backdrop'),
+                             _el('div', 'detail')]
+        cls.body = body
+
+    def _ff(self, path):
+        return _resolve_font(self.rules, path)
+
+    def _block(self, sel):
+        m = re.search(re.escape(sel) + r'\s*\{([^{}]*)\}', self.css)
+        return m.group(1) if m else ''
+
+    def test_chat_prose_resolves_system_sans(self):
+        """Message bubbles, rendered markdown inline content, the meta
+        line, action-card prose, usage readouts, citation chips, the
+        notice strip, the composer textarea, header text, rail titles
+        and settings text all resolve to the system sans stack."""
+        sans_paths = [
+            self.abody,                                  # message text
+            self.ubody,                                  # user bubble
+            self.abody + [_el('p')],
+            self.abody + [_el('h3')],
+            self.abody + [_el('ul'), _el('li')],
+            self.abody + [_el('blockquote')],
+            self.abody + [_el('table', cls=('mdtable',)),
+                          _el('td')],
+            self.aim_a + [_el('div', cls=('aim-meta',))],
+            self.abody + [_el('details', cls=('ai-trace',)),
+                          _el('div', cls=('ai-trace-d',)),
+                          _el('div', cls=('ai-trace-l',))],
+            self.aim_a + [_el('div', cls=('aim-card',)),
+                          _el('div', cls=('act-why',))],
+            self.aim_a + [_el('details', cls=('aim-use',)),
+                          _el('div', cls=('aim-udet',)),
+                          _el('div', cls=('um-l',))],
+            self.aim_a + [_el('div', cls=('aim-srcs',)),
+                          _el('button', cls=('aim-src',))],
+            self.panel + [_el('div', cls=('ai-note',))],
+            self.panel + [_el('div', cls=('ai-head',)),
+                          _el('span', 'ai-title')],
+            self.panel + [_el('div', cls=('ai-sub',)),
+                          _el('button', 'ai-name', ('ai-name',))],
+            self.panel + [_el('div', cls=('ai-sub',)),
+                          _el('details', 'ai-usage', ('ai-usage',)),
+                          _el('div', 'ai-useview', ('ai-useview',))],
+            # the composer: textarea + font:inherit picks up #aichat
+            self.panel + [_el('div', cls=('ai-compose',)),
+                          _el('div', cls=('ai-cwrap',)),
+                          _el('textarea', 'ai-text')],
+            self.rail + [_el('div', cls=('ai-convs',)),
+                         _el('div', cls=('ai-conv-row',)),
+                         _el('button', cls=('ai-conv',)),
+                         _el('span', cls=('t',))],
+            self.rail + [_el('input', cls=('ai-ren-in',))],
+            self.aset + [_el('label')],
+            self.aset + [_el('select', 'ais-model')],
+            self.aset + [_el('div', cls=('sub',))],
+        ]
+        for path in sans_paths:
+            with self.subTest(leaf=path[-1]):
+                self.assertEqual(self._ff(path), _SANS_STACK)
+
+    def test_code_pre_and_literals_stay_mono(self):
+        """Inline code pills (both bubble colors), fenced pre blocks and
+        the literal action params/target strings keep the dashboard's
+        ui-monospace stack inside the sans prose."""
+        mono_paths = [
+            self.abody + [_el('p'), _el('code')],
+            self.ubody + [_el('p'), _el('code')],
+            self.abody + [_el('pre', cls=('mdpre',))],
+            self.abody + [_el('pre', cls=('mdpre',)), _el('code')],
+            self.aim_a + [_el('div', cls=('aim-card',)),
+                          _el('div', cls=('act-params',))],
+            self.aim_a + [_el('div', cls=('aim-card',)),
+                          _el('div', cls=('act-armed',)),
+                          _el('div', cls=('act-tgt',))],
+        ]
+        for path in mono_paths:
+            with self.subTest(leaf=path[-1]):
+                self.assertEqual(self._ff(path), _MONO_STACK)
+
+    def test_non_chat_typography_unchanged(self):
+        """The dashboard body font stays ui-monospace, and the launchers
+        (which sit fused with dashboard chrome: #aifab floats over the
+        page, #dask pins beside the modal's Close X) keep it - only the
+        chat surface itself switched to sans."""
+        self.assertEqual(self._ff(self.body), _MONO_STACK)
+        self.assertEqual(self._ff(self.detail), _MONO_STACK)
+        self.assertEqual(self._ff(self.detail + [_el('div')]),
+                         _MONO_STACK)
+        self.assertEqual(self._ff(self.body + [_el('button', 'aifab')]),
+                         _MONO_STACK)
+        self.assertEqual(self._ff(self.detail + [_el('button', 'dask')]),
+                         _MONO_STACK)
+        # and every chat.css rule stays inside the feature's own ids -
+        # nothing in this stylesheet can restyle dashboard elements
+        roots = ('#aifab', '#dask', '#aichat', '#ai-rail', '#aiset')
+        bad = [s for s, _ in _rules(_strip_css(self.css))
+               if not s.startswith(roots)]
+        self.assertEqual(bad, [])
+
+    def test_no_external_font_loading(self):
+        """System font lookup only: no imports, font faces, resource
+        URLs or external references anywhere in the stylesheet."""
+        for needle in ('@import', '@font-face', 'url(', 'http://',
+                       'https://'):
+            self.assertNotIn(needle, self.css)
+        self.assertIn('system-ui', self.css)
+
+    def test_code_pill_contrast_and_ui_scale_preserved(self):
+        """Only the font changed: the code pill keeps its tinted fill +
+        accent text, and every size/wrap declaration is untouched."""
+        code = self._block('#aichat .aim-body code')
+        self.assertIn('rgba(110, 118, 129, .16)', code)
+        self.assertIn('rgba(110, 118, 129, .32)', code)
+        self.assertIn('#a5d6ff', code)
+        ucode = self._block('#aichat .aim-u .aim-body code')
+        self.assertIn('rgba(255, 255, 255, .15)', ucode)
+        self.assertIn('#fff', ucode)
+        self.assertIn('font-size: 13px', self._block('#aichat'))
+        body = self._block('#aichat .aim-body')
+        self.assertIn('font-size: 13px', body)
+        self.assertIn('overflow-wrap: anywhere', body)
+        self.assertIn('word-break: break-word', body)
+        text = self._block('#aichat #ai-text')
+        self.assertIn('font: inherit', text)
+        self.assertIn('font-size: 13px', text)
+        pre = self._block('#aichat .aim-body .mdpre')
+        self.assertIn('font-size: 12px', pre)
+        self.assertIn('white-space: pre-wrap', pre)
 
 
 if __name__ == '__main__':
