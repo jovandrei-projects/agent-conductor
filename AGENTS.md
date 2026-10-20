@@ -855,8 +855,25 @@ tmp+replace writes.
 
 `tour_feeds.py` (repo root, stdlib-only, imports `tour_state`) builds
 the deterministic feed: `build_feed(state, boundary, repo_dir=,
-runs_dir=, requests_dir=, manifests_dir=, flags_dir=)` -> `{entries,
-history, unseen_count, range, boundary, warnings}` - no LLM, no HTTP.
+runs_dir=, requests_dir=, manifests_dir=, flags_dir=, emit=,
+workers=)` -> `{entries, history, unseen_count, range, boundary,
+warnings}` - no LLM, no HTTP. A build COLLECTS FIRST: the live window's
+four scans (commit log, run dirs, request files, curated whatsnew) run
+concurrently on a bounded `ThreadPoolExecutor` (`workers` default 4,
+one shared pool also serves same-window merge chains and every stored
+descriptor range); each task returns an isolated result the caller
+folds in `_SOURCE_ORDER` (commits, runs, requests, curated), so a
+source that raises degrades to a `<name> scan failed` warning while
+its siblings still feed - never an all-or-nothing loss. `emit=`
+(group, parts) is the staged-delivery hook, invoked as the build
+produces each group in order: `collect` (interim publishes carry a
+`sources` status map; the completion publish flags `complete` and the
+first one stamps `boundary`/`range`), `tool` (annotated Tool-update
+cards), `work` (annotated Work-digest cards), `history`
+(`{entries: live-deck reinjects, history: re-materialized viewed
+cards}`). Every emitted group is already annotated + viewed-filtered,
+so a publisher can never deal a viewed card; the final return is
+unchanged and serial/parallel builds are byte-identical.
 Every card carries `section`/`section_title` splitting the feed in two:
 change + curated cards are "Tool updates" (spotlight anchors), record
 cards are the "Work digest". Records use their OWN event stamps inside
@@ -949,40 +966,60 @@ hidden or zero-rect anchor keeps the centered/dimmed fallback. The
 card is placed below or above the ring, and when the clamped slot
 would still cover its anchor (a tall row mid-viewport) it parks right
 or left of it instead - staying on-screen wins only when every side
-fails. While `GET /api/tour` is in flight the loading card polls
-`/api/tour/progress` on a 400ms interval and relays the build's
-current stage ('reading commit log', 'loading run records', ...)
-instead of a bare spinner.
+fails. The feed protocol IS the progress channel: a `partial` answer
+keeps the client polling `/api/tour` itself (500ms) - every snapshot
+carries its `loading` block (`elapsed_s` re-stamped per poll, group +
+source marks, the current stage name) plus `seq`/`gen`, so elapsed time
+advances across polls and a repeat or stale-gen publication never
+re-applies (no card resurrections, no selection resets). The picker
+labels an empty section 'loading…' while its group is still publishing
+instead of lying 'all caught up'; an 'unview' marks `tourSt.seek` so
+the deck jumps to the returning card the moment a later snapshot lands
+it. `/api/tour/progress` stays as the lean busy/stage/at probe.
 
 The HTTP layer lives in conductor.py's `tour_ctx` block (just before
 `collect_dashboard`): one ctx per `make_dashboard_handler` holds the
 dirs, a ~60s `TOUR_FEED_TTL_S` feed cache, the retained last-built
-payload (`last`), a count snapshot, a mutation epoch (`gen`) and
-busy/wanted refresh coalescing, so tests/second dashboards never share
-state (the handler takes `tour_repo=`; the ctx is `Handler.tour_ctx`).
-`GET /api/tour` serves `tour_feed(ctx)` = `{generated_at, boundary,
-range, entries, history, unseen_count, warnings}` - the ONLY endpoint
-that builds inline; read-only end to end (the state file first appears
+payload (`last`), a count snapshot, a mutation epoch (`gen`), the
+newest published snapshot (`snap`), the running build's publication
+record (`build` - gen, started_at, accumulated entries/history/
+warnings, group + source marks), a monotonic publication counter
+(`seq`), and busy/wanted refresh coalescing, so tests/second
+dashboards never share state (the handler takes `tour_repo=`; the ctx
+is `Handler.tour_ctx`). `GET /api/tour` calls
+`tour_feed(ctx, progressive=True)`: it arms ONE coalesced daemon
+`_tour_build` and answers the newest snapshot immediately - an empty
+partial shell while nothing has published, then accumulating partial
+snapshots as `build_feed`'s `emit` hook publishes each group (collect
+status, tool, work, history) under the captured `gen`. A stale build
+(gen moved past it) still finishes collecting but can never publish,
+store, or resurrect an acknowledged card. A raised build publishes a
+TERMINAL snapshot (partial false + `error`, cards gathered so far) so
+pollers stop instead of spinning, and the next request re-arms a
+fresh build. `tour_feed(ctx)` without `progressive` keeps the
+synchronous complete-build contract internal callers (assistant_host)
+rely on; the whole path stays read-only (the state file first appears
 on a mutation). `GET /api/tour/progress` serves the ctx's `progress`
-dict `{busy, stage, at}` - `_tour_build` threads a stage callback into
-`build_feed`/`_collect_window` (`progress=` kwarg) so a slow inline
-build narrates its phase; it is advisory (a 404 on an older server
-leaves the last stage up) and resets to not-busy when the build
+dict `{busy, stage, at, started_at, groups, sources}` with `elapsed_s`
+recomputed per call - advisory, resets to not-busy when the build
 settles, success or failure. `POST /api/tour/<id>/{viewed,snooze,unview}` runs
 `tour_transition`, which never builds inline: the id is validated
 against the newest built payload (`last` - entries + history + folded
 `covers`, TTL-agnostic, so a once-seen card stays acknowledgeable
 after the live feed moved on; a renamed id the newest build lacks is
-still 'unknown') or, when nothing has ever built, against the persisted
-descriptors (a restart clears caches, not the file). The transition
-then persists through tour_state FIRST, drops the feed cache + bumps
-`gen` (a pre-mutation build can never store), and arms a daemon
-refresh via `_tour_refresh` - coalesced: one build in flight plus one
-`wanted` rerun, so a stale in-flight build can't eat the post-mutation
-rebuild. The response's `unseen_count` is the count the retained feed
-implies under the just-saved states (`_tour_count_now` - last-known,
-not a fresh collection; None when nothing has ever built), with
-`count_pending` marking the refresh the /api/state poll converges on.
+still 'unknown'), then the newest published snapshot (`snap` - a card
+that only published inside a partial is still markable), or, when
+nothing has ever built, against the persisted descriptors (a restart
+clears caches, not the file). The transition then persists through
+tour_state FIRST, drops the feed cache + the published snapshot +
+bumps `gen` (a pre-mutation build can never store or publish), and
+arms a daemon refresh via `_tour_refresh` - coalesced: one build in
+flight plus one `wanted` rerun, so a stale in-flight build can't eat
+the post-mutation rebuild. The response's `unseen_count` is the count
+the retained feed implies under the just-saved states
+(`_tour_count_now` - last-known, not a fresh collection; None when
+nothing has ever built), with `count_pending` marking the refresh the
+/api/state poll converges on.
 A descriptor-only mark lands but cannot judge the remaining deck, so
 the watermark never advances blind (`remaining_new=None`). A no-op
 transition (`changed` false) skips invalidation entirely.
