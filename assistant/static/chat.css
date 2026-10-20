@@ -1,7 +1,14 @@
 /* Ask AI assistant surface (assistant/static/chat.css).
  *
- * Palette + typography deliberately match the dashboard shell
- * (#0d1117/#161b22/#21262d/#30363d, #58a6ff accent, ui-monospace body).
+ * Palette deliberately matches the dashboard shell (#0d1117/#161b22/
+ * #21262d/#30363d, #58a6ff accent). Typography: the chat surface runs
+ * prose on a system sans stack - paragraphs of the dashboard's
+ * ui-monospace body font are hard to read, while chrome that stays
+ * visually fused with the dashboard (the #aifab/#dask launchers) keeps
+ * the inherited shell font. Code, preformatted blocks, code pills and
+ * literal action params/targets are pinned to the dashboard's
+ * ui-monospace stack so they keep their token look inside the sans
+ * prose. System font names only - nothing is downloaded or imported.
  * Layering contract: launchers + panel sit at z-index 58 - above the
  * modal backdrop (#backdrop 50) and detail modal (51) so the chat stays
  * interactive over any open modal, but below the row menu (#ctxmenu 60
@@ -55,7 +62,12 @@
   display: flex; flex-direction: column;
   background: #161b22; border: 1px solid #30363d; border-radius: 10px;
   box-shadow: 0 12px 36px rgba(0, 0, 0, .5);
-  font-size: 13px; color: #e6edf3; overflow: hidden;
+  font-size: 13px; color: #e6edf3;
+  /* the panel is the prose root: message text, meta chips, usage
+     readouts and the composer (font: inherit) all pick this up */
+  font-family: system-ui, -apple-system, "Segoe UI", Inter, Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  overflow: hidden;
 }
 #aichat.expanded {
   width: min(720px, calc(100vw - 24px));
@@ -187,6 +199,7 @@
   border: 1px solid rgba(110, 118, 129, .32);
   border-radius: 5px;
   padding: .5px 5px; font-size: .92em; color: #a5d6ff;
+  font-family: ui-monospace,Consolas,monospace;
 }
 #aichat .aim-u .aim-body code {
   background: rgba(255, 255, 255, .15);
@@ -195,9 +208,10 @@
 #aichat .aim-body .mdpre { background: #0d1117;
   border: 1px solid #30363d; border-radius: 6px;
   padding: 8px 10px; font-size: 12px; overflow-x: auto;
-  white-space: pre-wrap; }
+  white-space: pre-wrap;
+  font-family: ui-monospace,Consolas,monospace; }
 #aichat .aim-body .mdpre code { background: none; border: 0; padding: 0;
-  color: inherit; font-size: inherit; }
+  color: inherit; font-size: inherit; font-family: inherit; }
 #aichat .aim-body .mdtable { border-collapse: collapse; width: 100%;
   margin: 8px 0; font-size: 12px; }
 #aichat .aim-body .mdtable th, #aichat .aim-body .mdtable td {
@@ -335,7 +349,10 @@
 #aichat .aim-card.st-denied { border-color: #30363d; opacity: .75; }
 #aichat .aim-card.st-denied .k { color: #8b949e; }
 #aichat .act-why { margin-top: 3px; }
-#aichat .act-params { color: #8b949e; font-family: inherit;
+/* params + the armed target are literal machine strings (k=v blobs,
+   JSON, branch/path names) - they keep the mono stack, not prose sans */
+#aichat .act-params { color: #8b949e;
+  font-family: ui-monospace,Consolas,monospace;
   margin-top: 3px; word-break: break-all; }
 #aichat .act-btns { display: flex; gap: 6px; margin-top: 6px; }
 #aichat .act-btn { background: #21262d; color: #e6edf3;
@@ -349,7 +366,8 @@
 #aichat .act-armed { margin-top: 6px; border-left: 3px solid #f85149;
   padding: 6px 9px; background: #161b22; }
 #aichat .act-warn { color: #ff7b72; }
-#aichat .act-tgt { color: #8b949e; font-family: inherit; margin-top: 3px;
+#aichat .act-tgt { color: #8b949e;
+  font-family: ui-monospace,Consolas,monospace; margin-top: 3px;
   word-break: break-all; }
 #aichat .act-ok { color: #3fb950; font-weight: 600; margin-top: 3px; }
 #aichat .act-err { color: #f85149; font-weight: 600; margin-top: 3px; }
@@ -448,6 +466,10 @@
   display: flex; flex-direction: column;
   background: #0d1117; border: 1px solid #30363d; border-radius: 10px;
   box-shadow: 0 12px 36px rgba(0, 0, 0, .5); overflow: hidden;
+  /* same prose stack as #aichat - conversation titles + the rename
+     input (font: inherit) are chat surface, not dashboard chrome */
+  font-family: system-ui, -apple-system, "Segoe UI", Inter, Roboto,
+    "Helvetica Neue", Arial, sans-serif;
 }
 #ai-rail[hidden] { display: none; }   /* display:flex would otherwise
   defeat the attribute (author rules beat the UA [hidden] rule) */
@@ -520,6 +542,10 @@
   padding: 16px 18px; width: min(430px, 92vw); max-height: 84vh;
   overflow-y: auto; font-size: 13px; color: #e6edf3;
   box-shadow: 0 12px 36px rgba(0, 0, 0, .5);
+  /* same prose stack as #aichat - labels/explanations/selects
+     (font: inherit) read as chat surface, not dashboard chrome */
+  font-family: system-ui, -apple-system, "Segoe UI", Inter, Roboto,
+    "Helvetica Neue", Arial, sans-serif;
 }
 #aiset h4 { margin: 0 0 10px; font-size: 13px; }
 #aiset label { display: block; color: #8b949e; margin: 12px 0 4px;
