@@ -14266,9 +14266,21 @@ def tour_ctx(runs_dir: Path, requests_dir: Path | None = None,
             "state_path": runs_dir.parent / "tour-state.json",
             "devin_argv": list(devin_argv or ["devin"]),
             "feed": None,     # {"at": epoch, "payload": GET /api/tour body}
-            "last": None,     # the newest payload ever stored - kept for
-                              # transition validation even after `feed`
-                              # drops; a once-seen card stays ackable
+            "last": None,     # the newest COMPLETE payload ever stored -
+                              # kept for transition validation even after
+                              # `feed` drops; a once-seen card stays
+                              # ackable
+            "snap": None,     # the newest published snapshot (a partial
+                              # while a build runs, the complete payload
+                              # when it lands) - GET /api/tour serves it
+                              # under the progressive protocol
+            "build": None,    # the running build's publication record:
+                              # captured gen, started_at, accumulated
+                              # entries/history/warnings, per-group +
+                              # per-source status
+            "seq": 0,         # monotonic publication counter - a client
+                              # applies a snapshot only when its seq
+                              # beats the last one it saw
             "count": None,    # {"at": epoch, "value": int}
             "busy": False,    # a background build owns the refresh
             "wanted": False,  # a refresh was requested mid-build: the
@@ -14276,9 +14288,10 @@ def tour_ctx(runs_dir: Path, requests_dir: Path | None = None,
                               # busy, so a transition's post-mutation
                               # rebuild is never lost to coalescing
             "gen": 0,         # mutation epoch - a build that started
-                              # before a transition can't overwrite the
-                              # post-mutation cache it races
-            "progress": {"busy": False, "stage": "", "at": 0.0},
+                              # before a transition can't publish or
+                              # store over the post-mutation state
+            "progress": {"busy": False, "stage": "", "at": 0.0,
+                         "started_at": 0.0, "groups": {}, "sources": {}},
                               # the loading screen's live narration -
                               # GET /api/tour/progress serves it while
                               # a build walks its phases
@@ -14311,44 +14324,185 @@ def _tour_polisher(ctx: dict):
     return ctx["polisher"]
 
 
+_TOUR_GROUPS = ("collect", "tool", "work", "history")
+
+
+def _tour_groups() -> dict:
+    """The build's publication stages, in emit order: the source scans
+    (collect), the Tool-updates cards, the Work-digest cards, then
+    viewed-history re-materialization."""
+    return {g: "pending" for g in _TOUR_GROUPS}
+
+
+def _tour_groups_run(groups: dict) -> None:
+    """Advance the stage map: the first pending stage after a done one
+    is the group the build is inside now."""
+    seen_pending = False
+    for g in _TOUR_GROUPS:
+        if groups.get(g) != "done" and not seen_pending:
+            groups[g] = "running"
+            seen_pending = True
+
+
+def _tour_loading(ctx: dict, build: dict | None) -> dict:
+    """The `loading` block a tour snapshot carries: elapsed time (still
+    advancing across polls), the narrated stage, per-group and
+    per-source done/pending state. Called under ctx['lock']."""
+    if build is None:
+        return {"busy": bool(ctx["busy"])}
+    out = {"busy": bool(ctx["busy"]),
+           "started_at": build["started_at"],
+           "elapsed_s": round(time.time() - build["started_at"], 1),
+           "stage": ctx["progress"].get("stage") or "",
+           "groups": dict(build["groups"]),
+           "sources": dict(build["sources"])}
+    if build.get("error"):
+        out["error"] = build["error"]
+    return out
+
+
+def _tour_enrichment(ctx: dict, rng: dict | None) -> dict:
+    """The enrichment field for a snapshot - the same shape the final
+    payload reports, recomputed per publish so a landing polish record
+    shows up on the next snapshot."""
+    polisher = _tour_polisher(ctx)
+    if polisher is None or not polisher.enabled():
+        return {"enabled": False}
+    out = {"enabled": True}
+    rec = polisher.record(rng) if rng else None
+    out["status"] = ("generating" if polisher.generating(rng)
+                     else (rec or {}).get("status") or "pending")
+    if rec and rec.get("error"):
+        out["error"] = rec["error"]
+    if rec and rec.get("model"):
+        out["model"] = rec["model"]
+    if rec and rec.get("dropped"):
+        out["dropped"] = rec["dropped"]
+    return out
+
+
+def _tour_compose(ctx: dict, build: dict, *, partial: bool,
+                  error: str | None = None) -> dict:
+    """A publishable snapshot from the running build's accumulated
+    groups - called under ctx['lock']; lists are copied so a later
+    publish can't mutate a served snapshot."""
+    out = {"generated_at": build["generated_at"],
+           "boundary": build["boundary"], "range": build["range"],
+           "entries": list(build["entries"]),
+           "history": list(build["history"]),
+           "unseen_count": build["unseen"],
+           "warnings": list(build["warnings"]),
+           "enrichment": _tour_enrichment(ctx, build["range"]),
+           "partial": partial, "seq": ctx["seq"], "gen": build["gen"],
+           "loading": _tour_loading(ctx, build)}
+    if error:
+        out["error"] = error
+    return out
+
+
 def _tour_build(ctx: dict, *, now: float | None = None) -> dict:
-    """One feed build, cached as both the GET payload and the unseen
-    count. Pure reads (tour_state.load never writes): nothing on the
-    GET path can mark an entry or move the watermark. Optional LLM
-    enrichment applies ONLY from the persisted tour-cache.json (never
-    generated inline); an uncached range kicks one coalesced background
-    attempt that invalidates the cache when it lands."""
+    """One staged feed build: tour_feeds emits each feed group as it
+    lands; every emitted group publishes into ctx['snap'] under the
+    captured generation so GET /api/tour serves progressively-growing
+    snapshots while the build runs - Tool updates first, the Work
+    digest behind them, viewed history last. A build that started
+    before a transition (gen moved on) still finishes collecting but
+    can never publish or store - its stale groups can't resurrect a
+    just-acknowledged card. The last stage stores the complete payload
+    as the feed cache, the retained `last` and the count, exactly as
+    the all-at-once build did. Pure reads (tour_state.load never
+    writes): nothing on the GET path can mark an entry or move the
+    watermark. Optional LLM enrichment applies ONLY from the persisted
+    tour-cache.json (never generated inline); an uncached range kicks
+    one coalesced background attempt that invalidates the cache when
+    it lands."""
     tour_state, tour_feeds = _tour_mods()
     ts = time.time() if now is None else now
     polisher = _tour_polisher(ctx)
     polish_on = polisher is not None and polisher.enabled()
     with ctx["lock"]:
         gen0 = ctx["gen"]
+        build = {"gen": gen0, "started_at": ts,
+                 "generated_at": (_iso_from(now) if now is not None
+                                  else now_iso()),
+                 "boundary": None, "range": None,
+                 "entries": [], "history": [], "warnings": [],
+                 "unseen": 0, "groups": _tour_groups(), "sources": {},
+                 "error": None}
+        build["groups"]["collect"] = "running"
+        ctx["build"] = build
+        ctx["progress"].update(busy=True, stage="", at=ts,
+                               started_at=ts,
+                               groups=dict(build["groups"]),
+                               sources={})
 
     def prog(s: str) -> None:
-        # the What's-new loading screen polls /api/tour/progress so a
-        # long build narrates which source it's on instead of sitting
-        # on a bare spinner - advisory only, never raises
+        # the What's-new loading screen reads the stage name off each
+        # snapshot/progress poll - advisory only, never raises
         try:
             with ctx["lock"]:
-                ctx["progress"].update(busy=True, stage=s,
-                                       at=time.time())
+                ctx["progress"].update(stage=s, at=time.time())
         except Exception:                                # noqa: BLE001
             pass
+
+    def publish(group: str, parts: dict) -> None:
+        """Fold one emitted feed group into ctx['snap'] - the mutation
+        epoch guard drops every group a pre-mutation build emits, so a
+        stale response can't overwrite post-transition state or deal
+        an acknowledged card back in."""
+        with ctx["lock"]:
+            b = ctx["build"]
+            if b is not build or ctx["gen"] != gen0:
+                return
+            if group in b["groups"]:
+                if group != "collect" or parts.get("complete"):
+                    b["groups"][group] = "done"
+                _tour_groups_run(b["groups"])
+            if parts.get("sources"):
+                b["sources"].update(parts["sources"])
+            if parts.get("warnings") is not None:
+                b["warnings"] = list(parts["warnings"])
+            if parts.get("entries"):
+                b["entries"].extend(parts["entries"])
+            if parts.get("history"):
+                b["history"].extend(parts["history"])
+            if parts.get("boundary") is not None:
+                b["boundary"] = parts["boundary"]
+            if parts.get("range") is not None:
+                b["range"] = parts["range"]
+            b["unseen"] = sum(1 for e in b["entries"]
+                              if e.get("state") == "new")
+            ctx["seq"] += 1
+            ctx["snap"] = _tour_compose(ctx, b, partial=True)
+            ctx["progress"].update(groups=dict(b["groups"]),
+                                   sources=dict(b["sources"]))
+
     prog("loading tour state")
-    state = tour_state.load(ctx["state_path"])
+    error = None
     try:
+        state = tour_state.load(ctx["state_path"])
         feed = tour_feeds.build_feed(
             state, repo_dir=ctx["repo_dir"],
             runs_dir=ctx["runs_dir"], requests_dir=ctx["requests_dir"],
             manifests_dir=ctx["manifests_dir"],
             polish=polisher.cards_for if polish_on else None,
-            progress=prog,
-            now=now)
-    finally:
+            progress=prog, emit=publish, now=now)
+    except Exception as exc:                             # noqa: BLE001
+        # a build that died mid-way still publishes what landed: a
+        # terminal snapshot (partial False - pollers stop) carrying the
+        # accumulated cards plus the error, never an endless spinner
+        error = str(exc) or type(exc).__name__
         with ctx["lock"]:
+            b = ctx["build"]
+            if b is build and ctx["gen"] == gen0:
+                b["error"] = error
+                ctx["seq"] += 1
+                ctx["snap"] = _tour_compose(ctx, b, partial=False,
+                                            error=error)
+            ctx["build"] = None
             ctx["progress"].update(busy=False, stage="",
                                    at=time.time())
+        raise
     payload = {"generated_at": (_iso_from(now) if now is not None
                                 else now_iso()),
                "boundary": feed["boundary"], "range": feed["range"],
@@ -14366,9 +14520,17 @@ def _tour_build(ctx: dict, *, now: float | None = None) -> dict:
                           on_done=lambda _r: _tour_invalidate(ctx))
     with ctx["lock"]:
         if ctx["gen"] == gen0:
+            ctx["seq"] += 1
+            payload.update(partial=False, seq=ctx["seq"], gen=gen0,
+                           loading={"busy": False,
+                                    "groups": dict(build["groups"]),
+                                    "sources": dict(build["sources"])})
             ctx["feed"] = {"at": ts, "payload": payload}
             ctx["last"] = payload
             ctx["count"] = {"at": ts, "value": feed["unseen_count"]}
+            ctx["snap"] = payload
+        ctx["build"] = None
+        ctx["progress"].update(busy=False, stage="", at=time.time())
     return payload
 
 
@@ -14421,17 +14583,69 @@ def _tour_refresh(ctx: dict, *, rerun: bool = False) -> None:
             ctx["busy"] = False
 
 
+def _tour_snapshot(ctx: dict, *, now: float) -> dict:
+    """GET /api/tour's progressive payload after arming the daemon
+    build: the newest published snapshot (a partial while the build
+    runs, the complete payload when it lands) with its `loading` block
+    re-stamped so elapsed time keeps advancing across polls; an old
+    COMPLETE snapshot re-serves as partial while a newer build is in
+    flight so the client keeps polling instead of freezing on stale
+    content. With nothing published yet (a build just armed) the
+    answer is an empty partial shell carrying the loading view."""
+    with ctx["lock"]:
+        snap = ctx["snap"]
+        build = ctx["build"]
+        busy = ctx["busy"]
+        gen = ctx["gen"]
+        seq = ctx["seq"]
+        loading = _tour_loading(ctx, build)
+    if snap is not None:
+        out = dict(snap)
+        if busy:
+            # the current build is still producing: this content is a
+            # floor, not the deck - keep the client polling
+            out["partial"] = True
+            out["loading"] = loading
+        return out
+    return {"generated_at": (build or {}).get("generated_at")
+            or _iso_from(now),
+            "boundary": (build or {}).get("boundary"),
+            "range": (build or {}).get("range"),
+            "entries": [], "history": [], "unseen_count": None,
+            "warnings": [],
+            "enrichment": _tour_enrichment(
+                ctx, (build or {}).get("range")),
+            "partial": True, "seq": seq, "gen": gen,
+            "loading": loading}
+
+
 def tour_feed(ctx: dict, *, now: float | None = None,
-              fresh: bool = False) -> dict:
-    """GET /api/tour's payload: the ~60s cache while warm, one rebuild
-    on expiry (or when `fresh` forces it). Read-only."""
+              fresh: bool = False, progressive: bool = False) -> dict:
+    """GET /api/tour's payload: the ~60s cache while warm. On expiry the
+    progressive path (the endpoint's mode) arms ONE coalesced daemon
+    build and answers the newest published snapshot - Tool-update cards
+    usable as soon as they land, the Work digest and viewed history
+    behind them - while `progressive=False` keeps the synchronous
+    complete-build contract internal callers rely on. Read-only either
+    way: nothing here marks an entry or moves the watermark."""
     ts = time.time() if now is None else now
     with ctx["lock"]:
         cached = ctx["feed"]
-    if not fresh and cached is not None \
+        busy = ctx["busy"]
+    if not progressive:
+        if not fresh and cached is not None \
+                and ts - cached["at"] < TOUR_FEED_TTL_S:
+            return cached["payload"]
+        return _tour_build(ctx, now=now)
+    # a warm cache while a build is in flight is the SUPERSEDED build's
+    # answer (a wanted rerun armed behind it) - keep serving snapshots
+    # so the poll rides through to the newer build instead of stopping
+    # on content that is about to be replaced
+    if not fresh and cached is not None and not busy \
             and ts - cached["at"] < TOUR_FEED_TTL_S:
         return cached["payload"]
-    return _tour_build(ctx, now=now)
+    _tour_refresh(ctx)
+    return _tour_snapshot(ctx, now=ts)
 
 
 def tour_unseen(ctx: dict, *, now: float | None = None) -> int | None:
@@ -14523,7 +14737,14 @@ def tour_transition(ctx: dict, entry_id: str, action: str,
     tour_state, _tour_feeds = _tour_mods()
     with ctx["lock"]:
         payload = ctx["last"]
+        snap = ctx["snap"]
     entry = _tour_find(payload, entry_id) if payload is not None else None
+    if entry is None and snap is not None:
+        # a card the progressive feed has already PUBLISHED (but no
+        # complete build has retained yet) stays acknowledgeable -
+        # the partial snapshot is the client's source of truth for the
+        # early groups
+        entry = _tour_find(snap, entry_id)
     if entry is None:
         desc = tour_state.descriptor(tour_state.load(ctx["state_path"]),
                                      entry_id)
@@ -14533,9 +14754,12 @@ def tour_transition(ctx: dict, entry_id: str, action: str,
         entry = {"id": entry_id, "range": desc.get("range")}
     if action == "viewed":
         # ids still 'new' after this mark - only an empty list lets the
-        # watermark advance, and only to the payload's captured boundary
-        # (never a fresh HEAD); mark_viewed re-checks each id against
-        # the persisted file, so concurrent marks can't over-acknowledge
+        # watermark advance, and only to the RETAINED payload's captured
+        # boundary (never a fresh HEAD); mark_viewed re-checks each id
+        # against the persisted file, so concurrent marks can't
+        # over-acknowledge. A partial snapshot can name a card the last
+        # build predates, but watermark math stays pinned to `last`:
+        # the snap's own range/boundary aren't complete-build truth yet
         still_new = boundary = None
         if payload is not None:
             still_new = [e["id"] for e in payload["entries"]
@@ -14555,8 +14779,12 @@ def tour_transition(ctx: dict, entry_id: str, action: str,
     if result.get("changed"):
         with ctx["lock"]:
             ctx["feed"] = None      # a GET must never serve pre-mutation
+            ctx["snap"] = None      # nor a partial a stale build dealt
             ctx["gen"] += 1         # any build started before this
-                                    # transition now fails its store
+                                    # transition can neither store nor
+                                    # publish over the post-mutation
+                                    # state - a just-marked card can't
+                                    # come back through a stale group
         _tour_refresh(ctx, rerun=True)
         result["count_pending"] = True
     result["unseen_count"] = _tour_count_now(
@@ -22176,11 +22404,17 @@ function tourActionsHtml(){
         `${tourSt.pending?' disabled':''}>` +
         `${tourSt.pending?'marking&hellip;':'Mark viewed'}</button>`);
 }
+function tourHistPending(){
+  const f = tourSt && tourSt.feed;
+  return !!(f && f.partial &&
+    ((tourSt.loading||{}).groups||{}).history !== 'done');
+}
 function tourHistHtml(){
   const hs = tourHist();
   if (!hs.length) return '';
   return `<details class="tourhist"><summary>viewed earlier ` +
-    `(${hs.length})</summary>` + hs.map((h,i)=>
+    `(${hs.length})${tourHistPending() ? ' \u00b7 loading\u2026' : ''}` +
+    `</summary>` + hs.map((h,i)=>
       `<button type="button" class="thist" data-tour="hist" ` +
       `data-hi="${i}" title="reopen this card">` +
       `${esc(h.title||'(untitled)')}` +
@@ -22220,13 +22454,18 @@ function tourShow(){
       `<div class="notice">loading the change feed&hellip;` +
       `<div class="sub tstage" id="tourstage">` +
       `${esc(tourSt.stage||'asking the server')}</div></div>` +
+      (tourLoadingLine()
+        ? `<div class="sub tprog">${tourLoadingLine()}</div>` : '') +
       `<div class="sub">assembled automatically from this repo's git ` +
       `log and run/request records - deterministic reads, not an ` +
       `agent task</div>`;
   } else if (tourSt.mode==='menu'){
     // the deck picker: one row per section with its unviewed count -
-    // a section with nothing left reads 'all caught up' in place
+    // a section with nothing left reads 'all caught up' in place, or
+    // 'loading' while its group is still publishing (never a fake
+    // 'caught up' that the next snapshot would contradict)
     const es = tourSt.feed.entries || [];
+    const groups = (tourSt.loading||{}).groups || {};
     const secs = [['tool','Tool updates',
                    'changes to this dashboard and conductor'],
                   ['work','Work digest',
@@ -22240,10 +22479,12 @@ function tourShow(){
       `<div class="tmenulist">` +
       secs.map(([k,t,d])=>{
         const n = es.filter(e=>tourSec(e)===k).length;
+        const pend = tourSt.feed.partial && groups[k] !== 'done';
         return `<button type="button" class="tmenu" data-tour="sec" ` +
           `data-sec="${k}"${n?'':' disabled'}><span class="tmh"><b>` +
           `${t}</b><span class="tsecname ${k}">` +
-          (n ? `${n} card${n>1?'s':''}` : `all caught up`) +
+          (n ? `${n} card${n>1?'s':''}`
+             : (pend ? `loading&hellip;` : `all caught up`)) +
           `</span></span><span class="tmsub">${d}</span></button>`;
       }).join('') + `</div>` +
       `<div class="tactions">` +
@@ -22281,6 +22522,9 @@ function tourShow(){
         `<button type="button" class="btn secondary" data-tour="skip">` +
         `Close</button></div>` + tourHistHtml();
   }
+  // while later groups still publish, every rendered mode gets one
+  // honest 'still loading' line at the bottom - gone on the complete
+  inner += tourMoreLine();
   card.innerHTML = inner;
   card.classList.toggle('busy', !!tourSt.pending);
   // the section accent follows the CURRENT card only - error/loading/
@@ -22404,67 +22648,202 @@ function tourBind(on){
     tourSt._sc = null;
   }
 }
+// ---- progressive feed apply -------------------------------------------
+// The server publishes snapshots while a build walks its groups - Tool
+// updates first, the Work digest behind them, viewed history last.
+// Every response carries a monotonically increasing seq: an answer not
+// newer than the last applied one is a repeat or a stale publication
+// and never re-applies (it can't resurrect a card a newer build or the
+// user's own mark already removed). A complete response (partial
+// falsy) replaces the deck wholesale; a partial merges its newly
+// published groups by card id - never a duplicate, never a selection
+// reset, never the card a session-level mark already acknowledged.
+const TOUR_GROUPS = [['collect','sources'],['tool','tool updates'],
+  ['work','work digest'],['history','viewed history']];
+function tourLoadingLine(){
+  const l = tourSt && tourSt.loading;
+  if (!l) return '';
+  const bits = [];
+  if (typeof l.elapsed_s==='number')
+    bits.push(l.elapsed_s.toFixed(l.elapsed_s>=10?0:1)+'s');
+  const groups = l.groups || {};
+  const g = TOUR_GROUPS.map(([k,t])=>{
+    const s = groups[k];
+    return esc(t) + (s==='done' ? ' done'
+      : s==='running' ? ' \u2026' : ' pending');
+  }).join(' \u00b7 ');
+  if (g) bits.push(g);
+  const src = l.sources || {}, srcs=[];
+  for (const k of ['commits','runs','requests','curated'])
+    if (src[k]!=null)
+      srcs.push(k + (src[k]==='error' ? ' failed'
+        : src[k]==='ok' ? ' done' : ' \u2026'));
+  if (srcs.length) bits.push(srcs.join(' \u00b7 '));
+  return bits.join(' \u00b7 ');
+}
+// while the build still walks later groups the deck stays usable - this
+// one line says so (elapsed + pending stages), then disappears on the
+// complete payload
+function tourMoreLine(){
+  const f = tourSt && tourSt.feed;
+  if (!f || !f.partial) return '';
+  const line = tourLoadingLine();
+  return `<div class="sub tprog">` +
+    `${line || 'still loading&hellip;'}</div>`;
+}
+function tourApplyFeed(f){
+  const st = tourSt;
+  if (!st || !f) return;
+  st.loading = f.loading || null;
+  // the newest applied snapshot's error state is truth: a fresh build
+  // publishing past an earlier failure clears the error card itself
+  st.err = f.error || null;
+  const seq = (typeof f.seq==='number') ? f.seq : null;
+  if (seq!==null && st.seq!==null && seq<=st.seq){
+    // a repeat/stale answer: only its loading view is still news
+    if (st.feed) st.feed.partial = !!f.partial;
+    return;
+  }
+  if (seq!==null) st.seq = seq;
+  const curId = (tourCur()||{}).id;
+  if (!st.feed || !f.partial){
+    // the unread deck walks as two separated sections - Tool updates
+    // first, then the Work digest - each keeping the feed's own
+    // oldest->newest order (an empty section simply contributes no
+    // cards, so navigation never lands on a blank). Ids acknowledged
+    // this session are filtered out too: a re-pulled feed can briefly
+    // predate the mark (the transition's refresh is deferred), and a
+    // stale copy must never reinsert an acknowledged card.
+    const tool=[], work=[];
+    for (const e of (f.entries||[])){
+      if (tourAcked.has(e.id)) continue;
+      (tourSec(e)==='work' ? work : tool).push(e);
+    }
+    f.entries = tool.concat(work);
+    // a card acknowledged since the feed was built also reattaches to
+    // 'viewed earlier' when the stale copy doesn't carry it yet
+    f.history = f.history || [];
+    const known = new Set(f.history.map(x=>x.id));
+    for (const [id, c] of tourAcked)
+      if (!known.has(id)) f.history.push(c);
+    st.feed = f;
+  } else {
+    // merge the newly published groups into the deck on screen:
+    // upsert by id (a newer snapshot's version of a card wins), keep
+    // the Tool-then-Work order, keep history's landed cards current
+    const feed = st.feed;
+    const at = new Map(feed.entries.map((e,i)=>[e.id,i]));
+    for (const e of (f.entries||[])){
+      if (tourAcked.has(e.id)) continue;
+      if (at.has(e.id)) feed.entries[at.get(e.id)] = e;
+      else feed.entries.push(e);
+    }
+    const tool=[], work=[];
+    for (const e of feed.entries)
+      (tourSec(e)==='work' ? work : tool).push(e);
+    feed.entries = tool.concat(work);
+    feed.history = feed.history || [];
+    const hh = new Map(feed.history.map((h,i)=>[h.id,i]));
+    for (const h of (f.history||[]))
+      if (hh.has(h.id)) feed.history[hh.get(h.id)] = h;
+      else feed.history.push(h);
+    for (const [id,c] of tourAcked)
+      if (!feed.history.some(x=>x.id===id)) feed.history.push(c);
+    feed.boundary = f.boundary; feed.range = f.range;
+    feed.generated_at = f.generated_at;
+    feed.warnings = f.warnings; feed.enrichment = f.enrichment;
+    feed.unseen_count = f.unseen_count;
+    feed.partial = true;
+  }
+  // entry point is decided once content exists: exactly one populated
+  // deck walks straight in (the picker would be one click for
+  // nothing); more or none show the menu. A group landing later never
+  // re-picks - that would move the user mid-walk.
+  if (!st.picked){
+    const secs = new Set((st.feed.entries||[]).map(tourSec));
+    if (secs.size===1){ st.sec=[...secs][0]; st.mode='deck';
+      st.picked=true; }
+    else if (secs.size>1){ st.sec=null; st.mode='menu'; st.picked=true; }
+    else st.mode='menu';
+  }
+  // keep the user's spot: the same id wins its new position; a card
+  // that vanished slides the next one in rather than jumping decks
+  if (st.mode==='hist'){
+    const hs = tourHist(), ni = hs.findIndex(x=>x.id===curId);
+    if (ni>=0) st.hi = ni;
+    else if (st.hi>hs.length) st.hi = hs.length;
+  } else {
+    const deck = tourDeck(), ni = deck.findIndex(x=>x.id===curId);
+    if (ni>=0) st.idx = ni;
+    else if (st.idx>deck.length) st.idx = deck.length;
+  }
+  // a card the user unviewed joins its deck whenever it lands - the
+  // transition re-publishes it behind the early groups
+  if (st.seek){
+    const hit = (st.feed.entries||[]).find(x=>x.id===st.seek);
+    if (hit){ st.sec = tourSec(hit); st.mode='deck';
+      st.idx = tourDeck().indexOf(hit); st.seek = null; }
+  }
+}
+function tourPoll(my){
+  // continue polling while the current build publishes: each newer
+  // snapshot merges in place until a complete (partial falsy) one
+  // lands; a dropped poll just retries on the next tick
+  const st = tourSt;
+  if (!st || st.pt!==null || typeof setInterval!=='function') return;
+  const iv = setInterval(()=>{
+    if (tourSt!==st || st.req!==my || st.pt!==iv){
+      // a newer load or a close owns the deck now - retire this poll
+      if (typeof clearInterval==='function') clearInterval(iv);
+      if (tourSt===st && st.pt===iv) st.pt = null;
+      return;
+    }
+    api('GET','/api/tour').then(f=>{
+      if (tourSt!==st || st.req!==my || st.pt!==iv) return;
+      tourApplyFeed(f);
+      tourShow();
+      if (f && !f.partial) tourPollStop();
+    }).catch(()=>{});
+  }, 500);
+  st.pt = iv;
+}
+function tourPollStop(){
+  const st = tourSt;
+  if (st && st.pt!==null && typeof clearInterval==='function')
+    clearInterval(st.pt);
+  if (st) st.pt = null;
+}
 async function tourLoad(){
   if (!tourSt) return;
-  tourSt.feed = null; tourSt.err = null;
-  tourSt.stage = 'asking the server'; tourShow();
-  // /api/tour builds inline when its cache is stale - while that GET is
-  // in flight, /api/tour/progress names the phase the build is on, so a
-  // slow load narrates ('reading commit log', 'loading run records'...)
-  // instead of sitting on a bare spinner. The poll is advisory: a 404 on
-  // an older server or a failed probe just leaves the last stage up.
-  let pt = null;
-  if (typeof setInterval==='function')
-    pt = setInterval(()=>{
-      api('GET','/api/tour/progress', null, 5000).then(p=>{
-        if (tourSt && !tourSt.feed && !tourSt.err && p && p.busy &&
-            p.stage && tourSt.stage!==p.stage){
-          tourSt.stage = p.stage;
-          const el = document.getElementById('tourstage');
-          if (el && el.textContent!==undefined)
-            el.textContent = p.stage + '\u2026';
-          else tourShow();
-        }
-      }).catch(()=>{});
-    }, 400);
-  try { const f = await api('GET', '/api/tour');
-    if (tourSt){
-      // the unread deck walks as two separated sections - Tool updates
-      // first, then the Work digest - each keeping the feed's own
-      // oldest->newest order (an empty section simply contributes no
-      // cards, so navigation never lands on a blank). Ids acknowledged
-      // this session are filtered out too: a re-pulled feed can briefly
-      // predate the mark (the transition's refresh is deferred), and a
-      // stale copy must never reinsert an acknowledged card.
-      const tool=[], work=[];
-      for (const e of (f.entries||[])){
-        if (tourAcked.has(e.id)) continue;
-        (tourSec(e)==='work' ? work : tool).push(e);
-      }
-      f.entries = tool.concat(work);
-      // a card acknowledged since the feed was built also reattaches to
-      // 'viewed earlier' when the stale copy doesn't carry it yet
-      f.history = f.history || [];
-      const known = new Set(f.history.map(x=>x.id));
-      for (const [id, c] of tourAcked)
-        if (!known.has(id)) f.history.push(c);
-      tourSt.feed = f;
-      // entry point: exactly one non-empty deck walks straight in
-      // (the picker would be one click for nothing); two or zero land
-      // on the menu so each deck is chosen on its own
-      const secs = new Set((f.entries||[]).map(tourSec));
-      tourSt.sec = secs.size===1 ? [...secs][0] : null;
-      tourSt.mode = secs.size===1 ? 'deck' : 'menu';
-      tourSt.idx = 0;
-    }
-  } catch(e){ if (tourSt) tourSt.err = e.message || String(e); }
-  if (pt!==null && typeof clearInterval==='function') clearInterval(pt);
-  if (tourSt){ tourSt.stage = null; tourShow(); }
+  const st = tourSt, my = ++st.req;
+  tourPollStop();
+  st.err = null;
+  // a deliberate reload re-decides the entry point from what lands -
+  // 'picked' only guards against mid-stream auto-repicks while partial
+  // groups of THIS load are still publishing
+  st.picked = false;
+  st.stage = 'asking the server'; tourShow();
+  // the first answer is already a snapshot - usable cards or an empty
+  // shell, never a wait-for-the-whole-build block; 'partial' means the
+  // build still walks later groups and the poll below picks them up
+  try {
+    const f = await api('GET', '/api/tour');
+    if (tourSt!==st || st.req!==my) return;
+    tourApplyFeed(f);
+    st.stage = null; tourShow();
+    if (f && f.partial) tourPoll(my);
+  } catch(e){
+    if (tourSt!==st || st.req!==my) return;
+    tourSt.err = e.message || String(e);
+    tourSt.stage = null;
+    tourShow();
+  }
 }
 function openTour(){
   if (tourSt) return;
   tourSt = {feed:null, err:null, notice:null, idx:0, hi:0, mode:'deck',
-    sec:null, stage:null,
+    sec:null, stage:null, seq:null, req:0, pt:null, loading:null,
+    picked:false, seek:null,
     pending:false, returnEl:document.activeElement||null, _sc:null};
   tourBind(true);
   applySel();           // Ask AI's about-chip follows into the tour
@@ -22478,6 +22857,7 @@ function tourClose(){
   // none of them POSTs viewed or snooze, so dismissing never
   // acknowledges or implicitly defers an entry
   if (!tourSt) return;
+  tourPollStop();
   tourBind(false);
   const back = tourSt.returnEl;
   tourSt = null;
@@ -22539,6 +22919,10 @@ async function tourMark(){
   if (tourSt.idx > tourDeck().length) tourSt.idx = tourDeck().length;
   tourSt.mode = 'deck';
   tourShow();
+  // the transition's guarded rebuild is already running - resume the
+  // poll so its snapshots merge post-mutation cards back in (never the
+  // acked one: tourAcked filters it on every apply)
+  tourPoll(tourSt.req);
 }
 async function tourUnview(){
   const h = tourSt && tourSt.mode==='hist' && tourHist()[tourSt.hi];
@@ -22554,16 +22938,12 @@ async function tourUnview(){
     tourSt.mode = 'deck';
     // the card returns to the live deck - the transition dropped the
     // feed cache, so the re-pull rebuilds post-mutation state rather
-    // than trusting local position guesses
+    // than trusting local position guesses. It lands inside a later
+    // snapshot (history group publishes last): seek marks it so the
+    // apply jumps the deck to it the moment it arrives
+    tourSt.seek = h.id;
     await tourLoad();
     if (!tourSt) return;
-    // open the deck the card actually landed in - tourLoad's
-    // auto-pick doesn't know which section it re-entered
-    const hit = ((tourSt.feed && tourSt.feed.entries) || [])
-      .find(x=>x.id===h.id);
-    if (hit){ tourSt.sec = tourSec(hit); tourSt.mode = 'deck'; }
-    const j = tourDeck().findIndex(x=>x.id===h.id);
-    if (j>=0) tourSt.idx = j;
     tourShow();
   } catch(err){
     if (!tourSt) return;
@@ -22869,13 +23249,22 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     payload["tour_unseen"] = tour_unseen(tour)
                     self._json(payload)
                 elif path == "/api/tour":
-                    self._json(tour_feed(tour))
+                    # progressive: a snapshot per poll (Tool updates
+                    # land first), 'partial' until the build finishes -
+                    # the client polls till partial:false. The feed's
+                    # own snapshots carry loading/elapsed/groups, so the
+                    # client never needs the progress endpoint.
+                    self._json(tour_feed(tour, progressive=True))
                 elif path == "/api/tour/progress":
-                    # the What's-new loading screen polls this while
-                    # /api/tour builds - stage names the source the
-                    # build is on (git log, run records, ...)
+                    # the What's-new loading narration - busy/stage plus
+                    # elapsed + per-group/per-source completion so a
+                    # reader sees real milestones, not a bare spinner
                     with tour["lock"]:
-                        self._json(dict(tour["progress"]))
+                        prog = dict(tour["progress"])
+                        st = prog.get("started_at")
+                        prog["elapsed_s"] = (round(time.time() - st, 1)
+                                             if st else None)
+                    self._json(prog)
                 elif path == "/api/repos":
                     # the repos modal's light list: watched repo names +
                     # paths only - the heavy worktree scan goes per-repo
