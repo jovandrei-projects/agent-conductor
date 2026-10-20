@@ -27,6 +27,7 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
 | 14 | Ask AI assistant: persistent contextual chat on dashboard + every modal, history db, view-context, citations, images, dictation, model settings, read-only gate, controlled actions, usage/cost | in progress | ask-ai/ | manifest run 20261017-051357-dashboard-ask-ai; research+design done (ask-ai/DESIGN.md): devin -p -r transport + gpt-6-luna-low-priority + vision + permission gate all live-verified; ACP session/new blocked on devin 3000.6.2 session-db migration; persistent-chat-core + view-context-and-retrieval + assistant-runtime done (assistant/ pkg + sqlite store; ConductorContext + ConductorRetrieval + static preamble; devin_print provider + AssistantRuntime dispatcher + tool loop + reconcile; modelpick catalog validation; /api/assistant/* registered in serve; live -p/-r smoke verified on gpt-6-luna-low-priority; persistent-chat-interface done (assistant/static chat.js+md.js+chat.css, #dask shell launcher, aiView/aiNav bridge, /api/assistant/static/*, 16 UI tests + :8806 smoke); images-and-dictation done (id-gated /api/assistant/attachments raw POST + row-id GET, composer paste/pick/preview/remove/bind, SpeechRecognition mic with unavailable/permission states + teardown; 24 UI + 134 assistant tests + 667-test quick suite green, headless-Chromium :8806 probe). guarded-dashboard-actions done (ConductorActions adapter over the same conductor.py functions: 28-kind whitelist, propose-time validation, launch-tier second-confirm acks, readonly re-check at execute, rejected proposals audited as failed rows, action cards + armed confirm in chat.js; 37 new tests, schema v4 actions.explain; 170 assistant + 702-test suite green). usage-and-price-visibility done (dispatch-time rate snapshots + priced fail/cancel paths, extra total_* counter passthrough into usage_extra, by-model rollup + unpriced honesty in GET .../usage, expandable per-exchange <details> usage breakdown + header conversation panel + settings price provenance in chat.js; 18 new tests, 130 assistant tests green). integration-and-design-review done (fetch-by-key re-resolution + nav/label synthesis, kinds/status filters, batch seq, fast-without-effort resolve, bounded pow, raced-terminal/attachment/ack fixes, conv-scoped actions + attachments, usage-details repaint, settings focus/outage, z-order, in-text nav links; 734-test suite green minus 1 transient file-lock, 46-browser-check probe, 2 live exchanges ~$0.034 verified incl. --noEmit + apartment-3d camera answers with working citations). fast-transport run 20261017-164321-assistant-fast-transport (parallel, 4 steps) ALL LANDED: transport-investigation done - warm ACP pool chosen over direct HTTP + api.devin.ai (assistant/TRANSPORT.md; ACP verified live on 3000.6.2, earlier session-db block was non-fatal); provider-adapter done (assistant/providers/devin_acp.py pooled devin-acp adapter + tests/fake_devin_chat.py acp ndjson fake + 25 tests in tests/test_assistant_acp.py green); runtime-and-settings done (per-conversation transport + fallback {from,to,reason} + read-only routing; landed merge 4a08d9c); chat-ui-and-verification done (feature-detected Transport select cli/fast + per-reply .aim-tp chip + fallback display + progressive repaint reuse; 6 ChatTransportTests; wire contract in DESIGN.md s12). Next: follow-up-plan |
 | 15 | Dashboard What's new tour: persistent state + feeds + API + walkthrough UI + optional LLM polish | done | dashboard-whats-new/ | manifest run 20261017-145726-dashboard-whats-new; all 6 steps done incl. tour-validation: both parked branches merged, 8-test real-HTTP e2e suite, 3 in-feature defects found+fixed (stale-build epoch guard on tour_ctx gen, curated fold-in surviving polish regrouping via aug_shas, mark-404 deck resync in tourMark), tail_status stale-base guard backported from master, 2 tempdir-teardown flake classes hardened; 114/114 tour tests + full suite 907 green (8/8 shards) |
 | 16 | What's new split: 'Tool updates' vs 'Work digest' feed sections + folded work cards + async refresh | done | whats-new-split/ | manifest run 20261019-031845-whats-new-split; feed-build done (sections/folding/tags/unreviewed/memoization + viewed-deck exclusion; 39 feed + 125 tour tests green); walkthrough-ui done (two-section deck, event tags, unreviewed+Request/Run chips, tourAcked stale-feed guard; 12 dash tests + 999-suite green); deferred-transition done (persist-first POST + retained-payload validation + coalesced daemon refresh w/ wanted-rerun + projected last-known unseen_count; 20 api + 109 tour-side tests green); tour-tests done (+23 deterministic regression tests incl. gated-daemon concurrency, no regressions found; 152/152 tour + 1024-test suite green); closing review done - all 7 requested items verified merged; empty follow-up proposal manifests/whats-new-split-followup.toml registers 'no work remains' |
+| 17 | What's new polish landing: merge the 5 parked whats-new-polish branches + integrated verification | next | whats-new-polish/ | run 20261020-030142-whats-new-polish: all 5 steps reported done but verify gates died (verify_timeout_min 10m < loaded --jobs 8 suite); ALL 5 branches now landed via merges 2e28604 + 6ffb4e5 + bee3f0b + c5778f3 + 53b6e0e (chat-font) - remaining work is integrated verification on the combined tree; proposal manifests/whats-new-polish-followup.toml (auto-registered 20261020-053816-aa91a839) still covers land-* steps that are now no-ops + the integrated-validation step - human launches via `conductor.py run`, or just run the suite on main |
 
 ## Not yet filed as tasks
 
@@ -1384,3 +1385,234 @@ Conventions for `STATE.md` are in `README.md`; the template is in `_template/`.
   have been dead (no poolBump handler survives the merge) - PLUS the
   branch's #tour-btn 'What's new' button, which the cleanly-merged
   tour CSS/JS (.tbadge, openTour/tourAct) wires up.
+
+- DONE 2026-10-20 (progressive-tour, wave step of run
+  20261020-030142-whats-new-polish): GET /api/tour is now a PROGRESSIVE
+  snapshot protocol instead of an all-or-nothing inline build.
+  tour_feeds.build_feed collects the window's four scans (commit log,
+  run dirs, request files, curated whatsnew) on ONE bounded
+  ThreadPoolExecutor (workers= default 4, shared with same-window
+  merge chains + descriptor ranges) - each source returns an isolated
+  result folded in _SOURCE_ORDER, so a raising source degrades to a
+  warning while siblings still feed. A new emit=(group, parts) hook
+  publishes collect/tool/work/history as it lands; every emitted group
+  is already annotated + viewed-filtered. conductor.py tour_ctx gained
+  `snap` (newest published snapshot), `build` (running publication
+  record: gen/started_at/groups/sources), and a monotonic `seq`;
+  _tour_build's publish() composes each emit into ctx["snap"] under
+  the captured gen so polls serve growing partial snapshots (Tool
+  updates first) and a stale build (a transition bumped gen) can
+  never publish or store. A raised build publishes a TERMINAL
+  partial:false + error snapshot (pollers stop, cards gathered so
+  far stay usable) and the next request re-arms. tour_transition now
+  validates ids against `last`, THEN `snap` (a partial-published card
+  is markable), THEN persisted descriptors; it persists first, drops
+  feed+snap, bumps gen, and returns the persisted result promptly -
+  _tour_refresh's busy/wanted coalescing still lands exactly one
+  post-mutation rebuild. tour_feed(progressive=True) joins/serves
+  snapshots; a warm cache is only fast-pathed when no build is in
+  flight so a poll can't stop on the superseded build's answer.
+  /api/tour/progress reports {busy,stage,at} + started_at/groups/
+  sources + per-call elapsed_s. The client polls /api/tour itself
+  (500ms) - every snapshot carries seq + loading {elapsed_s, groups,
+  sources, stage} so elapsed advances across polls, stale-seq/
+  duplicate publications never re-apply, the picker labels
+  still-loading sections instead of lying 'all caught up', tourAcked
+  keeps marked cards out of late partials, and a deliberate retry
+  re-picks the entry deck while mid-stream merges preserve
+  section/card selection. tests: +5 feed tests (source overlap, emit
+  order+annotation, tool-before-gated-work, failure degradation,
+  serial/parallel byte-identity), +6 api tests (partial-before-work +
+  mid-build mark, one-build coalescing, stale-build no-resurrection
+  via compose spy, terminal error + re-arm, empty window, progress
+  narration), 2 rewritten/new dash node tests (progressive loading
+  narration + shell/acked-card merge), plus get()/get_partial()
+  helpers; api 32/32, feeds+state+polish 106/106, dash 24/24,
+  e2e 8/8 green.
+
+- DONE 2026-10-20 (run-outcome-tags, wave step of run
+  20261020-030142-whats-new-polish): the What's-new work-digest run tag
+  is now proportionate - tour_feeds._run_outcome counts
+  failed/timed_out/lost as the unsuccessful verdicts and marks the run
+  'failed' only when they are a strict majority of the decisive
+  verdicts (done + unsuccessful) or no step is done at all; a mostly-
+  done run and an even split read 'partial' (the workflow-ux-safety
+  shape 29 done + 1 lost -> partial, was 'failed'). Recorded 'aborted'
+  reasons still win verbatim, empty/never-started runs stay 'ended'
+  (never failed on done==0 alone), all-clean stays 'done', and
+  nonterminal leftovers stay 'partial' - sectioning, ordering,
+  grouping and persisted run/step verdicts untouched. No new CSS:
+  'partial' already sat in TOUR_TAG_STYLE (#d29922) and work-section
+  cards already paint record-event words FILLED via .ttag.ev, so the
+  tag renders verbatim + amber + filled, distinct from green 'done'
+  and red 'failed'. New RunOutcomeTests (7) + feed-level 29+1 card pin
+  + node-harness test for the amber chip in the Work digest; two stale
+  fixtures (test_tour_feeds, test_tour_e2e) retargeted to real
+  failure-majorities. Verified: 7/7 new tests, 166/166 tour suite,
+  test_conductor 453/453 modulo one pre-existing tempdir-teardown
+  flake (summarize.launch.log lock on test_summarize_manifest_
+  autospawns - passes standalone, unrelated); .agent_tasks/
+  run-outcome-tags/STATE.md has the full rule + matrix.
+
+- DONE 2026-10-20 (summary-regressions, parallel-pool step of run
+  20261020-030142-whats-new-polish): restored the three run-summary
+  behaviors LLM summaries displaced. Statistics: `_run_stats_lines`/
+  `_run_stats_md`/`_ensure_stats_block` (conductor.py ~2784-2832,
+  extracted from `run_report_md` so both docs share one fact sheet)
+  now tops every served run summary - `summarize_run` bakes it into
+  run.summary.md between the `_written_` byline and the LLM prose
+  (regeneration rewrites the file, never stacks), and
+  `run_summary_doc` injects it on the read for legacy files whose
+  body lacks `- **steps:**` anywhere (stored artifact untouched, a
+  second block impossible). Numbers come from `_run_step_stats` over
+  step records: per-status counts (failed/timed_out/lost stay
+  distinct), started/ended + `_run_elapsed_md` driver elapsed,
+  prompt+completion(+cached) tokens, merged/parked-branch tallies;
+  unrecorded values render '-' (mocks show `- **tokens:** -`), and a
+  retried step counts once (rec['tokens'] already banks every
+  attempt once). Headings: `_summary_prompt` (~2888) now instructs
+  the model to head EVERY step '## <step-name> - <status>' verbatim,
+  copied from its '### <step> - <status>' source lines under
+  '## Steps' - thematic prose goes in non-step sections.
+  decorateRunSum needed NO code change: it already accepts h2/h3/h4,
+  -/–/— separators, case-insensitive step names, every recorded
+  status word + '?', skips aux/unknown/prose headings, and the
+  dataset.sumstep guard keeps refresh re-decoration idempotent
+  (task-modal link, .stc status color, mark-as-reviewed/needing-
+  review toggle, strike-through). Styling: '#detail .sumdoc code'
+  now wears the Ask-AI chip (rgba(110,118,129,.16) + .32 border +
+  #a5d6ff) with overflow-wrap:anywhere for long slugs like
+  deferred-transition; '.sumdoc pre code' resets inside fences;
+  summary_html's standalone per-task page got the same chip+wrap+
+  pre-reset. Scoped to summary containers - #aichat and dashboard
+  typography untouched; no HTML report, no badge changes (siblings
+  own those). Tests: +6 RunSummaryTests (write-time block, regen
+  single-block, legacy injection, honest missing, canonical prompt,
+  CSS) + 1 node-harness case (h2/h3+em-dash decoration, both toggle
+  directions, strike, untouched prose, idempotency); 22/22
+  RunSummaryTests + 150/150 tour green; --jobs 8 suite ran with only
+  load flakes - http_draft_review, tour_api timing asserts
+  (assertLess t<5 at ~9s), ACP _pending KeyError - each verified
+  failing identically on pristine HEAD under parallel-agent load.
+
+- DONE 2026-10-20 (html-summary-report, wave step of run
+  20261020-030142-whats-new-polish): the summarize session now drops a
+  second artifact - `_summary_prompt` gained an additive
+  `## Also write run.summary.html` block (self-contained lavish doc:
+  header stat strip + `<section>` findings + per-step `<article>`s,
+  dashboard palette, stats from real run data) and `summarize_run`
+  collects `run.summary.html` into the run dir next to
+  `run.summary.md` (untouched). `GET /api/runs/<run>/summary.html`
+  serves it re-sanitized on every read under
+  `.run-summary-report` (missing/unrenderable -> 404, run-identity
+  checks intact); `sanitize_report_html` is a real
+  `html.parser`-based allowlist re-serializer - no scripts, styles,
+  handlers, URLs, ids, classes or active content can survive, output
+  always balanced, input capped at 512 KiB. The modal appends the
+  fragment once at the END of `openRunSummary` below the sumdoc
+  (`runReportFor` + `summaryView.key` + backdrop guards kill stale
+  and duplicate appends); a fixed `#detail .run-summary-report`
+  element-selector stylesheet is the only styling channel. 15 new
+  `RunSummaryHtmlTests` (artifact gen/loading, endpoint, adversarial
+  sanitizer battery, node-harness ordering/legacy/malformed/stale/
+  decoration checks). Markdown statistics, canonical step headings
+  and decorateRunSum review controls stay with the sibling
+  summary-regressions step - untouched here.
+
+- DONE 2026-10-20 (follow-up-plan, closing review of run
+  20261020-030142-whats-new-polish): the run's five features are all
+  written and self-tested but ZERO landed - every step's verify gate
+  (`python run_tests.py --jobs 8`, ~8-14min wall) hit the default
+  verify_timeout_min=10 under 4-agent box load (4x 'verify timed out
+  after 600s', 1x shard-5 load-flake errors), so all steps recorded
+  'failed' and every branch stayed parked (step_merge_kept). Each
+  parked branch merges clean vs main today; simulated manifest-order
+  merges conflict only in .agent_tasks/QUEUE.md, efficiency_stats.md,
+  tests/test_tour_feeds.py and conductor.py - inside merge_resolver
+  scope. Baseline verify on the merged result (main 0d42d39): 1047
+  tests, 3 errors, all the known shared-box flake family (2x
+  test_tour_api /api/state client timeouts, 1x test_assistant_acp
+  session race); the node-VM harness rides inside the suite. None of
+  the five human requirements are on main. Follow-up proposal saved
+  at manifests/whats-new-polish-followup.toml (auto-registered
+  request 20261020-053816-aa91a839): five parallel land-* steps merge
+  each parked branch with verify_timeout_min=30 + merge_resolver,
+  then a dependent integrated-validation step runs the suite on the
+  combined tree. Human launches it; alternative is `conductor.py
+  merge` on the run dir + a manual suite run. Task 17 filed.
+
+- DONE 2026-10-20 (resolve-progressive-tour, merge resolution):
+  unioned `conductor/20261020-030142-whats-new-polish/progressive-tour`
+  onto main (merge 2e28604) - the wave step's progressive /api/tour
+  snapshot protocol (tour_feeds emit hook, tour_ctx snap/build/seq,
+  /api/tour/progress, client-side poll/merge) plus its staged
+  AGENTS.md/conductor.py/test changes landed; everything outside
+  .agent_tasks merged clean. Both conflicts were doc tail-appends:
+  QUEUE.md kept the branch's progressive-tour DONE bullet AND HEAD's
+  closing-review bullet (chronological - the wave step wrote first);
+  efficiency_stats.md kept the same pair of rows in the same order.
+  No code touched. Four whats-new-polish branches remain parked -
+  task 17 still open.
+
+- DONE 2026-10-20 (resolve-run-outcome-tags, merge resolution):
+  unioned `conductor/20261020-030142-whats-new-polish/run-outcome-tags`
+  onto main (merge 6ffb4e5) - the wave step's proportionate
+  What's-new run tag (_run_outcome strict-majority rule, 'partial'
+  verdict, RunOutcomeTests) plus its staged tour_feeds/test changes
+  landed; tour_feeds.py and the other test files merged clean. Both
+  conflicts were same-spot additions: QUEUE.md kept the branch's
+  run-outcome-tags DONE bullet placed chronologically with HEAD's
+  wave-step/closing-review/resolve bullets; test_tour_feeds.py kept
+  BOTH new classes - HEAD's ProgressiveEmitTests and the branch's
+  RunOutcomeTests - ahead of ProgressTests. 63/63 tests in the merged
+  file green. Three whats-new-polish branches remain parked - task 17
+  still open.
+
+- DONE 2026-10-20 (resolve-summary-regressions, merge resolution):
+  unioned `conductor/20261020-030142-whats-new-polish/summary-regressions`
+  onto main (merge bee3f0b) - the parallel-pool step's restored
+  run-summary behaviors (stats block baked at write + served-time
+  injection for legacy files, canonical '## <step> - <status>'
+  headings, Ask-AI chip styling on .sumdoc code + summary_html) plus
+  its staged conductor.py/test changes landed; conductor.py and
+  test_conductor.py merged clean. Both conflicts were doc
+  tail-appends: QUEUE.md kept the branch's summary-regressions DONE
+  bullet placed chronologically with HEAD's wave-step bullets
+  (before the closing-review/resolve bullets); efficiency_stats.md
+  kept the same row in the same position. No code touched. Two
+  whats-new-polish branches remain parked (html-summary-report,
+  chat-font) - task 17 still open.
+
+- DONE 2026-10-20 (resolve-html-summary-report, merge resolution):
+  unioned `conductor/20261020-030142-whats-new-polish/html-summary-report`
+  onto main (merge c5778f3) - the wave step's run.summary.html
+  artifact (additive `_summary_prompt` '## Also write
+  run.summary.html' block, summarize_run collection, html.parser
+  allowlist re-serializer `sanitize_report_html`, GET
+  /api/runs/<run>/summary.html re-sanitized per read, modal
+  appendRunReport once-below-sumdoc + scoped element-selector
+  stylesheet) plus its staged mock_devin/test_conductor changes
+  landed; those merged clean. conductor.py had ONE real conflict:
+  `_summary_prompt` kept BOTH instruction blocks - HEAD's canonical
+  '## <step-name> - <status>' heading rules AND the branch's '##
+  Also write run.summary.html' section, blank-separated before '##
+  Run'. Doc conflicts were chronological inserts: QUEUE.md placed
+  the branch's html-summary-report DONE bullet with the wave-step
+  bullets; efficiency_stats.md kept its row in the same position.
+  37/37 *RunSummary* tests green on the merged tree. One
+  whats-new-polish branch remains parked (chat-font) - task 17
+  still open.
+
+- DONE 2026-10-20 (resolve-chat-font, merge resolution): unioned
+  `conductor/20261020-030142-whats-new-polish/chat-font` onto main
+  (merge 53b6e0e) - the wave step's Ask-AI chat typography change
+  (prose off ui-monospace onto a system-sans stack, code surfaces
+  pinned monospace, ChatTypographyTests cascade resolver) plus its
+  staged chat.css/test_assistant_ui/ask-ai STATE.md changes landed;
+  everything outside .agent_tasks merged clean. The only conflict
+  was a doc tail-append on efficiency_stats.md - kept the branch's
+  chat-font row placed chronologically among HEAD's wave-step rows
+  (after html-summary-report, before the closing-review row). No
+  code touched; the branch carried no QUEUE.md bullet of its own.
+  All five whats-new-polish branches are now landed - task 17's
+  remaining work is the integrated verification.

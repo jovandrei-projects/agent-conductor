@@ -504,7 +504,15 @@ and `plan_gen_id` marks the attempt that produced the current manifest.
 `plan-proposal-N` for other attempts) 'step 0' history rows on the plan's
 task list - after publish, after launch (same `request:<id>` run_key) and
 after reload, with real status + session/log links but never a `run_dir`
-or a `counts` share, so nothing about them is runnable. Saving or generating NEVER
+or a `counts` share, so nothing about them is runnable. Failed/stopped
+attempts BEFORE the producer render `superseded` automatically (history,
+not outstanding work); a failed attempt AFTER it keeps 'failed' until a
+human retires it - `plan_sessions[i].superseded` (`POST
+/api/requests/<id>/plan-supersede` `{attempt: N}`, or the attempt row's
+context menu / task modal 'Mark attempt superseded') maps the rendered
+row to superseded while the recorded status/note stay honest. The
+endpoint refuses the producing attempt, out-of-range numbers, and a
+request with a generation pass parked on it. Saving or generating NEVER
 launches implementation: only the separate Start run button does.
 Staleness is a *computed* diff (`_pending_actions`), not a latched flag:
 generation inputs (`raw`/`project`/`attachments` - `GEN_INPUT_FIELDS`)
@@ -750,6 +758,18 @@ resume/merge is in flight, and the JS button is disabled then too. A
 deleted run's spawned devin sessions are NOT removed - they leave the
 `sessions` whitelist and age into manual `devin rm <id>` (trap-13
 shape), and its parked worktree branches outlive the record.
+The archived LIST is cached per run: `_ARCH_RUN_CACHE` keeps each
+archived run's emitted rows + run row under a signature
+(`_arch_run_sig`) covering state.json, the run dir, the linked request
+file + parked spool overlay, the manifest, this run's flag-dir
+sentinels, per-step prompt/stdout/export/STATE.md files, summarize/
+events/resume artifacts, the session-map generation, and every liveness
+verdict the rows derive - a matching sig means the per-run builder
+would emit identical rows, so the 2s poll serves the cached slice
+instead of re-reading every artifact (cold ~6s -> warm ~0.4s on the
+real data dir). Any mutation to a covered file rebuilds just that run;
+the cache clears itself past 400 entries. `_flag_key()`'s run-dir
+resolve is memoized in `_FLAG_KEY_MEMO` for the same reason.
 
 Prompt controls sit beside the lifecycle ones on the agent modal.
 **Edit prompt** (`POST .../steps/<step>/prompt` `{prompt}`) writes a
@@ -835,8 +855,25 @@ tmp+replace writes.
 
 `tour_feeds.py` (repo root, stdlib-only, imports `tour_state`) builds
 the deterministic feed: `build_feed(state, boundary, repo_dir=,
-runs_dir=, requests_dir=, manifests_dir=, flags_dir=)` -> `{entries,
-history, unseen_count, range, boundary, warnings}` - no LLM, no HTTP.
+runs_dir=, requests_dir=, manifests_dir=, flags_dir=, emit=,
+workers=)` -> `{entries, history, unseen_count, range, boundary,
+warnings}` - no LLM, no HTTP. A build COLLECTS FIRST: the live window's
+four scans (commit log, run dirs, request files, curated whatsnew) run
+concurrently on a bounded `ThreadPoolExecutor` (`workers` default 4,
+one shared pool also serves same-window merge chains and every stored
+descriptor range); each task returns an isolated result the caller
+folds in `_SOURCE_ORDER` (commits, runs, requests, curated), so a
+source that raises degrades to a `<name> scan failed` warning while
+its siblings still feed - never an all-or-nothing loss. `emit=`
+(group, parts) is the staged-delivery hook, invoked as the build
+produces each group in order: `collect` (interim publishes carry a
+`sources` status map; the completion publish flags `complete` and the
+first one stamps `boundary`/`range`), `tool` (annotated Tool-update
+cards), `work` (annotated Work-digest cards), `history`
+(`{entries: live-deck reinjects, history: re-materialized viewed
+cards}`). Every emitted group is already annotated + viewed-filtered,
+so a publisher can never deal a viewed card; the final return is
+unchanged and serial/parallel builds are byte-identical.
 Every card carries `section`/`section_title` splitting the feed in two:
 change + curated cards are "Tool updates" (spotlight anchors), record
 cards are the "Work digest". Records use their OWN event stamps inside
@@ -884,11 +921,19 @@ covers their id. `entries` excludes `state=='viewed'` cards even before
 the watermark advances - the live deck is the unread walkthrough;
 viewed cards stay reachable through `history`.
 
-The `_DASH_HTML` renderer (tour block at the end of the script) walks
-the unread deck as TWO separated sections - `tourLoad` reorders
-`entries` into Tool updates (change/curated) first, then the Work
-digest (record cards), each keeping the feed's `at` order; an empty
-section just contributes no cards. Every card header names its section
+The `_DASH_HTML` renderer (tour block at the end of the script) opens
+on a DECK PICKER when the feed holds more than one populated section
+(`tourSt.mode 'menu'`): one row per section with its remaining count
+('all caught up' when empty), a 'walk everything' link for the old
+combined order, and the viewed-history fold. Picking a deck walks only
+that section (`tourSt.sec` filters `tourDeck`); exactly one populated
+section skips the picker and walks straight in. Marking a deck's last
+card lands on its own caught-up screen ('nothing left in <section>')
+with a '← Decks' link back to the picker - never a silent hop into a
+deck the user didn't pick. `tourLoad` reorders `entries` into Tool
+updates (change/curated) first, then the Work digest (record cards),
+each keeping the feed's `at` order; an empty section just contributes
+no cards. Every card header names its section
 (`tsecname` + per-section `card i of n` position, `sec-tool`/`sec-work`
 top-edge accent on #tourcard); `tourSec` falls back to the id prefix
 when a card lacks `section`. Work cards paint their `tag` FILLED
@@ -913,31 +958,68 @@ build can never reinsert a dealt card, and reattaches it to `history`
 when the stale copy lacks it; transition responses repaint the badge
 only when `unseen_count` is a real number (a deferred/absent count
 leaves the last-known pill to the /api/state poll, which converges).
+Anchoring: a Work digest card's spotlight prefers the dashboard ROW it
+describes (`tourAnchorEl` scans `tr[data-run-key]` for the card's
+`runs`/`requests` keys - recorded relationships, never name matches)
+before falling back to the card's `anchor` stop selector; a missing,
+hidden or zero-rect anchor keeps the centered/dimmed fallback. The
+card is placed below or above the ring, and when the clamped slot
+would still cover its anchor (a tall row mid-viewport) it parks right
+or left of it instead - staying on-screen wins only when every side
+fails. The feed protocol IS the progress channel: a `partial` answer
+keeps the client polling `/api/tour` itself (500ms) - every snapshot
+carries its `loading` block (`elapsed_s` re-stamped per poll, group +
+source marks, the current stage name) plus `seq`/`gen`, so elapsed time
+advances across polls and a repeat or stale-gen publication never
+re-applies (no card resurrections, no selection resets). The picker
+labels an empty section 'loading…' while its group is still publishing
+instead of lying 'all caught up'; an 'unview' marks `tourSt.seek` so
+the deck jumps to the returning card the moment a later snapshot lands
+it. `/api/tour/progress` stays as the lean busy/stage/at probe.
 
 The HTTP layer lives in conductor.py's `tour_ctx` block (just before
 `collect_dashboard`): one ctx per `make_dashboard_handler` holds the
 dirs, a ~60s `TOUR_FEED_TTL_S` feed cache, the retained last-built
-payload (`last`), a count snapshot, a mutation epoch (`gen`) and
-busy/wanted refresh coalescing, so tests/second dashboards never share
-state (the handler takes `tour_repo=`; the ctx is `Handler.tour_ctx`).
-`GET /api/tour` serves `tour_feed(ctx)` = `{generated_at, boundary,
-range, entries, history, unseen_count, warnings}` - the ONLY endpoint
-that builds inline; read-only end to end (the state file first appears
-on a mutation). `POST /api/tour/<id>/{viewed,snooze,unview}` runs
+payload (`last`), a count snapshot, a mutation epoch (`gen`), the
+newest published snapshot (`snap`), the running build's publication
+record (`build` - gen, started_at, accumulated entries/history/
+warnings, group + source marks), a monotonic publication counter
+(`seq`), and busy/wanted refresh coalescing, so tests/second
+dashboards never share state (the handler takes `tour_repo=`; the ctx
+is `Handler.tour_ctx`). `GET /api/tour` calls
+`tour_feed(ctx, progressive=True)`: it arms ONE coalesced daemon
+`_tour_build` and answers the newest snapshot immediately - an empty
+partial shell while nothing has published, then accumulating partial
+snapshots as `build_feed`'s `emit` hook publishes each group (collect
+status, tool, work, history) under the captured `gen`. A stale build
+(gen moved past it) still finishes collecting but can never publish,
+store, or resurrect an acknowledged card. A raised build publishes a
+TERMINAL snapshot (partial false + `error`, cards gathered so far) so
+pollers stop instead of spinning, and the next request re-arms a
+fresh build. `tour_feed(ctx)` without `progressive` keeps the
+synchronous complete-build contract internal callers (assistant_host)
+rely on; the whole path stays read-only (the state file first appears
+on a mutation). `GET /api/tour/progress` serves the ctx's `progress`
+dict `{busy, stage, at, started_at, groups, sources}` with `elapsed_s`
+recomputed per call - advisory, resets to not-busy when the build
+settles, success or failure. `POST /api/tour/<id>/{viewed,snooze,unview}` runs
 `tour_transition`, which never builds inline: the id is validated
 against the newest built payload (`last` - entries + history + folded
 `covers`, TTL-agnostic, so a once-seen card stays acknowledgeable
 after the live feed moved on; a renamed id the newest build lacks is
-still 'unknown') or, when nothing has ever built, against the persisted
-descriptors (a restart clears caches, not the file). The transition
-then persists through tour_state FIRST, drops the feed cache + bumps
-`gen` (a pre-mutation build can never store), and arms a daemon
-refresh via `_tour_refresh` - coalesced: one build in flight plus one
-`wanted` rerun, so a stale in-flight build can't eat the post-mutation
-rebuild. The response's `unseen_count` is the count the retained feed
-implies under the just-saved states (`_tour_count_now` - last-known,
-not a fresh collection; None when nothing has ever built), with
-`count_pending` marking the refresh the /api/state poll converges on.
+still 'unknown'), then the newest published snapshot (`snap` - a card
+that only published inside a partial is still markable), or, when
+nothing has ever built, against the persisted descriptors (a restart
+clears caches, not the file). The transition then persists through
+tour_state FIRST, drops the feed cache + the published snapshot +
+bumps `gen` (a pre-mutation build can never store or publish), and
+arms a daemon refresh via `_tour_refresh` - coalesced: one build in
+flight plus one `wanted` rerun, so a stale in-flight build can't eat
+the post-mutation rebuild. The response's `unseen_count` is the count
+the retained feed implies under the just-saved states
+(`_tour_count_now` - last-known, not a fresh collection; None when
+nothing has ever built), with `count_pending` marking the refresh the
+/api/state poll converges on.
 A descriptor-only mark lands but cannot judge the remaining deck, so
 the watermark never advances blind (`remaining_new=None`). A no-op
 transition (`changed` false) skips invalidation entirely.
@@ -999,6 +1081,13 @@ provider sessions register in the assistant workspace's own cwd-scoped
 only run-recorded ids - so leaks surface there and die by
 `devin rm <id>` (the id is in `exchanges.provider_session_id`), while
 a crashed serve leaves live children adoptable via reconcile() by pid.
+ACP chunk dedup exists ONLY for `session/load` replayed history
+(timestamped chunks re-sent verbatim). Live `agent_message_chunk`
+deltas may carry no `_meta` timestamp or a shared one - deduping them
+on (kind,ts,text) silently eats every repeated fragment (markdown
+repeats bullets/backticks constantly); the 'garbled answer' incident
+of 2026-10-20 was exactly that. Only `turn is ws.replay` may add sigs;
+a live turn only rejects sigs seeded from the replay set.
 
 ## Traps
 
@@ -1223,6 +1312,21 @@ Append as they are hit.
     machine pool. While a step sits in this window the record now
     carries `reported` - the worker's printed STATUS - so the
     dashboard can say 'reported done' instead of a bare 'running'.
+18. **`verify_timeout_min` defaults to 10 min - too small for the
+    registered gate on a busy box.** Burned 20261020-030142-whats-new-
+    polish end to end: `python run_tests.py --jobs 8` needs ~8-14 min
+    wall even lightly loaded and more while sibling agents + their own
+    gates hold the machine, so all five parallel steps printed `STATUS:
+    done`, all five gates timed out at 600s (one hit shard flakes
+    instead), every step recorded `failed`, and the merge pipeline kept
+    every worktree (`step_merge_kept`) - a full run's worth of finished,
+    self-tested work parked unmerged with zero defects in it. A failed
+    verify is terminal: retries only fire on `timed_out`, never on
+    `failed`. Any manifest whose registered gate approaches the cap -
+    especially a `parallel = true` pool where gates run while agents
+    still own the box - must set `verify_timeout_min` explicitly (~30
+    for `--jobs 8`) in `[defaults]` or per step, or it will burn the
+    same way.
 
 ## The task workspace - read before starting work
 

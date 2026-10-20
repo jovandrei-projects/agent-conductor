@@ -1,0 +1,133 @@
+[run]
+summarize = true
+name = "whats-new-polish"
+description = "Polish What's New and run summaries with progressive loading, proportionate outcome tags, restored summary controls, a safe HTML report, and readable chat typography."
+on_failure = "continue"
+checkpoint = true
+merge_resolver = true
+parallel = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 90
+max_attempts = 3
+verify = "python run_tests.py --jobs 8"
+
+[[step]]
+name = "progressive-tour"
+project = "agent-conductor"
+worktree = true
+timeout_min = 120
+prompt = '''
+Implement progressive What's New loading after the whats-new-split work. Own tour feed orchestration, staged API responses, tour_transition rebuild behavior, and the tour client's incremental loading/navigation. Do not change run-outcome classification, summary generation/rendering, or chat typography.
+
+Trace GET /api/tour, _tour_build, the independent feed collectors, and the existing generation/guard pattern. Replace the all-or-nothing synchronous build with staged endpoints or a polled partial-feed protocol consistent with existing API conventions. Deliver available tool-update cards without waiting for work-digest construction or re-materialization of all viewed history. Deliver work-digest cards and viewed-history behind the tool updates.
+
+Parallelize independent commit collection, run-directory scanning, request collection, curated whatsnew.jsonl collection, and history work where safe, using bounded concurrency and protecting shared mutable state. Avoid starting duplicate full builds for repeated polls. Preserve existing feed identity, sectioning, filtering, and viewed-state semantics.
+
+Make the first available card usable immediately. Navigation and viewing actions must remain enabled while later groups load. Incorporate later cards without duplicates, resetting the selected card, or unexpectedly moving the user through the deck. Reuse and extend the existing generation/guard mechanism so stale responses after refreshes, modal reopening, transitions, or newer builds cannot overwrite current feed state or resurrect a viewed card.
+
+Show elapsed time and meaningful completed/pending loading stages. Keep elapsed time advancing across polls; do not fabricate percentages or repeatedly reset the loading message. Handle empty groups and individual source failures without discarding usable cards or leaving an endless loading state.
+
+Remove tour_transition's synchronous full rebuild after mark_viewed: persist the transition, return its persisted result promptly, and invalidate/rebuild lazily through the guarded progressive flow. Preserve persistence-error reporting and transition correctness.
+
+Extend relevant test_tour_*.py suites and the existing node harness. Use controlled slow collectors to prove tool cards and navigation are available before later sources finish, collectors overlap safely, late responses are ignored, transitions do not await a full rebuild, and incremental updates preserve selection and viewed state. Cover progress, empty feeds, and partial source errors. Run the tour suites, test_conductor, and relevant node harness checks using the repository's actual commands.
+
+Leave step-specific .agent_tasks notes using existing conventions and finish with STATUS/NEXT lines recording changed areas, the staged API contract, actual test results, and remaining issues.
+'''
+
+[[step]]
+name = "run-outcome-tags"
+project = "agent-conductor"
+worktree = true
+timeout_min = 40
+prompt = '''
+Make What's New run-outcome tags proportionate without changing feed sectioning or persisted run/step verdicts. Own tour_feeds._run_outcome, any directly associated badge styling, and focused classification/rendering tests. Do not refactor feed loading or summary/chat styles.
+
+Inspect the actual status schema and existing verdict precedence. Count failed, timed_out, and lost as unsuccessful step outcomes. For terminal mixed-result runs, use partial when there is at least one done step and unsuccessful outcomes are not a strict majority of decisive outcomes (done plus unsuccessful). Reserve failed for runs with unsuccessful outcomes and either no done steps or an unsuccessful majority. Treat an even done/unsuccessful split as partial rather than a failure majority. Preserve existing handling of nonterminal and special run states; do not classify empty or never-started runs as failed solely because their done count is zero.
+
+The workflow-ux-safety shape of 29 done and 1 lost must display partial, not failed or successful. Reuse an existing partial badge if available; otherwise add a visually distinct dashboard-compatible style. Keep grouping, section placement, ordering, and underlying statuses unchanged.
+
+Extend the relevant test_tour_*.py suites with mostly-done runs containing each unsuccessful status, failure-majority runs, no-done failures, ties, all-done runs, and existing empty/nonterminal/special-state cases. Extend the node harness where needed to verify the displayed tag and unchanged sectioning. Run focused tests, the tour suites, test_conductor, and relevant node checks.
+
+Leave step-specific .agent_tasks notes and STATUS/NEXT lines explaining the classification rule, compatibility decisions, actual verification results, and any unresolved cases.
+'''
+
+[[step]]
+name = "summary-regressions"
+project = "agent-conductor"
+worktree = true
+timeout_min = 90
+prompt = '''
+Restore the three run-summary behaviors lost with LLM summaries. Own deterministic markdown statistics, canonical markdown step headings and decorateRunSum behavior, and code styling in run/task summary views. Keep edits within those areas even where conductor.py is shared. Do not implement the HTML report attachment, modify outcome badges, or change #aichat typography.
+
+First, prepend a deterministic technical-statistics block to whatever the existing summarizer writes to run.summary.md. Derive the numbers from actual run/step state and existing aggregation facilities, not LLM prose. Include steps done/failed counts, started/ended timestamps, elapsed duration, token totals, and merged/parked counts. Preserve meaningful distinctions among unsuccessful statuses where existing data supports them. Represent unavailable values honestly rather than inventing numbers. Ensure normal generation, regeneration, and relevant fallback paths keep exactly one authoritative statistics block at the top without double-counting attempts or duplicating headers.
+
+Second, update the markdown summarizer prompt/template so per-step sections retain the canonical '<step> - <status>' heading text consumed by decorateRunSum. Preserve task-modal links, mark-as-reviewed/mark-as-needing-review toggles, and strike-through for reviewed steps on LLM summaries. Inspect the current decorator rather than assuming its historical line number. Make only narrowly necessary decorator changes, and retain compatibility with older deterministic summaries. Keep these markdown instructions separate from any additive HTML-output instructions another step introduces.
+
+Third, restyle '#detail .sumdoc code' to match the existing Ask-AI code-pill treatment: visible border, subtle background, readable contrast, and wrapping of long identifiers such as deferred-transition. Apply the same long-code wrapping fix to the actual per-task summary view. Scope changes to summary containers and preserve appropriate whitespace/readability for preformatted blocks. Do not alter the chat's code-pill rules or dashboard-wide typography.
+
+Add deterministic statistics and regeneration regression tests using the project's existing test organization. Extend the node harness for canonical LLM headings, task links, review toggles, reviewed decoration, and summary code styling/wrapping as supported by the harness. Run the tour suites, test_conductor, and relevant node checks.
+
+Leave step-specific .agent_tasks notes and STATUS/NEXT lines documenting the statistics source, canonical heading contract, affected selectors, verification results, and remaining gaps.
+'''
+
+[[step]]
+name = "html-summary-report"
+project = "agent-conductor"
+worktree = true
+timeout_min = 120
+prompt = '''
+Add run.summary.html as a second artifact from the existing summarize session, and append its safe rendering below the existing markdown sumdoc in the run-summary modal. Own HTML-output instructions, artifact persistence/loading, report sanitization/scoped styling, and the appended report renderer. Do not rewrite markdown statistics, canonical markdown heading instructions, or review-decoration logic owned by the summary-regressions step. Make additive, localized edits to shared summarizer and modal code; do not depend on unpublished helpers from another worktree.
+
+The same summarize session must additionally write the plain run.summary.html file in the run directory without replacing run.summary.md. Use a lavish-style organization with a stat strip, sectioned findings, and per-step blocks. Match the dashboard palette (#0d1117, #161b22, #58a6ff), typography, and UI scale rather than copying an external stylesheet. Base report statistics on actual run data. The lavish-axi reference is aesthetic only: do not start, contact, or serve through the lavish whiteboard server.
+
+Make the artifact self-contained and treat its contents as untrusted when rendering, including stored artifacts that have been modified after generation. Use the project's existing safe parsing/sanitization facilities where suitable. Prefer a fixed trusted stylesheet scoped beneath a dedicated new .run-summary-report wrapper, stripping generated style elements and inline styles rather than accepting arbitrary model CSS. Ensure all surviving report styles are confined to that container and cannot affect the dashboard, markdown summary, or chat.
+
+Allow only inert report markup. Remove scripts, event handlers, executable URLs, active embedded content, forms, and unsafe attributes. Prevent DOM identifier collisions. Disallow external resources, CSS imports/resource URLs, and resource loads or actions against loopback services; the report must require no network access. Do not rely solely on prompt instructions or regex substitutions for sanitization. Preserve existing artifact-access and run-identity protections rather than exposing arbitrary file paths.
+
+Append the sanitized report exactly once at the END of the existing modal content, below the markdown sumdoc. Preserve the markdown view and its task links/review controls. Handle missing, malformed, or rejected HTML gracefully so older runs remain readable. Guard asynchronous report loading so switching runs or reopening the modal cannot append another run's report.
+
+Add artifact-generation/loading tests and node harness coverage for ordering, legacy runs without HTML, malformed reports, repeated rendering, stale responses, and preservation of markdown decoration. Add adversarial sanitizer tests for script/event injection, style escape, unsafe URLs, external/loopback resource loading, and tampered stored artifacts. Run the tour suites, test_conductor, and relevant node checks.
+
+Leave step-specific .agent_tasks notes and STATUS/NEXT lines describing the artifact contract, sanitization boundary, style scope, actual test results, and remaining issues.
+'''
+
+[[step]]
+name = "chat-font"
+project = "agent-conductor"
+worktree = true
+timeout_min = 30
+prompt = '''
+Change Ask-AI chat prose from inherited dashboard monospace to a readable system sans stack. Own only #aichat typography rules, associated narrowly scoped overrides, and typography regression tests. Inspect chat.css and the actual chat markup before editing. Do not change the dashboard body font, summary selectors, outcome badges, or shared code-pill appearance.
+
+Use a stack such as system-ui, 'Segoe UI', Inter, sans-serif for chat prose, including relevant message text and composer text. Keep code, preformatted content, and code pills explicitly on the existing ui-monospace stack so they do not inherit the new prose font. Preserve current UI scale, spacing, wrapping behavior, and code-pill contrast. Use system font lookup only: no bundled fonts, downloads, font imports, or external requests.
+
+Extend the existing node harness or applicable stylesheet tests to verify sans-serif prose and monospace code/pre/pills without changing non-chat typography. Run relevant node checks, the tour suites, and test_conductor.
+
+Leave step-specific .agent_tasks notes and STATUS/NEXT lines recording changed selectors, verification results, and any remaining typography issues.
+'''
+
+[[step]]
+name = "follow-up-plan"
+project = "agent-conductor"
+worktree = true
+timeout_min = 20
+depends_on = ["progressive-tour", "run-outcome-tags", "summary-regressions", "html-summary-report", "chat-font"]
+prompt = '''
+Perform the closing review after all five implementation steps have reached terminal states and the parallel pool and serialized merges have drained. This step is review, verification, and follow-up proposal writing only; do not implement fixes, merge parked changes, or launch another run.
+
+Find this run's evidence under C:/Projects/agent-conductor/data/runs in the newest directory whose name ends in whats-new-polish. Review every step's logs, STATUS/NEXT lines, verification results, merge-resolver results, and notes, together with agent-conductor's .agent_tasks files. Inspect the actual merged result rather than assuming a successful session means its changes landed. Account explicitly for failed steps, parked worktrees, incomplete verification, and unresolved merges.
+
+Compare the result against all five human requirements: usable progressive tool-first loading with guarded transitions and visible progress; proportionate run tags without section changes; deterministic summary statistics, canonical review-enabled headings, and code wrapping; a second safe, scoped HTML report appended beneath markdown; and sans-serif chat prose with monospace code.
+
+Run integrated verification on the merged result with python run_tests.py --jobs 8. Confirm the tour suites and test_conductor are covered, and run the existing node harness through its actual repository command if it is not included. Record failures or unverified behavior as evidence for follow-up rather than fixing implementation code here.
+
+Write a NEW conductor TOML manifest at C:/Projects/agent-conductor/manifests/whats-new-polish-followup.toml proposing only still-unfinished requirements or newly discovered issues supported by this review. Do not repeat completed work or expand into unrelated cleanup. If nothing remains, record that outcome without inventing implementation tasks.
+
+Use the registered project slug agent-conductor, concrete scoped prompts, appropriate dependencies, worktree isolation, automatic merge resolution, and the registered verification command. Preserve parallelism for independent proposed work; do not invent a merge_target or request cloud execution. Do not embed credentials or private data; reference their existing project files if necessary.
+
+Save the proposal for human review only. Do not launch it or implement any proposed follow-up. Finish with STATUS/NEXT lines identifying the saved manifest, verification outcomes, and any remaining blockers.
+'''

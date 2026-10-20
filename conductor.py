@@ -27,6 +27,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import html
+import html.parser
 import http.server
 import json
 import logging
@@ -2781,26 +2782,66 @@ def _run_step_stats(st: dict) -> dict:
             "cached": cached, "merged": merged, "parked": parked}
 
 
-def run_report_md(st: dict) -> str:
-    """Deterministic run roll-up - run stats plus each step's own closing
-    report in record order. Served by the run summary endpoint whenever
-    no LLM-written run.summary.md exists, and embedded verbatim in the
-    summarizer prompt as the source material."""
+def _run_stats_lines(st: dict) -> list[str]:
+    """The deterministic fact-sheet bullets that top every run summary:
+    per-status step counts (each unsuccessful outcome keeps its own
+    count), the run's timestamps and driver elapsed, token totals, and
+    merge tallies - all from the step records via _run_step_stats, so a
+    retried step still counts once and only its banked tokens roll up.
+    Anything the state never recorded renders as '-' or an omitted
+    claim, never an invented number."""
     agg = _run_step_stats(st)
-    L = [f"# {st.get('run') or '?'} - run summary", "",
-         "- **steps:** " + (", ".join(
+    L = ["- **steps:** " + (", ".join(
              f"{n} {k}" for k, n in sorted(agg["counts"].items()))
              or "none"),
          f"- **started:** {st.get('started_at') or '-'} · "
          f"**ended:** {st.get('ended_at') or '-'} · "
          f"**elapsed:** {_run_elapsed_md(st)}"]
-    if agg["prompt"] or agg["completion"]:
+    if agg["prompt"] or agg["completion"] or agg["cached"]:
         L.append(f"- **tokens:** {_fmtK(agg['prompt'])} prompt + "
                  f"{_fmtK(agg['completion'])} completion"
                  + (f" ({_fmtK(agg['cached'])} cached)"
                     if agg["cached"] else ""))
+    else:
+        L.append("- **tokens:** -")
     L.append(f"- **merged:** {agg['merged']} · "
              f"**parked branch:** {agg['parked']}")
+    return L
+
+
+def _run_stats_md(st: dict) -> str:
+    return "\n".join(_run_stats_lines(st))
+
+
+def _ensure_stats_block(md: str, st: dict) -> str:
+    """Serve an LLM-written run.summary.md with exactly one statistics
+    block at the top. Files written by summarize_run already carry it
+    and are returned untouched - a legacy file without it gets the block
+    injected under its own title/byline for this read only (the stored
+    artifact stays as written; regenerating rewrites it on disk)."""
+    # the whole document is scanned, not just the head - a file whose
+    # body already carries the steps bullet anywhere must never grow a
+    # second stats block
+    if re.search(r"^- \*\*steps:\*\*", md, re.M):
+        return md
+    blocks = md.split("\n\n")
+    pos = 0
+    if blocks and blocks[0].lstrip().startswith("# "):
+        pos = 1
+        # the generated '_written <ts> · session ..._' byline rides
+        # directly under the title - stats belong below it
+        if len(blocks) > 1 and blocks[1].strip().startswith("_"):
+            pos = 2
+    return "\n\n".join(blocks[:pos] + [_run_stats_md(st)] + blocks[pos:])
+
+
+def run_report_md(st: dict) -> str:
+    """Deterministic run roll-up - run stats plus each step's own closing
+    report in record order. Served by the run summary endpoint whenever
+    no LLM-written run.summary.md exists, and embedded verbatim in the
+    summarizer prompt as the source material."""
+    L = [f"# {st.get('run') or '?'} - run summary", ""]
+    L += _run_stats_lines(st)
     for name, rec in (st.get("steps") or {}).items():
         meta = [_elapsed_md(rec),
                 rec.get("model_actual") or rec.get("model") or "?"]
@@ -2836,8 +2877,7 @@ def _summary_prompt(st: dict) -> str:
         "reading the dashboard in the morning:",
         "",
         "- what the run set out to do and whether it got there",
-        "- what actually landed (merged vs parked vs failed); group by",
-        "  theme when that reads better than step order",
+        "- what actually landed (merged vs parked vs failed)",
         "- failures, surprises, unfinished work, anything worth a",
         "  human look in the morning",
         "- do NOT invent work or verification - only report what the",
@@ -2847,6 +2887,38 @@ def _summary_prompt(st: dict) -> str:
         "Plain markdown, ~300-600 words unless the run earned more.",
         "Your final message IS the document - output only the summary,",
         "no preamble, no sign-off.",
+        "",
+        "Give EVERY step its own section headed exactly",
+        "'## <step-name> - <status>' - the step slug and the status word",
+        "copied verbatim from the '### <step> - <status>' source lines",
+        "under '## Steps' below (e.g. '## build-ui - done'). The",
+        "dashboard rewires those exact headings into task links and",
+        "review toggles; 'Step build-ui: ...', '## build-ui (done)' or a",
+        "shared section heading read as prose and silently lose the",
+        "wiring. Thematic narrative is welcome in additional non-step",
+        "sections; the per-step headings must survive verbatim.",
+        "",
+        "## Also write run.summary.html",
+        "",
+        "Before your final message, write a file named run.summary.html",
+        "in your current directory - a standalone HTML executive report",
+        "of the SAME run, collected next to (never replacing) the",
+        "markdown. Requirements:",
+        "- a complete self-contained document (<!doctype html>, <head>",
+        "  carrying its own <style>, <body>) that renders with zero",
+        "  network access - no external links, fonts, scripts, images",
+        "  or resources of any kind",
+        "- lavish but compact organization: a <header> with the run",
+        "  name and a stat strip (one <ul> of <li><strong>N</strong>",
+        "  label</li> items), then <section>s of findings grouped by",
+        "  theme, then a steps <section> holding one <article> per",
+        "  step (<h3>step - status</h3>, key facts, a short paragraph)",
+        "- palette + scale: background #0d1117, panels #161b22, accent",
+        "  #58a6ff, text #c9d1d9, headings #e6edf3, borders #21262d,",
+        "  system sans at dashboard size (~13px)",
+        "- every number comes from the run data below - never invent",
+        "- inert markup only: no scripts, no event handlers, no forms,",
+        "  no embedded media, no URLs of any kind",
         "",
         "## Run",
         "",
@@ -2978,6 +3050,18 @@ def summarize_run(run_dir: Path, devin_argv: list[str] | None = None,
                 log_event(run_dir, event="run_summary_failed",
                           exit_code=rc, timed_out=timed_out)
                 return False
+            # second artifact: the session's run.summary.html rides the
+            # same session into the run dir - the markdown contract
+            # (closing message -> run.summary.md) is untouched, and a
+            # missing/oversized HTML file just means no second artifact
+            try:
+                produced = Path(wd) / "run.summary.html"
+                if (produced.is_file() and 0 < produced.stat().st_size
+                        <= _REPORT_HTML_MAX_BYTES):
+                    shutil.copyfile(produced,
+                                    run_dir / "run.summary.html")
+            except OSError as exc:
+                print(f"[summary] run.summary.html not collected: {exc}")
         report = final_report(export_path)
         if not report:
             print("[summary] session produced no closing report")
@@ -2991,8 +3075,12 @@ def summarize_run(run_dir: Path, devin_argv: list[str] | None = None,
         header = (f"# {st.get('run') or run_dir.name} - run summary\n\n"
                   f"_written {now_iso()}"
                   + (f" · session `{sid}`" if sid else "") + "_\n\n")
+        # The LLM writes prose; the fact sheet is ours - the same
+        # deterministic block the roll-up leads with, baked in once at
+        # write time so regeneration replaces rather than stacks it.
         (run_dir / "run.summary.md").write_text(
-            header + report.rstrip() + "\n", encoding="utf-8")
+            header + _run_stats_md(st) + "\n\n" + report.rstrip() + "\n",
+            encoding="utf-8")
         _summary_result(st, run_dir, "done", t0, export_path, model, rc,
                         session=sid)
         log_event(run_dir, event="run_summarized",
@@ -3010,8 +3098,212 @@ def run_summary_doc(name: str, runs_dir: Path = RUNS_DIR) -> str:
     d, st = _run_dir_checked(name, runs_dir)
     f = d / "run.summary.md"
     if f.is_file():
-        return f.read_text(encoding="utf-8", errors="replace")
+        md = f.read_text(encoding="utf-8", errors="replace")
+        return _ensure_stats_block(md, st)
     return run_report_md(st)
+
+
+# --- HTML report sanitization ------------------------------------------
+# run.summary.html is LLM-authored and stored in the run dir - both the
+# file and anything later written into it are UNTRUSTED at render time.
+# The sanitizer re-serializes through html.parser (never regex alone):
+# an allowlist of inert elements survives, only a tiny set of inert
+# attributes is kept (no URL-bearing, id/name, style, or event
+# attributes - so no network access, no DOM-identifier collisions and
+# no dashboard classes on report markup), and emitted tags are always
+# balanced so the fragment cannot break out of its container on reparse.
+# Styling comes only from the fixed stylesheet scoped under
+# .run-summary-report - generated <style> elements and inline styles
+# are dropped with everything else.
+
+_REPORT_HTML_MAX_BYTES = 512 * 1024      # larger artifacts are rejected
+
+# Elements re-serialized into the fragment. Anything else is either
+# dropped with its subtree (_REPORT_DROP) or unwrapped to its children.
+_REPORT_ALLOWED = frozenset({
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "header", "section", "article", "aside", "footer", "main", "nav",
+    "figure", "figcaption",
+    "p", "div", "span", "ul", "ol", "li", "dl", "dt", "dd",
+    "blockquote", "pre", "code", "hr", "br", "wbr",
+    "strong", "em", "b", "i", "u", "s", "small", "mark",
+    "sub", "sup", "kbd", "samp", "var", "abbr", "dfn", "cite", "q",
+    "time", "a", "bdi", "bdo", "ins", "del",
+    "details", "summary",
+    "table", "caption", "colgroup", "col", "thead", "tbody", "tfoot",
+    "tr", "th", "td",
+})
+
+# Active, raw-text, or foreign-content subtrees removed whole - their
+# text children (script source, CSS, RCDATA) must not surface either.
+_REPORT_DROP = frozenset({
+    "script", "style", "template", "noscript", "iframe", "object",
+    "applet", "frameset", "head", "title", "textarea",
+    "xmp", "plaintext", "listing", "noembed", "noframes",
+    "svg", "math", "canvas", "audio", "video", "map", "select",
+    "datalist", "dialog",
+})
+
+# Dropped resource/form voids - they have no contents, so they never
+# reach the drop stack (an <embed> would otherwise swallow the rest).
+_REPORT_DROP_VOID = frozenset({
+    "embed", "link", "img", "input", "meta", "base", "source", "track",
+    "area", "frame", "param", "keygen",
+})
+
+# Allowlisted elements that never take an end tag.
+_REPORT_VOID = frozenset({"br", "hr", "wbr", "col"})
+
+# The only attributes that survive - inert metadata only. Nothing
+# URL-bearing (href/src/srcset/action/formaction/poster/cite/
+# background/ping/data), nothing identifying (id/name/for), nothing
+# presentational (style), and no event handlers (on*): report markup
+# can never navigate, load, collide with dashboard DOM ids, or pick up
+# a dashboard class.
+_REPORT_ATTRS = {
+    "td": ("colspan", "rowspan"),
+    "th": ("colspan", "rowspan", "scope"),
+    "col": ("span",),
+    "colgroup": ("span",),
+    "time": ("datetime",),
+    "details": ("open",),
+}
+_REPORT_ATTRS_GLOBAL = ("title",)
+_REPORT_INT_ATTRS = frozenset({"colspan", "rowspan", "span"})
+_REPORT_SCOPE_VALUES = frozenset({"row", "col", "rowgroup", "colgroup"})
+
+
+class _ReportSanitizer(html.parser.HTMLParser):
+    """Streaming re-serializer for report HTML: allowed tags emit with
+    filtered attributes, disallowed tags unwrap to their children,
+    drop-set subtrees are skipped whole, and every emitted open tag is
+    force-closed at EOF so output stays balanced on malformed input."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.out: list[str] = []
+        self.open_tags: list[str] = []
+        self.drop_stack: list[str] = []
+
+    def _emit(self, tag: str, attrs: list, close: bool) -> None:
+        keep: list[str] = []
+        extra = _REPORT_ATTRS.get(tag, ())
+        for k, v in attrs:
+            k = k.lower()
+            if k not in _REPORT_ATTRS_GLOBAL and k not in extra:
+                continue
+            if k in _REPORT_INT_ATTRS:
+                try:
+                    v = str(max(1, min(100, int(str(v).strip()))))
+                except (TypeError, ValueError):
+                    continue
+            elif k == "scope" and str(v).lower() not in _REPORT_SCOPE_VALUES:
+                continue
+            if v is None:
+                keep.append(f" {k}")
+            else:
+                keep.append(f' {k}="{html.escape(str(v), quote=True)}"')
+        self.out.append("<" + tag + "".join(keep) + ">")
+        if tag in _REPORT_VOID:
+            return
+        if close:
+            self.out.append(f"</{tag}>")
+        else:
+            self.open_tags.append(tag)
+
+    def handle_starttag(self, tag, attrs):
+        if self.drop_stack:
+            if tag in _REPORT_DROP:
+                self.drop_stack.append(tag)
+            return
+        if tag in _REPORT_DROP:
+            self.drop_stack.append(tag)
+            return
+        if tag in _REPORT_DROP_VOID:
+            return
+        if tag in _REPORT_ALLOWED:
+            self._emit(tag, attrs, close=False)
+        # anything else unwraps: its children still get their own pass
+
+    def handle_startendtag(self, tag, attrs):
+        # "/>" on an element HTML never self-closes (script, iframe) is
+        # an OPEN tag in a real parser - treat it like one
+        if self.drop_stack:
+            return
+        if tag in _REPORT_DROP:
+            self.drop_stack.append(tag)
+            return
+        if tag in _REPORT_DROP_VOID:
+            return
+        if tag in _REPORT_ALLOWED:
+            self._emit(tag, attrs, close=True)
+
+    def handle_endtag(self, tag):
+        if self.drop_stack:
+            if tag == self.drop_stack[-1]:
+                self.drop_stack.pop()
+            elif tag in _REPORT_DROP and tag in self.drop_stack:
+                # mismatched nesting - close the drop frames down to it
+                while self.drop_stack and self.drop_stack[-1] != tag:
+                    self.drop_stack.pop()
+                if self.drop_stack:
+                    self.drop_stack.pop()
+            return
+        if tag in self.open_tags:
+            while self.open_tags:
+                t = self.open_tags.pop()
+                self.out.append(f"</{t}>")
+                if t == tag:
+                    break
+
+    def handle_data(self, data):
+        if not self.drop_stack:
+            self.out.append(html.escape(data))
+
+    # comments, decls, PIs and CDATA sections never survive (base
+    # handlers are no-ops, which is exactly the drop we want)
+
+    def result(self) -> str:
+        while self.open_tags:
+            self.out.append(f"</{self.open_tags.pop()}>")
+        return "".join(self.out)
+
+
+def sanitize_report_html(src: str) -> str:
+    """Sanitize an LLM-authored run.summary.html to inert markup for
+    in-dashboard rendering. Parser-based, never regex substitution:
+    allowed elements are re-serialized with filtered attributes, active
+    and foreign subtrees drop whole, and output is always balanced."""
+    p = _ReportSanitizer()
+    try:
+        p.feed(src[:_REPORT_HTML_MAX_BYTES])
+        p.close()
+    except Exception:                        # malformed input degrades
+        pass                                 # to what was emitted so far
+    return p.result().strip()
+
+
+def run_summary_html(name: str, runs_dir: Path = RUNS_DIR) -> str:
+    """GET /api/runs/<run>/summary.html - the summarizer session's
+    second artifact, re-sanitized on every read (a stored file edited
+    after generation is still untrusted) and wrapped in the
+    .run-summary-report container the dashboard stylesheet scopes to.
+    Missing or unrenderable artifacts 404 so the modal just skips them.
+    """
+    d, _st = _run_dir_checked(name, runs_dir)
+    f = d / "run.summary.html"
+    if not f.is_file():
+        raise RequestError("No HTML report for this run", 404)
+    try:
+        raw = f.read_bytes()[:_REPORT_HTML_MAX_BYTES + 1]
+    except OSError as exc:
+        raise RequestError("Cannot read the HTML report", 500) from exc
+    frag = sanitize_report_html(
+        raw[:_REPORT_HTML_MAX_BYTES].decode("utf-8", errors="replace"))
+    if not frag:
+        raise RequestError("The HTML report has no renderable content",
+                           404)
+    return '<div class="run-summary-report">' + frag + "</div>"
 
 
 def summarize_run_start(name: str, runs_dir: Path = RUNS_DIR,
@@ -3176,10 +3468,14 @@ def summary_html(md: str, title: str) -> str:
             "h1{font-size:20px;border-bottom:1px solid #21262d;"
             "padding-bottom:8px}h2{font-size:15px;color:#58a6ff;"
             "margin:20px 0 6px}ul{padding-left:20px}li{margin:3px 0}"
-            "code{background:#161b22;border-radius:4px;padding:1px 5px;"
-            "font-size:12px}pre{background:#161b22;border-radius:6px;"
+            "code{background:rgba(110,118,129,.16);border:1px solid "
+            "rgba(110,118,129,.32);border-radius:5px;padding:.5px 5px;"
+            "font-size:.92em;color:#a5d6ff;overflow-wrap:anywhere}"
+            "pre{background:#161b22;border-radius:6px;"
             "padding:10px 12px;font-size:12px;overflow:auto;"
-            "white-space:pre-wrap}strong{color:#e6edf3}</style></head>"
+            "white-space:pre-wrap}pre code{background:none;border:0;"
+            "padding:0;color:inherit;font-size:inherit}"
+            "strong{color:#e6edf3}</style></head>"
             f"<body>{_summary_body(md)}</body></html>")
 
 
@@ -3220,13 +3516,24 @@ def _safe_name(s: str) -> str:
     return re.sub(r"[^\w.-]", "_", s)
 
 
+_FLAG_KEY_MEMO: dict[str, str] = {}
+
+
 def _flag_key(run_dir: Path) -> str:
     """Sentinel names pin the run's resolved path, not just its dir name -
     the flag dir is machine-global, and the same `<ts>-<name>` can live in
-    two checkouts' data/runs (or two test sandboxes) at once."""
-    h = hashlib.sha256(
-        os.path.normcase(str(run_dir.resolve())).encode()).hexdigest()[:8]
-    return f"{_safe_name(run_dir.name)}-{h}"
+    two checkouts' data/runs (or two test sandboxes) at once. The
+    resolve() is memoized per path string - collect_dashboard asks once
+    per step otherwise, and a moved/renamed dir arrives under a new
+    string, so entries never mislabel a reused name."""
+    k = _FLAG_KEY_MEMO.get(str(run_dir))
+    if k is None:
+        h = hashlib.sha256(
+            os.path.normcase(
+                str(run_dir.resolve())).encode()).hexdigest()[:8]
+        k = f"{_safe_name(run_dir.name)}-{h}"
+        _FLAG_KEY_MEMO[str(run_dir)] = k
+    return k
 
 
 def stop_flag(run_dir: Path, step: str | None = None) -> Path:
@@ -8887,6 +9194,37 @@ def _publish_proposal(rec: dict, text: str, requests_dir: Path,
     return dict(rec)
 
 
+def plan_supersede(request_id: str, attempt: int,
+                   requests_dir: Path = REQUESTS_DIR) -> dict:
+    """Hand-mark one recorded planner attempt superseded: the human says
+    a different attempt is the one that counts. The auto rule already
+    supersedes failed attempts BEFORE the producing one; this covers a
+    failed regen after it, or any recorded attempt the user retires.
+    The record keeps its real status/note - the dashboard row maps to
+    'superseded' only at render, so history stays honest."""
+    with REQUEST_LOCK:
+        rec = _read_request_file(request_id, requests_dir)
+        if (_spool_dir(request_id) / "request.json").is_file():
+            raise RequestError(
+                "a generation pass is parked on this request - retry "
+                "when it finishes", 409)
+        entries = rec.get("plan_sessions") or []
+        i = attempt - 1
+        if not (0 <= i < len(entries)):
+            raise RequestError(
+                f"no planner attempt #{attempt} on record", 404)
+        e = entries[i]
+        if e.get("gen_id") and e.get("gen_id") == rec.get("plan_gen_id"):
+            raise RequestError(
+                "that attempt produced the current plan - nothing to "
+                "supersede", 409)
+        if not e.get("superseded"):
+            e["superseded"] = True
+            e["superseded_at"] = now_iso()
+            _save_request(rec, requests_dir)
+    return {"ok": True, "request": request_id, "attempt": attempt}
+
+
 def save_request(request_id: str, payload: dict,
                  requests_dir: Path = REQUESTS_DIR,
                  manifests_dir: Path = MANIFESTS_DIR,
@@ -13702,8 +14040,12 @@ def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
         # outstanding failure - 'superseded' (same treatment resolve-*
         # rows get) keeps it out of the failed filter instead of
         # leaving it red forever. An attempt AFTER the producer keeps
-        # its real status: a regen that failed is still actionable.
-        if (status not in ("done", "superseded")
+        # its real status: a regen that failed is still actionable -
+        # unless the human marked it superseded by hand (the recorded
+        # outcome stays on the record; only the rendered status moves).
+        if e.get("superseded") and not produced:
+            status = "superseded"
+        elif (status not in ("done", "superseded")
                 and producer_idx is not None and i < producer_idx):
             status = "superseded"
         if produced:
@@ -13715,6 +14057,9 @@ def plan_attempt_agents(rec: dict, key: str, *, generating: bool,
             note = e["note"]
         elif status == "failed":
             note = "preparation attempt failed"
+        elif e.get("superseded"):
+            note = ("marked superseded - the recorded outcome stays in "
+                    "history")
         else:
             note = "superseded by a later preparation"
         out.append({
@@ -13794,7 +14139,10 @@ def summary_agent(st: dict, key: str, run_dir: Path,
         "task_full": None, "purpose": None,
         "note": rs.get("note"), "next": None,
         "exit_code": rs.get("exit_code"),
-        "outcome": ("wrote run.summary.md"
+        "outcome": (("wrote run.summary.md"
+                     + (" + run.summary.html"
+                        if (run_dir / "run.summary.html").is_file()
+                        else ""))
                     if rs.get("generated_at") else None),
         "outcomes": None,
         "branch": None, "merged": None,
@@ -14227,9 +14575,21 @@ def tour_ctx(runs_dir: Path, requests_dir: Path | None = None,
             "state_path": runs_dir.parent / "tour-state.json",
             "devin_argv": list(devin_argv or ["devin"]),
             "feed": None,     # {"at": epoch, "payload": GET /api/tour body}
-            "last": None,     # the newest payload ever stored - kept for
-                              # transition validation even after `feed`
-                              # drops; a once-seen card stays ackable
+            "last": None,     # the newest COMPLETE payload ever stored -
+                              # kept for transition validation even after
+                              # `feed` drops; a once-seen card stays
+                              # ackable
+            "snap": None,     # the newest published snapshot (a partial
+                              # while a build runs, the complete payload
+                              # when it lands) - GET /api/tour serves it
+                              # under the progressive protocol
+            "build": None,    # the running build's publication record:
+                              # captured gen, started_at, accumulated
+                              # entries/history/warnings, per-group +
+                              # per-source status
+            "seq": 0,         # monotonic publication counter - a client
+                              # applies a snapshot only when its seq
+                              # beats the last one it saw
             "count": None,    # {"at": epoch, "value": int}
             "busy": False,    # a background build owns the refresh
             "wanted": False,  # a refresh was requested mid-build: the
@@ -14237,8 +14597,13 @@ def tour_ctx(runs_dir: Path, requests_dir: Path | None = None,
                               # busy, so a transition's post-mutation
                               # rebuild is never lost to coalescing
             "gen": 0,         # mutation epoch - a build that started
-                              # before a transition can't overwrite the
-                              # post-mutation cache it races
+                              # before a transition can't publish or
+                              # store over the post-mutation state
+            "progress": {"busy": False, "stage": "", "at": 0.0,
+                         "started_at": 0.0, "groups": {}, "sources": {}},
+                              # the loading screen's live narration -
+                              # GET /api/tour/progress serves it while
+                              # a build walks its phases
             "lock": threading.Lock()}
 
 
@@ -14268,26 +14633,185 @@ def _tour_polisher(ctx: dict):
     return ctx["polisher"]
 
 
+_TOUR_GROUPS = ("collect", "tool", "work", "history")
+
+
+def _tour_groups() -> dict:
+    """The build's publication stages, in emit order: the source scans
+    (collect), the Tool-updates cards, the Work-digest cards, then
+    viewed-history re-materialization."""
+    return {g: "pending" for g in _TOUR_GROUPS}
+
+
+def _tour_groups_run(groups: dict) -> None:
+    """Advance the stage map: the first pending stage after a done one
+    is the group the build is inside now."""
+    seen_pending = False
+    for g in _TOUR_GROUPS:
+        if groups.get(g) != "done" and not seen_pending:
+            groups[g] = "running"
+            seen_pending = True
+
+
+def _tour_loading(ctx: dict, build: dict | None) -> dict:
+    """The `loading` block a tour snapshot carries: elapsed time (still
+    advancing across polls), the narrated stage, per-group and
+    per-source done/pending state. Called under ctx['lock']."""
+    if build is None:
+        return {"busy": bool(ctx["busy"])}
+    out = {"busy": bool(ctx["busy"]),
+           "started_at": build["started_at"],
+           "elapsed_s": round(time.time() - build["started_at"], 1),
+           "stage": ctx["progress"].get("stage") or "",
+           "groups": dict(build["groups"]),
+           "sources": dict(build["sources"])}
+    if build.get("error"):
+        out["error"] = build["error"]
+    return out
+
+
+def _tour_enrichment(ctx: dict, rng: dict | None) -> dict:
+    """The enrichment field for a snapshot - the same shape the final
+    payload reports, recomputed per publish so a landing polish record
+    shows up on the next snapshot."""
+    polisher = _tour_polisher(ctx)
+    if polisher is None or not polisher.enabled():
+        return {"enabled": False}
+    out = {"enabled": True}
+    rec = polisher.record(rng) if rng else None
+    out["status"] = ("generating" if polisher.generating(rng)
+                     else (rec or {}).get("status") or "pending")
+    if rec and rec.get("error"):
+        out["error"] = rec["error"]
+    if rec and rec.get("model"):
+        out["model"] = rec["model"]
+    if rec and rec.get("dropped"):
+        out["dropped"] = rec["dropped"]
+    return out
+
+
+def _tour_compose(ctx: dict, build: dict, *, partial: bool,
+                  error: str | None = None) -> dict:
+    """A publishable snapshot from the running build's accumulated
+    groups - called under ctx['lock']; lists are copied so a later
+    publish can't mutate a served snapshot."""
+    out = {"generated_at": build["generated_at"],
+           "boundary": build["boundary"], "range": build["range"],
+           "entries": list(build["entries"]),
+           "history": list(build["history"]),
+           "unseen_count": build["unseen"],
+           "warnings": list(build["warnings"]),
+           "enrichment": _tour_enrichment(ctx, build["range"]),
+           "partial": partial, "seq": ctx["seq"], "gen": build["gen"],
+           "loading": _tour_loading(ctx, build)}
+    if error:
+        out["error"] = error
+    return out
+
+
 def _tour_build(ctx: dict, *, now: float | None = None) -> dict:
-    """One feed build, cached as both the GET payload and the unseen
-    count. Pure reads (tour_state.load never writes): nothing on the
-    GET path can mark an entry or move the watermark. Optional LLM
-    enrichment applies ONLY from the persisted tour-cache.json (never
-    generated inline); an uncached range kicks one coalesced background
-    attempt that invalidates the cache when it lands."""
+    """One staged feed build: tour_feeds emits each feed group as it
+    lands; every emitted group publishes into ctx['snap'] under the
+    captured generation so GET /api/tour serves progressively-growing
+    snapshots while the build runs - Tool updates first, the Work
+    digest behind them, viewed history last. A build that started
+    before a transition (gen moved on) still finishes collecting but
+    can never publish or store - its stale groups can't resurrect a
+    just-acknowledged card. The last stage stores the complete payload
+    as the feed cache, the retained `last` and the count, exactly as
+    the all-at-once build did. Pure reads (tour_state.load never
+    writes): nothing on the GET path can mark an entry or move the
+    watermark. Optional LLM enrichment applies ONLY from the persisted
+    tour-cache.json (never generated inline); an uncached range kicks
+    one coalesced background attempt that invalidates the cache when
+    it lands."""
     tour_state, tour_feeds = _tour_mods()
     ts = time.time() if now is None else now
     polisher = _tour_polisher(ctx)
     polish_on = polisher is not None and polisher.enabled()
     with ctx["lock"]:
         gen0 = ctx["gen"]
-    state = tour_state.load(ctx["state_path"])
-    boundary = tour_state.capture_boundary(ctx["repo_dir"], now=now)
-    feed = tour_feeds.build_feed(
-        state, boundary, repo_dir=ctx["repo_dir"],
-        runs_dir=ctx["runs_dir"], requests_dir=ctx["requests_dir"],
-        manifests_dir=ctx["manifests_dir"],
-        polish=polisher.cards_for if polish_on else None)
+        build = {"gen": gen0, "started_at": ts,
+                 "generated_at": (_iso_from(now) if now is not None
+                                  else now_iso()),
+                 "boundary": None, "range": None,
+                 "entries": [], "history": [], "warnings": [],
+                 "unseen": 0, "groups": _tour_groups(), "sources": {},
+                 "error": None}
+        build["groups"]["collect"] = "running"
+        ctx["build"] = build
+        ctx["progress"].update(busy=True, stage="", at=ts,
+                               started_at=ts,
+                               groups=dict(build["groups"]),
+                               sources={})
+
+    def prog(s: str) -> None:
+        # the What's-new loading screen reads the stage name off each
+        # snapshot/progress poll - advisory only, never raises
+        try:
+            with ctx["lock"]:
+                ctx["progress"].update(stage=s, at=time.time())
+        except Exception:                                # noqa: BLE001
+            pass
+
+    def publish(group: str, parts: dict) -> None:
+        """Fold one emitted feed group into ctx['snap'] - the mutation
+        epoch guard drops every group a pre-mutation build emits, so a
+        stale response can't overwrite post-transition state or deal
+        an acknowledged card back in."""
+        with ctx["lock"]:
+            b = ctx["build"]
+            if b is not build or ctx["gen"] != gen0:
+                return
+            if group in b["groups"]:
+                if group != "collect" or parts.get("complete"):
+                    b["groups"][group] = "done"
+                _tour_groups_run(b["groups"])
+            if parts.get("sources"):
+                b["sources"].update(parts["sources"])
+            if parts.get("warnings") is not None:
+                b["warnings"] = list(parts["warnings"])
+            if parts.get("entries"):
+                b["entries"].extend(parts["entries"])
+            if parts.get("history"):
+                b["history"].extend(parts["history"])
+            if parts.get("boundary") is not None:
+                b["boundary"] = parts["boundary"]
+            if parts.get("range") is not None:
+                b["range"] = parts["range"]
+            b["unseen"] = sum(1 for e in b["entries"]
+                              if e.get("state") == "new")
+            ctx["seq"] += 1
+            ctx["snap"] = _tour_compose(ctx, b, partial=True)
+            ctx["progress"].update(groups=dict(b["groups"]),
+                                   sources=dict(b["sources"]))
+
+    prog("loading tour state")
+    error = None
+    try:
+        state = tour_state.load(ctx["state_path"])
+        feed = tour_feeds.build_feed(
+            state, repo_dir=ctx["repo_dir"],
+            runs_dir=ctx["runs_dir"], requests_dir=ctx["requests_dir"],
+            manifests_dir=ctx["manifests_dir"],
+            polish=polisher.cards_for if polish_on else None,
+            progress=prog, emit=publish, now=now)
+    except Exception as exc:                             # noqa: BLE001
+        # a build that died mid-way still publishes what landed: a
+        # terminal snapshot (partial False - pollers stop) carrying the
+        # accumulated cards plus the error, never an endless spinner
+        error = str(exc) or type(exc).__name__
+        with ctx["lock"]:
+            b = ctx["build"]
+            if b is build and ctx["gen"] == gen0:
+                b["error"] = error
+                ctx["seq"] += 1
+                ctx["snap"] = _tour_compose(ctx, b, partial=False,
+                                            error=error)
+            ctx["build"] = None
+            ctx["progress"].update(busy=False, stage="",
+                                   at=time.time())
+        raise
     payload = {"generated_at": (_iso_from(now) if now is not None
                                 else now_iso()),
                "boundary": feed["boundary"], "range": feed["range"],
@@ -14305,9 +14829,17 @@ def _tour_build(ctx: dict, *, now: float | None = None) -> dict:
                           on_done=lambda _r: _tour_invalidate(ctx))
     with ctx["lock"]:
         if ctx["gen"] == gen0:
+            ctx["seq"] += 1
+            payload.update(partial=False, seq=ctx["seq"], gen=gen0,
+                           loading={"busy": False,
+                                    "groups": dict(build["groups"]),
+                                    "sources": dict(build["sources"])})
             ctx["feed"] = {"at": ts, "payload": payload}
             ctx["last"] = payload
             ctx["count"] = {"at": ts, "value": feed["unseen_count"]}
+            ctx["snap"] = payload
+        ctx["build"] = None
+        ctx["progress"].update(busy=False, stage="", at=time.time())
     return payload
 
 
@@ -14360,17 +14892,69 @@ def _tour_refresh(ctx: dict, *, rerun: bool = False) -> None:
             ctx["busy"] = False
 
 
+def _tour_snapshot(ctx: dict, *, now: float) -> dict:
+    """GET /api/tour's progressive payload after arming the daemon
+    build: the newest published snapshot (a partial while the build
+    runs, the complete payload when it lands) with its `loading` block
+    re-stamped so elapsed time keeps advancing across polls; an old
+    COMPLETE snapshot re-serves as partial while a newer build is in
+    flight so the client keeps polling instead of freezing on stale
+    content. With nothing published yet (a build just armed) the
+    answer is an empty partial shell carrying the loading view."""
+    with ctx["lock"]:
+        snap = ctx["snap"]
+        build = ctx["build"]
+        busy = ctx["busy"]
+        gen = ctx["gen"]
+        seq = ctx["seq"]
+        loading = _tour_loading(ctx, build)
+    if snap is not None:
+        out = dict(snap)
+        if busy:
+            # the current build is still producing: this content is a
+            # floor, not the deck - keep the client polling
+            out["partial"] = True
+            out["loading"] = loading
+        return out
+    return {"generated_at": (build or {}).get("generated_at")
+            or _iso_from(now),
+            "boundary": (build or {}).get("boundary"),
+            "range": (build or {}).get("range"),
+            "entries": [], "history": [], "unseen_count": None,
+            "warnings": [],
+            "enrichment": _tour_enrichment(
+                ctx, (build or {}).get("range")),
+            "partial": True, "seq": seq, "gen": gen,
+            "loading": loading}
+
+
 def tour_feed(ctx: dict, *, now: float | None = None,
-              fresh: bool = False) -> dict:
-    """GET /api/tour's payload: the ~60s cache while warm, one rebuild
-    on expiry (or when `fresh` forces it). Read-only."""
+              fresh: bool = False, progressive: bool = False) -> dict:
+    """GET /api/tour's payload: the ~60s cache while warm. On expiry the
+    progressive path (the endpoint's mode) arms ONE coalesced daemon
+    build and answers the newest published snapshot - Tool-update cards
+    usable as soon as they land, the Work digest and viewed history
+    behind them - while `progressive=False` keeps the synchronous
+    complete-build contract internal callers rely on. Read-only either
+    way: nothing here marks an entry or moves the watermark."""
     ts = time.time() if now is None else now
     with ctx["lock"]:
         cached = ctx["feed"]
-    if not fresh and cached is not None \
+        busy = ctx["busy"]
+    if not progressive:
+        if not fresh and cached is not None \
+                and ts - cached["at"] < TOUR_FEED_TTL_S:
+            return cached["payload"]
+        return _tour_build(ctx, now=now)
+    # a warm cache while a build is in flight is the SUPERSEDED build's
+    # answer (a wanted rerun armed behind it) - keep serving snapshots
+    # so the poll rides through to the newer build instead of stopping
+    # on content that is about to be replaced
+    if not fresh and cached is not None and not busy \
             and ts - cached["at"] < TOUR_FEED_TTL_S:
         return cached["payload"]
-    return _tour_build(ctx, now=now)
+    _tour_refresh(ctx)
+    return _tour_snapshot(ctx, now=ts)
 
 
 def tour_unseen(ctx: dict, *, now: float | None = None) -> int | None:
@@ -14462,7 +15046,14 @@ def tour_transition(ctx: dict, entry_id: str, action: str,
     tour_state, _tour_feeds = _tour_mods()
     with ctx["lock"]:
         payload = ctx["last"]
+        snap = ctx["snap"]
     entry = _tour_find(payload, entry_id) if payload is not None else None
+    if entry is None and snap is not None:
+        # a card the progressive feed has already PUBLISHED (but no
+        # complete build has retained yet) stays acknowledgeable -
+        # the partial snapshot is the client's source of truth for the
+        # early groups
+        entry = _tour_find(snap, entry_id)
     if entry is None:
         desc = tour_state.descriptor(tour_state.load(ctx["state_path"]),
                                      entry_id)
@@ -14472,9 +15063,12 @@ def tour_transition(ctx: dict, entry_id: str, action: str,
         entry = {"id": entry_id, "range": desc.get("range")}
     if action == "viewed":
         # ids still 'new' after this mark - only an empty list lets the
-        # watermark advance, and only to the payload's captured boundary
-        # (never a fresh HEAD); mark_viewed re-checks each id against
-        # the persisted file, so concurrent marks can't over-acknowledge
+        # watermark advance, and only to the RETAINED payload's captured
+        # boundary (never a fresh HEAD); mark_viewed re-checks each id
+        # against the persisted file, so concurrent marks can't
+        # over-acknowledge. A partial snapshot can name a card the last
+        # build predates, but watermark math stays pinned to `last`:
+        # the snap's own range/boundary aren't complete-build truth yet
         still_new = boundary = None
         if payload is not None:
             still_new = [e["id"] for e in payload["entries"]
@@ -14494,13 +15088,96 @@ def tour_transition(ctx: dict, entry_id: str, action: str,
     if result.get("changed"):
         with ctx["lock"]:
             ctx["feed"] = None      # a GET must never serve pre-mutation
+            ctx["snap"] = None      # nor a partial a stale build dealt
             ctx["gen"] += 1         # any build started before this
-                                    # transition now fails its store
+                                    # transition can neither store nor
+                                    # publish over the post-mutation
+                                    # state - a just-marked card can't
+                                    # come back through a stale group
         _tour_refresh(ctx, rerun=True)
         result["count_pending"] = True
     result["unseen_count"] = _tour_count_now(
         payload, tour_state.load(ctx["state_path"]))
     return result
+
+
+# Per-run row cache for the ARCHIVED view: an ended+archived run's rows
+# change only when a sentinel file, its state.json, the linked request,
+# or liveness moves - all cheap to check. With the archived view on, the
+# 2s poll re-pays the full per-step rebuild otherwise (reviews, skip
+# flags, prompt/log/export reads, arc parses), which made toggling the
+# chip feel like the server hung.
+_ARCH_RUN_CACHE: dict[str, dict] = {}
+
+
+def _arch_run_sig(sj: Path, st: dict, requests_dir: Path,
+                  projects: dict) -> tuple:
+    """Everything an archived run's dashboard rows can still read, as one
+    cheap signature: the state file + run dir itself, the linked request
+    file + a parked spool overlay, the manifest, this run's flag-dir
+    sentinels, each step's prompt/stdout/export/STATE.md and the run's
+    summarize/events files, the session-map generation, and every
+    liveness verdict the rows derive (pid, driver, merge, summarizer).
+    A matching sig means the per-run builder would emit identical rows,
+    so collect_dashboard may serve the cached slice."""
+    run_dir = sj.parent
+
+    def fsig(p) -> tuple | None:
+        try:
+            s = Path(p).stat()
+            return (s.st_mtime_ns, s.st_size)
+        except (OSError, TypeError, ValueError):
+            return None
+
+    rid = st.get("request_id")
+    fkey = _flag_key(run_dir)
+    try:
+        flags = tuple(sorted(
+            (f.name, f.stat().st_mtime_ns, f.stat().st_size)
+            for f in _flag_dir().glob(f"*{fkey}*")))
+    except OSError:
+        flags = ()
+    steps = st.get("steps") or {}
+    files = []
+    for n, rec in steps.items():
+        for k in ("prompt", "stdout_log", "export"):
+            files.append(fsig(rec.get(k)))
+        slug = rec.get("slug")
+        wd = rec.get("work_dir") or rec.get("project") or str(
+            projects.get(slug, {}).get("path") or "")
+        pdir = str(projects.get(slug, {}).get("path") or "")
+        for base in (wd, pdir):
+            files.append(fsig(
+                str(Path(base) / ".agent_tasks" / n / "STATE.md")
+                if base else None))
+    files += [fsig(run_dir / "summarize.stdout.log"),
+              fsig(run_dir / "summarize.export.json"),
+              fsig(run_dir / "events.jsonl"),
+              fsig(run_dir / "run.summary.md"),
+              fsig(run_dir / "run.summary.html"),
+              fsig(run_dir / "resume.launch.log")]
+    if rid:
+        files += [fsig(requests_dir / f"{rid}.json"),
+                  fsig(_spool_dir(rid) / "request.json"),
+                  fsig(requests_dir / f"{rid}.gen.log"),
+                  fsig(requests_dir / f"{rid}.gen.export.json")]
+    drv = driver_alive(st)
+    live_sig = tuple(
+        (n, bool(step_live(r, drv)),
+         bool(pid_alive(r.get("pid"), r.get("started_at"))))
+        for n, r in sorted(steps.items()))
+    claim = _merge_claim_held(run_dir)
+    return (
+        fsig(sj), fsig(run_dir), fsig(st.get("manifest")),
+        flags, tuple(files), live_sig, drv,
+        _SESS_CACHE[0], _PRICE_CACHE["fetched"],
+        tuple(sorted((k, str(v.get("path") or ""))
+                     for k, v in projects.items())),
+        bool(pid_alive(_RESUME_PIDS.get(run_dir.name))),
+        run_dir.name in _MERGE_BUSY,
+        bool(pid_alive(_MERGE_PIDS.get(run_dir.name))),
+        claim and claim.get("by"),
+        _summarizing(run_dir))
 
 
 def collect_dashboard(runs_dir: Path,
@@ -14565,6 +15242,24 @@ def collect_dashboard(runs_dir: Path,
             archived_runs += 1
             if not include_archived:
                 continue
+        # Archived rows are historical - the poll's per-step rebuild is
+        # wasted work on them. Serve the cached slice when every input
+        # it read still matches (_arch_run_sig), else fall through and
+        # re-store below.
+        arch_sig = None
+        if st.get("archived"):
+            arch_sig = _arch_run_sig(sj, st, requests_dir, projects)
+            hit = _ARCH_RUN_CACHE.get(str(sj.parent))
+            if hit and hit["sig"] == arch_sig:
+                agents.extend(hit["main"])
+                prid = hit["prep_rid"]
+                if prid and hit["prep"] and prid not in emitted_prep:
+                    emitted_prep.add(prid)
+                    agents.extend(hit["prep"])
+                agents.extend(hit["post"])
+                runs.append(hit["row"])
+                continue
+        a0 = len(agents)
         key = (f"request:{st['request_id']}" if st.get("request_id")
                else str(sj.parent))
         counts: dict[str, int] = {}
@@ -14815,12 +15510,14 @@ def collect_dashboard(runs_dir: Path,
         # plan, kept as step 0. Deliberately NOT in counts: it is not a
         # run step, and a 'stopped' planner row must never read as
         # resumable work.
+        a1 = len(agents)
         if request and request["id"] not in emitted_prep:
             emitted_prep.add(request["id"])
             agents.extend(plan_attempt_agents(
                 request, key, generating=False,
                 log_path=requests_dir / f"{request['id']}.gen.log",
                 prices=prices))
+        a2 = len(agents)
         # The detached summarizer session rides the same task list as an
         # aux row - bookkeeping, not a pipeline step (seq=None keeps it
         # out of prev/next; the client hides it until the run is
@@ -14898,6 +15595,18 @@ def collect_dashboard(runs_dir: Path,
                                          st.get("steps", {}).values()
                                          if r.get("slug")} |
                                         {s["slug"] for s in proposed.values()})})
+        if arch_sig is not None:
+            # main+pend rows / prep attempt rows (emitted once per
+            # request - replay honors emitted_prep) / summarizer rows /
+            # the run row - the next collect reuses them while the sig
+            # still matches
+            _ARCH_RUN_CACHE[str(sj.parent)] = {
+                "sig": arch_sig, "main": agents[a0:a1],
+                "prep_rid": request["id"] if request else None,
+                "prep": agents[a1:a2], "post": agents[a2:],
+                "row": runs[-1]}
+            if len(_ARCH_RUN_CACHE) > 400:
+                _ARCH_RUN_CACHE.clear()
     for rid, rec in requests.items():
         if rid in launched:
             continue
@@ -15158,10 +15867,10 @@ h3.proj .sub { margin-bottom:0; font-weight:400; }
    column widths regardless of content - the act column (and its merge
    link) can never get squeezed off-screen by a fat commit list */
 #detail table.repotab { table-layout:fixed; width:100%; }
-#detail table.repotab col.c-wt { width:33%; }
-#detail table.repotab col.c-vs { width:14%; }
+#detail table.repotab col.c-wt { width:28%; }
+#detail table.repotab col.c-vs { width:20%; }
 #detail table.repotab col.c-cond { width:15%; }
-#detail table.repotab col.c-path { width:16%; }
+#detail table.repotab col.c-path { width:15%; }
 #detail table.repotab col.c-age { width:14%; }
 #detail table.repotab col.c-act { width:8%; }
 #detail table.repotab td, #detail table.repotab th {
@@ -15390,6 +16099,24 @@ a { color:#58a6ff; text-decoration:none; }
   font:inherit; font-size:12px; padding:5px 2px; cursor:pointer; }
 #tourcard .thist:hover { color:#58a6ff; }
 #tourcard .thist .sub { float:right; font-size:11px; }
+/* the deck picker: one row per section, its count right-aligned in the
+   section's accent color; an empty deck reads 'all caught up' and is
+   inert rather than opening a blank card */
+#tourcard .tmenulist { display:flex; flex-direction:column; gap:8px;
+  margin:6px 0 4px; }
+#tourcard .tmenu { display:block; width:100%; text-align:left;
+  background:#1c2129; border:1px solid #30363d; border-radius:8px;
+  color:#e6edf3; font:inherit; padding:10px 12px; cursor:pointer; }
+#tourcard .tmenu:hover:not(:disabled) { border-color:#58a6ff;
+  background:#21262e; }
+#tourcard .tmenu:focus-visible { outline:2px solid #58a6ff;
+  outline-offset:1px; }
+#tourcard .tmenu:disabled { opacity:.55; cursor:default; }
+#tourcard .tmenu .tmh { display:flex; justify-content:space-between;
+  align-items:baseline; gap:10px; }
+#tourcard .tmenu .tmsub { color:#8b949e; font-size:11px;
+  margin-top:3px; }
+#tourcard .tstage { margin-top:4px; }
 /* the split walkthrough: a colored top edge plus the colored section
    name in the header mark which half a card belongs to - blue for Tool
    updates, cyan for the Work digest */
@@ -15493,8 +16220,53 @@ a { color:#58a6ff; text-decoration:none; }
 #detail .sumdoc ul { padding-left:20px; margin:6px 0; }
 #detail .sumdoc li { margin:3px 0; }
 #detail .sumdoc p { margin:8px 0; }
-#detail .sumdoc code { background:#0d1117; border-radius:4px; padding:1px 5px; font-size:12px; }
+/* inline code is the same soft tinted chip the Ask-AI body uses - muted
+   translucent fill + hairline border + accent text - and long slugs
+   (deferred-transition, a run dir name) wrap instead of overflowing;
+   fenced pre blocks keep their own chrome */
+#detail .sumdoc code { background:rgba(110,118,129,.16); border:1px solid rgba(110,118,129,.32); border-radius:5px; padding:.5px 5px; font-size:.92em; color:#a5d6ff; overflow-wrap:anywhere; }
+#detail .sumdoc pre code { background:none; border:0; padding:0; color:inherit; font-size:inherit; }
 #detail .sumdoc strong { color:#e6edf3; }
+/* the summarize session's second artifact paints as inert markup under
+   .run-summary-report - the sanitizer strips every class/id/style/URL,
+   so element selectors beneath the wrapper are the ONLY styling
+   channel: nothing here can reach the dashboard, the markdown sumdoc,
+   or the chat, and no report rule exists outside this block */
+#detail .run-summary-report { margin-top:18px; padding-top:14px; border-top:1px solid #30363d; color:#c9d1d9; font-size:13px; line-height:1.5; }
+#detail .run-summary-report header { margin-bottom:12px; }
+#detail .run-summary-report h1 { font-size:15px; font-weight:600; color:#e6edf3; margin:0 0 4px; }
+#detail .run-summary-report h2 { font-size:13px; font-weight:600; color:#79b8ff; margin:0 0 6px; }
+#detail .run-summary-report h3 { font-size:12px; font-weight:600; color:#e6edf3; margin:0 0 4px; }
+#detail .run-summary-report h4, #detail .run-summary-report h5,
+#detail .run-summary-report h6 { font-size:12px; font-weight:600; color:#8b949e; margin:8px 0 4px; }
+/* the stat strip: the report header's <ul> of <strong>N</strong>-led
+   items renders as a row of stat cards */
+#detail .run-summary-report header ul { list-style:none; display:flex; flex-wrap:wrap; gap:8px; padding:0; margin:10px 0 0; }
+#detail .run-summary-report header ul li { background:#161b22; border:1px solid #21262d; border-radius:6px; padding:6px 12px; font-size:11px; color:#8b949e; }
+#detail .run-summary-report header ul li strong { display:block; font-size:16px; font-weight:600; color:#58a6ff; }
+#detail .run-summary-report section { background:#161b22; border:1px solid #21262d; border-radius:6px; padding:10px 14px; margin:10px 0; }
+#detail .run-summary-report article { border-left:2px solid #58a6ff; padding:2px 10px; margin:10px 0; }
+#detail .run-summary-report article h3 { color:#58a6ff; }
+#detail .run-summary-report p { margin:6px 0; }
+#detail .run-summary-report ul, #detail .run-summary-report ol { padding-left:20px; margin:6px 0; }
+#detail .run-summary-report li { margin:3px 0; }
+#detail .run-summary-report dl { margin:6px 0; }
+#detail .run-summary-report dt { font-size:11px; color:#8b949e; }
+#detail .run-summary-report dd { margin:0 0 6px; color:#e6edf3; }
+#detail .run-summary-report pre { background:#0d1117; border:1px solid #21262d; border-radius:6px; padding:10px 12px; font-size:12px; overflow:auto; white-space:pre-wrap; }
+#detail .run-summary-report code { background:#0d1117; border:1px solid #21262d; border-radius:4px; padding:1px 5px; font-size:12px; }
+#detail .run-summary-report pre code { border:none; padding:0; }
+#detail .run-summary-report blockquote { border-left:3px solid #21262d; margin:8px 0; padding:2px 12px; color:#8b949e; }
+#detail .run-summary-report table { border-collapse:collapse; margin:8px 0; font-size:12px; }
+#detail .run-summary-report th, #detail .run-summary-report td { border:1px solid #21262d; padding:4px 10px; text-align:left; }
+#detail .run-summary-report th { background:#0d1117; color:#8b949e; font-weight:600; }
+#detail .run-summary-report details { margin:6px 0; }
+#detail .run-summary-report summary { cursor:pointer; color:#58a6ff; }
+#detail .run-summary-report a { color:#58a6ff; text-decoration:none; }
+#detail .run-summary-report hr { border:none; border-top:1px solid #21262d; margin:12px 0; }
+#detail .run-summary-report strong { color:#e6edf3; }
+#detail .run-summary-report mark { background:#3b2d00; color:#e6edf3; padding:0 2px; border-radius:3px; }
+#detail .run-summary-report small { color:#8b949e; }
 /* the summary modal's own title - quiet, like the doc header under it */
 #detail h3.sumtitle { font-size:13px; font-weight:500; color:#8b949e; margin:0 170px 4px 0; }
 /* the task prompt box: a fixed visual slot in modal and summary alike,
@@ -16819,8 +17591,35 @@ async function openRunSummary(key, push=true){
       `below is the interim answer.</div>`:'') +
     (err!=null ? `<div class="notice error">${esc(err)}</div>`
       : `<div class="sumdoc">${frag}</div>`);
+  runReportFor=null;               // this paint owns the report slot now
   decorateRunSum(document.querySelector('#detail .sumdoc'), key);
   applyModalScroll();
+  appendRunReport(key, r.dir);     // second artifact rides its own fetch
+}
+// The summarizer's second artifact - run.summary.html - lands BELOW the
+// markdown sumdoc as one .run-summary-report block. The server already
+// re-serialized the stored file to inert markup (no scripts, styles,
+// handlers, ids, classes or URLs - the fixed stylesheet owns every
+// surviving rule), so it can be painted verbatim. Two guards keep the
+// append honest: the view must still be THIS run's summary when the
+// fetch lands, and runReportFor makes a racing duplicate or a re-open
+// of the same run paint the report exactly once.
+let runReportFor=null;             // run key whose report the modal holds
+async function appendRunReport(rkey, dir){
+  if (!dir) return;
+  let frag=null;
+  try{
+    const res=await fetch('/api/runs/'+encodeURIComponent(base(dir))+
+      '/summary.html');
+    if (res.ok) frag=await res.text();
+  }catch(e){}
+  if (frag==null || !frag.trim()) return;   // no artifact (older runs),
+                                            // rejected or malformed HTML
+  if (!summaryView || summaryView.key!=='run|'+rkey) return;
+  if (document.getElementById('backdrop').hidden) return;
+  if (runReportFor===rkey) return;          // already appended (or racing)
+  runReportFor=rkey;
+  document.getElementById('dbody').insertAdjacentHTML('beforeend', frag);
 }
 // A run summary's '<step> - <status>' headings are live controls, not
 // prose: the step name (rendered in its canonical lowercase, even when
@@ -17317,9 +18116,22 @@ function showDetail(i, keepStack){
       `title="cancel this planning pass - the request stays editable ` +
       `and any previous proposal is kept">Stop proposal</button></div>`
     : '');
-  const actHtml = (actBits || genBit)
+  // a recorded non-producing attempt (failed regen, superseded pass)
+  // can be retired by hand - the record keeps its real status, the row
+  // just stops counting as an outstanding failure
+  const supBit = (a.mode==='planner' && a.request_id &&
+      /^plan-proposal-\d+$/.test(a.step||'') &&
+      a.status!=='running' && a.status!=='superseded'
+    ? `<div class="actions"><button type="button" ` +
+      `class="btn secondary" ` +
+      `data-plan-supersede="${esc(a.request_id)}" ` +
+      `data-plan-attempt="${esc(a.step.split('-').pop())}">` +
+      `Mark attempt superseded</button>` +
+      `<span class="sub">a different attempt is the one that counts - ` +
+      `the recorded outcome stays in history.</span></div>` : '');
+  const actHtml = (actBits || genBit || supBit)
     ? `<div class="actzone"><div class="acth">Actions</div>` +
-      actBits + genBit + `</div>` : '';
+      actBits + genBit + supBit + `</div>` : '';
   const html =
     navBar +
     `<h3 id="modal-title">${esc(a.slug)} / ${esc(a.step)}` +
@@ -17966,6 +18778,19 @@ function ctxAgentItems(a){
   if (a.step==='plan-proposal' && a.status==='running' && a.request_id)
     act.push({label:'Stop proposal', danger:true,
       attrs:ctxAttrs({'stop-gen':a.request_id})});
+  // a non-producing planner attempt keeps its real recorded status -
+  // including 'failed' - until the human says a different attempt is
+  // the one that counts. Numbered rows are the non-producers; the bare
+  // 'plan-proposal' name is the producer at rest.
+  if (a.mode==='planner' && a.request_id &&
+      /^plan-proposal-\d+$/.test(a.step||'') &&
+      a.status!=='running' && a.status!=='superseded')
+    act.push({label:'Mark attempt superseded',
+      attrs:ctxAttrs({'plan-supersede':a.request_id,
+                      'plan-attempt':a.step.split('-').pop()}),
+      title:'a different attempt is the one that counts - the recorded ' +
+            'outcome stays honest in history but stops reading as an ' +
+            'outstanding failure'});
   if (a.run_dir)
     act.push({label:a.needs_review?'Mark as reviewed':'Mark as needing review',
       attrs:ctxAttrs({'review-step':base(a.run_dir),'step':a.step,
@@ -19732,7 +20557,9 @@ function wtRow(w, r){
   }
   let h = `<tr><td class="wrap"><code>${esc(w.branch||'(detached)')}` +
     `</code>${staging}${cmts}</td>` +
-    `<td>${ws.join(' ')}${rec}</td>` +
+    // wrap: 'up to date' + 'dirty' + 'N behind' chips stack rather
+    // than ellipsis-clip inside the fixed vs column
+    `<td class="wrap">${ws.join(' ')}${rec}</td>` +
     `<td class="wrap ccond">${link}</td>` +
     `<td class="wrap"><span class="sub rpath" title="${esc(w.path)}">` +
     `${esc(tailPath(w.path))}</span></td>` +
@@ -21182,6 +22009,24 @@ document.addEventListener('click', async e=>{
     }
     actEnd(actKey);
     return; }
+  // Retire one planner attempt row: the request record keeps the real
+  // outcome, the row just renders 'superseded' and leaves the failed
+  // filter. Confirmed because it rewrites the persisted request file.
+  if (t.dataset && t.dataset.planSupersede){
+    const rid = t.dataset.planSupersede,
+          att = +(t.dataset.planAttempt || 0);
+    if(!await askConfirm(`Mark planner attempt ${att} as superseded? ` +
+      `Its recorded status stays in history - the row stops counting ` +
+      `as an outstanding failure.`)) return;
+    t.disabled = true;
+    try {
+      await api('POST',
+        `/api/requests/${encodeURIComponent(rid)}/plan-supersede`,
+        {attempt:att});
+      await refresh();
+    } catch(err){ await showAlert('Supersede failed: ' + err.message);
+      t.disabled = false; }
+    return; }
   if (t.dataset && t.dataset.deleteRun){
     const dir=t.dataset.deleteRun;
     const r=(lastData?.runs||[]).find(x=>base(x.dir)===dir);
@@ -21770,10 +22615,18 @@ function tourBadge(n){
 }
 const tourReduced = () => typeof matchMedia==='function' &&
   matchMedia('(prefers-reduced-motion: reduce)').matches;
-const tourDeck = () => (tourSt && tourSt.feed && tourSt.feed.entries) || [];
+// the deck the user is walking: when tourSt.sec names a section it is
+// that section's cards only (one deck at a time); null walks all of
+// them, still in the feed's Tool-then-Work order
+const tourDeck = () => {
+  const es = (tourSt && tourSt.feed && tourSt.feed.entries) || [];
+  const s = tourSt && tourSt.sec;
+  return s ? es.filter(e=>tourSec(e)===s) : es;
+};
 const tourHist = () => (tourSt && tourSt.feed && tourSt.feed.history) || [];
 const tourCur = () => tourSt && (tourSt.mode==='hist'
-  ? tourHist()[tourSt.hi] : tourDeck()[tourSt.idx]);
+  ? tourHist()[tourSt.hi]
+  : tourSt.mode==='menu' ? null : tourDeck()[tourSt.idx]);
 // The walkthrough's two sections, in deck order: Tool updates (change/
 // curated cards) first, then the Work digest (record cards). `section`
 // is the feed's own stamp; the id-prefix fallback mirrors tour_feeds'
@@ -21937,7 +22790,9 @@ function tourActionsHtml(){
       `<button type="button" class="btn secondary" data-tour="skip">` +
       `Close</button>`;
   const e = tourCur(), deck = tourDeck();
-  return `<button type="button" class="btn secondary" data-tour="prev"` +
+  return `<button type="button" class="btn secondary" data-tour="menu"` +
+    ` title="back to the deck picker">decks</button>` +
+    `<button type="button" class="btn secondary" data-tour="prev"` +
     `${tourSt.idx<=0?' disabled':''}>&larr;</button>` +
     `<button type="button" class="btn secondary" data-tour="next"` +
     `${tourSt.idx>=deck.length-1?' disabled':''}>&rarr;</button>` +
@@ -21950,11 +22805,17 @@ function tourActionsHtml(){
         `${tourSt.pending?' disabled':''}>` +
         `${tourSt.pending?'marking&hellip;':'Mark viewed'}</button>`);
 }
+function tourHistPending(){
+  const f = tourSt && tourSt.feed;
+  return !!(f && f.partial &&
+    ((tourSt.loading||{}).groups||{}).history !== 'done');
+}
 function tourHistHtml(){
   const hs = tourHist();
   if (!hs.length) return '';
   return `<details class="tourhist"><summary>viewed earlier ` +
-    `(${hs.length})</summary>` + hs.map((h,i)=>
+    `(${hs.length})${tourHistPending() ? ' \u00b7 loading\u2026' : ''}` +
+    `</summary>` + hs.map((h,i)=>
       `<button type="button" class="thist" data-tour="hist" ` +
       `data-hi="${i}" title="reopen this card">` +
       `${esc(h.title||'(untitled)')}` +
@@ -21991,7 +22852,48 @@ function tourShow(){
       `</div>`;
   } else if (!tourSt.feed){
     inner = `<h3 id="tourcard-title">What's new</h3>` +
-      `<div class="notice">loading the change feed&hellip;</div>`;
+      `<div class="notice">loading the change feed&hellip;` +
+      `<div class="sub tstage" id="tourstage">` +
+      `${esc(tourSt.stage||'asking the server')}</div></div>` +
+      (tourLoadingLine()
+        ? `<div class="sub tprog">${tourLoadingLine()}</div>` : '') +
+      `<div class="sub">assembled automatically from this repo's git ` +
+      `log and run/request records - deterministic reads, not an ` +
+      `agent task</div>`;
+  } else if (tourSt.mode==='menu'){
+    // the deck picker: one row per section with its unviewed count -
+    // a section with nothing left reads 'all caught up' in place, or
+    // 'loading' while its group is still publishing (never a fake
+    // 'caught up' that the next snapshot would contradict)
+    const es = tourSt.feed.entries || [];
+    const groups = (tourSt.loading||{}).groups || {};
+    const secs = [['tool','Tool updates',
+                   'changes to this dashboard and conductor'],
+                  ['work','Work digest',
+                   'finished runs, proposals and things to review']];
+    inner = `<h3 id="tourcard-title">What's new</h3>` +
+      `<div class="sub">assembled automatically from this repo's git ` +
+      `log and run/request records` +
+      ((tourSt.feed.enrichment||{}).enabled
+        ? `; card text may be enriched by a bounded background pass` : ``) +
+      `</div>` +
+      `<div class="tmenulist">` +
+      secs.map(([k,t,d])=>{
+        const n = es.filter(e=>tourSec(e)===k).length;
+        const pend = tourSt.feed.partial && groups[k] !== 'done';
+        return `<button type="button" class="tmenu" data-tour="sec" ` +
+          `data-sec="${k}"${n?'':' disabled'}><span class="tmh"><b>` +
+          `${t}</b><span class="tsecname ${k}">` +
+          (n ? `${n} card${n>1?'s':''}`
+             : (pend ? `loading&hellip;` : `all caught up`)) +
+          `</span></span><span class="tmsub">${d}</span></button>`;
+      }).join('') + `</div>` +
+      `<div class="tactions">` +
+      `<button type="button" class="linkbtn" data-tour="sec" data-sec=""` +
+      `${es.length?'':' disabled'}>walk everything</button>` +
+      `<span class="tgap"></span>` +
+      `<button type="button" class="btn secondary" data-tour="skip">` +
+      `Close</button></div>` + tourHistHtml();
   } else if (tourSt.mode==='hist'){
     const h = tourHist()[tourSt.hi];
     inner = h
@@ -22009,12 +22911,21 @@ function tourShow(){
         `<div class="tactions">${tourActionsHtml()}</div>` +
         tourHistHtml()
       : `<h3 id="tourcard-title">All caught up</h3>` +
-        `<div class="notice ok">nothing new since the last ` +
-        `walkthrough</div>` +
-        `<div class="tactions"><span class="tgap"></span>` +
+        `<div class="notice ok">` +
+        (tourSt.sec
+          ? `nothing left in ${esc(TOUR_SEC_TITLE[tourSt.sec]||'this deck')}`
+          : `nothing new since the last walkthrough`) + `</div>` +
+        `<div class="tactions">` +
+        ((tourSt.sec || (tourSt.feed.entries||[]).length)
+          ? `<button type="button" class="btn secondary" ` +
+            `data-tour="menu">&larr; Decks</button>` : '') +
+        `<span class="tgap"></span>` +
         `<button type="button" class="btn secondary" data-tour="skip">` +
         `Close</button></div>` + tourHistHtml();
   }
+  // while later groups still publish, every rendered mode gets one
+  // honest 'still loading' line at the bottom - gone on the complete
+  inner += tourMoreLine();
   card.innerHTML = inner;
   card.classList.toggle('busy', !!tourSt.pending);
   // the section accent follows the CURRENT card only - error/loading/
@@ -22027,16 +22938,39 @@ function tourShow(){
   tourPlace(true);
 }
 function tourAnchorEl(e){
-  const sel = e && e.anchor;
-  if (!sel || !document.querySelector) return null;
-  let el = null;
-  try { el = document.querySelector(sel); } catch(_){ el = null; }
-  if (!el || !el.getBoundingClientRect) return null;
-  const r = el.getBoundingClientRect();
-  // a usable anchor has real layout - a hidden/zero-sized element gets
-  // the centered fallback like a missing selector
-  if (!r || r.width<=0 || r.height<=0) return null;
-  return {el, rect:r};
+  if (!document.querySelector) return null;
+  // a Work digest card's most honest spotlight is the table row it
+  // describes: the launched run row first, a staged proposal row by
+  // its request:<id> key next, and only then the generic stop anchor.
+  // Rows are matched on data-run-key rather than a selector so no id
+  // ever needs attribute escaping.
+  const want = [];
+  if (e && tourSec(e)==='work'){
+    for (const k of (e.runs||[])) want.push(k);
+    for (const r of (e.requests||[])) want.push('request:'+r);
+  }
+  const sels = [null].concat([e && e.anchor]);
+  if (want.length && document.querySelectorAll){
+    for (const tr of document.querySelectorAll('tr[data-run-key]')){
+      if (tr.dataset && want.includes(tr.dataset.runKey)){
+        const r = tr.getBoundingClientRect &&
+          tr.getBoundingClientRect();
+        if (r && r.width>0 && r.height>0) return {el:tr, rect:r};
+      }
+    }
+  }
+  for (const sel of sels){
+    if (!sel) continue;
+    let el = null;
+    try { el = document.querySelector(sel); } catch(_){ el = null; }
+    if (!el || !el.getBoundingClientRect) continue;
+    const r = el.getBoundingClientRect();
+    // a usable anchor has real layout - a hidden/zero-sized element
+    // falls through to the next candidate like a missing selector
+    if (!r || r.width<=0 || r.height<=0) continue;
+    return {el, rect:r};
+  }
+  return null;
 }
 function tourPlace(reveal){
   const wrap = document.getElementById('tourwrap');
@@ -22079,9 +23013,24 @@ function tourPlace(reveal){
   let top = rb + pad + gap;
   if (top + ch > vh - margin) top = r.top - pad - gap - ch;
   top = Math.max(margin, Math.min(top, Math.max(margin, vh-ch-margin)));
+  let left = Math.max(margin, Math.min(r.left, vw-cw-margin));
+  // ...but the card must never sit ON the thing it describes: when the
+  // clamped vertical slot still overlaps the anchor (a tall row parked
+  // mid-viewport, or a card taller than the space above and below),
+  // park it beside the ring instead - right first, then left. A card
+  // too big for every side keeps the clamped spot - staying on-screen
+  // wins over perfect clearance.
+  if (top < rb + pad && top + ch > r.top - pad){
+    if (r.right + gap + cw + margin <= vw){
+      left = r.right + gap;
+      top = Math.max(margin, Math.min(r.top, vh-ch-margin));
+    } else if (r.left - gap - cw - margin >= margin){
+      left = r.left - gap - cw;
+      top = Math.max(margin, Math.min(r.top, vh-ch-margin));
+    }
+  }
   card.style.top = top+'px';
-  card.style.left = Math.max(margin,
-    Math.min(r.left, vw-cw-margin))+'px';
+  card.style.left = left+'px';
   card.classList.add('anchored');
 }
 // scroll/resize listeners live only while the tour is open - closing
@@ -22100,38 +23049,202 @@ function tourBind(on){
     tourSt._sc = null;
   }
 }
+// ---- progressive feed apply -------------------------------------------
+// The server publishes snapshots while a build walks its groups - Tool
+// updates first, the Work digest behind them, viewed history last.
+// Every response carries a monotonically increasing seq: an answer not
+// newer than the last applied one is a repeat or a stale publication
+// and never re-applies (it can't resurrect a card a newer build or the
+// user's own mark already removed). A complete response (partial
+// falsy) replaces the deck wholesale; a partial merges its newly
+// published groups by card id - never a duplicate, never a selection
+// reset, never the card a session-level mark already acknowledged.
+const TOUR_GROUPS = [['collect','sources'],['tool','tool updates'],
+  ['work','work digest'],['history','viewed history']];
+function tourLoadingLine(){
+  const l = tourSt && tourSt.loading;
+  if (!l) return '';
+  const bits = [];
+  if (typeof l.elapsed_s==='number')
+    bits.push(l.elapsed_s.toFixed(l.elapsed_s>=10?0:1)+'s');
+  const groups = l.groups || {};
+  const g = TOUR_GROUPS.map(([k,t])=>{
+    const s = groups[k];
+    return esc(t) + (s==='done' ? ' done'
+      : s==='running' ? ' \u2026' : ' pending');
+  }).join(' \u00b7 ');
+  if (g) bits.push(g);
+  const src = l.sources || {}, srcs=[];
+  for (const k of ['commits','runs','requests','curated'])
+    if (src[k]!=null)
+      srcs.push(k + (src[k]==='error' ? ' failed'
+        : src[k]==='ok' ? ' done' : ' \u2026'));
+  if (srcs.length) bits.push(srcs.join(' \u00b7 '));
+  return bits.join(' \u00b7 ');
+}
+// while the build still walks later groups the deck stays usable - this
+// one line says so (elapsed + pending stages), then disappears on the
+// complete payload
+function tourMoreLine(){
+  const f = tourSt && tourSt.feed;
+  if (!f || !f.partial) return '';
+  const line = tourLoadingLine();
+  return `<div class="sub tprog">` +
+    `${line || 'still loading&hellip;'}</div>`;
+}
+function tourApplyFeed(f){
+  const st = tourSt;
+  if (!st || !f) return;
+  st.loading = f.loading || null;
+  // the newest applied snapshot's error state is truth: a fresh build
+  // publishing past an earlier failure clears the error card itself
+  st.err = f.error || null;
+  const seq = (typeof f.seq==='number') ? f.seq : null;
+  if (seq!==null && st.seq!==null && seq<=st.seq){
+    // a repeat/stale answer: only its loading view is still news
+    if (st.feed) st.feed.partial = !!f.partial;
+    return;
+  }
+  if (seq!==null) st.seq = seq;
+  const curId = (tourCur()||{}).id;
+  if (!st.feed || !f.partial){
+    // the unread deck walks as two separated sections - Tool updates
+    // first, then the Work digest - each keeping the feed's own
+    // oldest->newest order (an empty section simply contributes no
+    // cards, so navigation never lands on a blank). Ids acknowledged
+    // this session are filtered out too: a re-pulled feed can briefly
+    // predate the mark (the transition's refresh is deferred), and a
+    // stale copy must never reinsert an acknowledged card.
+    const tool=[], work=[];
+    for (const e of (f.entries||[])){
+      if (tourAcked.has(e.id)) continue;
+      (tourSec(e)==='work' ? work : tool).push(e);
+    }
+    f.entries = tool.concat(work);
+    // a card acknowledged since the feed was built also reattaches to
+    // 'viewed earlier' when the stale copy doesn't carry it yet
+    f.history = f.history || [];
+    const known = new Set(f.history.map(x=>x.id));
+    for (const [id, c] of tourAcked)
+      if (!known.has(id)) f.history.push(c);
+    st.feed = f;
+  } else {
+    // merge the newly published groups into the deck on screen:
+    // upsert by id (a newer snapshot's version of a card wins), keep
+    // the Tool-then-Work order, keep history's landed cards current
+    const feed = st.feed;
+    const at = new Map(feed.entries.map((e,i)=>[e.id,i]));
+    for (const e of (f.entries||[])){
+      if (tourAcked.has(e.id)) continue;
+      if (at.has(e.id)) feed.entries[at.get(e.id)] = e;
+      else feed.entries.push(e);
+    }
+    const tool=[], work=[];
+    for (const e of feed.entries)
+      (tourSec(e)==='work' ? work : tool).push(e);
+    feed.entries = tool.concat(work);
+    feed.history = feed.history || [];
+    const hh = new Map(feed.history.map((h,i)=>[h.id,i]));
+    for (const h of (f.history||[]))
+      if (hh.has(h.id)) feed.history[hh.get(h.id)] = h;
+      else feed.history.push(h);
+    for (const [id,c] of tourAcked)
+      if (!feed.history.some(x=>x.id===id)) feed.history.push(c);
+    feed.boundary = f.boundary; feed.range = f.range;
+    feed.generated_at = f.generated_at;
+    feed.warnings = f.warnings; feed.enrichment = f.enrichment;
+    feed.unseen_count = f.unseen_count;
+    feed.partial = true;
+  }
+  // entry point is decided once content exists: exactly one populated
+  // deck walks straight in (the picker would be one click for
+  // nothing); more or none show the menu. A group landing later never
+  // re-picks - that would move the user mid-walk.
+  if (!st.picked){
+    const secs = new Set((st.feed.entries||[]).map(tourSec));
+    if (secs.size===1){ st.sec=[...secs][0]; st.mode='deck';
+      st.picked=true; }
+    else if (secs.size>1){ st.sec=null; st.mode='menu'; st.picked=true; }
+    else st.mode='menu';
+  }
+  // keep the user's spot: the same id wins its new position; a card
+  // that vanished slides the next one in rather than jumping decks
+  if (st.mode==='hist'){
+    const hs = tourHist(), ni = hs.findIndex(x=>x.id===curId);
+    if (ni>=0) st.hi = ni;
+    else if (st.hi>hs.length) st.hi = hs.length;
+  } else {
+    const deck = tourDeck(), ni = deck.findIndex(x=>x.id===curId);
+    if (ni>=0) st.idx = ni;
+    else if (st.idx>deck.length) st.idx = deck.length;
+  }
+  // a card the user unviewed joins its deck whenever it lands - the
+  // transition re-publishes it behind the early groups
+  if (st.seek){
+    const hit = (st.feed.entries||[]).find(x=>x.id===st.seek);
+    if (hit){ st.sec = tourSec(hit); st.mode='deck';
+      st.idx = tourDeck().indexOf(hit); st.seek = null; }
+  }
+}
+function tourPoll(my){
+  // continue polling while the current build publishes: each newer
+  // snapshot merges in place until a complete (partial falsy) one
+  // lands; a dropped poll just retries on the next tick
+  const st = tourSt;
+  if (!st || st.pt!==null || typeof setInterval!=='function') return;
+  const iv = setInterval(()=>{
+    if (tourSt!==st || st.req!==my || st.pt!==iv){
+      // a newer load or a close owns the deck now - retire this poll
+      if (typeof clearInterval==='function') clearInterval(iv);
+      if (tourSt===st && st.pt===iv) st.pt = null;
+      return;
+    }
+    api('GET','/api/tour').then(f=>{
+      if (tourSt!==st || st.req!==my || st.pt!==iv) return;
+      tourApplyFeed(f);
+      tourShow();
+      if (f && !f.partial) tourPollStop();
+    }).catch(()=>{});
+  }, 500);
+  st.pt = iv;
+}
+function tourPollStop(){
+  const st = tourSt;
+  if (st && st.pt!==null && typeof clearInterval==='function')
+    clearInterval(st.pt);
+  if (st) st.pt = null;
+}
 async function tourLoad(){
   if (!tourSt) return;
-  tourSt.feed = null; tourSt.err = null; tourShow();
-  try { const f = await api('GET', '/api/tour');
-    if (tourSt){
-      // the unread deck walks as two separated sections - Tool updates
-      // first, then the Work digest - each keeping the feed's own
-      // oldest->newest order (an empty section simply contributes no
-      // cards, so navigation never lands on a blank). Ids acknowledged
-      // this session are filtered out too: a re-pulled feed can briefly
-      // predate the mark (the transition's refresh is deferred), and a
-      // stale copy must never reinsert an acknowledged card.
-      const tool=[], work=[];
-      for (const e of (f.entries||[])){
-        if (tourAcked.has(e.id)) continue;
-        (tourSec(e)==='work' ? work : tool).push(e);
-      }
-      f.entries = tool.concat(work);
-      // a card acknowledged since the feed was built also reattaches to
-      // 'viewed earlier' when the stale copy doesn't carry it yet
-      f.history = f.history || [];
-      const known = new Set(f.history.map(x=>x.id));
-      for (const [id, c] of tourAcked)
-        if (!known.has(id)) f.history.push(c);
-      tourSt.feed = f;
-    }
-  } catch(e){ if (tourSt) tourSt.err = e.message || String(e); }
-  if (tourSt) tourShow();
+  const st = tourSt, my = ++st.req;
+  tourPollStop();
+  st.err = null;
+  // a deliberate reload re-decides the entry point from what lands -
+  // 'picked' only guards against mid-stream auto-repicks while partial
+  // groups of THIS load are still publishing
+  st.picked = false;
+  st.stage = 'asking the server'; tourShow();
+  // the first answer is already a snapshot - usable cards or an empty
+  // shell, never a wait-for-the-whole-build block; 'partial' means the
+  // build still walks later groups and the poll below picks them up
+  try {
+    const f = await api('GET', '/api/tour');
+    if (tourSt!==st || st.req!==my) return;
+    tourApplyFeed(f);
+    st.stage = null; tourShow();
+    if (f && f.partial) tourPoll(my);
+  } catch(e){
+    if (tourSt!==st || st.req!==my) return;
+    tourSt.err = e.message || String(e);
+    tourSt.stage = null;
+    tourShow();
+  }
 }
 function openTour(){
   if (tourSt) return;
   tourSt = {feed:null, err:null, notice:null, idx:0, hi:0, mode:'deck',
+    sec:null, stage:null, seq:null, req:0, pt:null, loading:null,
+    picked:false, seek:null,
     pending:false, returnEl:document.activeElement||null, _sc:null};
   tourBind(true);
   applySel();           // Ask AI's about-chip follows into the tour
@@ -22145,6 +23258,7 @@ function tourClose(){
   // none of them POSTs viewed or snooze, so dismissing never
   // acknowledges or implicitly defers an entry
   if (!tourSt) return;
+  tourPollStop();
   tourBind(false);
   const back = tourSt.returnEl;
   tourSt = null;
@@ -22172,8 +23286,12 @@ async function tourMark(){
     // deck was pulled (a new commit re-grouped it): a retry can never
     // land, so resync the deck to the server's current feed instead
     if (/unknown tour entry/i.test(String(err && err.message || err))){
+      const prevSec = tourSt.sec;
       await tourLoad();
       if (!tourSt) return;
+      // stay in the deck the user was walking - tourLoad's auto-pick
+      // doesn't know which section this resync came from
+      tourSt.sec = prevSec; tourSt.mode = 'deck';
       const deck = tourDeck();
       const ni = deck.findIndex(x=>x.state!=='viewed');
       tourSt.idx = ni<0 ? deck.length : ni;
@@ -22192,14 +23310,20 @@ async function tourMark(){
   // /api/state poll, which converges once the refresh lands
   if (r && typeof r.unseen_count==='number') tourBadge(r.unseen_count);
   // a viewed card leaves the deck for good (the server's feed filters
-  // it out of entries too - it lives on in 'viewed earlier') - the
-  // splice puts the next unviewed card at this index, or runs the deck
-  // out into the caught-up view
-  const deck = tourDeck();
-  deck.splice(tourSt.idx, 1);
-  if (tourSt.idx > deck.length) tourSt.idx = deck.length;
+  // it out of entries too - it lives on in 'viewed earlier'). Splice
+  // the SOURCE array - tourDeck() returns a filtered copy when a
+  // section is selected - and the index then points at the deck's next
+  // card, or runs it out into the caught-up view
+  const es = tourSt.feed.entries;
+  const j = es.findIndex(x=>x.id===e.id);
+  if (j>=0) es.splice(j,1);
+  if (tourSt.idx > tourDeck().length) tourSt.idx = tourDeck().length;
   tourSt.mode = 'deck';
   tourShow();
+  // the transition's guarded rebuild is already running - resume the
+  // poll so its snapshots merge post-mutation cards back in (never the
+  // acked one: tourAcked filters it on every apply)
+  tourPoll(tourSt.req);
 }
 async function tourUnview(){
   const h = tourSt && tourSt.mode==='hist' && tourHist()[tourSt.hi];
@@ -22215,11 +23339,12 @@ async function tourUnview(){
     tourSt.mode = 'deck';
     // the card returns to the live deck - the transition dropped the
     // feed cache, so the re-pull rebuilds post-mutation state rather
-    // than trusting local position guesses
+    // than trusting local position guesses. It lands inside a later
+    // snapshot (history group publishes last): seek marks it so the
+    // apply jumps the deck to it the moment it arrives
+    tourSt.seek = h.id;
     await tourLoad();
     if (!tourSt) return;
-    const j = tourDeck().findIndex(x=>x.id===h.id);
-    if (j>=0) tourSt.idx = j;
     tourShow();
   } catch(err){
     if (!tourSt) return;
@@ -22237,14 +23362,30 @@ function tourAct(act, el){
   if (tourSt.pending) return;
   if (act==='mark'){ tourMark(); return; }
   if (act==='unview'){ tourUnview(); return; }
+  if (act==='menu'){ tourSt.sec=null; tourSt.mode='menu'; tourShow();
+    return; }
+  if (act==='sec'){
+    // open one deck: data-sec '' = 'walk everything' (the whole feed,
+    // Tool updates then Work digest); a named deck walks only its
+    // section
+    tourSt.sec = (el && el.dataset && el.dataset.sec) || null;
+    tourSt.mode = 'deck';
+    const d = tourDeck();
+    const ni = d.findIndex(x=>x.state!=='viewed');
+    tourSt.idx = ni<0 ? 0 : ni;
+    tourShow(); return; }
   if (act==='prev' && tourSt.idx>0){ tourSt.idx--; tourShow(); return; }
   if (act==='next' && tourSt.idx<tourDeck().length-1){
     tourSt.idx++; tourShow(); return; }
   if (act==='hist'){
     const i = +(el && el.dataset && el.dataset.hi || 0);
-    if (tourHist()[i]){ tourSt.mode='hist'; tourSt.hi=i; tourShow(); }
+    if (tourHist()[i]){ tourSt._hm = tourSt.mode;
+      tourSt.mode='hist'; tourSt.hi=i; tourShow(); }
     return; }
-  if (act==='back'){ tourSt.mode='deck'; tourShow(); return; }
+  // back returns to wherever history was opened from - the deck picker
+  // included (walking a combined deck with sec null keeps 'deck')
+  if (act==='back'){ tourSt.mode = tourSt._hm || 'deck'; tourShow();
+    return; }
 }
 // --- assistant surface bridge ----------------------------------------
 // The chat client (assistant/static/chat.js) reads which view is on
@@ -22509,7 +23650,22 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     payload["tour_unseen"] = tour_unseen(tour)
                     self._json(payload)
                 elif path == "/api/tour":
-                    self._json(tour_feed(tour))
+                    # progressive: a snapshot per poll (Tool updates
+                    # land first), 'partial' until the build finishes -
+                    # the client polls till partial:false. The feed's
+                    # own snapshots carry loading/elapsed/groups, so the
+                    # client never needs the progress endpoint.
+                    self._json(tour_feed(tour, progressive=True))
+                elif path == "/api/tour/progress":
+                    # the What's-new loading narration - busy/stage plus
+                    # elapsed + per-group/per-source completion so a
+                    # reader sees real milestones, not a bare spinner
+                    with tour["lock"]:
+                        prog = dict(tour["progress"])
+                        st = prog.get("started_at")
+                        prog["elapsed_s"] = (round(time.time() - st, 1)
+                                             if st else None)
+                    self._json(prog)
                 elif path == "/api/repos":
                     # the repos modal's light list: watched repo names +
                     # paths only - the heavy worktree scan goes per-repo
@@ -22596,6 +23752,14 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                         self._send(frag.encode("utf-8"),
                                    "text/html; charset=utf-8")
                 elif (m := re.fullmatch(
+                        r"/api/runs/([^/]+)/summary\.html", path)):
+                    # the summarizer's second artifact - served already
+                    # re-sanitized under .run-summary-report; the stored
+                    # file itself is never handed out raw
+                    self._send(run_summary_html(m.group(1), runs_dir)
+                               .encode("utf-8"),
+                               "text/html; charset=utf-8")
+                elif (m := re.fullmatch(
                         r"/api/runs/([^/]+)/steps/([^/]+)/trajectory",
                         path)):
                     # full per-entry text behind the modal's arc rows -
@@ -22674,7 +23838,8 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                         runs_dir, run_dir=body.get("run")), 201)
                 elif (m := re.fullmatch(r"/api/requests/([^/]+)/"
                                          r"(save|generate|run|discard|apply"
-                                         r"|answer|stop|regen-followup)",
+                                         r"|answer|stop|regen-followup"
+                                         r"|plan-supersede)",
                                         path)):
                     request_id, action = m.groups()
                     if action == "save":
@@ -22691,6 +23856,10 @@ def make_dashboard_handler(runs_dir: Path, devin_argv: list[str],
                     elif action == "stop":
                         self._json(stop_generation(request_id, requests_dir,
                                                    runs_dir), 202)
+                    elif action == "plan-supersede":
+                        self._json(plan_supersede(
+                            request_id, int(body.get("attempt") or 0),
+                            requests_dir))
                     elif action == "run":
                         self._json(launch_request(request_id, requests_dir,
                                                   manifests_dir, runs_dir,

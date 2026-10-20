@@ -403,9 +403,19 @@ class _WarmSession:
             ts = str(((upd.get("_meta") or {})
                       .get("cognition.ai/timestamp")) or "")
             sig = (kind, ts, text)
-            if sig in turn.seen_chunks:
+            # Only REPLAYED history dedupes: replayed chunks carry a
+            # real timestamp and re-send verbatim, so a (kind,ts,text)
+            # hit is a straggler. A live turn's own chunks are never
+            # deduped against each other - identical fragments recur
+            # legitimately inside one answer (markdown repeats
+            # bullets/backticks constantly) and live deltas may carry
+            # no timestamp or a shared one, which collapses distinct
+            # repeats to the same sig and silently eats text (the
+            # 'garbled answer' corruption).
+            if ts and sig in turn.seen_chunks:
                 return                       # replayed history
-            turn.seen_chunks.add(sig)
+            if turn is self.replay:
+                turn.seen_chunks.add(sig)
             if kind == "agent_thought_chunk":
                 turn.thought_tail = text
                 return

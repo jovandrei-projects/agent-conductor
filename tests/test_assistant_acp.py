@@ -12,6 +12,7 @@ Convention: C:\\Projects\\TESTING.md
 """
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -25,7 +26,8 @@ sys.path.insert(0, str(HERE))
 
 from assistant.providers import (AuthUnavailable, ProviderUnavailable,  # noqa: E402
                                  )
-from assistant.providers.devin_acp import DevinAcpProvider  # noqa: E402
+from assistant.providers.devin_acp import (DevinAcpProvider, _Turn,  # noqa: E402
+                                           _WarmSession)
 from test_assistant_runtime import ask, make_runtime, wait_x  # noqa: E402
 
 FAKE_DEVIN = [sys.executable, str(HERE / "fake_devin_chat.py")]
@@ -223,6 +225,67 @@ class DevinAcpAdapterTests(unittest.TestCase):
             res = _poll_until(p, h)
             self.assertEqual(res.text, "streamed answer")
             p.close()
+
+    def test_repeated_live_deltas_are_never_deduped(self):
+        """Regression for the garbled-answer corruption: live
+        agent_message_chunk deltas may carry NO timestamp or a shared
+        one. Markdown repeats identical fragments constantly - a
+        (kind,ts,text) dedup on live chunks silently eats every repeat.
+        Only replayed-history chunks (real timestamps) may dedup."""
+        ws = _WarmSession(conn=None, sid="s1", workspace="w")
+        ws.turn = _Turn()
+
+        def upd(text, ts=None):
+            u = {"sessionUpdate": "agent_message_chunk",
+                 "content": {"type": "text", "text": text}}
+            if ts is not None:
+                u["_meta"] = {"cognition.ai/timestamp": ts}
+            return {"params": {"sessionId": "s1", "update": u}}
+
+        for meta in (None, "ts-shared"):
+            ws.turn.parts = []
+            for t in ("- `a`\n", "one\n", "- `a`\n", "two\n", "- `a`\n"):
+                ws.apply_update(upd(t, meta))
+            self.assertEqual(ws.turn.text(),
+                             "- `a`\none\n- `a`\ntwo\n- `a`")
+        # ...and a ts'd straggler matching the seeded replay set is still
+        # dropped - dedup lives on for its real purpose
+        ws.turn.parts = ["tail"]
+        ws.turn.seen_chunks = {("agent_message_chunk", "t1", "old bit")}
+        ws.apply_update(upd("old bit", "t1"))
+        self.assertEqual(ws.turn.text(), "tail")
+
+    def test_no_ts_reply_streams_intact(self):
+        """End-to-end through the real subprocess: a reply made of
+        IDENTICAL repeated fragments (markdown's whole nature) arrives
+        verbatim even when live deltas carry no timestamp or a shared
+        one - the live corruption case."""
+        chunks = ["- `x`\n", "one\n", "- `x`\n", "two\n", "- `x`\n"]
+        reply = "".join(chunks).strip()   # res.text is turn text stripped
+        for knob in ("FAKE_ACP_NO_TS", "FAKE_ACP_CONST_TS"):
+            # mkdtemp + retry loop: TemporaryDirectory's onerror path
+            # recurses unboundedly on a dir-level PermissionError
+            # (Windows holds the killed child's cwd a beat past kill)
+            td = tempfile.mkdtemp()
+            try:
+                p = self._provider({knob: "1",
+                                    "FAKE_CHUNKS": json.dumps(chunks)})
+                d = Path(td)
+                (d / "p.md").write_text("q", encoding="utf-8")
+                h = p.send(str(d / "p.md"), session_id=None,
+                           model_uid="fake-model",
+                           export_path=str(d / "e.json"), workspace=d)
+                res = _poll_until(p, h)
+                self.assertTrue(res.done)
+                self.assertEqual(res.text, reply, knob)
+                p.close()
+            finally:
+                for _ in range(20):
+                    try:
+                        shutil.rmtree(td)
+                        break
+                    except OSError:
+                        time.sleep(0.2)
 
     def test_snapshot_chunks_resolve_to_full_text(self):
         with tempfile.TemporaryDirectory() as td:

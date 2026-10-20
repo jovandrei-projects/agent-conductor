@@ -161,7 +161,8 @@ class TourE2ETests(unittest.TestCase):
             {"run": "somename", "request_id": self.RID1,
              "ended_at": "2026-10-17T02:00:00",
              "steps": {"s1": {"status": "done"},
-                       "s2": {"status": "failed"}}}), encoding="utf-8")
+                       "s2": {"status": "failed"},
+                       "s3": {"status": "timed_out"}}}), encoding="utf-8")
         (self.requests / f"{self.RID2}.json").write_text(json.dumps(
             {"id": self.RID2, "status": "ready", "label": "follow up",
              "source_run": self.RUN_DIR,
@@ -218,6 +219,20 @@ class TourE2ETests(unittest.TestCase):
             return res.status, raw
 
     def get(self, path="/api/tour"):
+        """GET /api/tour's COMPLETE payload - the endpoint publishes
+        progressively ('partial' while a build walks its groups), so
+        tests needing the whole feed poll until the build finishes."""
+        s, d = self.call("GET", path)
+        self.assertEqual(s, 200, d)
+        deadline = time.time() + 30
+        while d.get("partial") and time.time() < deadline:
+            time.sleep(0.1)
+            s, d = self.call("GET", path)
+            self.assertEqual(s, 200, d)
+        return d
+
+    def get_partial(self, path="/api/tour"):
+        """ONE snapshot - whatever the server has published so far."""
         s, d = self.call("GET", path)
         self.assertEqual(s, 200, d)
         return d
@@ -289,11 +304,11 @@ class TourE2ETests(unittest.TestCase):
         # three events share the window)
         self.assertEqual(run["kind"], "pipeline")
         self.assertEqual(run["section"], "work")
-        self.assertEqual(run["tag"], "failed")      # s2 failed
+        self.assertEqual(run["tag"], "failed")    # bad verdicts majority
         self.assertEqual(run["outcome"], "failed")
         self.assertEqual(run["proposed_at"], "2026-10-17T01:00:00")
         self.assertEqual(run["steps_done"], 1)
-        self.assertEqual(run["steps_total"], 2)
+        self.assertEqual(run["steps_total"], 3)
         self.assertEqual({c for c in run["covers"]},
                          {f"request:{self.RID1}", f"followup:{self.RID2}"})
         fu = run["followups"][0]
@@ -446,10 +461,14 @@ class TourE2ETests(unittest.TestCase):
 
         with mock.patch.object(tour_feeds, "build_feed",
                                side_effect=slow):
-            t0 = time.time()
             s, d = self.call("GET", "/api/state")
             self.assertEqual(s, 200, d)
-            self.assertLess(time.time() - t0, 5)
+            # the response landed while the feed build is still gated -
+            # were /api/state feed-blocking it could only return after
+            # the gate's own 10s expiry + the real build; the structure
+            # is the proof, not an elapsed bound (which would just
+            # re-measure collect_dashboard's own cost on a loaded box)
+            self.assertFalse(gate.is_set())
             self.assertIsNone(d["tour_unseen"])    # unknown, not a lie
             self.assertTrue(entered.wait(5))       # daemon mid-build
             # the page itself is a static string - it paints while the

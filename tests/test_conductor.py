@@ -1883,6 +1883,172 @@ assert.doesNotMatch(html,/st-other">leased</);
         self.assertEqual(st2["plan-proposal-1"], "failed")
         self.assertEqual(st2["plan-proposal-4"], "failed")
 
+    def test_plan_supersede_manual_mark(self):
+        """The auto rule only supersedes attempts BEFORE the producer;
+        a failed regen after it keeps 'failed' until the human retires
+        it. plan_supersede stamps a flag the renderer honors - the
+        record itself stays honest ('failed' + superseded marker)."""
+        with tempfile.TemporaryDirectory() as td:
+            reqdir = Path(td) / "requests"
+            reqdir.mkdir()
+            rid = "20261019-000000-aaaabbbb"
+            rec = {"id": rid, "status": "ready", "plan_gen_id": "g-good",
+                   "plan_sessions": [
+                       {"gen_id": "g-old", "status": "failed",
+                        "note": "x"},
+                       {"gen_id": "g-good", "status": "done"},
+                       {"gen_id": "g-regen", "status": "failed",
+                        "note": "interrupted by server restart"}]}
+            (reqdir / f"{rid}.json").write_text(json.dumps(rec))
+            # attempt 3 is a POST-producer failure - still 'failed'
+            rows = conductor.plan_attempt_agents(
+                rec, f"request:{rid}", generating=False,
+                log_path=reqdir / f"{rid}.gen.log", prices={})
+            st = {r["step"]: r["status"] for r in rows}
+            self.assertEqual(st["plan-proposal-3"], "failed")
+            self.assertEqual(st["plan-proposal-1"], "superseded")
+            out = conductor.plan_supersede(rid, 3, reqdir)
+            self.assertTrue(out["ok"])
+            # the file keeps its real status - only a marker was added
+            rec2 = json.loads((reqdir / f"{rid}.json").read_text())
+            self.assertEqual(rec2["plan_sessions"][2]["status"], "failed")
+            self.assertEqual(rec2["plan_sessions"][2]["note"],
+                             "interrupted by server restart")
+            self.assertTrue(rec2["plan_sessions"][2]["superseded"])
+            self.assertTrue(rec2["plan_sessions"][2]["superseded_at"])
+            rows2 = conductor.plan_attempt_agents(
+                rec2, f"request:{rid}", generating=False,
+                log_path=reqdir / f"{rid}.gen.log", prices={})
+            r3 = {r["step"]: r for r in rows2}["plan-proposal-3"]
+            self.assertEqual(r3["status"], "superseded")
+            # guards: the producer and out-of-range ids are refused
+            with self.assertRaises(conductor.RequestError):
+                conductor.plan_supersede(rid, 2, reqdir)   # producer
+            with self.assertRaises(conductor.RequestError):
+                conductor.plan_supersede(rid, 9, reqdir)   # no attempt 9
+            with self.assertRaises(conductor.RequestError):
+                conductor.plan_supersede("20261019-000000-nosuch00", 1,
+                                         reqdir)
+            # idempotent: re-marking is a no-op success
+            out = conductor.plan_supersede(rid, 3, reqdir)
+            self.assertTrue(out["ok"])
+
+    def test_plan_supersede_endpoint(self):
+        """POST /api/requests/<id>/plan-supersede routes through the same
+        guards: 404 unknown request or attempt, 409 on the producing
+        attempt, 200 stamps the marker on the record."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            reqs = base / "reqs"
+            runs = base / "runs"
+            reqs.mkdir(); runs.mkdir()
+            rid = "20261019-000000-ccccdddd"
+            (reqs / f"{rid}.json").write_text(json.dumps({
+                "id": rid, "status": "ready", "plan_gen_id": "g2",
+                "plan_sessions": [
+                    {"gen_id": "g1", "status": "failed"},
+                    {"gen_id": "g2", "status": "done"},
+                    {"gen_id": "g3", "status": "failed"}]}))
+            handler = conductor.make_dashboard_handler(
+                runs, ["no-such-devin"], reqs, base / "manifests")
+            server = conductor.http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0), handler)
+            threading.Thread(target=server.serve_forever, daemon=True) \
+                .start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            port = server.server_port
+
+            def post(path, body):
+                conn = http.client.HTTPConnection("127.0.0.1", port,
+                                                  timeout=5)
+                conn.request("POST", path, json.dumps(body), headers={
+                    "Origin": f"http://127.0.0.1:{port}",
+                    "Content-Type": "application/json"})
+                res = conn.getresponse()
+                raw = res.read()
+                conn.close()
+                return res.status, json.loads(raw)
+
+            s, d = post(f"/api/requests/{rid}/plan-supersede",
+                        {"attempt": 3})
+            self.assertEqual(s, 200, d)
+            rec = json.loads((reqs / f"{rid}.json").read_text())
+            self.assertTrue(rec["plan_sessions"][2]["superseded"])
+            s, d = post(f"/api/requests/{rid}/plan-supersede",
+                        {"attempt": 2})              # the producer
+            self.assertEqual(s, 409, d)
+            s, d = post(f"/api/requests/{rid}/plan-supersede",
+                        {"attempt": 9})              # out of range
+            self.assertEqual(s, 404, d)
+            s, d = post("/api/requests/20261019-000000-eeeeffff/"
+                        "plan-supersede", {"attempt": 1})
+            self.assertEqual(s, 404, d)
+
+    def test_archived_rows_cached_by_signature(self):
+        """The archived view's per-run rebuild is the expensive part of
+        collect_dashboard - the cache serves a byte-identical slice
+        while the sig matches, and touching the run's state.json
+        rebuilds it (a stale cache must never mask a real change)."""
+        conductor._ARCH_RUN_CACHE.clear()
+        self.addCleanup(conductor._ARCH_RUN_CACHE.clear)
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            runs = base / "runs"
+            reqs = base / "requests"
+            rdir = runs / "r1"
+            rdir.mkdir(parents=True)
+            reqs.mkdir()
+            state = {"run": "r1", "archived": "2026-10-01T00:00:00",
+                     "started_at": "2026-10-01T00:00:00",
+                     "ended_at": "2026-10-01T01:00:00",
+                     "steps": {"s1": {"slug": "p", "status": "done",
+                                      "project": str(base / "proj"),
+                                      "pid": 1,
+                                      "started_at": "2026-10-01T00:00:00",
+                                      "ended_at": "2026-10-01T00:10:00"}}}
+            (rdir / "state.json").write_text(json.dumps(state))
+            calls = [0]
+            real = conductor._skip_flagged
+
+            def spy(p):
+                calls[0] += 1
+                return real(p)
+
+            with mock.patch.object(conductor, "live_sessions_by_dir",
+                                   return_value={}), \
+                 mock.patch.object(conductor, "_skip_flagged",
+                                   side_effect=spy):
+                d1 = conductor.collect_dashboard(
+                    runs, requests_dir=reqs, include_archived=True)
+                d2 = conductor.collect_dashboard(
+                    runs, requests_dir=reqs, include_archived=True)
+            self.assertEqual(calls[0], 1)   # second collect hit the cache
+            self.assertEqual(d1["runs"], d2["runs"])
+            self.assertEqual(d1["agents"], d2["agents"])
+            self.assertEqual(len(d1["runs"]), 1)
+            self.assertTrue(d1["runs"][0]["archived"])
+            # state.json moved -> the sig moved -> rebuild happens once
+            state["note"] = "touched"
+            (rdir / "state.json").write_text(json.dumps(state))
+            with mock.patch.object(conductor, "live_sessions_by_dir",
+                                   return_value={}), \
+                 mock.patch.object(conductor, "_skip_flagged",
+                                   side_effect=spy):
+                d3 = conductor.collect_dashboard(
+                    runs, requests_dir=reqs, include_archived=True)
+            self.assertEqual(calls[0], 2)
+            # and the non-archived poll never consults the cache at all
+            with mock.patch.object(conductor, "live_sessions_by_dir",
+                                   return_value={}), \
+                 mock.patch.object(conductor, "_skip_flagged",
+                                   side_effect=spy):
+                d4 = conductor.collect_dashboard(
+                    runs, requests_dir=reqs)
+            self.assertEqual(d4["runs"], [])        # archived stays hidden
+            self.assertEqual(d4["archived_runs"], 1)
+            self.assertEqual(calls[0], 2)           # archived run skipped
+
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_repos_modal_renders_merge_states(self):
         """The repos modal paints each watched repo's base HEAD plus
@@ -2230,9 +2396,9 @@ assert.match(html,/merge 2 pending/);
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_repos_modal_progressive_scan_and_links(self):
         """The modal walks GET /api/repos/<name> one repo at a time: the
-        status line narrates 'scanning <name> · i of n', not-yet-scanned
-        repos show queued/scanning placeholders, a {quiet:true} answer
-        folds into the footnote, a per-repo error stays a section-local
+        status line narrates 'scanning <name> · i of n' with NO
+        per-repo skeleton placeholders, a {quiet:true} answer folds
+        into the footnote, a per-repo error stays a section-local
         notice (the rest still render), and merge affordances are
         link-styled on fixed-layout tables."""
         js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
@@ -2275,11 +2441,11 @@ const sectA={name:'a',path:'/a',base:'main',
   await vm.runInContext('fetchRepos(true)',ctx);
   assert.deepEqual(calls,['/api/repos','/api/repos/a?fresh=1',
     '/api/repos/b?fresh=1','/api/repos/c?fresh=1']);
-  // mid-scan: 'a' narrates as scanning, b/c queued behind it
+  // mid-scan: 'a' narrates as scanning; no skeleton blocks for b/c
   assert.match(snapshots['/api/repos/a?fresh=1'],
     /scanning <b>a<\/b> &middot; 1 of 3/);
-  assert.match(snapshots['/api/repos/a?fresh=1'],
-    /<h4>b <span class="sub">\/b<\/span>[\s\S]*queued/);
+  assert.doesNotMatch(snapshots['/api/repos/a?fresh=1'],
+    /queued|scanning&hellip;/);
   // mid-scan after a landed: its section rendered, b narrating
   assert.match(snapshots['/api/repos/b?fresh=1'],
     /scanning <b>b<\/b> &middot; 2 of 3/);
@@ -6943,6 +7109,106 @@ const menuBtn=dataset=>({id:'',dataset,disabled:false,
   assert.equal(vm.runInContext('selectedRun',ctx),'/runs/done');
   assert.doesNotMatch(elem('agents').innerHTML,/>live-step</);
   assert.match(elem('agents').innerHTML,/>held</);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_plan_supersede_menu_item_and_dispatch(self):
+        """A failed planner attempt AFTER the producer stays 'failed'
+        forever unless the human retires it - the row's context menu and
+        the task modal both offer 'Mark attempt superseded', which
+        confirms then POSTs {attempt} to the request's endpoint. The
+        producer and a live attempt never show the item."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, posts=[], alerts=[];
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,{innerHTML:'',hidden:true,
+  textContent:'',scrollTop:0,style:{},querySelector:()=>null,
+  querySelectorAll:()=>[]}); return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const sel={isCollapsed:true,toString:()=>''};
+const window={innerWidth:1200,innerHeight:800,addEventListener:()=>{},
+  getSelection:()=>sel};
+const data={serve_boot:'b',generated_at:'2026-10-16T00:00:00',agents:[
+  {step:'plan-proposal',mode:'planner',run:'req',run_key:'request:r1',
+   slug:'p',status:'done',request_id:'r1',task:'planner'},
+  {step:'plan-proposal-2',mode:'planner',run:'req',run_key:'request:r1',
+   slug:'p',status:'superseded',request_id:'r1',task:'planner'},
+  {step:'plan-proposal-5',mode:'planner',run:'req',run_key:'request:r1',
+   slug:'p',status:'failed',request_id:'r1',task:'planner',
+   note:'interrupted by server restart'},
+  {step:'plan-proposal-9',mode:'planner',run:'req',run_key:'request:r1',
+   slug:'p',status:'running',request_id:'r1',task:'planner'}],runs:[
+  {run:'req',dir:'/runs/req',key:'request:r1',request_id:'r1',
+   counts:{done:1}}]};
+const fetch=async(url,opt)=>{
+  posts.push({url,body:opt&&opt.body?JSON.parse(opt.body):null});
+  if(url.startsWith('/api/state')) return {ok:true,json:async()=>data};
+  return {ok:true,json:async()=>({}),text:async()=>''}; };
+const ctx=vm.createContext({document,window,fetch,confirm:()=>true,
+  alert:m=>alerts.push(m),location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const cls=c=>({contains:x=>c.split(' ').includes(x),add(){},remove(){}});
+const agenRow=i=>({cls:'agen',dataset:{i:String(i)},classList:cls('agen'),
+  isConnected:true,focused:0,focus(){this.focused++;},
+  matches:s=>s==='tr.agen'||s==='tr.runrow,tr.agen',
+  getBoundingClientRect:()=>({left:10,top:20,bottom:30})});
+const onRow=row=>({isContentEditable:false,dataset:{},
+  closest:sel=>{
+    if(sel==='#ctxmenu')return null;
+    if(sel.indexOf('input')===0)return null;
+    if(sel==='tr.agen')return row.cls==='agen'?row:null;
+    if(sel==='tr.runrow,tr.agen')return row;
+    return null;}});
+const rclick=t=>{let pd=0;handlers.contextmenu({target:t,clientX:60,
+  clientY:70,preventDefault:()=>{pd++;}});return pd;};
+const menuBtn=dataset=>({id:'',dataset,disabled:false,
+  closest:sel=>{
+    if(sel==='#ctxmenu')return {inMenu:1};
+    const m=sel.match(/^\[data-([a-z-]+)\]$/);
+    if(m){const k=m[1].replace(/-([a-z])/g,(s,c)=>c.toUpperCase());
+      return k in dataset?{dataset}:null;}
+    return null;}});
+const askBtn=i=>({id:'',dataset:{},closest:sel=>
+  sel==='[data-ask]'?{dataset:{ask:String(i)}}:null});
+const flush=async()=>{for(let i=0;i<10;i++)await Promise.resolve();};
+(async()=>{
+  const m=elem('ctxmenu');
+  // the producer row (bare 'plan-proposal', done) - no retire item
+  assert.equal(rclick(onRow(agenRow(0))),1);
+  assert.doesNotMatch(m.innerHTML,/data-plan-supersede/);
+  // an already-superseded row - no item either
+  assert.equal(rclick(onRow(agenRow(1))),1);
+  assert.doesNotMatch(m.innerHTML,/data-plan-supersede/);
+  // the post-producer failure - the item, naming its request + attempt
+  assert.equal(rclick(onRow(agenRow(2))),1);
+  assert.match(m.innerHTML,
+    /data-plan-supersede="r1"[^>]*data-plan-attempt="5"[^>]*>Mark attempt superseded/);
+  // a still-running attempt is never retired mid-flight
+  assert.equal(rclick(onRow(agenRow(3))),1);
+  assert.doesNotMatch(m.innerHTML,/data-plan-supersede/);
+  // dispatch: confirm -> POST {attempt:5} to the request endpoint
+  assert.equal(rclick(onRow(agenRow(2))),1);
+  posts.length=0;
+  const p=handlers.click({target:menuBtn({planSupersede:'r1',
+    planAttempt:'5'}),preventDefault:()=>{}});
+  await flush();
+  assert.equal(elem('askwrap').hidden,false);         // confirm first
+  assert.equal(posts.length,0);                       // nothing sent yet
+  await handlers.click({target:askBtn(1),preventDefault:()=>{}});
+  await p; await flush();
+  assert.equal(posts[0].url,'/api/requests/r1/plan-supersede');
+  assert.deepEqual(posts[0].body,{attempt:5});
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         p = subprocess.run(["node", "-e", harness], input=js,
@@ -11635,11 +11901,18 @@ class RunSummaryTests(unittest.TestCase):
             self.assertIn("merged", md)
             self.assertIn("## s2 - failed", md)
             self.assertIn("ended without a closing report", md)
-            # an LLM-written run.summary.md takes precedence on disk
+            # an LLM-written run.summary.md takes precedence on disk -
+            # served with the deterministic stats block injected under
+            # its title (pre-stats-block artifacts get it for the read;
+            # the stored file is left alone)
             (rd / "run.summary.md").write_text("# llm roll-up\n",
                                                encoding="utf-8")
+            md2 = conductor.run_summary_doc("20261015-000000-sum", runs)
+            self.assertIn("# llm roll-up", md2)
+            self.assertEqual(md2.count("- **steps:**"), 1)
+            self.assertIn("- **steps:** 1 done, 1 failed", md2)
             self.assertEqual(
-                conductor.run_summary_doc("20261015-000000-sum", runs),
+                (rd / "run.summary.md").read_text(encoding="utf-8"),
                 "# llm roll-up\n")
 
     def test_summary_prompt_carries_reports(self):
@@ -11846,6 +12119,149 @@ prompt = "first"
             self.assertIn('<div class="llmsum">', frag)
             self.assertIn("<h2>LLM said</h2>", frag)
 
+    def test_llm_summary_gets_deterministic_stats_block(self):
+        """run.summary.md = our fact sheet under the title/byline, then
+        the LLM prose: exactly one authoritative stats block at the top,
+        counted from step records (a retried step counts once, only its
+        banked tokens roll up), each unsuccessful status its own count,
+        missing data honest. Regeneration replaces rather than stacks.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            rd = next(runs.iterdir())
+            self.assertTrue(conductor.summarize_run(
+                rd, shlex.split(MOCK)))
+            out = (rd / "run.summary.md").read_text(encoding="utf-8")
+            self.assertEqual(out.count("- **steps:**"), 1)
+            self.assertIn("- **steps:** 1 done", out)
+            self.assertIn("**started:**", out)
+            self.assertIn("**ended:**", out)
+            self.assertIn("**elapsed:**", out)
+            # mock exports carry no final_metrics - the honest '-', not
+            # an invented 0-token claim
+            self.assertIn("- **tokens:** -", out)
+            self.assertIn("- **merged:** 0 · **parked branch:** 0", out)
+            # the block sits under title+byline, above the LLM prose
+            self.assertLess(out.index("_written"),
+                            out.index("- **steps:**"))
+            self.assertLess(out.index("- **steps:**"),
+                            out.index("Executive summary (mock)"))
+            # regeneration rewrites the file - the block never stacks
+            self.assertTrue(conductor.summarize_run(
+                rd, shlex.split(MOCK)))
+            out2 = (rd / "run.summary.md").read_text(encoding="utf-8")
+            self.assertEqual(out2.count("- **steps:**"), 1)
+            self.assertEqual(out2.count("# t - run summary"), 1)
+            # and the serve path adds nothing on top of a file that
+            # already carries the block
+            self.assertEqual(conductor.run_summary_doc(rd.name, runs),
+                             out2)
+
+    def test_summary_doc_injects_stats_for_legacy_llm_file(self):
+        """A run.summary.md written before the stats block existed gets
+        it injected under its own title/byline at serve time - the read
+        gains the numbers, the stored artifact is left as written."""
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run_state(td, {
+                "s1": {"status": "done", "elapsed_s": 60,
+                       "tokens": {"prompt": 100, "completion": 40}},
+                "s2": {"status": "lost"},
+                "s3": {"status": "timed_out"}})
+            legacy = ("# sum - run summary\n\n"
+                      "_written 2026-10-15T02:00:00 · session `s9`_\n\n"
+                      "Hand-written old prose.\n")
+            (rd / "run.summary.md").write_text(legacy, encoding="utf-8")
+            md = conductor.run_summary_doc(rd.name, runs)
+            self.assertIn("# sum - run summary", md)
+            self.assertIn("_written 2026-10-15T02:00:00", md)
+            self.assertEqual(md.count("- **steps:**"), 1)
+            # each unsuccessful status keeps its own count
+            self.assertIn("- **steps:** 1 done, 1 lost, 1 timed_out", md)
+            self.assertIn("100 prompt + 40 completion", md)
+            self.assertLess(md.index("_written"),
+                            md.index("- **steps:**"))
+            self.assertLess(md.index("- **steps:**"),
+                            md.index("Hand-written old prose."))
+            self.assertEqual(
+                (rd / "run.summary.md").read_text(encoding="utf-8"),
+                legacy)
+            # a file with no title at all still leads with the block
+            (rd / "run.summary.md").write_text(
+                "Just prose, no title.\n", encoding="utf-8")
+            md = conductor.run_summary_doc(rd.name, runs)
+            self.assertTrue(md.startswith("- **steps:**"))
+            self.assertIn("Just prose, no title.", md)
+
+    def test_stats_block_honest_when_state_missing(self):
+        """Unavailable values render honestly: unrecorded token data is
+        '-', missing timestamps are '-', an empty run says 'none' for
+        steps - the deterministic block never invents a number."""
+        st = {"run": "r", "steps": {
+            "s1": {"status": "failed"},
+            "s2": {"status": "timed_out", "attempts": 2}}}
+        md = conductor._run_stats_md(st)
+        self.assertIn("- **steps:** 1 failed, 1 timed_out", md)
+        self.assertIn("**started:** -", md)
+        self.assertIn("**ended:** -", md)
+        self.assertIn("- **tokens:** -", md)
+        self.assertIn("- **merged:** 0 · **parked branch:** 0", md)
+        # a retried step still counts once; banked tokens roll up once
+        st2 = {"run": "r", "steps": {
+            "s1": {"status": "done", "attempts": 3,
+                   "tokens": {"prompt": 100, "completion": 40,
+                              "cached": 10}}}}
+        md2 = conductor._run_stats_md(st2)
+        self.assertIn("- **steps:** 1 done", md2)
+        self.assertIn("100 prompt + 40 completion (10 cached)", md2)
+        # the deterministic roll-up leads with the same block
+        st3 = {"run": "r3", "steps": {"s1": {"status": "done"}}}
+        rep = conductor.run_report_md(st3)
+        self.assertLess(rep.index("- **steps:**"),
+                        rep.index("## s1 - done"))
+
+    def test_summary_prompt_demands_canonical_headings(self):
+        """The summarizer prompt pins the machine-read contract: every
+        step keeps its '## <step> - <status>' heading verbatim - the
+        exact form decorateRunSum rewires into links + review toggles -
+        and the prompt's own source lines model it."""
+        with tempfile.TemporaryDirectory() as td:
+            exp = self._closing_export(Path(td), "did the work")
+            st = {"run": "sum", "steps": {
+                "s1": {"status": "done", "task": "t",
+                       "export": str(exp)}}}
+            prompt = conductor._summary_prompt(st)
+            self.assertIn("'## <step-name> - <status>'", prompt)
+            self.assertIn("### s1 - done", prompt)   # the source line
+
+    def test_summary_code_pill_styling(self):
+        """'.sumdoc code' carries the Ask-AI tinted-chip treatment -
+        translucent fill + hairline border + accent text - and wraps
+        long identifiers; fenced pre keeps its own chrome, and the
+        standalone per-task summary page gets the same wrap fix."""
+        h = conductor._DASH_HTML
+        i = h.index("#detail .sumdoc code {")
+        body = h[i:h.index("}", i)]
+        self.assertIn("border:1px solid", body)
+        self.assertIn("rgba(110,118,129", body)
+        self.assertIn("overflow-wrap:anywhere", body)
+        self.assertIn("color:#a5d6ff", body)
+        self.assertIn("#detail .sumdoc pre code", h)
+        page = conductor.summary_html("`deferred-transition`", "t")
+        self.assertIn("overflow-wrap:anywhere", page)
+        self.assertIn("pre code{", page)
+        self.assertIn("rgba(110,118,129", page)
+        # the chat pill rules are untouched - scoped to .sumdoc/#aichat
+        self.assertNotIn("#aichat .aim-body code", h)
+
     def test_run_summary_buttons_wired(self):
         self.assertIn('data-run-summary="', conductor._DASH_HTML)
         self.assertIn('data-summarize-run="', conductor._DASH_HTML)
@@ -11876,6 +12292,89 @@ prompt = "first"
         self.assertIn("Mark as reviewed", h)
         self.assertIn("Mark as needing review", h)
 
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_js_decorateRunSum_canonical_headings(self):
+        """decorateRunSum rewires canonical '<step> - <status>' headings
+        from either document shape (deterministic h2, LLM h3 + em dash):
+        step name -> task-modal link, status -> .stc color, the
+        mark-as-reviewed/needing-review toggle carrying the delegated
+        data-review-* contract, strike-through on a reviewed step -
+        while prose/non-step/punctuated headings stay untouched."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,
+  {innerHTML:'',hidden:true,textContent:'',scrollTop:0});
+  return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const fetch=async()=>({ok:true,status:200,json:async()=>({})});
+const ctx=vm.createContext({document,fetch,confirm:()=>true,alert:()=>{},
+  location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-20T00:00:00',agents:[
+  {step:'s1',run:'r',run_dir:'/r',run_key:'rk',slug:'p',status:'done',
+   task:'t1',completion_seq:1,needs_review:false,
+   review:{reviewed:true,seq:1,at:'2026-10-20T01:00:00'}},
+  {step:'s2',run:'r',run_dir:'/r',run_key:'rk',slug:'p',status:'failed',
+   task:'t2',completion_seq:2,needs_review:true},
+  {step:'run-summary',run:'r',run_dir:'/r',run_key:'rk',slug:'p',
+   status:'done',task:'aux',aux:true}],
+  runs:[{run:'r',dir:'/r',key:'rk',counts:{done:1,failed:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+// heading stubs carrying the shape decorateRunSum reads off a real
+// heading: textContent, dataset, classList, writable innerHTML
+const mkH=(tag,text)=>{const h={tagName:tag,textContent:text,dataset:{},
+  _cls:new Set(),_toggles:[],innerHTML:''};
+  h.classList={toggle:(c,f)=>{h._toggles.push([c,f]);
+    f?h._cls.add(c):h._cls.delete(c);return f;},
+    contains:c=>h._cls.has(c)};
+  return h;};
+const heads=[mkH('H2','s1 - done'),     // deterministic roll-up shape
+             mkH('H3','s2 — failed'),    // LLM file: h3 + em dash
+             mkH('H3','Step s1: done'),  // non-canonical prose
+             mkH('H2','s3 - done'),      // no such step in the run
+             mkH('H3','s1 - done.'),     // trailing punctuation
+             mkH('H3','run-summary - done')]; // aux row: not a step
+const root={querySelectorAll:sel=>sel==='h2,h3,h4'?heads:[]};
+ctx.root=root; ctx.rkey='rk';
+vm.runInContext('decorateRunSum(root, rkey)',ctx);
+// s1 - done: reviewed flag -> strike + 'mark as needing review', name
+// is the task-modal link, status colored
+assert.equal(heads[0].dataset.sumstep,'s1');
+assert.match(heads[0].innerHTML,/data-agent-detail="rk\|s1"/);
+assert.match(heads[0].innerHTML,/stc st-ok">done</);
+assert.match(heads[0].innerHTML,/data-review-step="r"[^>]*data-step="s1"[^>]*data-review-set="0"[^>]*data-review-seq="1"/);
+assert.match(heads[0].innerHTML,/>mark as needing review</);
+assert.deepEqual(heads[0]._toggles,[['sumh-reviewed',true]]);
+// s2 — failed: em dash still canonical; needs_review -> 'mark as
+// reviewed', no strike-through
+assert.equal(heads[1].dataset.sumstep,'s2');
+assert.match(heads[1].innerHTML,/data-agent-detail="rk\|s2"/);
+assert.match(heads[1].innerHTML,/stc st-bad">failed</);
+assert.match(heads[1].innerHTML,/data-review-set="1"/);
+assert.match(heads[1].innerHTML,/>mark as reviewed</);
+assert.deepEqual(heads[1]._toggles,[['sumh-reviewed',false]]);
+// everything else stays plain prose - no link, no toggle, no dataset
+for (const h of heads.slice(2)) {
+  assert.equal(h.innerHTML,'');
+  assert.equal(h.dataset.sumstep,undefined);
+  assert.deepEqual(h._toggles,[]);
+}
+// re-decoration is idempotent: the dataset guard rebuilds from the
+// remembered step, never re-parses the mutated markup
+vm.runInContext('decorateRunSum(root, rkey)',ctx);
+assert.equal(heads[0].innerHTML.match(/data-review-step/g).length,1);
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+
     def test_modal_ux_wiring(self):
         """The modal-revamp bits the layout depends on: three-zone nav
         bar, muted aux rows, the Actions zone, a disabled-until-dirty
@@ -11897,6 +12396,388 @@ prompt = "first"
         for gone in ('Open as page', 'req-open', 'tok-help',
                      'Session summary</a>', 'Back: '):
             self.assertNotIn(gone, h)
+
+
+class RunSummaryHtmlTests(unittest.TestCase):
+    """The summarizer's second artifact: the session drops
+    run.summary.html in its tempdir, conductor collects it next to
+    run.summary.md, the endpoint serves it re-sanitized under
+    .run-summary-report, and the modal appends it once below the
+    markdown sumdoc."""
+
+    def _run_state(self, td, steps, run="20261015-000000-sum"):
+        runs = Path(td) / "runs"
+        rd = runs / run
+        rd.mkdir(parents=True)
+        st = {"run": "sum", "started_at": "2026-10-15T00:00:00",
+              "ended_at": "2026-10-15T01:00:00", "steps": steps}
+        (rd / "state.json").write_text(json.dumps(st), encoding="utf-8")
+        return runs, rd
+
+    def _server(self, runs, td):
+        handler = conductor.make_dashboard_handler(
+            runs, ["no-such-devin"], Path(td) / "reqs",
+            Path(td) / "manifests")
+        srv = conductor.http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv
+
+    def _get(self, port, path):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", path,
+                     headers={"Host": f"127.0.0.1:{port}"})
+        res = conn.getresponse()
+        body = res.read().decode("utf-8")
+        ctype = res.getheader("Content-Type")
+        conn.close()
+        return res.status, body, ctype
+
+    # -- artifact generation + persistence ------------------------------
+
+    def test_summarize_run_collects_html_artifact(self):
+        """The same session drops run.summary.html next to
+        run.summary.md - the markdown contract is untouched and the
+        bookkeeping row advertises both files."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            rd = next(runs.iterdir())
+            self.assertTrue(conductor.summarize_run(
+                rd, shlex.split(MOCK)))
+            md = (rd / "run.summary.md").read_text(encoding="utf-8")
+            self.assertIn("Executive summary (mock)", md)
+            rep = rd / "run.summary.html"
+            self.assertTrue(rep.is_file())
+            body = rep.read_text(encoding="utf-8")
+            self.assertIn("run summary (mock)", body)
+            self.assertIn("<article>", body)
+            d = conductor.collect_dashboard(
+                runs, ["no-such-devin"], base / "requests")
+            aux = [a for a in d["agents"] if a.get("aux")][0]
+            self.assertIn("run.summary.md", aux["outcome"])
+            self.assertIn("run.summary.html", aux["outcome"])
+
+    def test_summary_prompt_instructs_html_report(self):
+        """The prompt names the second artifact and its contract - the
+        markdown instructions stay the document's own."""
+        prompt = conductor._summary_prompt({"run": "r", "steps": {}})
+        self.assertIn("run.summary.html", prompt)
+        self.assertIn("<article>", prompt)
+        self.assertIn("#0d1117", prompt)
+
+    # -- the serving endpoint -------------------------------------------
+
+    def test_run_summary_html_endpoint(self):
+        """GET /api/runs/<run>/summary.html - always served re-sanitized
+        under .run-summary-report; missing or unrenderable is 404."""
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run_state(td, {
+                "s1": {"status": "done", "task": "t"}})
+            srv = self._server(runs, td)
+            port = srv.server_port
+            url = "/api/runs/20261015-000000-sum/summary.html"
+            status, body, _ = self._get(port, url)
+            self.assertEqual(status, 404)          # legacy run: no file
+            (rd / "run.summary.html").write_text(
+                '<!doctype html><html><head><style>x{}</style></head>'
+                '<body><header><h1>sum report</h1></header>'
+                '<section><p>ok</p><script>alert(1)</script></section>'
+                '</body></html>', encoding="utf-8")
+            status, body, ctype = self._get(port, url)
+            self.assertEqual(status, 200)
+            self.assertIn("text/html", ctype)
+            self.assertTrue(body.startswith(
+                '<div class="run-summary-report">'))
+            self.assertIn("<h1>sum report</h1>", body)
+            self.assertNotIn("<script", body)
+            self.assertNotIn("<style", body)
+            # a tampered stored artifact is re-sanitized on every read -
+            # handlers, frames and loopback loads never reach the page
+            (rd / "run.summary.html").write_text(
+                '<section><p onclick="x()">ev</p>'
+                '<iframe src="http://127.0.0.1:8809/"></iframe></section>',
+                encoding="utf-8")
+            status, body, _ = self._get(port, url)
+            self.assertEqual(status, 200)
+            self.assertNotIn("iframe", body)
+            self.assertNotIn("onclick", body)
+            # an all-active document sanitizes to nothing -> 404
+            (rd / "run.summary.html").write_text(
+                "<script>x</script>", encoding="utf-8")
+            status, body, _ = self._get(port, url)
+            self.assertEqual(status, 404)
+
+    # -- the sanitizer itself --------------------------------------------
+
+    def test_sanitize_strips_active_content(self):
+        out = conductor.sanitize_report_html(
+            '<p>a</p><script>alert(1)</script>'
+            '<script src="http://x"></script>'
+            '<iframe src="http://127.0.0.1:8809/x"></iframe>'
+            '<object data="x"></object><embed src="x">'
+            '<link rel="stylesheet" href="http://x"><img src="x.png">'
+            '<audio src="x">a</audio><video src="x">v</video>'
+            '<form action="/x"><input><select><option>o</option>'
+            '</select></form><p>b</p>')
+        self.assertIn("<p>a</p>", out)
+        self.assertIn("<p>b</p>", out)
+        for bad in ("script", "iframe", "object", "embed", "<link",
+                    "<img", "audio", "video", "form", "input",
+                    "select", "option"):
+            self.assertNotIn("<" + bad, out)
+
+    def test_sanitize_strips_handlers_styles_ids(self):
+        """Event handlers, inline styles, <style>, DOM identifiers and
+        dashboard classes all go - markup can't collide with or restyle
+        the host page."""
+        out = conductor.sanitize_report_html(
+            '<p onclick="x()" onmouseover="y()">t</p>'
+            '<div id="backdrop" name="n" for="x" class="modal sumdoc" '
+            'style="position:fixed;inset:0" tabindex="0">c</div>'
+            '<style>.x{position:fixed}</style>'
+            '<p style="background:url(http://x)">s</p>')
+        self.assertIn("<p>t</p>", out)
+        self.assertIn("<div>c</div>", out)
+        self.assertIn("<p>s</p>", out)
+        for bad in ("onclick", "onmouseover", 'id="backdrop"', "name=",
+                    'for="', "class=", "style=", "<style"):
+            self.assertNotIn(bad, out)
+
+    def test_sanitize_neutralizes_urls(self):
+        """No URL-bearing attribute survives on any element - the report
+        can never navigate out or load external/loopback resources."""
+        out = conductor.sanitize_report_html(
+            '<a href="javascript:alert(1)">j</a>'
+            '<a href="http://127.0.0.1:8773/api">l</a>'
+            '<a href="#frag">f</a><a href>x</a>'
+            '<q cite="http://x">q</q>'
+            '<form><button formaction="http://x">b</button></form>')
+        self.assertIn("<a>j</a>", out)
+        self.assertIn("<a>l</a>", out)
+        self.assertIn("<a>f</a>", out)
+        self.assertIn("<q>q</q>", out)
+        for bad in ("href", "javascript:", "cite=", "formaction",
+                    "127.0.0.1"):
+            self.assertNotIn(bad, out)
+
+    def test_sanitize_keeps_inert_structure(self):
+        out = conductor.sanitize_report_html(
+            '<header><h1>t</h1><ul><li><strong>2</strong> done</li></ul>'
+            '</header><section><h2>F</h2><p>x</p>'
+            '<table><thead><tr><th scope="col">h</th></tr></thead>'
+            '<tbody><tr><td colspan="99" rowspan="x">c</td></tr></tbody>'
+            '</table><details open><summary>d</summary>body</details>'
+            '<pre>a &lt; b</pre><time datetime="2026-01-01">t</time>'
+            '<mark>m</mark><abbr title="Abbr">a</abbr></section>')
+        self.assertIn("<header>", out)
+        self.assertIn("<strong>2</strong>", out)
+        self.assertIn('<th scope="col">h</th>', out)
+        self.assertIn('<td colspan="99">c</td>', out)     # bad int dropped
+        self.assertIn("<details open>", out)
+        self.assertIn('<time datetime="2026-01-01">t</time>', out)
+        self.assertIn('<abbr title="Abbr">a</abbr>', out)
+        self.assertIn("a &lt; b", out)                    # text escaped
+
+    def test_sanitize_balanced_on_malformed(self):
+        """Truncated/unbalanced input still emits balanced markup - the
+        fragment can't break out of its container on reparse."""
+        out = conductor.sanitize_report_html(
+            '<section><h2>t</h2><p>unclosed<div>deep')
+        for tag in ("section", "p", "div", "h2"):
+            self.assertEqual(out.count("<" + tag + ">"),
+                             out.count("</" + tag + ">"))
+        self.assertTrue(out.endswith("</section>"))
+
+    def test_sanitize_drops_foreign_and_rawtext(self):
+        """svg/math/template/RCDATA subtrees go whole - their text
+        children never surface either."""
+        out = conductor.sanitize_report_html(
+            '<svg><a xlink:href="x">s</a><style>p{}</style></svg>'
+            '<math><mi>x</mi></math><template><p>hidden</p></template>'
+            '<textarea><b>raw</b></textarea><noscript>n</noscript>'
+            '<xmp><i>x</i></xmp><p>keep</p>')
+        self.assertIn("<p>keep</p>", out)
+        for bad in ("<svg", "<math", "<mi", "xlink", "hidden", "raw",
+                    "<style", "p{}", "<i>x", "<noscript"):
+            self.assertNotIn(bad, out)
+
+    def test_sanitize_drops_comments_and_decls(self):
+        out = conductor.sanitize_report_html(
+            '<!doctype html><!-- c --><?php echo 1 ?><p>x</p>'
+            '<![CDATA[ <p>y</p> ]]>')
+        self.assertIn("<p>x</p>", out)
+        for bad in ("php", "<!--", "CDATA", "<p>y"):
+            self.assertNotIn(bad, out)
+
+    def test_sanitize_report_cap(self):
+        """Oversized artifacts are rejected, not buffered whole."""
+        big = "<p>" + "x" * (conductor._REPORT_HTML_MAX_BYTES + 10) \
+            + "</p>"
+        out = conductor.sanitize_report_html(big)
+        self.assertLessEqual(len(out),
+                             conductor._REPORT_HTML_MAX_BYTES + 200)
+
+    # -- the modal-side append (node harness) -----------------------------
+
+    _JS_STUB = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={}, fetches=[];
+const mkEl=id=>({id,innerHTML:'',hidden:true,textContent:'',scrollTop:0,
+  insertAdjacentHTML(pos,h){ this.innerHTML+=h; },
+  querySelector:()=>null,querySelectorAll:()=>[]});
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,mkEl(id)); return nodes.get(id); };
+// a stand-in .sumdoc for decorateRunSum: two heading stubs it can lift
+const heads=[
+  {textContent:'s1 - done',dataset:{},innerHTML:'',
+   classList:{toggle(){}}},
+  {textContent:'prose heading',dataset:{},innerHTML:'',
+   classList:{toggle(){}}}];
+const sumdoc={querySelectorAll:sel=>sel==='h2,h3,h4'?heads:[],dataset:{}};
+const document={getElementById:elem,
+  querySelector:s=>s==='#detail .sumdoc'?sumdoc:null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const defers=[], htmlFrags={};        // 'defer' parks a summary.html fetch
+const fetch=url=>{
+  fetches.push(url);
+  const m=url.match(/runs\/([^/]+)\/summary\.html/);
+  if (m){
+    const dir=decodeURIComponent(m[1]), v=htmlFrags[dir];
+    if (v==='defer') return new Promise(r=>defers.push({dir,r}));
+    if (v!=null) return Promise.resolve({ok:true,status:200,
+      text:async()=>v,json:async()=>({})});
+    return Promise.resolve({ok:false,status:404,
+      json:async()=>({error:'No HTML report for this run'}),
+      text:async()=>''});
+  }
+  if (url.includes('/summary')) return Promise.resolve({ok:true,
+    status:200,
+    text:async()=>'<h1>sum - run summary</h1><h2>s1 - done</h2>',
+    json:async()=>({})});
+  throw new Error('no net '+url);
+};
+const ctx=vm.createContext({document,fetch,confirm:()=>true,alert:()=>{},
+  location:{reload:()=>{}},setTimeout:(fn)=>{fn();return 0;},
+  setInterval:()=>0,clearInterval:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'g0',agents:[
+  {step:'s1',run:'rA',run_dir:'/rA',run_key:'/rA',slug:'p',
+   status:'done',task:'t1',seq:0},
+  {step:'s1',run:'rB',run_dir:'/rB',run_key:'/rB',slug:'p',
+   status:'done',task:'t1',seq:0}],
+  runs:[{run:'rA',dir:'/rA',key:'/rA',counts:{done:1}},
+        {run:'rB',dir:'/rB',key:'/rB',counts:{done:1}},
+        {run:'rC',dir:'/rC',key:'/rC',counts:{done:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+const body=()=>elem('dbody').innerHTML;
+const openRun=k=>vm.runInContext(
+  'openRunSummary('+JSON.stringify(k)+')',ctx);
+const countReport=()=>(body().match(/run-summary-report/g)||[]).length;
+const flush=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
+'''
+
+    def _node(self, body):
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        p = subprocess.run(["node", "-e", self._JS_STUB + body],
+                           input=js, capture_output=True, text=True,
+                           encoding="utf-8", timeout=15)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_report_appends_below_sumdoc_js(self):
+        """The report lands at the END of the modal, after the markdown
+        sumdoc, and the heading decoration still runs on the markdown."""
+        self._node(r'''
+(async()=>{
+  htmlFrags['rA']='<div class="run-summary-report"><header><h1>rA rep' +
+    '</h1></header></div>';
+  await openRun('/rA'); await flush();
+  const b=body();
+  const si=b.indexOf('class="sumdoc"'), ri=b.indexOf('run-summary-report');
+  assert.ok(si>=0 && ri>si, 'report must land below the markdown sumdoc');
+  assert.equal(b.lastIndexOf('run-summary-report'), ri);   // exactly once
+  assert.match(b,/<h2>s1 - done<\/h2>/);                   // sumdoc intact
+  // markdown decoration preserved: the '<step> - <status>' heading is
+  // still a live task link + review toggle, prose headings untouched
+  assert.match(heads[0].innerHTML,/data-agent-detail="\/rA\|s1"/);
+  assert.match(heads[0].innerHTML,/sumh-rev/);
+  assert.equal(heads[1].innerHTML,'');
+  // the report sits inside #detail's fixed stylesheet scope
+  assert.match(b,/<div class="run-summary-report"><header><h1>rA rep/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_report_missing_or_malformed_skipped_js(self):
+        """Legacy runs (404) and empty/rejected fragments append
+        nothing - the markdown view stands alone."""
+        self._node(r'''
+(async()=>{
+  await openRun('/rC'); await flush();           // no htmlFrags -> 404
+  assert.match(body(),/class="sumdoc"/);
+  assert.equal(countReport(),0);
+  // a whitespace-only fragment is skipped too
+  htmlFrags['rA']='   ';
+  await openRun('/rA'); await flush();
+  assert.equal(countReport(),0);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_report_once_and_stale_guard_js(self):
+        """Repeated rendering never stacks a second report, and a stale
+        fetch from a previous run can't paint into the new view."""
+        self._node(r'''
+(async()=>{
+  htmlFrags['rA']='<div class="run-summary-report"><p>A</p></div>';
+  htmlFrags['rB']='<div class="run-summary-report"><p>B</p></div>';
+  await openRun('/rA'); await flush();
+  assert.equal(countReport(),1);
+  // a racing duplicate fetch for the same run can't double-append
+  await openRun('/rA'); await flush();
+  assert.equal(countReport(),1);
+  // stale-guard: rA's deferred fetch must not land on rB's view
+  htmlFrags['rA']='defer';
+  await openRun('/rA'); await flush();
+  assert.equal(defers.length,1);          // rA report still in flight
+  await openRun('/rB'); await flush();    // user moved on to rB
+  assert.equal(countReport(),1);
+  assert.match(body(),/<p>B<\/p>/);
+  defers.forEach(x=>x.r({ok:true,status:200,
+    text:async()=>'<div class="run-summary-report"><p>A2</p></div>',
+    json:async()=>({})}));
+  await flush();
+  assert.equal(countReport(),1);
+  assert.doesNotMatch(body(),/<p>A2<\/p>/);   // the stale frag was dropped
+  assert.match(body(),/<p>B<\/p>/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    def test_report_stylesheet_scoped(self):
+        """Every report rule lives under #detail .run-summary-report -
+        report markup (classes stripped) can only be styled there."""
+        css = conductor._DASH_HTML.split("<style>", 1)[1].split(
+            "</style>", 1)[0]
+        self.assertIn(".run-summary-report", css)
+        for line in css.splitlines():
+            s = line.strip()
+            if "run-summary-report" not in s or "{" not in s:
+                continue
+            if not s.startswith("#detail .run-summary-report"):
+                self.fail(f"unscoped report rule: {s}")
 
 
 class PowerDialogTests(unittest.TestCase):

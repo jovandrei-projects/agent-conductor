@@ -405,21 +405,25 @@ assert.ok(!fetches.some(u=>u.includes('/api/tour')));   // badge never GETs the 
     @unittest.skipUnless(shutil.which("node"), "Node unavailable")
     def test_loading_error_retry_and_empty_states(self):
         """Opening paints a loading card first; a failed feed GET shows
-        the error with a Retry that refetches; an empty feed renders the
-        caught-up card (still reachable for the viewed section)."""
+        the error with a Retry that refetches; an empty feed lands on
+        the deck picker with both sections reading 'all caught up'."""
         self._node(r'''
 (async()=>{
   vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
   defers=[];
   await click(tourBtn('btn'));
   assert.match(card(),/loading the change feed/);      // paint precedes feed
+  assert.match(card(),/asking the server/);            // stage narration
   defers[0].r({ok:false,json:async()=>({error:'boom'})}); await flush();
   defers=null;                                   // back to queue mode
   assert.match(card(),/notice error">boom/);
   queue.push({ok:true,json:async()=>({generated_at:'g',boundary:{},
     range:{},entries:[],history:[],unseen_count:0,warnings:[]})});
   await click(act('retry'));
-  assert.match(card(),/All caught up/);
+  const h=card();
+  assert.match(h,/What's new/);
+  assert.equal((h.match(/all caught up/g)||[]).length,2);
+  assert.match(h,/data-sec="" disabled/);         // nothing to walk
   assert.equal(elem('tourwrap').classList.contains('dim'),true);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 ''')
@@ -489,15 +493,18 @@ const FEED2={generated_at:'g1',boundary:{commit:'b',at:'t'},range:{},
   vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
   queue.push({ok:true,json:async()=>FEED2});
   await open();
-  // tool updates first even though the run event is newer
+  // two populated decks -> the picker, not a card: each row names its
+  // section + remaining count, 'walk everything' is the combined run
   let h=card();
-  assert.match(h,/Tool updates<\/span> · card 1 of 1/);
-  assert.match(h,/Power polish/);
-  assert.equal(elem('tourcard').classList.contains('sec-tool'),true);
-  assert.match(h,/class="ttag"[^>]*>improved</);       // outline change tag
-  assert.doesNotMatch(h,/ttag ev/);
-  // -> Work digest card 1: the finished run
-  await click(act('next'));
+  assert.match(h,/What's new/);
+  assert.match(h,/data-sec="tool"><span class="tmh"><b>Tool updates<\/b>/);
+  assert.match(h,/tsecname tool">1 card</);
+  assert.match(h,/data-sec="work"><span class="tmh"><b>Work digest<\/b>/);
+  assert.match(h,/tsecname work">2 cards</);
+  assert.match(h,/data-sec="">walk everything</);
+  // Work digest deck: each card counts within its own section and the
+  // card edge takes the section accent
+  await click(act('sec',{sec:'work'}));
   h=card();
   assert.match(h,/Work digest<\/span> · card 1 of 2/);
   assert.match(h,/Run finished: job one/);
@@ -532,6 +539,20 @@ const FEED2={generated_at:'g1',boundary:{commit:'b',at:'t'},range:{},
     s==='[data-open-request]'?{dataset:{openRequest:ds}}:null});
   await click(reqChip('req9'));
   assert.ok(fetches.some(u=>u==='/api/requests/req9'));
+  // back to the picker, then the Tool-updates deck on its own
+  await click({id:'dx',dataset:{},closest:()=>null});   // close the modal
+  await click(act('menu'));
+  h=card();
+  assert.match(h,/tsecname tool">1 card</);
+  await click(act('sec',{sec:'tool'}));
+  h=card();
+  assert.match(h,/Tool updates<\/span> · card 1 of 1/);
+  assert.match(h,/Power polish/);
+  assert.equal(elem('tourcard').classList.contains('sec-tool'),true);
+  assert.match(h,/class="ttag"[^>]*>improved</);       // outline change tag
+  assert.doesNotMatch(h,/ttag ev/);
+  await click(act('next'));            // nav can't leave the deck
+  assert.match(card(),/card 1 of 1/);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 ''')
 
@@ -562,12 +583,13 @@ const FEED2={generated_at:'g1',boundary:{commit:'b',at:'t'},range:{},
   assert.equal(elem('tour-badge').textContent,'2');    // no flicker-to-0
   assert.match(card(),/All caught up/);
   // a re-pull serves a STALE feed still listing the acked card - the
-  // session acked-set keeps it out of the deck (the card header would
-  // carry a section name; the caught-up view has none)
+  // session acked-set keeps it out of every deck, so the picker lands
+  // with both sections reading 'all caught up' (no card is dealt)
   queue.push({ok:true,json:async()=>onlyWork});
   await click(act('retry'));
   h=card();
-  assert.match(h,/<h3 id="tourcard-title">All caught up<\/h3>/);
+  assert.match(h,/<h3 id="tourcard-title">What's new<\/h3>/);
+  assert.equal((h.match(/all caught up/g)||[]).length,2); // both decks
   assert.doesNotMatch(h,/class="tpos"/);               // no card dealt
   // and the acknowledged card stays reachable through viewed history
   assert.match(h,/viewed earlier \(1\)/);
@@ -633,8 +655,15 @@ const FEED2={generated_at:'g1',boundary:{commit:'b',at:'t'},range:{},
      viewed_at:'2026-10-16T01:00:00'}]};
   queue.push({ok:true,json:async()=>f});
   await open();
-  // no section fields at all: the run card still lands in Work digest
-  // AFTER the tool card even though its stamp is newer
+  // no section fields at all: the picker still splits both decks by id
+  // prefix - record ids into the Work digest, the rest into Tool
+  // updates
+  let h=card();
+  assert.match(h,/tsecname tool">1 card</);
+  assert.match(h,/tsecname work">1 card</);
+  // walk everything keeps the old order: the run card lands in Work
+  // digest AFTER the tool card even though its stamp is newer
+  await click(act('sec',{sec:''}));
   assert.match(card(),/Tool updates<\/span> · card 1 of 1/);
   await click(act('next'));
   assert.match(card(),/Work digest<\/span> · card 1 of 1 · Runs/);
@@ -655,10 +684,18 @@ const FEED2={generated_at:'g1',boundary:{commit:'b',at:'t'},range:{},
   vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
   queue.push({ok:true,json:async()=>FEED2});
   await open();
-  // mark the Tool-updates card; the deck becomes work-only
+  // two live decks -> the picker; enter the Tool-updates deck and mark
+  // its card - the picker then shows that deck caught up
+  await click(act('sec',{sec:'tool'}));
   queue.push({ok:true,json:async()=>({id:'x',state:'viewed',
     changed:true,unseen_count:2})});
   await click(act('mark'));
+  assert.match(card(),/All caught up/);
+  assert.match(card(),/nothing left in Tool updates/);
+  await click(act('menu'));
+  assert.match(card(),/tsecname tool">all caught up</);
+  assert.match(card(),/tsecname work">2 cards</);
+  await click(act('sec',{sec:'work'}));
   assert.match(card(),/Work digest<\/span> · card 1 of 2/);
   await click(act('skip'));
   assert.equal(elem('tourwrap').hidden,true);
@@ -718,6 +755,53 @@ const FEED2={generated_at:'g1',boundary:{commit:'b',at:'t'},range:{},
   const h2=card();
   assert.match(h2,/class="chip trev" data-run-details/);
   assert.match(h2,/>1 unreviewed</);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_partial_outcome_tag_renders_amber_in_work_deck(self):
+        """A mostly-done run's 'partial' word rides the same FILLED
+        event chip as done/failed - amber #d29922, verbatim text, the
+        'run outcome' title - inside the Work digest deck, which keeps
+        its own position counter and section chrome; the tool deck and
+        its outline change tag are untouched."""
+        self._node(self._SPLIT + r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  const f=JSON.parse(JSON.stringify(FEED2));
+  // the workflow-ux-safety shape: 29/30 steps clean + 1 lost -> partial
+  f.entries[0]=Object.assign({},f.entries[0],{
+    title:'Run finished: workflow-ux-safety',
+    tag:'partial',outcome:'partial',steps_done:29,steps_total:30});
+  queue.push({ok:true,json:async()=>f});
+  await open();
+  // sectioning unchanged: same two decks, same counts
+  let h=card();
+  assert.match(h,/tsecname tool">1 card</);
+  assert.match(h,/tsecname work">2 cards</);
+  await click(act('sec',{sec:'work'}));
+  h=card();
+  assert.match(h,/Work digest<\/span> · card 1 of 2/);
+  assert.equal(elem('tourcard').classList.contains('sec-work'),true);
+  // the partial word: verbatim, amber, FILLED - never red 'failed'
+  assert.match(h,/class="ttag ev"[^>]*>partial</);
+  assert.match(h,/style="color:#d29922;border-color:#d29922/);
+  assert.match(h,/background:#d2992226/);
+  assert.match(h,/title="run outcome - a record event"/);
+  assert.doesNotMatch(h,/>failed</);
+  assert.match(h,/29\/30 steps done/);
+  // the rest of the deck is untouched: request card + its tag
+  await click(act('next'));
+  h=card();
+  assert.match(h,/Work digest<\/span> · card 2 of 2/);
+  assert.match(h,/class="ttag ev"[^>]*>ready</);
+  // and the tool card keeps its own outline change tag
+  await click(act('menu'));
+  await click(act('sec',{sec:'tool'}));
+  h=card();
+  assert.match(h,/Tool updates<\/span> · card 1 of 1/);
+  assert.match(h,/class="ttag"[^>]*>improved</);
+  assert.doesNotMatch(h,/ttag ev/);
 })().catch(e=>{console.error(e);process.exitCode=1;});
 ''')
 
@@ -830,6 +914,280 @@ const FEED2={generated_at:'g1',boundary:{commit:'b',at:'t'},range:{},
 })().catch(e=>{console.error(e);process.exitCode=1;});
 ''')
 
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_loading_progress_narrates_the_build(self):
+        """The feed protocol IS the progress channel: a 'partial'
+        snapshot keeps the client polling /api/tour, paints elapsed
+        time + done/pending group marks (never a fabricated percent),
+        keeps the first cards usable while later groups land, and stops
+        polling when the complete snapshot arrives."""
+        self._node(r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  // give the tour a live interval: capture the snapshot-poll callback
+  // (globalThis inside the vm IS ctx, so this lands where we can call it)
+  vm.runInContext(
+    'setInterval=f=>{globalThis.__iv=f;return 7};' +
+    'clearInterval=i=>{globalThis.__cl=i}',ctx);
+  defers=[];                              // every fetch now pends
+  const p=open();                         // /api/tour is mid-flight
+  await flush();
+  assert.match(card(),/loading the change feed/);
+  assert.match(card(),/asking the server/);
+  assert.match(card(),/not an\s+agent task/);   // honesty footnote
+  // the first snapshot is PARTIAL - the tool card is already usable
+  // and the loading line narrates the groups still publishing
+  const p1={generated_at:'g',boundary:{},range:{},seq:1,partial:true,
+    unseen_count:1,warnings:[],history:[],entries:[
+    {id:'area:power:aaa111bbb222',kind:'change',section:'tool',
+     section_title:'Tool updates',stop:'power',
+     stop_title:'Dashboard power',title:'Power <img>',blurb:'b',
+     tag:'improved',anchor:'#power-btn',commits:[],runs:[],requests:[],
+     at:'2026-10-17T01:00:00',range:{},state:'new'}],
+    loading:{busy:true,elapsed_s:2.5,stage:'loading run records',
+      groups:{collect:'done',tool:'done',work:'running',
+              history:'pending'},
+      sources:{commits:'ok',runs:'ok',requests:'pending'}}};
+  defers.find(d=>d.u==='/api/tour').r({ok:true,json:async()=>p1});
+  await p; await flush();
+  let h=card();
+  assert.match(h,/Tool updates<\/span> · card 1 of 1/);
+  assert.match(h,/2\.5s/);
+  assert.match(h,/sources done/);
+  assert.match(h,/tool updates done/);
+  assert.match(h,/work digest \u2026|work digest \.\.\./);
+  assert.match(h,/viewed history pending/);
+  // nav + mark are live while the rest of the feed builds
+  assert.match(h,/data-tour="mark"/);
+  // the poll fires: it re-GETs /api/tour - no separate progress probe
+  ctx.__iv(); await flush();
+  assert.ok(defers.filter(d=>d.u==='/api/tour').length>=2,
+    'the poll must re-issue GET /api/tour');
+  assert.ok(!defers.some(d=>d.u==='/api/tour/progress'));
+  // the next snapshot merges the work group in place - the tool card's
+  // spot is kept (no selection reset), the new card appends
+  const p2=Object.assign({},p1,{seq:2,
+    entries:p1.entries.concat([
+      {id:'request:req9',kind:'request',section:'work',
+       section_title:'Work digest',stop:'requests',
+       stop_title:'Proposals & requests',title:'New proposal: nine',
+       blurb:'d',tag:'ready',anchor:'#runs',commits:[],runs:[],
+       requests:['req9'],at:'2026-10-17T05:00:00',
+       proposed_at:'2026-10-17T05:00:00',range:{},state:'new'}]),
+    loading:{busy:true,elapsed_s:3.1,stage:'rebuilding viewed history',
+      groups:{collect:'done',tool:'done',work:'done',
+              history:'running'},
+      sources:{commits:'ok',runs:'ok',requests:'ok',curated:'ok'}}});
+  defers[defers.length-1].r({ok:true,json:async()=>p2});
+  await flush();
+  h=card();
+  assert.match(h,/Tool updates<\/span> · card 1 of 1/);   // still on it
+  assert.match(h,/3\.1s/);                              // elapsed advances
+  assert.match(h,/work digest done/);
+  // a repeat seq is a no-op (stale publications never reapply)
+  ctx.__iv(); await flush();
+  defers[defers.length-1].r({ok:true,json:async()=>p2});
+  await flush();
+  // the complete snapshot lands: the poll interval is cleared
+  ctx.__iv(); await flush();
+  const fin=Object.assign({},p2,{seq:3,partial:false,
+    unseen_count:2,loading:{busy:false}});
+  defers[defers.length-1].r({ok:true,json:async()=>fin});
+  await flush();
+  assert.equal(ctx.__cl,7);
+  h=card();
+  assert.doesNotMatch(h,/still loading|elapsed_s/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
 
-if __name__ == "__main__":
-    unittest.main()
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_partial_shell_and_acked_card_never_reinserts(self):
+        """An empty partial shell lands on the picker with 'loading'
+        rows (not a fake 'all caught up'); a card marked viewed while
+        later groups still publish is never reinserted by a stale
+        partial snapshot that still lists it - tourAcked filters every
+        apply, and the card waits for the user in viewed history."""
+        self._node(r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  vm.runInContext(
+    'setInterval=f=>{globalThis.__iv=f;return 7};' +
+    'clearInterval=i=>{globalThis.__cl=i}',ctx);
+  defers=[];
+  const p=open();
+  await flush();
+  // snapshot 1: an empty shell - the build hasn't published content
+  const shell={generated_at:'g',boundary:{},range:{},seq:1,
+    partial:true,unseen_count:null,warnings:[],entries:[],history:[],
+    loading:{busy:true,elapsed_s:0.4,stage:'reading commit log',
+      groups:{collect:'running',tool:'pending',work:'pending',
+              history:'pending'},sources:{}}};
+  defers.find(d=>d.u==='/api/tour').r({ok:true,json:async()=>shell});
+  await p; await flush();
+  let h=card();
+  assert.match(h,/What's new/);                  // picker, not a card
+  assert.equal((h.match(/loading&hellip;/g)||[]).length,2);
+  assert.doesNotMatch(h,/all caught up/);        // never lies 'empty'
+  // snapshot 2: the tool group lands - auto-walks its single deck
+  const tool={id:'area:power:aaa111bbb222',kind:'change',section:'tool',
+    section_title:'Tool updates',stop:'power',
+    stop_title:'Dashboard power',title:'Power',blurb:'b',
+    tag:'improved',anchor:'#power-btn',commits:[],runs:[],requests:[],
+    at:'2026-10-17T01:00:00',range:{},state:'new'};
+  ctx.__iv(); await flush();
+  defers[defers.length-1].r({ok:true,json:async()=>
+    Object.assign({},shell,{seq:2,entries:[tool],
+      loading:Object.assign({},shell.loading,{elapsed_s:1.2,
+        groups:{collect:'done',tool:'done',work:'running',
+                history:'pending'}})})});
+  await flush();
+  assert.match(card(),/Tool updates<\/span> · card 1 of 1/);
+  // mark it viewed NOW - mid-build; the POST returns a deferred count
+  await click(act('mark'));
+  defers.find(d=>d.u.includes('/viewed')).r(
+    {ok:true,json:async()=>({id:tool.id,state:'viewed',
+      changed:true,unseen_count:null})});
+  await flush();
+  assert.match(card(),/All caught up|What's new/);
+  // snapshot 3 (stale): still lists the acked card + lands a work card
+  // - the session acked-set must keep the marked one out
+  const work={id:'request:req9',kind:'request',section:'work',
+    section_title:'Work digest',stop:'requests',
+    stop_title:'Proposals & requests',title:'New proposal: nine',
+    blurb:'d',tag:'ready',anchor:'#runs',commits:[],runs:[],
+    requests:['req9'],at:'2026-10-17T05:00:00',
+    proposed_at:'2026-10-17T05:00:00',range:{},state:'new'};
+  ctx.__iv(); await flush();
+  defers[defers.length-1].r({ok:true,json:async()=>
+    Object.assign({},shell,{seq:3,entries:[tool,work],
+      loading:Object.assign({},shell.loading,{elapsed_s:2.0,
+        groups:{collect:'done',tool:'done',work:'done',
+                history:'running'}})})});
+  await flush();
+  h=card();
+  assert.doesNotMatch(h,/class="tpos"/);         // no card dealt back
+  await click(act('menu'));
+  h=card();
+  assert.match(h,/tsecname work">1 card</);      // work card landed
+  await click(act('sec',{sec:'work'}));
+  assert.match(card(),/New proposal: nine/);
+  // the complete lands: acked card sits in viewed history, never dealt
+  ctx.__iv(); await flush();
+  defers[defers.length-1].r({ok:true,json:async()=>
+    Object.assign({},shell,{seq:4,partial:false,unseen_count:1,
+      entries:[work],history:[tool],
+      loading:{busy:false}})});
+  await flush();
+  h=card();
+  assert.match(h,/viewed earlier \(1\)/);
+  assert.doesNotMatch(h,/<h3 id="tourcard-title">Power<\/h3>/);
+  assert.match(h,/New proposal: nine/);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_work_card_spotlights_the_run_row(self):
+        """A Work digest card's spotlight is the dashboard row it
+        describes: tourAnchorEl prefers the tr[data-run-key] row over
+        the card's generic stop anchor, so the ring hugs the row the
+        update is about."""
+        self._node(r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  // the generic stop AND a live row both resolve - the row wins
+  anchor('#runs',mkRect({left:8,top:300,width:900,height:200,
+    right:908,bottom:500}));
+  const row={dataset:{runKey:'request:req1'},isConnected:true,
+    classList:mkCls('runrow'),scrolled:0,
+    scrollIntoView(){this.scrolled++;},
+    getBoundingClientRect:()=>mkRect(
+      {left:10,top:780,width:900,height:24,right:910,bottom:804})};
+  document.querySelectorAll=sel=>
+    sel.indexOf('data-run-key')>=0?[row]:[];
+  const f={generated_at:'g',boundary:{},range:{},unseen_count:1,
+    warnings:[],history:[],entries:[
+    {id:'run:2026-r9:t',kind:'pipeline',section:'work',
+     section_title:'Work digest',stop:'runs',stop_title:'Runs',
+     title:'Run finished: nine',blurb:'b',tag:'done',outcome:'done',
+     anchor:'#runs',commits:[],runs:['request:req1'],requests:['req1'],
+     covers:['request:req1'],proposed_at:'2026-10-17T20:00:00',
+     completed_at:'2026-10-18T01:00:00',steps_done:2,steps_total:2,
+     unreviewed:0,at:'2026-10-18T01:00:00',range:{},state:'new'}]};
+  queue.push({ok:true,json:async()=>f});
+  await open();
+  // the ring hugs the ROW's rect (780-804, peeking below the fold),
+  // not the table's (300-500): reveal scrolled the row into view
+  const ring=elem('tourring');
+  assert.equal(ring.hidden,false);
+  assert.equal(ring.style.top,'772px');       // 780 - pad
+  assert.equal(ring.style.height,'40px');     // 24 + pad*2
+  assert.equal(row.scrolled,1);               // reveal scrolls to it
+  assert.equal(elem('tourcard').classList.contains('anchored'),true);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_card_parks_beside_a_tall_anchor(self):
+        """A clamped card must never sit on the thing it lights: when
+        the anchor fills the viewport's middle (neither above nor below
+        fits), the card parks beside the ring instead of covering it."""
+        self._node(r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  // tall mid-viewport anchor: below needs ~1020px, above ~-220px,
+  // both clamp inside the anchor's own span - the left lane is free
+  anchor('#power-btn',mkRect({left:600,top:100,width:200,height:600,
+    right:800,bottom:700}));
+  queue.push({ok:true,json:async()=>FEED});
+  await open();
+  const c=elem('tourcard');
+  assert.equal(c.classList.contains('anchored'),true);
+  // parked left of the ring: left = anchor.left - gap - cardWidth
+  assert.equal(c.style.left,'148px');         // 600 - 12 - 440
+  assert.equal(c.style.top,'100px');          // aligned to anchor top
+  // and the ring still hugs the anchor itself
+  assert.equal(elem('tourring').hidden,false);
+  assert.equal(elem('tourring').style.left,'592px');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_walk_everything_and_end_of_deck_returns_to_menu(self):
+        """'walk everything' covers both decks in feed order; marking
+        the last card lands on the deck's own caught-up screen, and its
+        '← Decks' link returns to the picker - never a silent hop into
+        another deck the user didn't pick."""
+        self._node(self._SPLIT + r'''
+(async()=>{
+  vm.runInContext('render('+JSON.stringify(DATA)+')',ctx);
+  queue.push({ok:true,json:async()=>FEED2});
+  await open();
+  // the picker: both decks with counts
+  assert.match(card(),/tsecname tool">1 card</);
+  assert.match(card(),/tsecname work">2 cards</);
+  // 'walk everything' (data-sec '') walks tool first, then work
+  await click(act('sec',{sec:''}));
+  assert.match(card(),/Tool updates<\/span> · card 1 of 1/);
+  queue.push({ok:true,json:async()=>({id:'x',state:'viewed',
+    changed:true,unseen_count:2})});
+  await click(act('mark'));
+  assert.match(card(),/Work digest<\/span> · card 1 of 2/);
+  // single-deck flow: work only; its last mark lands on caught-up
+  await click(act('menu'));
+  await click(act('sec',{sec:'work'}));
+  assert.match(card(),/Work digest<\/span> · card 1 of 2/);
+  queue.push({ok:true,json:async()=>({id:'x',state:'viewed',
+    changed:true,unseen_count:1})});
+  await click(act('mark'));
+  assert.match(card(),/Work digest<\/span> · card 1 of 1/);
+  queue.push({ok:true,json:async()=>({id:'x',state:'viewed',
+    changed:true,unseen_count:0})});
+  await click(act('mark'));
+  assert.match(card(),/All caught up/);
+  assert.match(card(),/nothing left in Work digest/);
+  // '← Decks' returns to the picker with both decks now empty
+  await click(act('menu'));
+  assert.match(card(),/tsecname tool">all caught up</);
+  assert.match(card(),/tsecname work">all caught up</);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+''')

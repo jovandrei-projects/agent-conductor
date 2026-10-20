@@ -115,8 +115,10 @@ class TourApiTests(unittest.TestCase):
 
     def call(self, method, path, data=None, ctype="application/json",
              origin=None, host=None):
+        # generous timeout - assertions carry the contract; the box is
+        # shared and git spawns (dashboard + fixtures) can queue
         conn = http.client.HTTPConnection("127.0.0.1", self.port,
-                                          timeout=10)
+                                          timeout=30)
         headers = {"Content-Type": ctype,
                    "Origin": origin or f"http://127.0.0.1:{self.port}"}
         if host:
@@ -133,6 +135,22 @@ class TourApiTests(unittest.TestCase):
             return res.status, raw
 
     def get(self, path="/api/tour"):
+        """GET /api/tour's COMPLETE payload: the endpoint publishes
+        progressively ('partial' snapshots while a build walks its
+        groups), so tests that need the whole feed poll until the
+        build finishes - the snapshots themselves are covered
+        separately."""
+        s, d = self.call("GET", path)
+        self.assertEqual(s, 200, d)
+        deadline = time.time() + 10
+        while d.get("partial") and time.time() < deadline:
+            time.sleep(0.05)
+            s, d = self.call("GET", path)
+            self.assertEqual(s, 200, d)
+        return d
+
+    def get_partial(self, path="/api/tour"):
+        """ONE snapshot - whatever the server has published so far."""
         s, d = self.call("GET", path)
         self.assertEqual(s, 200, d)
         return d
@@ -287,13 +305,21 @@ class TourApiTests(unittest.TestCase):
         self.post(f"area:power:{self.c_power[:12]}", "viewed")
         c_new = commit(self.repo, "conductor.py", "y",
                        "Improve power dialog again")
-        # the ~60s cache may still hold the pre-commit feed - expire it
-        # the way the TTL would (the transition's refresh may already
-        # have dropped it), then the fresh card surfaces
-        if self.tour["feed"] is not None:
-            self.tour["feed"]["at"] -= conductor.TOUR_FEED_TTL_S + 1
-        ids = self.ids(self.call("GET", "/api/tour")[1])
-        fresh = ids[f"area:power:{c_new[:12]}"]
+        # the transition-armed build may already be mid-collection when
+        # the commit lands (a GET joins the build in flight rather than
+        # restarting it, so that build's window can predate c_new) -
+        # expire whatever lands and re-poll until a build collects it
+        fresh_key = f"area:power:{c_new[:12]}"
+        ids = {}
+        for _ in range(40):
+            ids = self.ids(self.get())
+            if fresh_key in ids:
+                break
+            if self.tour["feed"] is not None:
+                self.tour["feed"]["at"] -= \
+                    conductor.TOUR_FEED_TTL_S + 1
+            time.sleep(0.1)
+        fresh = ids[fresh_key]
         self.assertEqual(fresh["state"], "new")
         self.assertNotEqual(fresh["id"],
                             f"area:power:{self.c_power[:12]}")
@@ -383,6 +409,53 @@ class TourApiTests(unittest.TestCase):
             lambda: self.tour["count"] is not None
             and self.tour["count"]["value"] == 1))
 
+    # ------------------------------------------- /api/tour/progress
+
+    def test_progress_endpoint_narrates_the_build(self):
+        """GET /api/tour/progress answers {busy, stage}: idle at rest,
+        and while the inline feed build runs it carries the current
+        phase name - the loading card polls this instead of sitting on
+        a bare 'loading the change feed' line."""
+        s, d = self.call("GET", "/api/tour/progress")
+        self.assertEqual(s, 200, d)
+        self.assertEqual(d["busy"], False)
+        gate = threading.Event()
+        entered = threading.Event()
+        real = tour_feeds.build_feed
+
+        def slow(*a, **kw):
+            prog = kw.get("progress")
+            if prog:
+                prog("loading run records")
+            entered.set()
+            gate.wait(10)
+            return real(*a, **kw)
+
+        got = {}
+        with mock.patch.object(tour_feeds, "build_feed",
+                               side_effect=slow):
+            t = threading.Thread(
+                target=lambda: got.setdefault(
+                    "r", self.call("GET", "/api/tour")), daemon=True)
+            t.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                s, d = self.call("GET", "/api/tour/progress")
+                self.assertEqual(s, 200)
+                self.assertTrue(d["busy"])
+                self.assertEqual(d["stage"], "loading run records")
+                self.assertTrue(d["at"] > 0)
+            finally:
+                gate.set()
+            t.join(10)
+        self.assertEqual(got["r"][0], 200, got.get("r"))
+        # GET /api/tour's snapshot answers immediately - the build lands
+        # behind it; once it does, the endpoint goes quiet again
+        self.get()
+        s, d = self.call("GET", "/api/tour/progress")
+        self.assertEqual(d["busy"], False)
+        self.assertEqual(d["stage"], "")
+
     # -------------------------------------------------- /api/state
 
     def test_state_field_is_tiny_and_eventually_filled(self):
@@ -409,10 +482,13 @@ class TourApiTests(unittest.TestCase):
 
         with mock.patch.object(tour_feeds, "build_feed",
                                side_effect=slow) as spy:
-            t0 = time.time()
             s, d = self.call("GET", "/api/state")
             self.assertEqual(s, 200, d)
-            self.assertLess(time.time() - t0, 5)
+            # the answer landed while the build is still gated - a
+            # feed-blocking /api/state could only return after the
+            # gate's own 10s expiry + the real build; the structure is
+            # the proof, not an elapsed bound
+            self.assertFalse(gate.is_set())
             self.assertIsNone(d["tour_unseen"])
             # a second poll joins the same in-flight build, not another
             self.call("GET", "/api/state")
@@ -540,8 +616,9 @@ class TourApiTests(unittest.TestCase):
             self.assertEqual({v["id"] for v in st["viewed"]}, {e1, e2})
             gate.set()
             # the gated pre-mutation build + exactly one coalesced
-            # rerun - then busy and wanted both clear
-            self.assertTrue(_poll(lambda: not self.tour["busy"]))
+            # rerun - then busy and wanted both clear (a real build's
+            # cost under a loaded shard box, not an instant)
+            self.assertTrue(_poll(lambda: not self.tour["busy"], 15))
             self.assertEqual(spy.call_count, 2)
             self.assertFalse(self.tour["wanted"])
             # converged caches reflect BOTH marks - the stale build's
@@ -684,6 +761,229 @@ class TourApiTests(unittest.TestCase):
         self.assertEqual(d["state"], "new")
         self.assertEqual(d["unseen_count"], 2)
         self.assertIn(f"request:{rid}", self.ids())
+
+    # --------------------------------------------- progressive loading
+
+    def test_partial_snapshots_publish_tool_before_work(self):
+        """While the work digest's card assembly is gated, the endpoint
+        already serves a 'partial' snapshot carrying the published
+        Tool updates - usable cards with honest group marks; the
+        complete snapshot lands once released."""
+        gate = threading.Event()
+        entered = threading.Event()
+        self.addCleanup(gate.set)
+        real = tour_feeds._unreviewed_tasks
+        # a run record gives the work digest a card to assemble - the
+        # gate below then lands inside that stage, after 'tool' has
+        # already published
+        rd = self.runs / "20261017-020000-jobone"
+        rd.mkdir(parents=True)
+        (rd / "state.json").write_text(json.dumps(
+            {"run": "jobone", "ended_at": "2026-10-17T02:00:00",
+             "steps": {"s1": {"status": "done"}}}), encoding="utf-8")
+
+        def gated(*a, **kw):
+            entered.set()
+            gate.wait(15)
+            return real(*a, **kw)
+
+        eid = f"area:power:{self.c_power[:12]}"
+        with mock.patch.object(tour_feeds, "_unreviewed_tasks",
+                               side_effect=gated):
+            # poll until the tool group has published a snapshot
+            snap = None
+            for _ in range(200):
+                snap = self.get_partial()
+                if any(e.get("section") == "tool"
+                       for e in snap.get("entries", [])):
+                    break
+                time.sleep(0.05)
+            self.assertTrue(entered.wait(5))     # work stage is gated
+            self.assertTrue(snap["partial"])
+            ids = {e["id"]: e for e in snap["entries"]}
+            self.assertIn(eid, ids)              # tool card usable NOW
+            self.assertNotIn(
+                "work", {e.get("section") for e in snap["entries"]})
+            loading = snap["loading"]
+            self.assertEqual(loading["groups"]["tool"], "done")
+            self.assertIn(loading["groups"]["work"],
+                          ("pending", "running"))
+            # a mark mid-build validates against the partial snapshot
+            # and returns promptly - the card already exists client-side
+            t0 = time.time()
+            s, d = self.post(eid, "viewed")
+            self.assertLess(time.time() - t0, 5)
+            self.assertEqual(s, 200, d)
+            self.assertEqual(d["state"], "viewed")
+            self.assertEqual(self.state_file()["viewed"][0]["id"], eid)
+            gate.set()
+        feed = self.get()                        # converge to complete
+        self.assertFalse(feed.get("partial", False))
+        self.assertNotIn(eid, self.ids(feed))    # acked: never reinsert
+        self.assertEqual(feed["unseen_count"], 2)   # chat + run cards
+
+    def test_partial_polls_join_one_build(self):
+        """Repeated /api/tour polls while a build runs share ONE build -
+        the busy/wanted coalescing never spawns a build per request."""
+        gate = threading.Event()
+        entered = threading.Event()
+        self.addCleanup(gate.set)
+        real = tour_feeds.build_feed
+
+        def slow(*a, **kw):
+            entered.set()
+            gate.wait(15)
+            return real(*a, **kw)
+
+        with mock.patch.object(tour_feeds, "build_feed",
+                               side_effect=slow) as spy:
+            for _ in range(4):
+                self.get_partial()        # each joins, none spawns
+            self.assertTrue(entered.wait(5))
+            gate.set()
+            self.get()                    # the build lands once
+            self.assertEqual(spy.call_count, 1)
+
+    def test_stale_build_never_resurrects_a_marked_card(self):
+        """A mark landing mid-build drops every remaining group of the
+        pre-mutation build (the generation guard): no published
+        snapshot deals the acknowledged card back in."""
+        self.get()                              # a complete feed exists
+        gate = threading.Event()
+        entered = threading.Event()
+        self.addCleanup(gate.set)
+        published = []
+        real_compose = conductor._tour_compose
+
+        def spy(ctx, build, **kw):
+            out = real_compose(ctx, build, **kw)
+            published.append(out)
+            return out
+
+        # gate the WORK-stage assembly (after the tool group publishes)
+        # so the mark lands mid-build - pre-mutation groups already out,
+        # later groups still to come. The run record gives that stage a
+        # card to assemble.
+        real_unrev = tour_feeds._unreviewed_tasks
+        rd = self.runs / "20261017-020000-jobone"
+        rd.mkdir(parents=True)
+        (rd / "state.json").write_text(json.dumps(
+            {"run": "jobone", "ended_at": "2026-10-17T02:00:00",
+             "steps": {"s1": {"status": "done"}}}), encoding="utf-8")
+
+        def gated_unrev(*a, **kw):
+            entered.set()
+            gate.wait(15)
+            return real_unrev(*a, **kw)
+
+        eid = f"area:power:{self.c_power[:12]}"
+        # expire the cache so the next GET arms a fresh build
+        self.tour["feed"]["at"] -= conductor.TOUR_FEED_TTL_S + 1
+        with mock.patch.object(tour_feeds, "_unreviewed_tasks",
+                               side_effect=gated_unrev):
+            with mock.patch.object(conductor, "_tour_compose", spy):
+                self.get_partial()              # arm the gated build
+                # wait for the tool group (with our card) to publish
+                self.assertTrue(_poll(lambda: any(
+                    eid in {e["id"] for e in s["entries"]}
+                    for s in published), 10))
+                self.assertTrue(entered.wait(5))
+                s, d = self.post(eid, "viewed")
+                self.assertEqual(s, 200, d)
+                mark_at = len(published)
+                gate.set()
+                self.assertTrue(_poll(
+                    lambda: self.tour["feed"] is not None, 10))
+                # every snapshot composed after the mark (the wanted
+                # post-mutation build's) excludes the card
+                for snap in published[mark_at:]:
+                    self.assertNotIn(
+                        eid, {e["id"] for e in snap["entries"]})
+        self.assertNotIn(eid, self.ids(self.get()))
+
+    def test_failed_build_serves_terminal_error_snapshot(self):
+        """A build that raises publishes a TERMINAL snapshot (partial
+        False - clients stop polling) carrying the error - and the next
+        request re-arms a fresh build that converges."""
+        calls = [0]
+        published = []
+        real = tour_feeds.build_feed
+        real_compose = conductor._tour_compose
+
+        def flaky(*a, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise RuntimeError("simulated feed failure")
+            return real(*a, **kw)
+
+        def spy(ctx, build, **kw):
+            out = real_compose(ctx, build, **kw)
+            published.append(out)
+            return out
+
+        with mock.patch.object(tour_feeds, "build_feed",
+                               side_effect=flaky), \
+                mock.patch.object(conductor, "_tour_compose", spy):
+            self.get_partial()                  # arms the doomed build
+            self.assertTrue(_poll(lambda: not self.tour["busy"], 10))
+            # the terminal publication went out: partial False (pollers
+            # stop), error stamped, never an endless 'loading'
+            terms = [p for p in published
+                     if not p["partial"] and p.get("error")]
+            self.assertTrue(terms)
+            self.assertIn("simulated feed failure", terms[0]["error"])
+            # the next request serves it (error stamped) and re-arms
+            # a fresh build behind the same response
+            snap = self.get_partial()
+            self.assertTrue(snap.get("error"))
+            self.assertTrue(_poll(
+                lambda: self.tour["feed"] is not None, 10))
+            feed = self.get()
+            self.assertFalse(feed.get("partial", False))
+            self.assertEqual(feed["unseen_count"], 2)
+            self.assertEqual(calls[0], 2)
+
+    def test_empty_window_serves_a_fast_complete(self):
+        """Watermark at HEAD: nothing to collect - the snapshot is a
+        complete empty feed, never a stuck 'loading' deck."""
+        self.seed_state(watermark={"commit": rev(self.repo),
+                                   "at": "2026-10-17T00:00:00",
+                                   "origin": "advance"})
+        d = self.get()
+        self.assertFalse(d.get("partial", False))
+        self.assertEqual(d["entries"], [])
+        self.assertEqual(d["unseen_count"], 0)
+
+    def test_progress_endpoint_reports_groups_and_elapsed(self):
+        """/api/tour/progress narrates the staged build: busy + stage +
+        per-group/source marks, with elapsed_s advancing across polls
+        (no fabricated percentages)."""
+        gate = threading.Event()
+        entered = threading.Event()
+        self.addCleanup(gate.set)
+        real = tour_feeds.build_feed
+
+        def slow(*a, **kw):
+            entered.set()
+            gate.wait(15)
+            return real(*a, **kw)
+
+        with mock.patch.object(tour_feeds, "build_feed",
+                               side_effect=slow):
+            self.get_partial()                  # arm the build
+            self.assertTrue(entered.wait(5))
+            s, p1 = self.call("GET", "/api/tour/progress")
+            self.assertEqual(s, 200)
+            self.assertTrue(p1["busy"])
+            self.assertIn("groups", p1)
+            self.assertIn("sources", p1)
+            self.assertIn("collect", p1["groups"])
+            self.assertIsNotNone(p1.get("elapsed_s"))
+            time.sleep(0.15)
+            s, p2 = self.call("GET", "/api/tour/progress")
+            self.assertGreaterEqual(p2["elapsed_s"], p1["elapsed_s"])
+            gate.set()
+        self.assertTrue(_poll(lambda: self.tour["feed"] is not None, 10))
 
 
 if __name__ == "__main__":

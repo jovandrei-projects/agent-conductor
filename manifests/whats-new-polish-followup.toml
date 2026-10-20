@@ -1,0 +1,59 @@
+# RE-REVIEW 2026-10-20: all five land-* steps are DONE - the parked branches
+# were landed same morning by the dashboard merge flow (resolver sessions
+# resolve-*, merges 2e28604 / 6ffb4e5 / bee3f0b / c5778f3 / 53b6e0e; the
+# conductor/*whats-new-polish* branches are deleted and all five features are
+# present on main). The AGENTS.md verify-timeout trap is already recorded
+# (traps item 18). Dropped: land-progressive-tour, land-run-outcome-tags,
+# land-summary-regressions, land-html-summary-report, land-chat-font.
+# Kept: integrated validation - each resolver ran only focused tests and no
+# full suite has run on the combined tree (QUEUE.md: "task 17's remaining
+# work is the integrated verification"). Folded in: whats-new-polish/STATE.md
+# still lists chat-font as parked - stale bookkeeping to correct.
+# No parallel/merge_resolver needed: one step, no merges left.
+
+[run]
+summarize = true
+name = "whats-new-polish-followup"
+description = "Run the integrated verification the whats-new-polish run never reached - all five feature branches are merged on main now - and finish the stale task-17 bookkeeping."
+on_failure = "continue"
+checkpoint = true
+
+[defaults]
+model = "swe-2"
+effort = "max"
+mode = "bypass"
+timeout_min = 45
+max_attempts = 2
+# The registered gate (python run_tests.py --jobs 8, ~8-14 min wall) applies
+# to this step automatically; verify_timeout_min must clear it or the step
+# burns exactly like the original run did (AGENTS.md trap 18). One step on
+# an idle box has no sibling load, but keep the 30-min cap anyway.
+verify_timeout_min = 30
+
+[[step]]
+name = "integrated-validation"
+project = "agent-conductor"
+timeout_min = 45
+prompt = '''
+All five whats-new-polish branches are already landed on main - the dashboard merge flow merged them on 2026-10-20 morning via resolver sessions (progressive-tour 2e28604, run-outcome-tags 6ffb4e5, summary-regressions bee3f0b, html-summary-report c5778f3, chat-font 53b6e0e; the parked conductor/20261020-030142-whats-new-polish/* branches are deleted). What was never done is the INTEGRATED verification: each resolver ran only focused tests and no full suite has run on the combined tree. That is your whole job - validate and record; do not redesign or patch.
+
+You run directly on main (no worktree); your only writes are .agent_tasks/ bookkeeping.
+
+1. Confirm all five requirements are present in the tree:
+   a. Progressive What's New loading: GET /api/tour serves staged snapshots (tool-update cards usable first, work digest + viewed history behind), non-blocking tour_transition, seq/generation guards against stale builds, honest elapsed/progress narration (conductor.py ctx["snap"]/_tour_compose/_tour_snapshot, tour_feeds.py staged group emit, dashboard client incremental apply).
+   b. Proportionate run-outcome tags in tour_feeds._run_outcome: failed only on a strict unsuccessful majority of decisive verdicts or zero done; 29 done + 1 lost -> partial; aborted verbatim; empty/never-started -> ended; feed sectioning untouched.
+   c. Run summaries lead with a deterministic step-record statistics block (_ensure_stats_block/_run_stats_lines/_run_stats_md), the summarizer prompt pins canonical '<step> - <status>' headings so decorateRunSum keeps task links/review toggles/strike-through, and summary code pills wrap long identifiers.
+   d. run.summary.html as a second summarizer artifact served via GET /api/runs/<run>/summary.html, re-sanitized per read through sanitize_report_html, appended once below the markdown sumdoc under .run-summary-report; mock_devin.py emits it.
+   e. assistant/static/chat.css chat prose on a system-sans stack (#aichat/#ai-rail/#aiset) with code pills/.mdpre/.act-params/.act-tgt pinned ui-monospace.
+   If a requirement is absent, name it and end STATUS: blocked - report, do not patch.
+
+2. Run the full suite:
+
+       python run_tests.py --jobs 8
+
+   Confirm the tour suites (test_tour_feeds/api/dash/state/polish/e2e), test_conductor, and the node-VM harness (test_tour_dash.py runs the dashboard JS in node:vm) are covered. Distinguish real failures from the known shared-box flake family observed on pristine main (test_tour_api /api/state client timeouts, test_assistant_acp session race, test_conductor device/stop timing tests): re-run any suspect standalone before counting it against this work. A real regression ends STATUS: blocked with the failing test names.
+
+3. Bookkeeping: .agent_tasks/whats-new-polish/STATE.md still lists chat-font as parked in its branch list - strike it and mark it MERGED 53b6e0e like its siblings, and refresh 'Where it stopped'/'Next' so the file reflects that all five branches landed plus this validation's result. Append a - DONE note in .agent_tasks/QUEUE.md with per-requirement verdicts and the exact failing tests (if any). The verify_timeout_min trap is already recorded as AGENTS.md trap 18 - verify it is present; do not add a duplicate.
+
+Finish with STATUS/NEXT lines listing which requirements verified green, which failed or are absent, and remaining issues.
+'''
