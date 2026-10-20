@@ -11847,11 +11847,18 @@ class RunSummaryTests(unittest.TestCase):
             self.assertIn("merged", md)
             self.assertIn("## s2 - failed", md)
             self.assertIn("ended without a closing report", md)
-            # an LLM-written run.summary.md takes precedence on disk
+            # an LLM-written run.summary.md takes precedence on disk -
+            # served with the deterministic stats block injected under
+            # its title (pre-stats-block artifacts get it for the read;
+            # the stored file is left alone)
             (rd / "run.summary.md").write_text("# llm roll-up\n",
                                                encoding="utf-8")
+            md2 = conductor.run_summary_doc("20261015-000000-sum", runs)
+            self.assertIn("# llm roll-up", md2)
+            self.assertEqual(md2.count("- **steps:**"), 1)
+            self.assertIn("- **steps:** 1 done, 1 failed", md2)
             self.assertEqual(
-                conductor.run_summary_doc("20261015-000000-sum", runs),
+                (rd / "run.summary.md").read_text(encoding="utf-8"),
                 "# llm roll-up\n")
 
     def test_summary_prompt_carries_reports(self):
@@ -12058,6 +12065,149 @@ prompt = "first"
             self.assertIn('<div class="llmsum">', frag)
             self.assertIn("<h2>LLM said</h2>", frag)
 
+    def test_llm_summary_gets_deterministic_stats_block(self):
+        """run.summary.md = our fact sheet under the title/byline, then
+        the LLM prose: exactly one authoritative stats block at the top,
+        counted from step records (a retried step counts once, only its
+        banked tokens roll up), each unsuccessful status its own count,
+        missing data honest. Regeneration replaces rather than stacks.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = make_project(base)
+            runs = base / "runs"
+            m = write_manifest(base, f'''
+[[step]]
+name = "one"
+project = "{proj.as_posix()}"
+prompt = "first"
+''')
+            self.assertEqual(run_manifest(m, runs), 0)
+            rd = next(runs.iterdir())
+            self.assertTrue(conductor.summarize_run(
+                rd, shlex.split(MOCK)))
+            out = (rd / "run.summary.md").read_text(encoding="utf-8")
+            self.assertEqual(out.count("- **steps:**"), 1)
+            self.assertIn("- **steps:** 1 done", out)
+            self.assertIn("**started:**", out)
+            self.assertIn("**ended:**", out)
+            self.assertIn("**elapsed:**", out)
+            # mock exports carry no final_metrics - the honest '-', not
+            # an invented 0-token claim
+            self.assertIn("- **tokens:** -", out)
+            self.assertIn("- **merged:** 0 · **parked branch:** 0", out)
+            # the block sits under title+byline, above the LLM prose
+            self.assertLess(out.index("_written"),
+                            out.index("- **steps:**"))
+            self.assertLess(out.index("- **steps:**"),
+                            out.index("Executive summary (mock)"))
+            # regeneration rewrites the file - the block never stacks
+            self.assertTrue(conductor.summarize_run(
+                rd, shlex.split(MOCK)))
+            out2 = (rd / "run.summary.md").read_text(encoding="utf-8")
+            self.assertEqual(out2.count("- **steps:**"), 1)
+            self.assertEqual(out2.count("# t - run summary"), 1)
+            # and the serve path adds nothing on top of a file that
+            # already carries the block
+            self.assertEqual(conductor.run_summary_doc(rd.name, runs),
+                             out2)
+
+    def test_summary_doc_injects_stats_for_legacy_llm_file(self):
+        """A run.summary.md written before the stats block existed gets
+        it injected under its own title/byline at serve time - the read
+        gains the numbers, the stored artifact is left as written."""
+        with tempfile.TemporaryDirectory() as td:
+            runs, rd = self._run_state(td, {
+                "s1": {"status": "done", "elapsed_s": 60,
+                       "tokens": {"prompt": 100, "completion": 40}},
+                "s2": {"status": "lost"},
+                "s3": {"status": "timed_out"}})
+            legacy = ("# sum - run summary\n\n"
+                      "_written 2026-10-15T02:00:00 · session `s9`_\n\n"
+                      "Hand-written old prose.\n")
+            (rd / "run.summary.md").write_text(legacy, encoding="utf-8")
+            md = conductor.run_summary_doc(rd.name, runs)
+            self.assertIn("# sum - run summary", md)
+            self.assertIn("_written 2026-10-15T02:00:00", md)
+            self.assertEqual(md.count("- **steps:**"), 1)
+            # each unsuccessful status keeps its own count
+            self.assertIn("- **steps:** 1 done, 1 lost, 1 timed_out", md)
+            self.assertIn("100 prompt + 40 completion", md)
+            self.assertLess(md.index("_written"),
+                            md.index("- **steps:**"))
+            self.assertLess(md.index("- **steps:**"),
+                            md.index("Hand-written old prose."))
+            self.assertEqual(
+                (rd / "run.summary.md").read_text(encoding="utf-8"),
+                legacy)
+            # a file with no title at all still leads with the block
+            (rd / "run.summary.md").write_text(
+                "Just prose, no title.\n", encoding="utf-8")
+            md = conductor.run_summary_doc(rd.name, runs)
+            self.assertTrue(md.startswith("- **steps:**"))
+            self.assertIn("Just prose, no title.", md)
+
+    def test_stats_block_honest_when_state_missing(self):
+        """Unavailable values render honestly: unrecorded token data is
+        '-', missing timestamps are '-', an empty run says 'none' for
+        steps - the deterministic block never invents a number."""
+        st = {"run": "r", "steps": {
+            "s1": {"status": "failed"},
+            "s2": {"status": "timed_out", "attempts": 2}}}
+        md = conductor._run_stats_md(st)
+        self.assertIn("- **steps:** 1 failed, 1 timed_out", md)
+        self.assertIn("**started:** -", md)
+        self.assertIn("**ended:** -", md)
+        self.assertIn("- **tokens:** -", md)
+        self.assertIn("- **merged:** 0 · **parked branch:** 0", md)
+        # a retried step still counts once; banked tokens roll up once
+        st2 = {"run": "r", "steps": {
+            "s1": {"status": "done", "attempts": 3,
+                   "tokens": {"prompt": 100, "completion": 40,
+                              "cached": 10}}}}
+        md2 = conductor._run_stats_md(st2)
+        self.assertIn("- **steps:** 1 done", md2)
+        self.assertIn("100 prompt + 40 completion (10 cached)", md2)
+        # the deterministic roll-up leads with the same block
+        st3 = {"run": "r3", "steps": {"s1": {"status": "done"}}}
+        rep = conductor.run_report_md(st3)
+        self.assertLess(rep.index("- **steps:**"),
+                        rep.index("## s1 - done"))
+
+    def test_summary_prompt_demands_canonical_headings(self):
+        """The summarizer prompt pins the machine-read contract: every
+        step keeps its '## <step> - <status>' heading verbatim - the
+        exact form decorateRunSum rewires into links + review toggles -
+        and the prompt's own source lines model it."""
+        with tempfile.TemporaryDirectory() as td:
+            exp = self._closing_export(Path(td), "did the work")
+            st = {"run": "sum", "steps": {
+                "s1": {"status": "done", "task": "t",
+                       "export": str(exp)}}}
+            prompt = conductor._summary_prompt(st)
+            self.assertIn("'## <step-name> - <status>'", prompt)
+            self.assertIn("### s1 - done", prompt)   # the source line
+
+    def test_summary_code_pill_styling(self):
+        """'.sumdoc code' carries the Ask-AI tinted-chip treatment -
+        translucent fill + hairline border + accent text - and wraps
+        long identifiers; fenced pre keeps its own chrome, and the
+        standalone per-task summary page gets the same wrap fix."""
+        h = conductor._DASH_HTML
+        i = h.index("#detail .sumdoc code {")
+        body = h[i:h.index("}", i)]
+        self.assertIn("border:1px solid", body)
+        self.assertIn("rgba(110,118,129", body)
+        self.assertIn("overflow-wrap:anywhere", body)
+        self.assertIn("color:#a5d6ff", body)
+        self.assertIn("#detail .sumdoc pre code", h)
+        page = conductor.summary_html("`deferred-transition`", "t")
+        self.assertIn("overflow-wrap:anywhere", page)
+        self.assertIn("pre code{", page)
+        self.assertIn("rgba(110,118,129", page)
+        # the chat pill rules are untouched - scoped to .sumdoc/#aichat
+        self.assertNotIn("#aichat .aim-body code", h)
+
     def test_run_summary_buttons_wired(self):
         self.assertIn('data-run-summary="', conductor._DASH_HTML)
         self.assertIn('data-summarize-run="', conductor._DASH_HTML)
@@ -12087,6 +12237,89 @@ prompt = "first"
         self.assertIn("sum-review", h)
         self.assertIn("Mark as reviewed", h)
         self.assertIn("Mark as needing review", h)
+
+    @unittest.skipUnless(shutil.which("node"), "Node unavailable")
+    def test_js_decorateRunSum_canonical_headings(self):
+        """decorateRunSum rewires canonical '<step> - <status>' headings
+        from either document shape (deterministic h2, LLM h3 + em dash):
+        step name -> task-modal link, status -> .stc color, the
+        mark-as-reviewed/needing-review toggle carrying the delegated
+        data-review-* contract, strike-through on a reviewed step -
+        while prose/non-step/punctuated headings stay untouched."""
+        js = conductor._DASH_HTML.split("<script>\n", 1)[1].split(
+            "</script>", 1)[0]
+        harness = r'''
+const vm=require('node:vm'), assert=require('node:assert/strict');
+const src=require('node:fs').readFileSync(0,'utf8').replace(/\ntick\(\);\s*$/, '');
+const nodes=new Map(), handlers={};
+const elem=id=>{ if(!nodes.has(id)) nodes.set(id,
+  {innerHTML:'',hidden:true,textContent:'',scrollTop:0});
+  return nodes.get(id); };
+const document={getElementById:elem,querySelector:()=>null,
+  querySelectorAll:()=>[],activeElement:null,
+  addEventListener:(ev,h)=>{handlers[ev]=h;}};
+const fetch=async()=>({ok:true,status:200,json:async()=>({})});
+const ctx=vm.createContext({document,fetch,confirm:()=>true,alert:()=>{},
+  location:{reload:()=>{}},setTimeout:()=>{}});
+vm.runInContext(src,ctx);
+const data={serve_boot:'b',generated_at:'2026-10-20T00:00:00',agents:[
+  {step:'s1',run:'r',run_dir:'/r',run_key:'rk',slug:'p',status:'done',
+   task:'t1',completion_seq:1,needs_review:false,
+   review:{reviewed:true,seq:1,at:'2026-10-20T01:00:00'}},
+  {step:'s2',run:'r',run_dir:'/r',run_key:'rk',slug:'p',status:'failed',
+   task:'t2',completion_seq:2,needs_review:true},
+  {step:'run-summary',run:'r',run_dir:'/r',run_key:'rk',slug:'p',
+   status:'done',task:'aux',aux:true}],
+  runs:[{run:'r',dir:'/r',key:'rk',counts:{done:1,failed:1}}]};
+vm.runInContext('render('+JSON.stringify(data)+')',ctx);
+// heading stubs carrying the shape decorateRunSum reads off a real
+// heading: textContent, dataset, classList, writable innerHTML
+const mkH=(tag,text)=>{const h={tagName:tag,textContent:text,dataset:{},
+  _cls:new Set(),_toggles:[],innerHTML:''};
+  h.classList={toggle:(c,f)=>{h._toggles.push([c,f]);
+    f?h._cls.add(c):h._cls.delete(c);return f;},
+    contains:c=>h._cls.has(c)};
+  return h;};
+const heads=[mkH('H2','s1 - done'),     // deterministic roll-up shape
+             mkH('H3','s2 — failed'),    // LLM file: h3 + em dash
+             mkH('H3','Step s1: done'),  // non-canonical prose
+             mkH('H2','s3 - done'),      // no such step in the run
+             mkH('H3','s1 - done.'),     // trailing punctuation
+             mkH('H3','run-summary - done')]; // aux row: not a step
+const root={querySelectorAll:sel=>sel==='h2,h3,h4'?heads:[]};
+ctx.root=root; ctx.rkey='rk';
+vm.runInContext('decorateRunSum(root, rkey)',ctx);
+// s1 - done: reviewed flag -> strike + 'mark as needing review', name
+// is the task-modal link, status colored
+assert.equal(heads[0].dataset.sumstep,'s1');
+assert.match(heads[0].innerHTML,/data-agent-detail="rk\|s1"/);
+assert.match(heads[0].innerHTML,/stc st-ok">done</);
+assert.match(heads[0].innerHTML,/data-review-step="r"[^>]*data-step="s1"[^>]*data-review-set="0"[^>]*data-review-seq="1"/);
+assert.match(heads[0].innerHTML,/>mark as needing review</);
+assert.deepEqual(heads[0]._toggles,[['sumh-reviewed',true]]);
+// s2 — failed: em dash still canonical; needs_review -> 'mark as
+// reviewed', no strike-through
+assert.equal(heads[1].dataset.sumstep,'s2');
+assert.match(heads[1].innerHTML,/data-agent-detail="rk\|s2"/);
+assert.match(heads[1].innerHTML,/stc st-bad">failed</);
+assert.match(heads[1].innerHTML,/data-review-set="1"/);
+assert.match(heads[1].innerHTML,/>mark as reviewed</);
+assert.deepEqual(heads[1]._toggles,[['sumh-reviewed',false]]);
+// everything else stays plain prose - no link, no toggle, no dataset
+for (const h of heads.slice(2)) {
+  assert.equal(h.innerHTML,'');
+  assert.equal(h.dataset.sumstep,undefined);
+  assert.deepEqual(h._toggles,[]);
+}
+// re-decoration is idempotent: the dataset guard rebuilds from the
+// remembered step, never re-parses the mutated markup
+vm.runInContext('decorateRunSum(root, rkey)',ctx);
+assert.equal(heads[0].innerHTML.match(/data-review-step/g).length,1);
+'''
+        p = subprocess.run(["node", "-e", harness], input=js,
+                           capture_output=True, text=True, encoding="utf-8",
+                           timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
 
     def test_modal_ux_wiring(self):
         """The modal-revamp bits the layout depends on: three-zone nav
